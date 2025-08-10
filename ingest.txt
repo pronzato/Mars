@@ -1,0 +1,585 @@
+package com.example.fabric;
+
+import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
+import java.io.Closeable;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.Reader;
+import java.io.UncheckedIOException;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+* Minimal Fabric Source reference implementation compatible with Java 8.
+* - Canonical doIngest(InputEnvelope) plus ergonomic do* overloads
+* - Decoders for Map, CSV, JSON Lines (with naive JSON fallback)
+* - Reflection-based Arrow path kept, but avoid adding Arrow as a dependency for Java 8
+*/
+@SuppressWarnings({"unchecked","rawtypes"})
+public class FabricSourceDemoJava8 {
+
+  // ===== Public API =====
+
+  public interface FabricSource {
+    IngestResult doIngest(InputEnvelope in);
+
+    // Overloads delegate to canonical API
+    default IngestResult doIngestMap(Map<String, Object> row, Metadata meta) {
+      return doIngest(new MapInput(row, meta));
+    }
+    default IngestResult doIngestFile(Path file, Metadata meta) {
+      return doIngest(new FileInput(file, meta));
+    }
+    default IngestResult doIngestBytes(byte[] bytes, Metadata meta) {
+      return doIngest(new BytesInput(bytes, meta));
+    }
+    default IngestResult doIngestStream(InputStream stream, Metadata meta) {
+      return doIngest(new StreamInput(stream, meta));
+    }
+    // Arrow handled via reflection to avoid compile-time dependency.
+    public default IngestResult doIngestArrow(Object vectorSchemaRoot, Metadata meta) {
+      return doIngest(new ArrowInput(vectorSchemaRoot, meta));
+    }
+
+    default IngestResult doIngestBatch(List<InputEnvelope> batch) {
+      long totalRecs = 0L, totalBytes = 0L;
+      String schemaId = null;
+      List<String> notes = new ArrayList<String>();
+      for (InputEnvelope env : batch) {
+        IngestResult r = doIngest(env);
+        totalRecs += r.getRecords();
+        totalBytes += r.getBytes();
+        if (schemaId == null && r.getSchemaId() != null) schemaId = r.getSchemaId();
+        if (!r.getWarnings().isEmpty()) notes.addAll(r.getWarnings());
+      }
+      return new IngestResult(totalRecs, totalBytes, schemaId, notes);
+    }
+  }
+
+  public interface InputEnvelope { Metadata meta(); }
+
+  // Concrete envelopes
+  public static final class MapInput implements InputEnvelope {
+    private final Map<String,Object> data;
+    private final Metadata meta;
+    public MapInput(Map<String,Object> data, Metadata meta) { this.data = data; this.meta = meta; }
+    public Map<String,Object> data() { return data; }
+    public Metadata meta() { return meta; }
+  }
+
+  public static final class FileInput implements InputEnvelope {
+    private final Path path;
+    private final Metadata meta;
+    public FileInput(Path path, Metadata meta) { this.path = path; this.meta = meta; }
+    public Path path() { return path; }
+    public Metadata meta() { return meta; }
+  }
+
+  public static final class BytesInput implements InputEnvelope {
+    private final byte[] bytes;
+    private final Metadata meta;
+    public BytesInput(byte[] bytes, Metadata meta) { this.bytes = bytes; this.meta = meta; }
+    public byte[] bytes() { return bytes; }
+    public Metadata meta() { return meta; }
+  }
+
+  public static final class StreamInput implements InputEnvelope {
+    private final InputStream stream;
+    private final Metadata meta;
+    public StreamInput(InputStream stream, Metadata meta) { this.stream = stream; this.meta = meta; }
+    public InputStream stream() { return stream; }
+    public Metadata meta() { return meta; }
+  }
+
+  public static final class ArrowInput implements InputEnvelope {
+    private final Object vectorSchemaRoot;
+    private final Metadata meta;
+    public ArrowInput(Object vectorSchemaRoot, Metadata meta) { this.vectorSchemaRoot = vectorSchemaRoot; this.meta = meta; }
+    public Object vectorSchemaRoot() { return vectorSchemaRoot; }
+    public Metadata meta() { return meta; }
+  }
+
+  public static final class Metadata {
+    private final String contentType;
+    private final String contentEncoding;
+    private final String schemaId;
+    private final String tenantId;
+    private final Map<String,String> headers;
+    private final Instant ingestTs;
+
+    public Metadata(String contentType, String contentEncoding, String schemaId, String tenantId, Map<String,String> headers, Instant ingestTs) {
+      this.contentType = contentType;
+      this.contentEncoding = contentEncoding;
+      this.schemaId = schemaId;
+      this.tenantId = tenantId;
+      this.headers = headers == null ? Collections.<String,String>emptyMap() : new LinkedHashMap<String,String>(headers);
+      this.ingestTs = ingestTs == null ? Instant.now() : ingestTs;
+    }
+    public static Metadata of(String contentType, String schemaId) {
+      return new Metadata(contentType, null, schemaId, null, Collections.<String,String>emptyMap(), Instant.now());
+    }
+    public String contentType() { return contentType; }
+    public String contentEncoding() { return contentEncoding; }
+    public String schemaId() { return schemaId; }
+    public String tenantId() { return tenantId; }
+    public Map<String,String> headers() { return Collections.unmodifiableMap(headers); }
+    public Instant ingestTs() { return ingestTs; }
+  }
+
+  public static final class IngestResult {
+    private final long records;
+    private final long bytes;
+    private final String schemaId;
+    private final List<String> warnings;
+    public IngestResult(long records, long bytes, String schemaId, List<String> warnings) {
+      this.records = records; this.bytes = bytes; this.schemaId = schemaId;
+      this.warnings = warnings == null ? Collections.<String>emptyList() : new ArrayList<String>(warnings);
+    }
+    public long getRecords() { return records; }
+    public long getBytes() { return bytes; }
+    public String getSchemaId() { return schemaId; }
+    public List<String> getWarnings() { return Collections.unmodifiableList(warnings); }
+  }
+
+  // Minimal Schema types (replace with your own)
+  public static final class Schema {
+    private final String id;
+    private final String name;
+    private final Map<String,String> columns;
+    public Schema(String id, String name, Map<String,String> columns) {
+      this.id = id; this.name = name;
+      this.columns = columns == null ? Collections.<String,String>emptyMap() : new LinkedHashMap<String,String>(columns);
+    }
+    public static Schema of(String id, String name, Map<String,String> columns) { return new Schema(id, name, columns); }
+    public String id() { return id; }
+    public String name() { return name; }
+    public Map<String,String> columns() { return Collections.unmodifiableMap(columns); }
+  }
+
+  public static final class SchemaRecord {
+    private final String name;
+    private final LinkedHashMap<String,Object> fields = new LinkedHashMap<String,Object>();
+    public SchemaRecord(String name, Map<String,Object> fields) {
+      this.name = name;
+      if (fields != null) this.fields.putAll(fields);
+    }
+    public static SchemaRecord of(String name, Map<String,Object> fields) { return new SchemaRecord(name, fields); }
+    public String getName() { return name; }
+    public Map<String,Object> getFields() { return Collections.unmodifiableMap(fields); }
+    public String toString() { return "SchemaRecord{name=" + name + ", fields=" + fields + "}"; }
+  }
+
+  // ===== SPI =====
+
+  public interface Decoder {
+    boolean supports(String contentType, String contentEncoding, InputEnvelope env);
+    RecordStream decode(InputEnvelope in, Schema targetSchema) throws IOException;
+  }
+
+  public interface DecoderRegistry {
+    Decoder resolve(String contentType, String contentEncoding, InputEnvelope env);
+  }
+
+  public interface SchemaResolver {
+    Schema resolve(Metadata meta);
+  }
+
+  public interface Validator {
+    ValidationResult validate(Schema schema, SchemaRecord record);
+  }
+
+  public static final class ValidationResult {
+    private final boolean ok;
+    private final List<String> warnings;
+    public ValidationResult(boolean ok, List<String> warnings) { this.ok = ok; this.warnings = warnings == null ? Collections.<String>emptyList() : warnings; }
+    public static ValidationResult ok() { return new ValidationResult(true, Collections.<String>emptyList()); }
+    public static ValidationResult warn(String w) { return new ValidationResult(true, Collections.singletonList(w)); }
+    public boolean isOk() { return ok; }
+    public List<String> getWarnings() { return warnings; }
+  }
+
+  public interface Router { void route(SchemaRecord record); }
+
+  public interface RecordStream extends Iterable<SchemaRecord>, Closeable {
+    void close();
+  }
+
+  // ===== Implementations =====
+
+  public static final class SimpleDecoderRegistry implements DecoderRegistry {
+    private final List<Decoder> decoders = new ArrayList<Decoder>();
+    public SimpleDecoderRegistry() {
+      decoders.add(new MapDecoder());
+      decoders.add(new CsvDecoder());
+      decoders.add(new JsonLinesDecoder());
+      decoders.add(new ArrowDecoder());
+      decoders.add(new BytesDispatcher());
+      decoders.add(new StreamDispatcher());
+      decoders.add(new FileDispatcher());
+    }
+    public Decoder resolve(String contentType, String contentEncoding, InputEnvelope env) {
+      for (Decoder d : decoders) {
+        if (d.supports(contentType, contentEncoding, env)) return d;
+      }
+      throw new IllegalArgumentException("No decoder for contentType=" + contentType + " encoding=" + contentEncoding + " env=" + env.getClass().getSimpleName());
+    }
+  }
+
+  public static final class MapDecoder implements Decoder {
+    public boolean supports(String ct, String ce, InputEnvelope env) { return env instanceof MapInput; }
+    public RecordStream decode(InputEnvelope in, Schema targetSchema) {
+      MapInput mi = (MapInput) in;
+      final List<SchemaRecord> one = Collections.singletonList(SchemaRecord.of(targetSchema.name(), mi.data()));
+      return iterableStream(one);
+    }
+  }
+
+  public static final class CsvDecoder implements Decoder {
+    public boolean supports(String ct, String ce, InputEnvelope env) {
+      return "text/csv".equalsIgnoreCase(ct) || (ct == null && (env instanceof FileInput || env instanceof BytesInput || env instanceof StreamInput));
+    }
+    public RecordStream decode(InputEnvelope in, Schema targetSchema) throws IOException {
+      Reader reader = toReader(in, StandardCharsets.UTF_8);
+      BufferedReader br = new BufferedReader(reader);
+      String header = br.readLine();
+      if (header == null) return iterableStream(Collections.<SchemaRecord>emptyList());
+      String[] cols = header.split(",", -1);
+      List<SchemaRecord> out = new ArrayList<SchemaRecord>();
+      String line;
+      while ((line = br.readLine()) != null) {
+        String[] vals = line.split(",", -1);
+        Map<String,Object> map = new LinkedHashMap<String,Object>();
+        for (int i = 0; i < cols.length && i < vals.length; i++) {
+          map.put(cols[i], vals[i]);
+        }
+        out.add(SchemaRecord.of(targetSchema.name(), map));
+      }
+      closeQuietly(br);
+      return iterableStream(out);
+    }
+  }
+
+  public static final class JsonLinesDecoder implements Decoder {
+    public boolean supports(String ct, String ce, InputEnvelope env) {
+      return "application/jsonl".equalsIgnoreCase(ct) || "application/x-ndjson".equalsIgnoreCase(ct) || "application/json".equalsIgnoreCase(ct);
+    }
+    public RecordStream decode(InputEnvelope in, Schema targetSchema) throws IOException {
+      Reader reader = toReader(in, StandardCharsets.UTF_8);
+      BufferedReader br = new BufferedReader(reader);
+      List<SchemaRecord> out = new ArrayList<SchemaRecord>();
+      String line;
+      while ((line = br.readLine()) != null) {
+        line = line.trim();
+        if (line.length() == 0) continue;
+        Map<String,Object> map = tryJacksonParse(line);
+        if (map == null) map = naiveFlatJson(line);
+        out.add(SchemaRecord.of(targetSchema.name(), map));
+      }
+      closeQuietly(br);
+      return iterableStream(out);
+    }
+
+    private Map<String,Object> tryJacksonParse(String json) {
+      try {
+        Class<?> omClass = Class.forName("com.fasterxml.jackson.databind.ObjectMapper");
+        Object om = omClass.newInstance();
+        Object map = omClass.getMethod("readValue", String.class, Class.class).invoke(om, json, Map.class);
+        return (Map<String,Object>) map;
+      } catch (Throwable t) {
+        return null;
+      }
+    }
+
+    // Naive flat-object parser: {"a":"b","n":1}
+    private Map<String,Object> naiveFlatJson(String json) {
+      Map<String,Object> m = new LinkedHashMap<String,Object>();
+      String s = json.trim();
+      if (s.startsWith("{") && s.endsWith("}")) s = s.substring(1, s.length()-1);
+      if (s.length() == 0) return m;
+      String[] pairs = s.split("\\s*,\\s*");
+      for (String p : pairs) {
+        int idx = p.indexOf(':');
+        if (idx < 0) continue;
+        String k = stripQuotes(p.substring(0, idx).trim());
+        String v = p.substring(idx+1).trim();
+        Object val = parseScalar(stripQuotes(v));
+        m.put(k, val);
+      }
+      return m;
+    }
+    private String stripQuotes(String x) {
+      String t = x.trim();
+      if ((t.startsWith("\"") && t.endsWith("\"")) || (t.startsWith("'") && t.endsWith("'"))) {
+        return t.substring(1, t.length()-1);
+      }
+      return t;
+    }
+    private Object parseScalar(String v) {
+      if ("null".equals(v)) return null;
+      if ("true".equalsIgnoreCase(v)) return Boolean.TRUE;
+      if ("false".equalsIgnoreCase(v)) return Boolean.FALSE;
+      try { return Integer.valueOf(v); } catch (Exception ignore) {}
+      try { return Long.valueOf(v); } catch (Exception ignore) {}
+      try { return Double.valueOf(v); } catch (Exception ignore) {}
+      return v;
+    }
+  }
+
+  public static final class ArrowDecoder implements Decoder {
+    public boolean supports(String ct, String ce, InputEnvelope env) {
+      boolean typeOk = env instanceof ArrowInput
+          || "application/vnd.apache.arrow.stream".equalsIgnoreCase(ct)
+          || "application/vnd.apache.arrow.file".equalsIgnoreCase(ct);
+      return typeOk;
+    }
+    public RecordStream decode(InputEnvelope in, Schema targetSchema) {
+      ArrowInput ain = (ArrowInput) in;
+      Object vsr = ain.vectorSchemaRoot();
+      if (vsr == null) return iterableStream(Collections.<SchemaRecord>emptyList());
+      try {
+        int rowCount = ((Integer) vsr.getClass().getMethod("getRowCount").invoke(vsr)).intValue();
+        List fieldVectors = (List) vsr.getClass().getMethod("getFieldVectors").invoke(vsr);
+        List<String> names = new ArrayList<String>();
+        for (Object fv : fieldVectors) {
+          Object field = fv.getClass().getMethod("getField").invoke(fv);
+          String name = (String) field.getClass().getMethod("getName").invoke(field);
+          names.add(name);
+        }
+        List<SchemaRecord> out = new ArrayList<SchemaRecord>(rowCount);
+        for (int r = 0; r < rowCount; r++) {
+          Map<String,Object> map = new LinkedHashMap<String,Object>();
+          for (int c = 0; c < fieldVectors.size(); c++) {
+            Object fv = fieldVectors.get(c);
+            Object val = fv.getClass().getMethod("getObject", int.class).invoke(fv, r);
+            map.put(names.get(c), val);
+          }
+          out.add(SchemaRecord.of(targetSchema.name(), map));
+        }
+        return iterableStream(out);
+      } catch (Throwable t) {
+        throw new IllegalStateException("Arrow decoding failed (is Arrow on classpath and compatible with Java 8?)", t);
+      }
+    }
+  }
+
+  // Dispatchers (bytes/stream/file → reuse CSV/JSON decoders)
+  public static final class BytesDispatcher implements Decoder {
+    public boolean supports(String ct, String ce, InputEnvelope env) { return env instanceof BytesInput; }
+    public RecordStream decode(InputEnvelope in, Schema targetSchema) throws IOException {
+      BytesInput bi = (BytesInput) in;
+      String text = new String(bi.bytes(), StandardCharsets.UTF_8);
+      return new StringStream(text).pipeToBestDecoder(bi.meta(), targetSchema);
+    }
+  }
+  public static final class StreamDispatcher implements Decoder {
+    public boolean supports(String ct, String ce, InputEnvelope env) { return env instanceof StreamInput; }
+    public RecordStream decode(InputEnvelope in, Schema targetSchema) throws IOException {
+      StreamInput si = (StreamInput) in;
+      byte[] bytes = readAllBytes(si.stream());
+      String text = new String(bytes, StandardCharsets.UTF_8);
+      return new StringStream(text).pipeToBestDecoder(si.meta(), targetSchema);
+    }
+  }
+  public static final class FileDispatcher implements Decoder {
+    public boolean supports(String ct, String ce, InputEnvelope env) { return env instanceof FileInput; }
+    public RecordStream decode(InputEnvelope in, Schema targetSchema) throws IOException {
+      FileInput fi = (FileInput) in;
+      byte[] bytes = Files.readAllBytes(fi.path());
+      return new BytesDispatcher().decode(new BytesInput(bytes, fi.meta()), targetSchema);
+    }
+  }
+
+  // ===== Glue =====
+
+  public static final class DefaultFabricSource implements FabricSource {
+    private final DecoderRegistry decoders;
+    private final SchemaResolver schemaResolver;
+    private final Validator validator;
+    private final Router router;
+
+    public DefaultFabricSource(DecoderRegistry decoders, SchemaResolver schemaResolver, Validator validator, Router router) {
+      this.decoders = decoders;
+      this.schemaResolver = schemaResolver;
+      this.validator = validator;
+      this.router = router;
+    }
+
+    public IngestResult doIngest(InputEnvelope in) {
+      Metadata meta = in.meta();
+      Schema targetSchema = schemaResolver.resolve(meta);
+
+      long recs = 0L;
+      long bytes = estimateBytes(in);
+      List<String> warnings = new ArrayList<String>();
+
+      try {
+        Decoder decoder = decoders.resolve(meta.contentType(), meta.contentEncoding(), in);
+        RecordStream stream = decoder.decode(in, targetSchema);
+        try {
+          for (SchemaRecord r : stream) {
+            ValidationResult v = validator.validate(targetSchema, r);
+            if (!v.getWarnings().isEmpty()) warnings.addAll(v.getWarnings());
+            router.route(r);
+            recs++;
+          }
+        } finally {
+          closeQuietly(stream);
+        }
+      } catch (IOException e) {
+        throw new UncheckedIOException(e);
+      }
+      return new IngestResult(recs, bytes, targetSchema.id(), warnings);
+    }
+  }
+
+  // ===== Tiny defaults (swap with your real implementations) =====
+
+  public static final class InMemorySchemaResolver implements SchemaResolver {
+    public Schema resolve(Metadata meta) {
+      String id = meta.schemaId() != null ? meta.schemaId() : "unknown";
+      return Schema.of(id, id, Collections.<String,String>emptyMap());
+    }
+  }
+  public static final class NoopValidator implements Validator {
+    public ValidationResult validate(Schema schema, SchemaRecord record) { return ValidationResult.ok(); }
+  }
+  public static final class CollectingRouter implements Router {
+    private final List<SchemaRecord> sink = new ArrayList<SchemaRecord>();
+    public void route(SchemaRecord record) { sink.add(record); }
+    public List<SchemaRecord> records() { return sink; }
+  }
+
+  // ===== Utilities =====
+
+  static long estimateBytes(InputEnvelope in) {
+    try {
+      if (in instanceof BytesInput) return ((BytesInput) in).bytes().length;
+      if (in instanceof FileInput) return Files.size(((FileInput) in).path());
+      if (in instanceof StreamInput) return -1L;
+      if (in instanceof MapInput) return ((MapInput) in).data().toString().getBytes(StandardCharsets.UTF_8).length;
+      if (in instanceof ArrowInput) return -1L;
+      return -1L;
+    } catch (IOException e) {
+      return -1L;
+    }
+  }
+
+  static RecordStream iterableStream(final List<SchemaRecord> list) {
+    return new RecordStream() {
+      public void close() {}
+      public Iterator<SchemaRecord> iterator() { return list.iterator(); }
+    };
+  }
+
+  static Reader toReader(InputEnvelope in, Charset cs) throws IOException {
+    if (in instanceof BytesInput) return new InputStreamReader(new ByteArrayInputStream(((BytesInput) in).bytes()), cs);
+    if (in instanceof StreamInput) return new InputStreamReader(((StreamInput) in).stream(), cs);
+    if (in instanceof FileInput) return new InputStreamReader(new FileInputStream(((FileInput) in).path().toFile()), cs);
+    throw new IllegalArgumentException("Envelope not convertible to Reader: " + in.getClass().getSimpleName());
+  }
+
+  static byte[] readAllBytes(InputStream is) throws IOException {
+    try {
+      byte[] buf = new byte[8192];
+      int read;
+      List<byte[]> chunks = new ArrayList<byte[]>();
+      int total = 0;
+      while ((read = is.read(buf)) != -1) {
+        byte[] c = Arrays.copyOf(buf, read);
+        chunks.add(c);
+        total += read;
+      }
+      byte[] out = new byte[total];
+      int pos = 0;
+      for (byte[] c : chunks) {
+        System.arraycopy(c, 0, out, pos, c.length);
+        pos += c.length;
+      }
+      return out;
+    } finally {
+      closeQuietly(is);
+    }
+  }
+
+  static void closeQuietly(Closeable c) {
+    if (c == null) return;
+    try { c.close(); } catch (IOException ignore) {}
+  }
+
+  // Helper to route strings to CSV/JSON decoders based on contentType or sniffing
+  static final class StringStream {
+    final String text;
+    StringStream(String t) { this.text = t; }
+    RecordStream pipeToBestDecoder(Metadata meta, Schema targetSchema) throws IOException {
+      String ct = meta.contentType();
+      Decoder chosen;
+      if ("text/csv".equalsIgnoreCase(ct)) {
+        chosen = new CsvDecoder();
+      } else if ("application/jsonl".equalsIgnoreCase(ct) || "application/x-ndjson".equalsIgnoreCase(ct) || "application/json".equalsIgnoreCase(ct)) {
+        chosen = new JsonLinesDecoder();
+      } else {
+        String first = "";
+        String[] lines = text.split("\\R");
+        for (int i = 0; i < lines.length; i++) {
+          if (lines[i] != null && lines[i].trim().length() > 0) { first = lines[i].trim(); break; }
+        }
+        chosen = (first.startsWith("{") && first.endsWith("}")) ? new JsonLinesDecoder() : new CsvDecoder();
+      }
+      return chosen.decode(new StreamInput(new ByteArrayInputStream(text.getBytes(StandardCharsets.UTF_8)), meta), targetSchema);
+    }
+  }
+
+  // ===== Demo main =====
+
+  public static void main(String[] args) throws Exception {
+    SimpleDecoderRegistry registry = new SimpleDecoderRegistry();
+    InMemorySchemaResolver resolver = new InMemorySchemaResolver();
+    NoopValidator validator = new NoopValidator();
+    CollectingRouter router = new CollectingRouter();
+    DefaultFabricSource source = new DefaultFabricSource(registry, resolver, validator, router);
+
+    // 1) Map
+    Metadata metaMap = Metadata.of("application/json", "positions.v1");
+    source.doIngestMap(mapOf("id", (Object)1, "sym", "AAPL", "qty", 100), metaMap);
+
+    // 2) CSV file
+    Path tmp = Files.createTempFile("demo", ".csv");
+    String csv = "id,sym,qty\n" + "2,MSFT,200\n" + "3,GOOG,300\n";
+    Files.write(tmp, csv.getBytes(StandardCharsets.UTF_8));
+    Metadata metaCsv = Metadata.of("text/csv", "positions.v1");
+    source.doIngestFile(tmp, metaCsv);
+
+    // 3) JSON Lines
+    String jsonl = "{\"id\":4,\"sym\":\"NFLX\",\"qty\":400}\n" + "{\"id\":5,\"sym\":\"AMZN\",\"qty\":500}\n";
+    Metadata metaJsonl = Metadata.of("application/jsonl", "positions.v1");
+    source.doIngestBytes(jsonl.getBytes(StandardCharsets.UTF_8), metaJsonl);
+
+    System.out.println("Routed records: " + router.records().size());
+    for (SchemaRecord r : router.records()) System.out.println(r);
+  }
+
+  // Small helper since Map.of() isn't in Java 8
+  @SafeVarargs
+  public static <K,V> Map<K,V> mapOf(Object... kv) {
+    LinkedHashMap<K,V> m = new LinkedHashMap<K,V>();
+    for (int i = 0; i < kv.length; i+=2) {
+      K k = (K) kv[i];
+      V v = (V) kv[i+1];
+      m.put(k, v);
+    }
+    return m;
+  }
+} 
