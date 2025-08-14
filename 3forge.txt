@@ -1,0 +1,207 @@
+1) Create a minimal Data Model (optional but tidy)
+
+You don’t need a backing table to submit an order, but it’s convenient to keep defaults and last-used values.
+
+In Dashboard → Data Modeler, create an in-memory table TicketDefaults with columns:
+
+symbol (STRING), side (STRING), qty (INT), price (DOUBLE),
+
+ordType (STRING), tif (STRING), account (STRING), destination (STRING)
+
+Seed one row with sensible defaults (e.g., AAPL, BUY, 100, …). 
+3Forge Documentation
+
+2) Add a Form panel with fields
+
+In layout edit mode (Ctrl+D):
+
+Add a Form panel.
+
+Add fields (names in bold are the component IDs you’ll reference from AmiScript):
+
+symbol: Text
+
+side: Select (options: BUY, SELL)
+
+qty: Number
+
+price: Number
+
+ordType: Select (LIMIT, MARKET)
+
+tif: Select (DAY, IOC, FOK, GTC)
+
+account: Text
+
+destination: Select (e.g., NYSE, ARCA, NASDAQ)
+
+Buttons: submitBtn (“Submit”), resetBtn (“Reset”)
+
+You can wire Form fields to the TicketDefaults row for auto-populate, or leave them unbound and set defaults in AmiScript. (See Form classes like FormPanel, FormSelectField in the Javadoc for field behavior and APIs.) 
+3Forge Documentation
++1
+
+3) AmiScript: defaults, validation, and submit
+
+Open the Form’s AmiScript and paste this:
+
+// ----- Helpers -----
+def _trim(x) { return (x == null) ? "" : x.toString().trim(); }
+def _isPosInt(x) { try { return toInt(x) > 0; } catch (e) { return false; } }
+def _isPosNum(x) { try { return toDouble(x) > 0; } catch (e) { return false; } }
+
+// Set defaults on panel open (optional)
+onPanelLoad {
+  // If you stored defaults in a table, you could select them here.
+  // For a simple start, hardcode:
+  FORM.symbol.setValue("AAPL");
+  FORM.side.setValue("BUY");
+  FORM.qty.setValue(100);
+  FORM.price.setValue(200.00);
+  FORM.ordType.setValue("LIMIT");
+  FORM.tif.setValue("DAY");
+  FORM.account.setValue("ACC-123");
+  FORM.destination.setValue("NYSE");
+}
+
+// Build the order map from fields
+def buildOrder() {
+  map order = {
+    "symbol": _trim(FORM.symbol.getValue()),
+    "side": _trim(FORM.side.getValue()),
+    "qty": toInt(FORM.qty.getValue()),
+    "ordType": _trim(FORM.ordType.getValue()),
+    "price": toDouble(FORM.price.getValue()),
+    "tif": _trim(FORM.tif.getValue()),
+    "account": _trim(FORM.account.getValue()),
+    "destination": _trim(FORM.destination.getValue()),
+    "timestamp": now() // server-side clock
+  };
+  return order;
+}
+
+// Basic validation
+def validate(order) {
+  if (order.symbol == "") return "Symbol is required";
+  if (!(order.side == "BUY" || order.side == "SELL")) return "Side must be BUY or SELL";
+  if (!_isPosInt(order.qty)) return "Quantity must be a positive integer";
+  if (order.ordType == "LIMIT" && !_isPosNum(order.price)) return "Price must be > 0 for LIMIT";
+  if (!(order.ordType == "LIMIT" || order.ordType == "MARKET")) return "Order type invalid";
+  if (order.tif == "") return "TIF is required";
+  if (order.account == "") return "Account is required";
+  if (order.destination == "") return "Destination is required";
+  return null; // OK
+}
+
+// Submit via RPC to your order gateway
+// The RPC name and payload are examples; align them to your backend.
+def submitOrder(order) {
+  json req = toJson(order);
+
+  // Synchronously invoke a backend RPC (recommended for tickets).
+  // Your backend exposes "OrderService.placeOrder" and returns JSON.
+  // See AMI RPC flow & callRpcSync in docs.
+  json resp = session.callRpcSync("OrderService.placeOrder", req, 5000);
+
+  // Expecting structure like: {"status":"OK","orderId":"...","text":"..."}
+  if (resp["status"] == "OK") {
+    alert("✓ Order Accepted  ID=" + resp["orderId"]);
+    return true;
+  } else {
+    alert("✗ Order Rejected: " + (resp["text"] ?? "Unknown"));
+    return false;
+  }
+}
+
+// Button handlers
+onClick(FORM.submitBtn) {
+  map order = buildOrder();
+  string err = validate(order);
+  if (err != null) {
+    alert(err);
+    return;
+  }
+  submitOrder(order);
+}
+
+onClick(FORM.resetBtn) {
+  // Clear or reset to defaults
+  FORM.symbol.setValue("");
+  FORM.side.setValue("BUY");
+  FORM.qty.setValue(100);
+  FORM.price.setValue(null);
+  FORM.ordType.setValue("LIMIT");
+  FORM.tif.setValue("DAY");
+  FORM.account.setValue("");
+  FORM.destination.setValue("");
+}
+
+
+Why this approach?
+
+The RPC call uses session.callRpcSync(...), which is the simplest way to round-trip a JSON request from the dashboard to your server logic with an immediate response suitable for a ticket “Submit.” 
+docs.3forge.com
++1
+
+You can also implement the gateway as a Custom Java/AmiGuiService plugin if you prefer a browser-bridge for HTML/JS panels; AmiScript ↔ JS bridging is documented and supported. 
+docs.3forge.com
+3Forge Documentation
+
+4) Backend options (pick one)
+
+A) RPC endpoint (recommended for tickets)
+
+Expose OrderService.placeOrder on your AMI-side server (Java/.NET client or a relay) that accepts the JSON payload and returns {status, orderId, text}. See the AMI Client interface examples and note the threading caveat (client is not thread-safe). 
+docs.3forge.com
+
+B) REST adapter
+
+If your order gateway is HTTP, configure the REST Data Source adapter and wire a query to POST /orders with the AmiScript JSON. This is straightforward if you prefer REST over RPC. 
+3Forge Documentation
++1
+
+5) Small UX niceties (all doable with FormPanel)
+
+Disable price when ordType=MARKET.
+
+Keyboard shortcuts (e.g., Enter to submit).
+
+Increment/decrement steppers for qty and price.
+
+Conditional color (BUY=green, SELL=red) using field CSS class changes. (FormPanel & fields support programmatic interaction via AmiScript.) 
+3Forge Documentation
+
+6) Security & audit hooks
+
+Stamp server time and user principal (from AMI session) on submit.
+
+Log intent + response to an internal audit table (another simple AmiScript call).
+
+Consider a pre-trade check RPC before placeOrder.
+
+Notes & references
+
+AmiScript guide & cheatsheet (syntax reference and examples). 
+3Forge Documentation
++2
+3Forge Documentation
++2
+
+Form components Javadoc (FormPanel, Select field, buttons). 
+3Forge Documentation
++2
+3Forge Documentation
++2
+
+RPC flow / client interface (synchronous call pattern used above). 
+docs.3forge.com
++1
+
+REST adapter (if you prefer HTTP to your OMS). 
+3Forge Documentation
+
+HTML Panel / JS bridge (if you decide to render a custom HTML ticket and still call AmiScript). 
+3Forge Documentation
+docs.3forge.com
+
+If you want, tell me your exact OMS/gateway interface (RPC name, POST path, fields) and I’ll tailor the AmiScript, field constraints, and the success/error UI to match it precisely.
