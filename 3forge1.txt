@@ -1,0 +1,137 @@
+// ---------- Trading Dashboard (single-file) ----------
+// Save as: layouts/TradingDashboard.ami
+
+// ---------- Helpers ----------
+function buildTicketForm(String symbol, String side, String defaultQty, String defaultPx) -> panel {
+    panel p = new panel();
+    p.setLayout("V");
+    p.setPadding(16);
+    p.setStyle("background:#4a4f7a; color:#e7e7ef; border-radius:8px; min-width:420px;");
+
+    // Title row
+    panel title = new panel(); title.setLayout("H"); title.setSpacing(12);
+    label lblTest   = new label("TEST");                   lblTest.setStyle("opacity:0.8;");
+    label lblSymbol = new label(symbol);                   lblSymbol.setStyle("font-size:22px; font-weight:800;");
+    label lblSide   = new label(side);                     lblSide.setStyle("font-size:22px; font-weight:800; color:#2fe5e5;");
+    title.add(lblTest); title.add(lblSymbol); title.add(lblSide);
+
+    // Quantity
+    label qtyLbl = new label("Edit quantity (optional)");
+    textField qty = new textField(defaultQty);
+    qty.setName("ticket_qty");
+    qty.setStyle("font-size:16px; padding:10px; background:#e9edf2; color:#2a2a2a;");
+
+    // Range & price
+    String rangeText = "Range: 102.79 to 102.9"; // make dynamic if you wish
+    label pxLbl = new label(rangeText);
+    textField px = new textField(defaultPx);
+    px.setName("ticket_price");
+    px.setStyle("font-size:16px; padding:10px; background:#e9edf2; color:#2a2a2a;");
+
+    // Execute
+    button exec = new button("EXECUTE");
+    exec.setStyle("margin-top:12px; font-weight:800; padding:10px 18px; border-radius:10px; background:#ffb22c; color:#222;");
+
+    // Wire the click (replace with your real submission)
+    exec.onClick(function() {
+        String q  = qty.getValue();
+        String pr = px.getValue();
+        log.info("EXECUTE: sym=" + symbol + ", side=" + side + ", qty=" + q + ", px=" + pr);
+        // TODO: call your order submit (REST/SQL/FIX). Example:
+        // http.postJson("http://order-svc/submit", {"sym":symbol, "side":side, "qty":q, "px":pr});
+        window.closeCurrent();   // close modal after success
+    });
+
+    p.add(title);
+    p.add(qtyLbl); p.add(qty);
+    p.add(pxLbl);  p.add(px);
+    p.add(exec);
+    return p;
+}
+
+function openTicketModal(String symbol, String side, String qty, String px) {
+    window w = window.create("Trade Ticket");
+    w.setModal(true);
+    w.setCloseOnEscape(true);
+    w.setStyle("background:transparent;"); // keep outer chrome minimal
+    panel content = buildTicketForm(symbol, side, qty, px);
+    w.setContent(content);
+    w.center();
+    w.show();
+}
+
+// ---------- Mock data source (replace with real model/query) ----------
+tableModel ordersModel = new tableModel();
+ordersModel.addColumn("Time"); ordersModel.addColumn("Symbol"); ordersModel.addColumn("Side");
+ordersModel.addColumn("Qty");  ordersModel.addColumn("LimitPx"); ordersModel.addColumn("Status");
+ordersModel.addRow([now(), "DIS.N", "B", 100000, 102.79, "New"]);
+ordersModel.addRow([now(), "AAPL.O", "S",  50000,  234.12, "Working"]);
+
+// ---------- Main layout ----------
+panel root = new panel(); root.setLayout("V"); root.setSpacing(8); root.setPadding(8);
+
+// Header bar
+panel header = new panel(); header.setLayout("H"); header.setSpacing(8);
+label title = new label("Trading Dashboard");
+title.setStyle("font-size:18px; font-weight:800; margin-right:auto;");
+
+button newTicket = new button("New Ticket");
+newTicket.onClick(function() {
+    // Default values mirror the screenshot
+    openTicketModal("DIS.N", "B", "100,000", "102.7900");
+});
+
+header.add(title);
+header.add(newTicket);
+root.add(header);
+
+// Body split: left blotter, right details
+splitPanel body = new splitPanel();
+body.setOrientation("H");
+body.setDividerLocation(0.62);
+
+// Left: orders
+panel left = new panel(); left.setLayout("V");
+label l1 = new label("Orders"); l1.setStyle("font-weight:700; margin-bottom:4px;");
+table orders = new table(ordersModel);
+orders.setName("ordersTable");
+orders.setAutoSize(true);
+orders.setRowSelect(true);
+
+// Double-click an order to prefill and open ticket
+orders.onRowDoubleClick(function(int row) {
+    String sym = ordersModel.getValue(row, "Symbol");
+    String side = ordersModel.getValue(row, "Side");
+    String qty  = ordersModel.getValue(row, "Qty");
+    String px   = ordersModel.getValue(row, "LimitPx");
+    openTicketModal(sym, side, qty, px);
+});
+
+left.add(l1); left.add(orders);
+
+// Right: details panel
+panel right = new panel(); right.setLayout("V");
+label r1 = new label("Details"); r1.setStyle("font-weight:700; margin-bottom:4px;");
+textArea details = new textArea();
+details.setReadOnly(true);
+details.setRows(16);
+details.setText("Select an order to view details…");
+
+orders.onRowSelect(function(int row) {
+    details.setText("Order Detail\n"
+        + "Symbol: " + ordersModel.getValue(row, "Symbol") + "\n"
+        + "Side:   " + ordersModel.getValue(row, "Side")   + "\n"
+        + "Qty:    " + ordersModel.getValue(row, "Qty")    + "\n"
+        + "Px:     " + ordersModel.getValue(row, "LimitPx") + "\n"
+        + "Status: " + ordersModel.getValue(row, "Status"));
+});
+
+right.add(r1); right.add(details);
+
+// Assemble
+body.setLeft(left);
+body.setRight(right);
+root.add(body);
+
+// Attach to layout
+layout.setContent(root);
