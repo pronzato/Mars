@@ -1,0 +1,118 @@
+layout TradingTicket {
+    title: "Trading Ticket"
+    width: 420
+    height: 300
+    type: window
+    layout: absolute
+
+    component symbol {
+        type: textfield
+        label: "Symbol"
+        x: 10
+        y: 10
+        width: 150
+        height: 30
+        required: true
+    }
+
+    component side {
+        type: combobox
+        label: "Side"
+        x: 170
+        y: 10
+        width: 100
+        height: 30
+        required: true
+        option: "Buy"
+        option: "Sell"
+    }
+
+    component quantity {
+        type: numberfield
+        label: "Quantity"
+        x: 10
+        y: 50
+        width: 150
+        height: 30
+        required: true
+        minValue: 1
+    }
+
+    component price {
+        type: numberfield
+        label: "Price"
+        x: 170
+        y: 50
+        width: 100
+        height: 30
+        required: true
+        decimalPrecision: 2
+    }
+
+    component ordertype {
+        type: combobox
+        label: "Order Type"
+        x: 10
+        y: 90
+        width: 150
+        height: 30
+        required: true
+        option: "Market"
+        option: "Limit"
+        option: "Stop"
+    }
+
+    component tif {
+        type: combobox
+        label: "Time In Force"
+        x: 170
+        y: 90
+        width: 100
+        height: 30
+        required: true
+        option: "Day"
+        option: "GTC"
+        option: "IOC"
+        option: "FOK"
+    }
+
+    component notes {
+        type: textarea
+        label: "Notes"
+        x: 10
+        y: 130
+        width: 260
+        height: 60
+    }
+
+    component submit {
+        type: button
+        text: "Submit Order"
+        style: primary
+        x: 10
+        y: 210
+        width: 120
+        height: 35
+        onClick: publish {
+            topic: "Orders.New"
+            field: "symbol={symbol}"
+            field: "side={side}"
+            field: "quantity={quantity}"
+            field: "price={price}"
+            field: "ordertype={ordertype}"
+            field: "tif={tif}"
+            field: "notes={notes}"
+        }
+    }
+
+    component reset {
+        type: button
+        text: "Reset"
+        style: secondary
+        x: 140
+        y: 210
+        width: 100
+        height: 35
+        onClick: reset
+    }
+}
