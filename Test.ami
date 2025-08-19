@@ -1,0 +1,16 @@
+layout Test {
+    type: window
+    title: "Hello World"
+    width: 200
+    height: 100
+
+    component helloBtn {
+        type: button
+        text: "Click Me"
+        x: 20
+        y: 20
+        width: 100
+        height: 30
+        onClick: reset
+    }
+}
