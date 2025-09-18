@@ -1,0 +1,200 @@
+// ConfigAbstract.java
+// Hand-written base: parsing, alias resolution, list parsers, help scaffolding.
+
+import java.util.*;
+
+public abstract class ConfigAbstract<B, C> {
+
+  public enum Type {
+    STRING, INT, LONG, DOUBLE, BOOLEAN,
+    STRING_LIST, INT_LIST, LONG_LIST, DOUBLE_LIST, BOOLEAN_LIST
+  }
+
+  public static final class ParamInfo {
+    public final String name;
+    public final Type type;
+    public final boolean mandatory;
+    public final Object defaultValue;
+    public final List<String> aliases;
+
+    public ParamInfo(String name, Type type, boolean mandatory, Object defaultValue, List<String> aliases) {
+      this.name = name; this.type = type; this.mandatory = mandatory; this.defaultValue = defaultValue;
+      this.aliases = aliases == null ? List.of() : List.copyOf(aliases);
+    }
+  }
+
+  public static final class SubsetInfo {
+    public final String prefix;          // e.g., "amps"
+    public final String className;       // e.g., "ConfigAmps"
+    public final List<ParamInfo> params;
+
+    public SubsetInfo(String prefix, String className, List<ParamInfo> params) {
+      this.prefix = prefix; this.className = className; this.params = List.copyOf(params);
+    }
+  }
+
+  /* ===== Hooks for concrete class ===== */
+  protected abstract B newBuilder();
+  protected abstract C build(B builder);
+
+  protected abstract Map<String, List<String>> topAliases();
+  protected abstract Map<String, Map<String, List<String>>> subsetAliases();
+
+  protected abstract void applyTopKV(B builder, String canonicalKey, String rawValue);
+  protected abstract void applySubsetKV(B builder, String prefix, String canonicalField, String rawValue);
+
+  protected abstract List<ParamInfo> topParamsInfo();
+  protected abstract List<SubsetInfo> subsetsInfo();
+
+  /* ===== Public API ===== */
+
+  /** Parse CLI args: supports --k=v, --k v, --flag, --no-flag, dotted subset keys, kebab↔camel. */
+  public final C fromArgs(String[] args) {
+    B b = newBuilder();
+    Map<String, List<String>> tmap = topAliases();
+    Map<String, Map<String, List<String>>> smap = subsetAliases();
+
+    for (int i = 0; i < args.length; i++) {
+      String tok = args[i];
+      if (tok == null || !tok.startsWith("--")) continue;
+
+      String s = tok.substring(2);
+      boolean neg = s.startsWith("no-");
+      if (neg) s = s.substring(3);
+
+      String key, val;
+      int eq = s.indexOf('=');
+      if (eq > 0) {
+        key = s.substring(0, eq);
+        val = s.substring(eq + 1);
+      } else {
+        key = s;
+        if (i + 1 < args.length && !args[i + 1].startsWith("--")) {
+          val = args[++i];
+        } else {
+          val = neg ? "false" : "true";
+        }
+      }
+
+      key = toCamelDotted(key);
+      int dot = key.indexOf('.');
+      if (dot < 0) {
+        for (var e : tmap.entrySet()) {
+          if (matches(key, e.getValue())) {
+            applyTopKV(b, e.getKey(), val);
+            break;
+          }
+        }
+        continue;
+      }
+
+      String pref = key.substring(0, dot);
+      String field = key.substring(dot + 1);
+      Map<String, List<String>> fam = smap.get(pref);
+      if (fam == null) continue;
+      for (var fe : fam.entrySet()) {
+        if (matches(toCamel(field), fe.getValue())) {
+          applySubsetKV(b, pref, fe.getKey(), val);
+          break;
+        }
+      }
+    }
+
+    return build(b);
+  }
+
+  /** Print help text with options, types, defaults, and mandatory markers. */
+  public final void printHelp() {
+    StringBuilder h = new StringBuilder();
+    h.append("Options (top-level):\n");
+    for (ParamInfo p : topParamsInfo()) {
+      h.append("  --").append(toKebab(p.name));
+      if (!p.aliases.isEmpty()) h.append("  aliases: ").append(String.join(", ", p.aliases));
+      h.append("  type=").append(typeNameForHelp(p.type));
+      h.append("  default=").append(String.valueOf(p.defaultValue));
+      if (p.mandatory) h.append("  (mandatory)");
+      h.append("\n");
+    }
+    for (SubsetInfo s : subsetsInfo()) {
+      h.append("\nSubset ").append(s.className)
+       .append(" (CLI: --").append(s.prefix).append(".<field>):\n");
+      for (ParamInfo p : s.params) {
+        h.append("  --").append(s.prefix).append(".").append(toKebab(p.name));
+        if (!p.aliases.isEmpty()) h.append("  aliases: ").append(String.join(", ", p.aliases));
+        h.append("  type=").append(typeNameForHelp(p.type));
+        h.append("  default=").append(String.valueOf(p.defaultValue));
+        if (p.mandatory) h.append("  (mandatory when subset is used)");
+        h.append("\n");
+      }
+    }
+    System.out.print(h.toString());
+  }
+
+  /* ===== Helpers ===== */
+
+  protected static boolean matches(String key, List<String> aliases) {
+    if (aliases == null) return false;
+    for (String a : aliases) if (a.equals(key)) return true;
+    return false;
+  }
+
+  protected static String toCamel(String key) {
+    if (!key.contains("-")) return key;
+    StringBuilder sb = new StringBuilder(key.length());
+    boolean up = false;
+    for (char c : key.toCharArray()) {
+      if (c == '-') { up = true; continue; }
+      sb.append(up ? Character.toUpperCase(c) : c);
+      up = false;
+    }
+    return sb.toString();
+  }
+
+  protected static String toCamelDotted(String dotted) {
+    String[] parts = dotted.split("\\.");
+    for (int i = 0; i < parts.length; i++) parts[i] = toCamel(parts[i]);
+    return String.join(".", parts);
+  }
+
+  protected static String toKebab(String camel) {
+    StringBuilder sb = new StringBuilder(camel.length() + 8);
+    for (char c : camel.toCharArray()) {
+      if (Character.isUpperCase(c)) sb.append('-').append(Character.toLowerCase(c));
+      else sb.append(c);
+    }
+    return sb.toString();
+  }
+
+  protected static String typeNameForHelp(Type t) {
+    return switch (t) {
+      case STRING -> "string";
+      case INT -> "int";
+      case LONG -> "long";
+      case DOUBLE -> "double";
+      case BOOLEAN -> "boolean";
+      case STRING_LIST -> "list<string>";
+      case INT_LIST -> "list<int>";
+      case LONG_LIST -> "list<long>";
+      case DOUBLE_LIST -> "list<double>";
+      case BOOLEAN_LIST -> "list<boolean>";
+    };
+  }
+
+  /* list parsers for comma-delimited values */
+  public static List<String>  parseStringList (String s){ return splitMap(s, e -> e); }
+  public static List<Integer> parseIntList    (String s){ return splitMap(s, Integer::parseInt); }
+  public static List<Long>    parseLongList   (String s){ return splitMap(s, Long::parseLong); }
+  public static List<Double>  parseDoubleList (String s){ return splitMap(s, Double::parseDouble); }
+  public static List<Boolean> parseBooleanList(String s){ return splitMap(s, Boolean::parseBoolean); }
+
+  private static <T> List<T> splitMap(String s, java.util.function.Function<String, T> f) {
+    if (s == null || s.isBlank()) return List.of();
+    String[] a = s.split(",");
+    List<T> out = new ArrayList<>(a.length);
+    for (String e : a) {
+      e = e.trim();
+      if (!e.isEmpty()) out.add(f.apply(e));
+    }
+    return java.util.Collections.unmodifiableList(out);
+  }
+}
