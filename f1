@@ -1,0 +1,3 @@
+Fabric runs consistently across Windows, Linux, and containerized environments, ensuring the same code that powers production can be executed directly in a developer’s workspace.
+It operates both as an API for integrated applications and as a CLI for interactive workflows.
+When used within an IDE, Fabric integrates with Copilot to accelerate development and enable deep data exploration, giving developers rapid feedback and full parity between local and production environments.
