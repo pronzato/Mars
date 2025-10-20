@@ -1,0 +1,38 @@
+I have a monorepo in Bitbucket that contains multiple apps under apps/app1, apps/app2, etc.
+I also have a few external repositories like common that contain shared code used by those apps.
+
+My build/deploy chain is: Bitbucket → Jenkins → Artifactory → Ansible → XLR → host.
+
+I want you to:
+
+Explain in plain English how to set up a Jenkins pipeline that automatically determines which apps are impacted by a commit — including detecting changes in both the main repo and any external repos (like common).
+
+Show a complete, realistic Jenkinsfile (using declarative syntax with scripted logic inside) that:
+
+Checks out the repo and detects changed files (git diff)
+
+Reads a small metadata file for each app (e.g. apps/app1/app.yaml) that defines:
+
+the folders in this repo that impact that app
+
+optional external repos (with Git URLs and watched paths)
+
+Optionally respects a common.lock file to pin external repo SHAs (strict mode)
+
+Builds and deploys only impacted apps — running build/test → publish to Artifactory → Ansible → XLR
+
+Runs all impacted apps’ stages in parallel
+
+Include realistic helper functions for buildAndTest, publishArtifact, deployWithAnsible, and promoteInXLR.
+
+Include clear comments explaining each step and an example of app.yaml and optional common.lock file.
+
+Keep it generic and portable (no environment-specific secrets or plugin dependencies).
+
+Make the explanation and Jenkinsfile concise but production-ready — similar to a well-documented DevOps design note.
+
+The goal is a single clean summary and one Jenkinsfile example that merges:
+
+“Option C” (auto-detecting changed apps in a monorepo), and
+
+the ability to also watch changes in other repos (multi-repo watch).
