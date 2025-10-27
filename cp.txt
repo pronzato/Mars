@@ -1,0 +1,111 @@
+Agent Opportunity:
+Develop a “Fabric CoPilot Agent” that connects CoPilot Studio to Fabric’s unified data layer.
+
+This agent could:
+Expose Fabric schemas, endpoints, and metadata as prompts for CoPilot Studio.
+Enable AI-assisted creation of new Fabric-compliant services, components, and dashboards.
+Provide a foundation for future automation — e.g., self-documenting APIs, test generation, and pipeline creation for quants and developers.
+
+What the CoPilot Agent does with Fabric
+
+Uses Fabric as its system of record and action surface. The Agent reads Fabric’s schemas, endpoints, and metadata (discovery topics, component/endpoint models, entitlements) and then acts through Fabric to generate code, wire services, and configure UIs.
+
+Learns real flows via Fabric Chronicle. Chronicle captures AMPS message patterns (orders, acks, rejects, cancels, RFQs). The Agent ingests these traces to infer request/response shapes, SLAs, retry rules, error semantics, and back-pressure patterns.
+
+Generates Fabric-compliant services/UI. The Agent emits boilerplate APIs, DTOs, and 3Forge panel definitions that match Fabric’s schema/entitlement model—so everything is immediately consistent with the platform.
+
+Keeps governance automatic. The Agent calls Fabric’s policy/entitlements layer to scaffold default row-/field-level rules per group, logs changes to discovery/metadata topics, and produces auditable diffs/messages for review.
+
+Orchestrates modernization tasks. It can propose a plan, open PRs, update service manifests, produce test fixtures from Chronicle samples, and publish “how-to” docs into Fabric metadata for support and traders.
+
+Agent Capabilities (concrete “skills”)
+
+Discover & Model
+
+Read Fabric schemas/endpoints; map Chronicle traffic → canonical models.
+
+Detect field drifts and propose schema migrations + compat notes.
+
+Code & Configure
+
+Generate AMPS client stubs, validation, retries, idempotency keys.
+
+Create Fabric service scaffolds (gRPC/Flight/HTTP) with builders, config, and test harnesses.
+
+Emit 3Forge UI layouts/panels (tables, ladders, blotters, depth, alerts) bound to Fabric endpoints.
+
+Wire & Secure
+
+Create default group-scoped policies (deny-by-default outside group).
+
+Register endpoints/components in Fabric discovery with health/OTel hooks (toggleable).
+
+Test & Validate
+
+Build golden message sets from Chronicle; auto-generate unit/integration tests.
+
+Spin up a “shadow” run using recorded flows to validate new UI/API paths.
+
+Document & Coach
+
+Produce living README/playbooks + “diff explainers” per change.
+
+Generate 3Forge operator dashboards for runtime checks.
+
+Why this is a strong CoPilot Studio pilot
+
+High leverage: Agent operates where Fabric already centralizes truth (schemas, endpoints, policies), so output is usable immediately.
+
+Repeatable pattern: Once proven for the trading UI, the same Agent can modernize adjacent workflows (RFQ, quotes, allocations, surveillance).
+
+Risk-controlled: Chronicle-driven “shadow” validation + group-scoped default policies reduce migration risk without slowing delivery.
+
+Example “Agent loop” (Observe → Plan → Act)
+
+Observe: “Ingest last 7 days of Chronicle for /orders and /allocations; summarize API verbs, payloads, errors.”
+
+Plan: “Propose service/API + 3Forge layout that preserves current workflows and adds missing cancel/replace shortcuts.”
+
+Act: “Generate Fabric service + AMPS client + 3Forge panels; register endpoints; scaffold default policies for group ‘trading-x’; open PR.”
+
+Sample prompts you’d use with the Agent
+
+“Learn the /trading/new-order and /trading/cancel flows from Chronicle; produce schemas and validate against Fabric’s existing Order schema. Flag mismatches and propose a migration plan.”
+
+“Generate a 3Forge blotter + ladder wired to Fabric endpoints for quotes/orders; add hotkeys matching the attached screenshots.”
+
+“Create a Fabric service ‘trade-entry’ with AMPS in/out, default group policy, health checks, and tests replaying Chronicle samples for orders, rejects, and cancels.”
+
+“Publish an operator dashboard (3Forge) for message lag, NACKs, and downstream acks using Fabric discovery metadata.”
+
+Guardrails & compliance (built-in)
+
+Entitlements-first: The Agent must call Fabric’s policy APIs to create/modify rules; changes are auditable and review-gated.
+
+Data minimization: Chronicle sampling is scoped to message types and groups; PII fields are masked/redacted per Fabric schema tags.
+
+Human-in-the-loop: All code/policy/UI changes are PR’d with diffs, test evidence, and rollback notes.
+
+Success metrics (for the pilot)
+
+Time to first working UI (from screenshots to live 3Forge)
+
+Lines of boilerplate eliminated (Agent-generated vs hand-written)
+
+Defect rate in shadow validation (Chronicle replays)
+
+MTTR for policy/endpoint changes (via Agent vs manual)
+
+
+
+ONE PAGER
+
+I’d like to propose a CoPilot Studio pilot that showcases how an AI Agent integrated with Fabric can accelerate modernization and reduce tech debt:
+
+Use CoPilot Studio + Fabric Chronicle to record live AMPS trading API flows so CoPilot can learn the trading workflows automatically.
+
+Agent generates Fabric-compliant services and 3Forge UI panels from those recordings and screenshots of the legacy app — producing a working, supported replacement in a fraction of the time.
+
+Fabric integration provides unified schemas, entitlements, and metadata, so everything the Agent creates is automatically governed and discoverable.
+
+Result: Faster migration, less boilerplate, consistent governance, and a reusable pattern for future Fabric-based services and dashboards.
