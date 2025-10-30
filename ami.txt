@@ -1,29 +1,15 @@
 {
+  "IncludeFiles": [],
+  "metadata": {
+    "amiCustomCss": ".public_visible{display:flex;align-items:center;gap:8px;font-family:Arial,Helvetica,sans-serif;}",
+    "amiScriptMethods": [
+      "String formatNum(Double val){ if(val==null) return \"\"; int mult=1; String sfx=\"\"; if(val>1e9){mult=1000000000;sfx=\"B\";} else if(val>1e6){mult=1000000;sfx=\"M\";} else if(val>1e3){mult=1000;sfx=\"K\";} return formatNumber(val/mult, \"#,##0.0\", \"\")+sfx; }",
+      "Integer parseInt(Object inp){ if(inp==null) return null; return (int)inp; }",
+      "Double parseDouble(Object inp){ if(inp==null) return null; return (double)inp; }"
+    ]
+  },
   "layoutVersion": 1,
   "name": "Fabric Test Layout",
-  "theme": "dark",
-  "containers": [
-    {
-      "id": "root",
-      "type": "rows",
-      "ratio": [100],
-      "children": [
-        {
-          "id": "helloLabel",
-          "type": "label",
-          "text": "Fabric layout loaded ✅"
-        }
-      ]
-    }
-  ]
-}
-
-
-
-
-{
-  "layoutVersion": 1,
-  "name": "Fabric Test Layout (Legacy)",
   "theme": "dark",
   "root": {
     "id": "root",
@@ -34,7 +20,8 @@
       {
         "id": "helloLabel",
         "type": "label",
-        "text": "Fabric layout loaded ✅ (legacy)"
+        "text": "Fabric layout loaded ✅",
+        "classes": ["public_visible"]
       }
     ]
   }
