@@ -1,53 +1,41 @@
 {
-  "version": "1.0",
+  "layoutVersion": 1,
   "name": "Fabric Test Layout",
   "theme": "dark",
   "containers": [
     {
+      "id": "root",
       "type": "rows",
-      "ratio": [10, 90],
+      "ratio": [100],
       "children": [
         {
-          "type": "toolbar",
-          "id": "toolbar",
-          "items": [
-            {
-              "type": "label",
-              "text": "Fabric Dashboard"
-            },
-            {
-              "type": "button",
-              "label": "Refresh",
-              "action": {
-                "type": "reload",
-                "target": "fabricTable"
-              }
-            }
-          ]
-        },
-        {
-          "type": "table",
-          "id": "fabricTable",
-          "title": "Sample Orders",
-          "source": {
-            "type": "topic",
-            "value": "/fabric/demo/orders"
-          },
-          "columns": [
-            { "field": "orderId", "title": "Order ID", "width": 100 },
-            { "field": "symbol", "title": "Symbol", "width": 80 },
-            { "field": "side", "title": "Side", "width": 60 },
-            { "field": "qty", "title": "Qty", "width": 80, "align": "right" },
-            { "field": "price", "title": "Price", "width": 100, "align": "right", "format": "0,0.00" }
-          ],
-          "options": {
-            "striped": true,
-            "sortable": true,
-            "filterable": true,
-            "resizableColumns": true
-          }
+          "id": "helloLabel",
+          "type": "label",
+          "text": "Fabric layout loaded ✅"
         }
       ]
     }
   ]
+}
+
+
+
+
+{
+  "layoutVersion": 1,
+  "name": "Fabric Test Layout (Legacy)",
+  "theme": "dark",
+  "root": {
+    "id": "root",
+    "type": "container",
+    "layout": "rows",
+    "ratio": [100],
+    "children": [
+      {
+        "id": "helloLabel",
+        "type": "label",
+        "text": "Fabric layout loaded ✅ (legacy)"
+      }
+    ]
+  }
 }
