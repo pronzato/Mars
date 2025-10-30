@@ -1,0 +1,53 @@
+{
+  "version": "1.0",
+  "name": "Fabric Test Layout",
+  "theme": "dark",
+  "containers": [
+    {
+      "type": "rows",
+      "ratio": [10, 90],
+      "children": [
+        {
+          "type": "toolbar",
+          "id": "toolbar",
+          "items": [
+            {
+              "type": "label",
+              "text": "Fabric Dashboard"
+            },
+            {
+              "type": "button",
+              "label": "Refresh",
+              "action": {
+                "type": "reload",
+                "target": "fabricTable"
+              }
+            }
+          ]
+        },
+        {
+          "type": "table",
+          "id": "fabricTable",
+          "title": "Sample Orders",
+          "source": {
+            "type": "topic",
+            "value": "/fabric/demo/orders"
+          },
+          "columns": [
+            { "field": "orderId", "title": "Order ID", "width": 100 },
+            { "field": "symbol", "title": "Symbol", "width": 80 },
+            { "field": "side", "title": "Side", "width": 60 },
+            { "field": "qty", "title": "Qty", "width": 80, "align": "right" },
+            { "field": "price", "title": "Price", "width": 100, "align": "right", "format": "0,0.00" }
+          ],
+          "options": {
+            "striped": true,
+            "sortable": true,
+            "filterable": true,
+            "resizableColumns": true
+          }
+        }
+      ]
+    }
+  ]
+}
