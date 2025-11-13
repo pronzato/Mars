@@ -1,122 +1,104 @@
-# AMPS vs. Fabric Flight SQL – Zero-Copy Data Movement
+h1. AMPS vs. Fabric Flight SQL – Zero-Copy Data Movement
 
-## 1. Overview
-Fabric now supports two complementary data movement technologies:
+h2. 1. Overview
+Fabric supports two complementary data movement technologies:
 
-| Transport      | Optimized For                               | Pattern                          |
-|----------------|----------------------------------------------|----------------------------------|
-| **AMPS**       | Real-time streaming, low-latency fan-out     | Event bus + incremental updates  |
-| **Flight SQL** | High-throughput, zero-copy table movement    | Bulk reads, analytics, batch     |
+|| Transport || Optimized For || Pattern ||
+| *AMPS* | Real-time streaming, low-latency fan-out | Event bus + incremental updates |
+| *Flight SQL* | High-throughput, zero-copy table movement | Bulk reads, analytics, batch |
 
-AMPS continues to be our primary **streaming** mechanism.  
-Flight SQL becomes our primary **high-speed table transport and analytics** mechanism.
+AMPS remains our primary *streaming* system.  
+Flight SQL becomes our primary *table movement / analytics* system.
 
----
+----
 
-## 2. Why AMPS alone isn’t enough for modern workloads
-AMPS is excellent for:
+h2. 2. Why AMPS alone isn’t enough for modern workloads
+AMPS excels at:
+* Real-time updates
+* Market data streams
+* High fan-out subscriptions
+* Operational events
 
-- Real-time financial events  
-- Market data updates  
-- High fan-out subscriptions  
-- Operational event streams  
+But for *large table reads* (100k–100M+ rows), AMPS has limitations:
+* Row-encoded messages (JSON/Protobuf)
+* Per-row parsing costs
+* Per-language conversion (Python/Java/C++)
+* Higher CPU usage
+* Lower throughput than columnar engines
 
-However, for **large table reads** (100k–100M+ rows), AMPS has inherent limitations:
+This is why AMPS peaks around *~200k–240k rows/sec*.
 
-- Row-encoded messages (JSON/Protobuf)  
-- Per-row parsing costs  
-- Per-language object conversion (Python/Java/C++)  
-- Higher CPU usage  
-- Lower throughput compared to columnar engines  
+----
 
-This is why AMPS usually peaks around **~200k–240k rows/sec** on large datasets.
+h2. 3. Fabric Flight SQL & Zero-Copy
 
----
+Fabric uses Apache Arrow + Arrow Flight SQL to enable *zero-copy* columnar movement.
 
-## 3. Fabric Flight SQL & Zero-Copy
-Fabric adopts **Apache Arrow** and **Arrow Flight SQL** to enable **zero-copy, columnar data movement**.
+*Zero-copy means*:
+* Data is produced once in Arrow’s universal memory layout
+* All languages (Python/Java/C++/Rust/Go) read it directly
+* No serialization or deserialization
+* No per-row decoding
+* No duplicated objects
+* Much lower CPU usage
 
-### Zero-copy means:
-- Data is produced once in a **universal memory layout**  
-- All languages understand this layout (Python, Java, C++, Rust, Go)  
-- No serialization  
-- No deserialization  
-- No object trees  
-- No data reshaping  
-- Much lower CPU usage  
+Benchmark example:
 
-This gives **3×–10× higher throughput** and **orders-of-magnitude less overhead**.
-
-Benchmark proof:
-
-| Size | AMPS Max | Flight Max | Flight SQL Max |
-|------|-----------|-------------|----------------|
+|| Size || AMPS Max || Flight Max || Flight SQL Max ||
 | XL–XXXL | ~200k–240k r/s | ~800k–1.25M r/s | ~0.8M–1.04M r/s |
 
----
+----
 
-## 4. Zero-Copy in Simple Terms
-Traditional flow (AMPS SOW snapshot):
+h2. 4. Zero-Copy in Simple Terms
 
-```
-Network bytes → JSON/Protobuf → Language-specific objects → DataFrames
-```
+Traditional AMPS SOW flow:
+{code}
+Network bytes → JSON/Protobuf → language-specific objects → DataFrames
+{code}
 
-Zero-copy flow (Flight SQL):
-
-```
+Zero-copy Flight SQL flow:
+{code}
 Network bytes → Arrow buffers → Ready-to-use Table
-```
+{code}
 
 No parsing.  
 No duplicated data.  
-Minimal CPU.  
-Predictable performance.
+Minimal CPU.
 
----
+----
 
-## 5. Benefits for Application Teams
+h2. 5. Benefits for Application Teams
 
-### ✔ Faster analytics & service startup  
-Flight SQL loads millions of rows per second, even on XXL datasets.
+* *Faster analytics & startup times*
+* *Lower CPU usage* (no parsing)
+* *Simpler codebases*
+* *Consistent behavior across Python/Java/C++*
+* *Entitlements enforced before data leaves Fabric*
 
-### ✔ Lower CPU usage  
-Eliminates parsing, object creation, and per-language conversions.
+----
 
-### ✔ Smaller, simpler codebases  
-No JSON → dict → DataFrame glue code.  
-No Protobuf → POJO → Arrow conversions.
+h2. 6. When to use AMPS vs Flight SQL
 
-### ✔ Identical behavior across languages  
-Arrow provides the same schema + layout to Python, Java, C++, etc.
+h3. Use AMPS for:
+* Streaming updates
+* Real-time events
+* Market data
+* High fan-out delivery
 
-### ✔ Better entitlement enforcement  
-Fabric applies row/column policies before data is transmitted.
+h3. Use Flight SQL for:
+* Bulk table reads
+* Analytics queries
+* Python/ML ingestion
+* Inter-service table transfer
+* Large refdata/positions/orders snapshots
 
----
+Technologies are complementary.
 
-## 6. When to use AMPS vs Flight SQL
+----
 
-### **Use AMPS for:**
-- Streaming updates  
-- Market data  
-- Incremental deltas  
-- High fan-out delivery  
+h2. 7. Full Benchmark Results (Dark Code Block)
 
-### **Use Flight SQL for:**
-- Bulk table reads  
-- Analytics and vectorized queries  
-- Machine learning + Python notebooks  
-- Inter-service table movement  
-- High-volume refdata/positions/orders snapshots  
-
-These technologies **complement** each other inside Fabric.
-
----
-
-## 7. Full Benchmark Results (Dark Code Block)
-
-```bash
+{code:theme=Midnight|linenumbers=false|language=bash}
 # ===========================
 # Fabric Transport Benchmarks
 # Rows/sec | MB/sec | p95 Latency
@@ -153,20 +135,14 @@ xxxl   AMPS            241,095.5       26.97         0.00
 xxxl   FLIGHT          879,274.4       52.65       253.14
 xxxl   FLIGHT_SQL      863,594.4       51.71       295.69
 xxxl   GRPC           162,167.6         9.71         0.13
-```
+{code}
 
----
+----
 
-## 8. Technical Appendix
+h2. 8. Technical Appendix
 
-### Why AMPS is not zero-copy
-AMPS messages are row-oriented (JSON, MsgPack, Protobuf).  
-Each consumer must decode and reshape them.  
-Each language recreates its own objects, costing CPU and memory.
+*AMPS is not zero-copy because* JSON/Protobuf messages must be parsed and converted into objects by each language runtime.
 
-### Why Arrow enables zero-copy
-Arrow defines a **universal in-memory columnar representation**.  
-Flight/Flight SQL stream Arrow buffers directly.  
-Clients do no parsing, no conversion, and no reallocation.
+*Arrow enables zero-copy because* all languages understand the same in-memory columnar structure. Flight/Flight SQL simply pass Arrow buffers directly.
 
-This aligns Fabric with industry leaders such as DuckDB, MotherDuck, Spark, Polars, Pandas, and Snowflake.
+This aligns Fabric with modern data engines such as DuckDB, MotherDuck, Spark, Polars, Pandas, Snowflake, and BigQuery.
