@@ -39,6 +39,14 @@ public final class TestSecurityConfig {
       "HTTP/" + DEFAULT_SERVICE_HOST + "@" + REALM;
   public static final String FLIGHT_SQL_CLIENT_PRINCIPAL = "svc_flightsql@" + REALM;
 
+  public static final String HTTP_SERVICE_PRINCIPAL =
+      "HTTP/" + DEFAULT_SERVICE_HOST + "@" + REALM;
+  public static final String HTTP_CLIENT_PRINCIPAL = "svc_http@" + REALM;
+
+  public static final String KDB_SERVICE_PRINCIPAL =
+      "HTTP/" + DEFAULT_SERVICE_HOST + "@" + REALM;
+  public static final String KDB_CLIENT_PRINCIPAL = "svc_kdb@" + REALM;
+
   private static String resolveServiceHost() {
     String prop = System.getProperty("fabric.test.serviceHost");
     if (prop != null && !prop.isBlank()) {
