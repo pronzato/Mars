@@ -44,13 +44,14 @@ public final class KerberosEchoClient {
             .enabled(true)
             .principal(CLIENT_PRINCIPAL)
             .keytab(CLIENT_KEYTAB.toAbsolutePath().toString())
-            .autoRefresh(false);
+            .autoRefresh(false)
+            .refreshEvery(Duration.ofHours(1));
     if (Files.exists(DEFAULT_KRB5)) {
       kerberosConfig.krb5ConfigPath(DEFAULT_KRB5.toAbsolutePath().toString());
     }
 
-    KerberosTicketManager.ensureLogin(
-        "grpc-echo-client", kerberosConfig, false, Duration.ofHours(1));
+    // Use the shared client Subject for all outbound protocols; Kerberos manages per-service tickets.
+    KerberosTicketManager.ensureDefaultClientLogin(kerberosConfig);
 
     Path trustCert = GrpcDemoUtils.copyResourceToTempFile(TRUST_RESOURCE, "grpc-krb-trust", ".pem");
     SslContext sslContext =

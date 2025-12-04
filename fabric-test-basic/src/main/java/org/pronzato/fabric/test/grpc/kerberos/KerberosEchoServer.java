@@ -43,13 +43,14 @@ public final class KerberosEchoServer {
             .enabled(true)
             .principal(SERVICE_PRINCIPAL)
             .keytab(SERVICE_KEYTAB.toAbsolutePath().toString())
-            .autoRefresh(false);
+            .autoRefresh(false)
+            .refreshEvery(Duration.ofHours(1));
     if (Files.exists(DEFAULT_KRB5)) {
       kerberosConfig.krb5ConfigPath(DEFAULT_KRB5.toAbsolutePath().toString());
     }
 
-    KerberosTicketManager.ensureLogin(
-        "grpc-echo-server", kerberosConfig, false, Duration.ofHours(1));
+    // Reuse a single service Subject for all inbound connections; cache key is role-based, not protocol-specific.
+    KerberosTicketManager.ensureDefaultServiceLogin(kerberosConfig);
 
     Path cert = GrpcDemoUtils.copyResourceToTempFile(CERT_RESOURCE, "grpc-krb-cert", ".pem");
     Path key = GrpcDemoUtils.copyResourceToTempFile(KEY_RESOURCE, "grpc-krb-key", ".key");

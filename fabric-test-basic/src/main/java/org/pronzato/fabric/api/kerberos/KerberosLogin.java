@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -20,6 +21,7 @@ import javax.security.auth.callback.UnsupportedCallbackException;
 import javax.security.auth.login.AppConfigurationEntry;
 import javax.security.auth.login.Configuration;
 import javax.security.auth.login.LoginContext;
+import javax.security.auth.kerberos.KerberosPrincipal;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -112,10 +114,18 @@ public final class KerberosLogin {
     }
   }
 
+  public static LoginContext loginAsClient(Config cfg) {
+    return setupAndLogin(cfg, true);
+  }
+
+  public static LoginContext loginAsService(Config cfg) {
+    return setupAndLogin(cfg, false);
+  }
+
   /** Configure system properties and log in if enabled. Safe to call multiple times. */
-  public static void setupAndLogin(Config cfg) {
+  private static LoginContext setupAndLogin(Config cfg, boolean isInitiator) {
     if (cfg == null || !cfg.enabled) {
-      return;
+      return null;
     }
 
     cfg.krb5ConfigPath = ensureConfigFile(cfg.krb5ConfigPath, cfg.krb5ConfigData, "krb5-", ".conf");
@@ -139,6 +149,7 @@ public final class KerberosLogin {
         Objects.requireNonNull(cfg.principal, "Kerberos principal is required");
     final String keytab =
         Objects.requireNonNull(cfg.keytabPath, "Kerberos keytabPath or keytabData is required");
+    KerberosPrincipal kp = new KerberosPrincipal(principal);
 
     AppConfigurationEntry.LoginModuleControlFlag ctl =
         AppConfigurationEntry.LoginModuleControlFlag.REQUIRED;
@@ -152,6 +163,7 @@ public final class KerberosLogin {
     options.put("storeKey", "true");
     options.put("useTicketCache", "false");
     options.put("principal", principal);
+    options.put("isInitiator", Boolean.toString(isInitiator));
 
     AppConfigurationEntry entry =
         new AppConfigurationEntry(
@@ -160,15 +172,26 @@ public final class KerberosLogin {
     Configuration.setConfiguration(loginConfig);
 
     try {
-      LoginContext lc = new LoginContext(LOGIN_CONTEXT, (Subject) null, NO_PROMPT_HANDLER);
+      Subject subject =
+          new Subject(
+              false,
+              Collections.singleton(kp),
+              Collections.emptySet(),
+              Collections.emptySet());
+      LoginContext lc = new LoginContext(LOGIN_CONTEXT, subject, NO_PROMPT_HANDLER);
       lc.login();
       LOGGER.info("[Kerberos] Login OK as {} (keytab)", principal);
+      return lc;
     } catch (Exception e) {
       throw new RuntimeException("Kerberos login failed for " + principal + ": " + e, e);
     }
   }
 
   public static Refresher startAutoRefresh(Config cfg, Duration period) {
+    return startAutoRefresh(cfg, period, true);
+  }
+
+  public static Refresher startAutoRefresh(Config cfg, Duration period, boolean isInitiator) {
     if (cfg == null || !cfg.enabled) {
       return null;
     }
@@ -176,7 +199,7 @@ public final class KerberosLogin {
         (period == null || period.isZero() || period.isNegative())
             ? Duration.ofHours(6)
             : period;
-    return new Refresher(cfg.copy(), effective);
+    return new Refresher(cfg.copy(), effective, isInitiator);
   }
 
   private static boolean notBlank(String value) {
@@ -236,11 +259,13 @@ public final class KerberosLogin {
     private final ScheduledFuture<?> future;
     private final Config config;
     private final Duration refreshPeriod;
+    private final boolean isInitiator;
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
-    Refresher(Config config, Duration refreshPeriod) {
+    Refresher(Config config, Duration refreshPeriod, boolean isInitiator) {
       this.config = config.copy();
       this.refreshPeriod = refreshPeriod;
+      this.isInitiator = isInitiator;
       long refreshSeconds = Math.max(60, refreshPeriod.getSeconds());
       this.scheduler =
           Executors.newSingleThreadScheduledExecutor(
@@ -255,7 +280,7 @@ public final class KerberosLogin {
         return;
       }
       try {
-        setupAndLogin(config);
+        setupAndLogin(config, isInitiator);
       } catch (RuntimeException e) {
         LOGGER.error("[KerberosLogin] Periodic refresh failed", e);
       }

@@ -8,7 +8,7 @@ import java.nio.file.StandardOpenOption;
 import java.security.PrivilegedAction;
 import java.time.Duration;
 import java.util.Base64;
-import java.util.Locale;
+import java.util.Collections;
 import java.util.Objects;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -22,6 +22,7 @@ import javax.security.auth.callback.UnsupportedCallbackException;
 import javax.security.auth.login.AppConfigurationEntry;
 import javax.security.auth.login.Configuration;
 import javax.security.auth.login.LoginContext;
+import javax.security.auth.kerberos.KerberosPrincipal;
 import org.ietf.jgss.GSSContext;
 import org.ietf.jgss.GSSCredential;
 import org.ietf.jgss.GSSException;
@@ -213,7 +214,8 @@ public final class KerberosApi implements AutoCloseable {
       applySystemProperties(krb5File, config.realm, config.kdc);
       installLoginConfig(principal, keytabFile);
 
-      loginContext = new LoginContext(LOGIN_CONTEXT, NO_PROMPT_HANDLER);
+      Subject initialSubject = newSubject(principal);
+      loginContext = new LoginContext(LOGIN_CONTEXT, initialSubject, NO_PROMPT_HANDLER);
       loginContext.login();
       subject = loginContext.getSubject();
 
@@ -439,7 +441,7 @@ public final class KerberosApi implements AutoCloseable {
     java.util.Map<String, Object> options = new java.util.HashMap<>();
     options.put("useKeyTab", "true");
     options.put("keyTab", keytabPath.toAbsolutePath().toString());
-    options.put("principal", principal.toUpperCase(Locale.ROOT));
+    options.put("principal", principal);
     options.put("storeKey", "true");
     options.put("doNotPrompt", "true");
     options.put("useTicketCache", "false");
@@ -464,6 +466,22 @@ public final class KerberosApi implements AutoCloseable {
       Files.deleteIfExists(file);
     } catch (IOException ignore) {
     }
+  }
+
+  private static Subject newSubject(String principal) {
+    if (principal == null || principal.isBlank()) {
+      return new Subject(
+          false,
+          Collections.emptySet(),
+          Collections.emptySet(),
+          Collections.emptySet());
+    }
+    KerberosPrincipal kp = new KerberosPrincipal(principal);
+    return new Subject(
+        false,
+        Collections.singleton(kp),
+        Collections.emptySet(),
+        Collections.emptySet());
   }
 
   private void ensureStarted() {

@@ -42,13 +42,13 @@ public final class KerberosFlightServer {
             .enabled(true)
             .principal(SERVICE_PRINCIPAL)
             .keytab(SERVICE_KEYTAB.toAbsolutePath().toString())
-            .autoRefresh(true);
+            .autoRefresh(true)
+            .refreshEvery(Duration.ofHours(1));
     if (Files.exists(DEFAULT_KRB5)) {
       kerberosConfig.krb5ConfigPath(DEFAULT_KRB5.toAbsolutePath().toString());
     }
 
-    KerberosTicketManager.ensureLogin(
-        "flight-kerberos-server", kerberosConfig, true, Duration.ofHours(1));
+    KerberosTicketManager.ensureDefaultServiceLogin(kerberosConfig);
 
     BufferAllocator allocator = FlightDemoUtils.newAllocator("flight-kerberos-server");
     TestFlightProducer producer =
