@@ -1,0 +1,157 @@
+{toc}
+
+
+h2. Governed service execution
+Fabric provides a unified, governed execution model for exposing services to clients.
+
+Services are registered and exposed through Fabric, which becomes the consistent entry point for discovery, routing, security, and entitlement enforcement. Service providers can use different runtime technologies, while clients interact through a single, uniform access model.
+
+Fabric centralizes access control, identity propagation, and request routing at the platform boundary, rather than embedding these concerns inside each service implementation.
+
+h2. What Fabric takes care of
+Service providers and clients focus on business logic. Fabric provides the cross-cutting platform capabilities once, consistently, across all supported runtimes.
+
+Fabric handles:
+* Service discovery and routing (clients target a logical service name, not hosts)
+* TLS, Kerberos, SSO, and OBO identity propagation
+* Entitlements enforcement and auditability at the platform boundary
+* Compatibility and upgrade safety (service evolution without breaking clients)
+* Centralized interceptors (logging, tracing, standard headers, policy context)
+* Backpressure, retries, and failure handling at the platform boundary (consistent behavior)
+* Metrics and operational visibility (usage, denies, errors, status)
+
+This reduces duplicated boilerplate in every service and makes service integration predictable for both producers and consumers.
+
+h2. Invocation patterns supported
+Fabric supports the full set of common service interaction models:
+
+* Request/response (unary calls)
+* Server-side streaming (streaming responses)
+* Client-side streaming (streaming requests)
+* Bidirectional streaming (streaming requests and responses)
+
+These patterns are exposed through the same governed entry point, with consistent identity, entitlements, and auditing.
+
+h2. AMPS services
+Fabric supports AMPS-based services as first-class execution runtimes.
+
+* Publish/subscribe services for event-driven and streaming use cases.
+* Private inbox (request/reply) services for point-to-point interactions.
+* Centralized entitlements enforced per user, group, or application.
+* Consistent identity propagation across AMPS interactions.
+
+This allows organizations with large existing AMPS estates to expose services through Fabric without rewriting producers or consumers.
+
+h3. Python example (AMPS publish)
+{code:language=python}
+streams = session.streams()
+
+streams.publish(
+    stream="pricing_updates",
+    record={"symbol": "AAPL", "price": 187.42}
+)
+{code}
+
+h2. gRPC services
+Fabric exposes gRPC services through a governed execution layer.
+
+* gRPC services are registered with Fabric and exposed through a common access boundary.
+* Client calls are authorized and audited consistently.
+* Services can scale horizontally without client-side changes.
+* Clients are automatically routed to available service instances.
+
+Existing gRPC services can be adapted so Fabric becomes the entry point, without requiring changes to service implementations.
+
+h3. Java example (gRPC service provider — minimal)
+Assume *session* is already created and started.
+
+{code:language=java}
+ServiceRunOptions options =
+    ServiceRunOptions.builder()
+        .withRuntimeType("grpc")
+        .withInstanceName("service-echo")
+        .withBindHost("0.0.0.0")
+        .withBindPort(50051)
+        .withAdvertiseHost("127.0.0.1")
+        .withAdvertisePort(50051)
+        .withTls(
+            Path.of("vault/tls/demo-service.pem"),
+            Path.of("vault/tls/demo-service.key"))
+        .build();
+
+try (ServiceHandle service =
+    session.services().start("echo", options, new SimpleEchoService())) {
+  service.blockUntilShutdown();
+}
+{code}
+
+h3. Java example (gRPC client — minimal)
+Assume *session* is already created and started.
+
+{code:language=java}
+ServiceRunOptions options =
+    ServiceRunOptions.builder()
+        .withRuntimeType("grpc")
+        .withTrustCert(Path.of("vault/tls/demo-ca.pem"))
+        .build();
+
+try (ServiceClient client = session.services().client("echo", options)) {
+  demo.echo.EchoGrpc.EchoBlockingStub stub =
+      client.unwrap(demo.echo.EchoGrpc.EchoBlockingStub.class);
+
+  var reply =
+      stub.say(demo.echo.EchoRequest.newBuilder().setMsg("hello").build());
+
+  System.out.println(
+      "reply msg='" + reply.getMsg() + "' instance='" + reply.getInstance() + "' group='" + reply.getGroup() + "'");
+}
+{code}
+
+h2. Arrow Flight services
+Fabric supports Arrow Flight as a service execution runtime for high-performance data exchange.
+
+* Services expose Arrow-native interfaces for tabular data transfer.
+* Clients interact with Flight services through Fabric’s governed entry point.
+* Entitlements and identity are enforced consistently with other runtimes.
+* Flight services can be scaled independently of clients.
+
+This model is well suited for analytical and compute-heavy services that benefit from columnar data transfer.
+
+h2. Arrow Flight SQL services
+Fabric also supports Arrow Flight SQL as a governed execution runtime.
+
+* SQL services are exposed through a standard Flight SQL interface.
+* Clients issue SQL queries without needing to know where the service runs.
+* Results are delivered in tabular form with consistent entitlement enforcement.
+* Flight SQL services can back datasets, materialized views, or analytical services.
+
+This allows SQL-based services to participate fully in the same governance and routing model as other Fabric services.
+
+h2. Routing and scalability
+Fabric manages service discovery and client-side routing.
+
+* Clients automatically route to available service instances.
+* Multiple routing strategies can be applied without client changes.
+* Scaling services up or down does not require client reconfiguration.
+* Failover and instance availability are handled by the platform.
+
+From a client perspective, a service is a logical endpoint rather than a specific host.
+
+h2. Security and identity at execution time
+Fabric applies a consistent security and identity model across all service executions.
+
+* Secure transport using TLS.
+* Integration with Kerberos and enterprise authentication mechanisms.
+* Support for Acting On Behalf Of (OBO) in service calls.
+* Clear separation between service identity and end-user identity.
+
+Security and entitlement enforcement occur at execution time, uniformly across all runtimes.
+
+h2. Deployment environments
+Fabric services can be deployed across multiple environments.
+
+* Local development for rapid iteration.
+* Linux hosts or virtual machines for shared services.
+* Container platforms such as OpenShift for managed deployments.
+
+Deployment behavior is configuration-driven, allowing the same service execution model to be used from development through production without changing client behavior.

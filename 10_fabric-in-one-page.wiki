@@ -1,0 +1,39 @@
+{toc}
+
+
+h2. What Fabric is
+Fabric is a unified data and service platform that provides a single governed interface for ingesting, accessing, and delivering data across multiple transports and runtimes.
+
+It sits between clients and existing systems, allowing producers and services to remain unchanged while Fabric standardizes access, governance, and operational behavior.
+
+h2. What is available
+Fabric provides a cohesive set of capabilities that can be adopted incrementally:
+
+* *Entitlements* — A single, centralized access model that governs datasets, streams, and services consistently across all transports.
+* *Ingestion* — Governed ingestion and routing of data from multiple sources into managed datasets and services.
+* *Datasets* — Unified, tabular access to datasets through a single interface, independent of where data is stored or executed.
+* *Streaming* — Publish/subscribe access to streams across multiple transports with consistent identity, schema, and entitlement enforcement.
+* *Services* — Governed exposure of services across multiple runtime protocols with access control applied at the platform boundary.
+* *Materialized* — Declaratively defined derived datasets managed as first-class platform assets.
+* *Storage* — Open data storage using standard formats, accessible outside Fabric without loss of governance.
+* *APIs* — A single client API for accessing datasets and streams across all supported transports, available in Java and Python, designed for efficient, zero-copy data access.
+
+These capabilities are exposed through a single platform interface so clients interact with Fabric rather than individual systems.
+
+h2. Governance-first platform
+Governance is applied at the Fabric boundary rather than embedded in individual transports or storage systems.
+
+Access is evaluated using a single entitlement model that applies consistently across datasets, streams, and services. Requests are authorized once at the platform boundary and enforced uniformly, regardless of how data is accessed or delivered.
+
+Fabric supports acting on behalf of an end user (OBO) so services and applications can safely propagate user identity across transports while preserving auditability and policy enforcement.
+
+h2. Open, portable, and deployable anywhere
+Fabric is built around open standards and formats so data and services are not locked into proprietary systems.
+
+Storage and compute can be local to a team or domain, allowing groups to operate independent “data ponds” using their own infrastructure while still benefiting from centralized governance.  
+
+At the same time, Fabric integrates cleanly with strategic, centralized data lake platforms, allowing datasets to live in or be sourced from those environments when shared, large-scale analytics or cross-domain access is required. Fabric provides a consistent, governed access layer across both models, enabling teams to choose the appropriate storage and execution footprint for each workload.
+
+Fabric is developed in-house with minimal third-party runtime dependencies. This deliberate design choice keeps the platform lean, reduces external vendor risk, and minimizes exposure to third-party CVEs while maintaining full control over behavior and security posture.
+
+Fabric runs in standard environments, from developer machines to server hosts and container platforms, enabling consistent behavior across development and production deployments.
