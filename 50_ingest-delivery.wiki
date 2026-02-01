@@ -1,0 +1,133 @@
+{toc}
+
+
+
+h1. Unified ingest and delivery model
+Fabric provides a governed, platform-level model for getting data into the system and delivering it to consumers.
+
+Ingestion and streaming are treated as first-class platform capabilities, not bespoke pipelines. Fabric standardizes identity, schema, and governance at the boundary, while allowing producers and delivery mechanisms to evolve independently.
+
+This ensures that data is governed consistently from the moment it enters the platform through every downstream access path.
+
+h1. Feeds (ingest)
+Feeds provide a governed ingestion boundary for bringing data into Fabric.
+
+* Feeds define *how* data enters the platform, independent of where it comes from.
+* Dataset identity is assigned and managed centrally.
+* Schema is validated and enforced at ingest time.
+* Producers are not required to adopt a specific runtime or storage system.
+* Open formats can be used at the ingest edge to keep data portable.
+
+Feeds allow upstream producers to remain unchanged while Fabric standardizes how data is identified, validated, and governed.
+
+h2. Logical feed patterns
+The following table illustrates common *logical* feed patterns supported by Fabric:
+
+|| Source || Target || Notes ||
+| Files | Datasets | Batch or incremental ingest from filesystem-based sources |
+| AMPS | Datasets | Ingest from existing AMPS topics into governed datasets |
+| Kafka | Datasets | Stream-to-dataset ingestion with schema enforcement |
+| Aeron | Datasets | High-throughput ingest into managed datasets |
+| gRPC | Datasets | Service-driven ingestion without exposing internal schemas |
+| Files | Streams | File-backed publish into streaming topics |
+| Datasets | Streams | Dataset-backed streaming delivery |
+
+These patterns describe *how* data flows conceptually; the physical implementations are shown below.
+
+h2. Physical feed source and target matrix
+The table below summarizes the *physical* source and target combinations supported by the Fabric Feed API today.
+
+This reflects concrete implementations rather than conceptual patterns.
+
+|| Source \ Target || Local filesystem || S3 (Parquet) || HDFS (Parquet) || In-memory dataset || DuckDB dataset || Stream (AMPS / Kafka / Aeron) ||
+| Local filesystem | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| S3 (Parquet) | ✓ | — | ✓ | ✓ | ✓ | ✓ |
+| HDFS (Parquet) | ✓ | ✓ | — | ✓ | ✓ | ✓ |
+| AMPS (JSON / txn log) | — | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Kafka | — | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Aeron | — | ✓ | ✓ | ✓ | ✓ | ✓ |
+| gRPC service | — | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Fabric dataset | — | — | — | — | — | ✓ |
+
+*Legend:*  
+✓ = supported directly by Fabric feeds  
+— = not applicable or not meaningful
+
+*Notes*
+* Local filesystem includes local disk and SAN-mounted paths.
+* S3 and HDFS targets persist data in open formats (typically Parquet).
+* In-memory datasets are transient and commonly used for staging or transformation.
+* DuckDB datasets are managed, queryable datasets within Fabric.
+* Stream targets include AMPS, Kafka, and Aeron depending on deployment.
+* gRPC sources rely on adapters that translate service responses into tabular records.
+* Some combinations depend on connector configuration and credentials, but do not require custom code.
+
+h2. Python example (dataset ingest)
+A simple example of ingesting data into a dataset using a feed:
+
+{code:language=python}
+session = fabric.Session().environment("DEV").group("lab").connect()
+feeds = session.feeds()
+
+feeds.publish(
+    dataset="orders",
+    records=[
+        {"order_id": 1, "price": 100.0, "quantity": 10},
+        {"order_id": 2, "price": 250.0, "quantity": 5}
+    ]
+)
+{code}
+
+The dataset identity, schema validation, and entitlements are handled by Fabric at the platform boundary.
+
+h1. Streaming (publish / subscribe)
+Fabric exposes streaming as a unified publish/subscribe model.
+
+* Streams are first-class, governed resources.
+* Publish and subscribe operations are consistent across transports.
+* Stream schemas and metadata are managed centrally.
+* Entitlements are enforced for both producers and consumers.
+
+This allows streaming systems to be integrated into Fabric without leaking transport-specific semantics to clients.
+
+h2. Python example (stream publish)
+{code:language=python}
+session = fabric.Session().environment("DEV").group("lab").connect()
+streams = session.streams()
+
+streams.publish(
+    stream="orders_stream",
+    record={"order_id": 3, "price": 500.0, "quantity": 2}
+)
+{code}
+
+Producers interact with Fabric, not the underlying messaging system, while governance is applied uniformly.
+
+h1. Delivery to downstream consumers
+Fabric supports delivering ingested data through multiple access paths:
+
+* Pull-based access via SQL queries on datasets.
+* Push-based access via stream subscriptions.
+* Derived delivery through materialized datasets.
+* Exposure through governed services.
+
+All delivery paths use the same identity, schema, and entitlement model.
+
+h1. Governance alignment
+Ingest and delivery are governed in the same way as read access.
+
+* Entitlements are enforced at the platform boundary for ingest, publish, and subscribe operations.
+* Acting On Behalf Of (OBO) is supported so writes and publishes can be attributed to end-user identity.
+* Schema violations and unauthorized access are rejected early and consistently.
+
+This ensures that governance is applied *from the moment data enters the platform*, not retrofitted later.
+
+h1. Integration with existing systems
+Fabric is designed to integrate with existing ingestion and streaming systems.
+
+* Existing AMPS topics can be ingested and exposed as governed datasets or streams.
+* Kafka and Aeron can participate in the same ingest and delivery model.
+* Existing producers do not need to change to participate in Fabric.
+* Clients gain immediate benefits: unified identity, schema enforcement, and entitlements.
+
+This enables organizations to standardize ingest and delivery without disrupting current producers or pipelines.

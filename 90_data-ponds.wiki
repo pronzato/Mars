@@ -1,0 +1,228 @@
+{toc}
+
+h1. Fabric Data Ponds
+
+
+h2. Rethinking the default analytics footprint
+Centralized enterprise data platforms were designed to solve problems at very large scale:
+* Multi-petabyte storage
+* Shared distributed compute
+* Many teams querying the same raw data
+
+These platforms remain essential for certain classes of workloads.  
+However, in practice, many teams do not require these characteristics for their day-to-day analytics and operational workflows.
+
+Instead, they often encounter:
+* High infrastructure and operational cost
+* Long onboarding and change cycles
+* Multi-tenant contention and unpredictable performance
+* Governance spread across multiple engines and tools
+
+Fabric introduces the concept of *data ponds* — a complementary model optimized for domain-owned, high-velocity, and low-friction analytics.
+
+h2. The small data movement
+Industry experience increasingly shows that a large percentage of analytical workloads are:
+* Domain-owned
+* Bounded in size
+* Accessed by a small number of teams
+* Sensitive to latency and iteration speed
+
+This shift is often referred to as the *Small Data* or *Embedded Analytics* movement.  
+Modern columnar SQL engines such as DuckDB demonstrate that local or domain-owned data can deliver excellent analytical performance without requiring shared distributed compute.
+
+Fabric adopts this model and extends it with identity, entitlements, and auditability suitable for enterprise environments.
+
+For authoritative discussion of this approach, see:
+* [DuckDB – Why DuckDB|https://duckdb.org/why_duckdb]
+* [MotherDuck – Small Data Is the New Big Data|https://motherduck.com/blog/small-data-is-the-new-big-data/]
+
+h2. Domain-owned data ponds
+Fabric enables teams to operate *data ponds* alongside existing centralized platforms.
+
+A Fabric data pond is:
+* Owned by a single team or domain
+* Stored on local disk, SAN, or object storage (e.g. S3)
+* Governed centrally by Fabric
+* Queried using standard SQL
+
+Teams choose storage based on their needs:
+* Local disk for development and low-latency workloads
+* SAN for high-performance shared environments
+* S3 for durable, low-cost storage
+
+Fabric does not require a proprietary filesystem or a shared compute cluster.
+
+h2. Governance without centralization
+One of the primary reasons organizations adopt centralized data platforms is governance.
+
+Fabric decouples governance from storage and compute:
+* Entitlements are enforced at the access boundary
+* The same policies apply across datasets, streams, and services
+* Row- and column-level controls are supported
+* On-Behalf-Of (OBO) ensures correct end-user identity propagation
+
+This allows teams to operate independently while still meeting enterprise governance and audit requirements.
+
+h2. SQL capability depth within data ponds
+Fabric data ponds are not a “reduced SQL” experience.
+
+Fabric’s SQL runtime supports advanced analytical patterns commonly used in quant, trading, and time-series workflows — without requiring a centralized data lake.
+
+h3. Window functions
+{code:language=sql}
+SELECT
+  symbol,
+  trade_time,
+  price,
+  AVG(price) OVER (
+    PARTITION BY symbol
+    ORDER BY trade_time
+    ROWS BETWEEN 10 PRECEDING AND CURRENT ROW
+  ) AS rolling_avg_price
+FROM trades;
+{code}
+
+h3. As-of joins (temporal joins)
+{code:language=sql}
+SELECT
+  t.trade_id,
+  t.trade_time,
+  t.price,
+  q.bid,
+  q.ask
+FROM trades t
+ASOF JOIN quotes q
+  ON t.symbol = q.symbol
+ AND t.trade_time >= q.quote_time;
+{code}
+
+h3. SQL macros (reusable logic)
+{code:language=sql}
+CREATE MACRO notional(price, quantity) AS (
+  price * quantity
+);
+{code}
+
+{code:language=sql}
+SELECT
+  order_id,
+  notional(price, quantity) AS notional
+FROM orders;
+{code}
+
+h3. Pivot and unpivot
+{code:language=sql}
+SELECT *
+FROM orders
+PIVOT (
+  SUM(quantity)
+  FOR side IN ('BUY', 'SELL')
+);
+{code}
+
+h2. Moving data between data ponds and centralized platforms
+Fabric data ponds are not an isolated endpoint.  
+They are designed to *interoperate* with centralized platforms using the same Feed API that governs all ingestion and delivery.
+
+This enables two important workflows:
+
+h3. Developing locally, scaling centrally
+Teams can use Fabric data ponds for fast, iterative development and analytics, then move the resulting datasets into centralized platforms when scale or cross-domain access is required.
+
+Typical flow:
+* Ingest data into a Fabric data pond (local disk or S3).
+* Develop and validate analytics using fast, local execution.
+* Apply governance, schema, and entitlements early.
+* Use a Fabric feed to export the dataset into a centralized platform (e.g. HDFS / data lake).
+
+This supports a *develop locally, scale centrally* workflow without rewriting pipelines.
+
+h3. Pulling data from centralized platforms into data ponds
+Fabric can also ingest data from centralized platforms into data ponds for local or domain-specific analytics.
+
+Typical flow:
+* Ingest Parquet data from HDFS or S3-backed data lakes using Fabric feeds.
+* Materialize a governed dataset in a Fabric data pond.
+* Run low-latency, exploratory, or operational analytics locally.
+* Avoid shared compute queues and multi-tenant contention.
+
+This allows teams to work productively on subsets of large datasets without impacting shared infrastructure.
+
+h3. Bidirectional movement using the same abstraction
+Both directions use the same Fabric Feed API:
+* Source and target are declared explicitly.
+* Schema is validated at the boundary.
+* Entitlements are enforced consistently.
+* Storage format remains open (Parquet).
+
+Fabric acts as the *governed bridge* between domain-owned data ponds and centralized platforms.
+
+h2. S3-backed data ponds vs HDFS-centric platforms
+|| Dimension || HDFS-centric platforms || S3-backed Fabric data ponds ||
+| Small files | Actively discouraged | Natively supported |
+| Operational overhead | Requires cluster management | Managed service |
+| Onboarding friction | High | Low |
+| Multi-tenant contention | Common | Isolated by bucket/prefix |
+| File lifecycle | Manual | Native lifecycle policies |
+| Cost model | Fixed cluster cost | Pay for storage used |
+| Failure impact | Cluster-wide | Scoped |
+| Access patterns | Batch-oriented | Batch + interactive |
+| Governance | Often fragmented | Centralized in Fabric |
+| Suitability for event/JSON data | Poor | Excellent |
+
+h2. No shared compute requirement
+Fabric data ponds do not require a centralized, multi-tenant compute layer.
+
+Query execution can occur:
+* Directly against domain-owned storage
+* Inside team-operated services (e.g. Arrow Flight SQL)
+* Via embedded execution invoked by clients
+
+This eliminates:
+* Queueing delays
+* Resource contention
+* Cross-team performance interference
+
+Teams scale their own workloads independently.
+
+h2. Fabric data ponds and centralized platforms
+Fabric data ponds are not intended to replace centralized platforms universally.
+
+Centralized platforms remain appropriate when:
+* Many teams require access to the same raw data at very large scale
+* Workloads require distributed joins across multiple domains
+* Batch processing spans very large datasets
+
+Fabric integrates with these systems and can act as a governed access layer when needed.
+
+h2. When data ponds are the right choice
+Fabric data ponds are well suited when:
+* Data is owned and primarily used by a single team
+* Workloads fit comfortably on local disk or object storage
+* Low latency and iteration speed matter
+* Governance must be enforced without heavy infrastructure
+
+In these cases, Fabric allows teams to move faster with lower cost and fewer dependencies.
+
+h2. Open formats and zero lock-in
+Fabric relies exclusively on open standards:
+* Parquet
+* Arrow
+* SQL
+
+Data stored in Fabric-managed data ponds:
+* Can be accessed outside Fabric using standard tools
+* Is not locked into proprietary engines
+* Can be migrated or integrated easily
+
+This preserves long-term flexibility while still benefiting from a governed platform.
+
+h2. Practical outcome
+By adopting Fabric data ponds, organizations can:
+* Accelerate development and analytics cycles
+* Reduce unnecessary dependency on centralized platforms
+* Move datasets between local and central environments safely
+* Maintain strong governance and auditability
+* Choose the appropriate scale for each workload
+
+Fabric does not replace centralized platforms — it *complements* them by enabling modern, domain-oriented analytics workflows.

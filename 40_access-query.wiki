@@ -1,0 +1,125 @@
+{toc}
+
+
+
+h1. Unified access model
+Fabric provides a single, consistent way for clients to access data.
+
+Clients interact with Fabric through a unified tabular and streaming interface, independent of where data originates, how it is stored, or which runtime executes the request. Dataset and stream identity is canonical, allowing clients to reason about data logically rather than embedding transport or infrastructure details.
+
+The same access model applies across datasets, streams, services, and derived views.
+
+h1. Datasets (pull / SQL)
+Fabric exposes datasets through a unified SQL-based query interface.
+
+* Clients query datasets using standard SQL.
+* Projection and predicate push-down ensure clients request only the columns and rows they need.
+* Datasets can be joined using standard SQL, including joins across independently owned domains.
+* Authorization and entitlements are enforced consistently for every query.
+* Acting On Behalf Of (OBO) is supported so queries can be evaluated using end-user identity.
+
+From a client perspective, querying a dataset is a stable, uniform operation regardless of where the data lives.
+
+h2. Python example (dataset query)
+A typical quant workflow is: open a session, run SQL, and consume results in familiar analytical tools.
+
+{code:language=python}
+import fabric
+import polars as pl
+
+session = fabric.Session().environment("DEV").group("lab").connect()
+tabular = session.tabular()
+
+result = tabular.query("""
+    SELECT order_id, price, quantity
+    FROM orders
+    WHERE trade_date >= DATE '2026-01-01'
+""")
+
+df = pl.from_arrow(result.to_arrow())
+df = df.with_columns((pl.col("price") * pl.col("quantity")).alias("notional"))
+
+print(df.head())
+{code}
+
+h1. Result formats and client consumption
+Fabric allows clients to choose how query and stream results are materialized.
+
+The same logical query can be consumed in different formats depending on the client’s needs:
+
+* Columnar formats (analytics and compute)
+** Arrow (columnar, zero-copy where possible)
+** NumPy-compatible arrays
+** Polars DataFrames
+** Parquet files
+* Row-based formats (applications and integration)
+** JSON
+** CSV
+** FIX / domain-specific encodings (e.g. nvFIX)
+** JDBC-style ResultSet (Java)
+
+This flexibility allows:
+* Quants to work directly with columnar, vectorized data
+* Applications to consume row-oriented results
+* Integration with existing tools without rewriting client logic
+
+Format selection does not change governance behavior — entitlements and policies are enforced identically regardless of how results are consumed.
+
+h1. Streams (subscribe)
+Fabric also exposes streams as first-class platform resources.
+
+* Streams can be subscribed to using a unified API, regardless of the underlying messaging system.
+* Stream schemas and identity are governed centrally.
+* Entitlements are enforced on publish and subscribe operations.
+* Subscriptions can be evaluated using application identity or OBO user identity.
+
+This allows streaming data to be consumed with the same governance and identity model used for datasets.
+
+h2. Python example (stream subscribe)
+{code:language=python}
+import fabric
+import polars as pl
+
+session = fabric.Session().environment("DEV").group("lab").connect()
+streams = session.streams()
+
+subscription = streams.subscribe("orders_stream")
+
+for batch in subscription:
+    # batch is a tabular record batch
+    df = pl.from_arrow(batch)
+    process(df)
+{code}
+
+h1. Materialized views and enrichment
+Fabric supports materialized datasets defined using SQL.
+
+* Materialized views can join streaming data with static reference datasets.
+* Views are treated as first-class governed assets.
+* Entitlements apply to the view in the same way as base datasets.
+* Clients query materialized views using the same SQL interface as any other dataset.
+
+This enables common enrichment patterns such as:
+* Streaming orders joined with static reference data
+* Normalization of multiple feeds into a single analytical view
+* Precomputed datasets for repeated access patterns
+
+h1. Existing AMPS and gRPC integration
+Fabric can adapt existing AMPS topics and gRPC services into the unified access model.
+
+* AMPS topics can be exposed as datasets or streams that support SQL queries.
+* Clients can issue full SQL queries over AMPS-backed data with entitlements enforced per user or group.
+* This extends governance beyond topic-level service identities to fine-grained dataset and query access.
+* Existing gRPC services can be adapted so Fabric becomes the governed entry point without requiring provider changes.
+
+For organizations with large existing AMPS and gRPC estates, this allows immediate client-side benefits — unified access, SQL, and entitlements — without disrupting current producers or services.
+
+h1. Client-facing APIs
+Fabric exposes a single client API surface for accessing datasets and streams.
+
+* Java and Python clients provide access to the same logical capabilities.
+* Clients select the result format that best fits their workflow.
+* Execution, transport, and storage details are abstracted away from clients.
+* Governance, entitlements, and OBO enforcement are applied consistently across all access paths.
+
+This enables quants, applications, and services to interact with data using one model, regardless of source, delivery mechanism, or consumption style.
