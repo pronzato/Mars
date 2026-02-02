@@ -1,0 +1,58 @@
+h1. Transport Performance Comparison
+
+This section compares the performance characteristics of the Fabric-supported transports — *AMPS, gRPC, Arrow Flight, and Arrow Flight SQL* — across increasing dataset sizes. The benchmarks highlight the intentional tradeoffs between throughput, latency, and execution model.
+
+----
+
+h2. Throughput Comparison (Rows / Second)
+
+The following two charts present throughput using *both linear and logarithmic scales*. Together, they provide an executive-level view of absolute performance and a technical view of scaling behavior.
+
+|| Linear Scale Throughput || Logarithmic Scale Throughput ||
+| {image-placeholder:transport_throughput_linear.png} | {image-placeholder:transport_throughput_rows_per_sec.png} |
+
+*Figure 1a (left) — Transport Throughput Comparison (Linear Scale)*  
+*Figure 1b (right) — Transport Throughput Comparison (Logarithmic Scale)*
+
+*Narrative:*
+
+The linear-scale chart highlights the absolute dominance of *Arrow Flight SQL* for bulk data movement, sustaining approximately *1M+ rows/sec* across all tested dataset sizes. Other transports appear compressed near the x-axis, reflecting their optimization for lower-volume or latency-sensitive workloads rather than high-throughput analytical scans.
+
+The logarithmic-scale chart complements this view by illustrating how all transports scale as dataset size increases. Arrow Flight (non-SQL) shows strong scaling characteristics but remains consistently below Flight SQL. gRPC and AMPS scale linearly but operate several orders of magnitude lower in raw throughput, consistent with their streaming and RPC-oriented design goals.
+
+Using both scales together provides a complete picture: absolute performance leadership on the linear view, and relative scaling behavior on the log view.
+
+----
+
+h2. Latency Comparison (p95)
+
+The chart below compares p95 latency across transports as dataset size increases.
+
+{image-placeholder:transport_latency_p95.png}
+
+*Figure 2 — Transport Latency p95 Comparison*
+
+*Narrative:*
+
+This chart shows tail latency (p95) for each transport under increasing data volumes. *AMPS* and *gRPC* achieve near-zero p95 latency at larger sizes, reflecting their suitability for streaming and request/response workloads where small messages and steady flow dominate.
+
+*Arrow Flight* and *Arrow Flight SQL* exhibit higher but stable p95 latency, driven by batching, serialization, and (for Flight SQL) query planning and vectorized execution. This latency profile is expected for analytical transports and represents a deliberate tradeoff in exchange for significantly higher throughput and efficiency.
+
+----
+
+h2. Why This Matters: The Power of Fabric
+
+These results highlight the core strength of *Fabric* as a data platform.
+
+Fabric seamlessly supports multiple transport and execution models — streaming, RPC, bulk transfer, and analytical query — each optimized for its respective strengths. Rather than forcing clients or service providers to choose a single transport or compromise on performance characteristics, Fabric exposes a *simple, consistent, and governed API* that abstracts these differences away.
+
+Clients interact with a unified Fabric API, while Fabric internally selects and orchestrates the most appropriate transport (AMPS, gRPC, Arrow Flight, or Arrow Flight SQL) based on the workload. This allows application developers and data producers to focus on business logic and data semantics, not transport mechanics, while still achieving best-in-class performance for each use case.
+
+----
+
+h2. Key Takeaways
+
+* Arrow Flight SQL is the preferred transport for analytical and tabular workloads requiring maximum throughput.
+* Arrow Flight provides strong bulk-transfer performance without SQL planning overhead.
+* gRPC and AMPS excel in low-latency, event-driven, and streaming scenarios.
+* Fabric unifies these transports behind a single, consistent API, allowing each to be used for its strengths without exposing complexity to clients.
