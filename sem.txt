@@ -1,0 +1,80 @@
+h1. Fabric as the Semantic Layer
+
+h2. Overview
+
+A semantic layer translates raw data into consistent, business-friendly definitions and metrics.
+
+*Fabric provides this layer by exposing governed datasets and governed materialized views with fixed schemas, metadata, and enforced access rules, and making them available through standard query and API interfaces.*
+
+---
+
+h2. Curated datasets
+
+Fabric publishes datasets as managed assets, not raw tables.
+
+Each dataset has:
+* A defined schema
+* Stored metadata
+* An owner and lifecycle state
+* Enforced row- and column-level access rules
+
+Consumers query these datasets directly rather than accessing underlying sources.
+
+---
+
+h2. Governed materialized views
+
+Common joins and aggregations are published as governed materialized datasets.
+
+These:
+* Are defined once
+* Are versioned and managed
+* Replace repeated joins and calculations in tools and code
+
+Governed materialized views are queried like any other dataset.
+
+---
+
+h2. Schemas and metadata
+
+Schemas and metadata are stored and served with every dataset.
+
+They:
+* Define field names and types
+* Describe dataset purpose and provenance
+* Enable inspection and lineage tracking
+
+This information is available through APIs, CLI, and UI.
+
+---
+
+h2. Governance and access control
+
+Access rules are part of the dataset.
+
+Fabric enforces:
+* Row-level filters
+* Column-level masking
+* User and group-based permissions
+
+Rules are applied consistently regardless of how the data is accessed.
+
+---
+
+h2. Access and interfaces
+
+All consumers interact with the same datasets and views through standard interfaces:
+
+* *Fabric APIs (Java, Python)*
+* *JDBC / Arrow Flight SQL*
+* *Fabric Shell (CLI)*
+* *Fabric UI (Stitch)*
+* *Natural language (POC, MCP-based)*
+
+No interface bypasses schema, metadata, or access enforcement.
+
+---
+
+h3. Takeaway
+
+*Fabric serves as the semantic layer by ensuring all tools and users access the same governed datasets and materialized views rather than defining data meaning and access rules separately in each tool.*
