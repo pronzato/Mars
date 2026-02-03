@@ -1,1 +1,1 @@
-null
+For analytical workloads, Fabric exposes data in Apache Arrow format, enabling zero-copy interoperability with tools such as NumPy, Polars, and Pandas without serialization overhead.
