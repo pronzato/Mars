@@ -1,1 +1,60 @@
-null
+h1. Fabric as the Semantic Layer
+
+A semantic layer translates raw data into consistent, business-friendly definitions and metrics.
+
+*Fabric provides this layer by exposing governed datasets and governed materialized views with fixed schemas, metadata, and enforced access rules, and making them available through standard query and API interfaces.*
+
+Rather than introducing a separate semantic system, Fabric encodes semantics directly in the datasets that consumers query.
+
+h1. Curated datasets
+
+Fabric publishes datasets as managed assets rather than exposing raw source tables.
+
+Each dataset has a fixed schema, associated metadata, a defined owner, and an explicit lifecycle state.  
+Row-level and column-level access rules are enforced as part of the dataset itself.
+
+Consumers query these curated datasets directly, ensuring that all tools and users work from the same definitions instead of reconstructing meaning from underlying sources.
+
+h1. Governed materialized views
+
+Fabric publishes common joins and aggregations as governed materialized datasets.
+
+These materialized views are defined once, versioned, and managed in the same way as base datasets.  
+They replace repeated joins and calculations that would otherwise be re-implemented across dashboards, queries, and application code.
+
+From the consumer’s perspective, a governed materialized view is queried exactly like any other dataset.
+
+h1. Schemas and metadata
+
+Every dataset and materialized view in Fabric is served with an explicit schema and stored metadata.
+
+Schemas define field names and types and remain stable for consumers.  
+Metadata records what the dataset represents, where it comes from, and how it was produced.
+
+This information is available through the Fabric APIs, CLI, and UI, enabling inspection, traceability, and lineage without relying on external documentation.
+
+h1. Governance and access control
+
+Governance is enforced at the dataset level.
+
+Fabric applies row-level filters, column-level masking, and user or group-based permissions consistently across all access paths.  
+The same access rules apply whether data is queried through SQL, APIs, or services.
+
+No tool-specific security logic is required, and no interface can bypass enforcement.
+
+h1. Access and interfaces
+
+All consumers interact with the same governed datasets and materialized views through standard interfaces:
+
+* *Fabric APIs (Java, Python)* for programmatic discovery and querying  
+* *JDBC / Arrow Flight SQL* for BI tools and analytics platforms  
+* *Fabric Shell (CLI)* for command-line inspection and querying  
+* *Fabric UI (Stitch)* for browsing datasets, schemas, metadata, and entitlements  
+* *Natural language (POC, MCP-based)* for experimental conversational discovery  
+
+Each interface exposes the same schemas, metadata, and access rules.
+
+h2. Summary
+
+*Fabric serves as the semantic layer by ensuring all tools and users access the same governed datasets and materialized views rather than defining data meaning and access rules separately in each tool.*
+
