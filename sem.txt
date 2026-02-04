@@ -1,1 +1,11 @@
-null
+Semantic components in Fabric
+
+Curated datasets — named, governed datasets that define what the data represents
+
+Governed materialized views — derived datasets published and reused as first-class assets
+
+Schemas — fixed field names and types that define the data contract
+
+Metadata — stored context describing dataset meaning, origin, and production
+
+Entitlements — row- and column-level access rules enforced at query time
