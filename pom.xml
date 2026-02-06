@@ -1,1 +1,269 @@
-null
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>org.pronzato.fabric</groupId>
+  <artifactId>fabric-parent</artifactId>
+  <version>1.0.0-SNAPSHOT</version>
+  <packaging>pom</packaging>
+  <name>fabric-parent</name>
+
+  <properties>
+    <maven.compiler.release>21</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+    <!-- libs -->
+    <grpc.version>1.66.0</grpc.version>
+    <protobuf.version>4.30.2</protobuf.version>
+    <protobuf.skip>false</protobuf.skip>
+    <jackson.version>2.17.2</jackson.version>
+    <amps.client.version>5.3.3.4</amps.client.version>
+    <arrow.version>18.3.0</arrow.version>
+    <duckdb.version>1.4.1.0</duckdb.version>
+    <aws.sdk.version>2.27.19</aws.sdk.version>
+    <mongodb.driver.version>5.1.0</mongodb.driver.version>
+    <nimbus.version>11.26</nimbus.version>
+    <nimbus.jwt.version>10.0.2</nimbus.jwt.version>
+    <junit.version>5.10.2</junit.version>
+    <mockito.version>4.11.0</mockito.version>
+    <bytebuddy.version>1.14.12</bytebuddy.version>
+    <fabric.arrow.add-opens>--add-opens=java.base/java.nio=ALL-UNNAMED</fabric.arrow.add-opens>
+    <surefire.plugin.version>3.2.5</surefire.plugin.version>
+    <bouncycastle.version>1.78.1</bouncycastle.version>
+    <slf4j.version>2.0.16</slf4j.version>
+    <logback.version>1.5.9</logback.version>
+    <jacoco.plugin.version>0.8.12</jacoco.plugin.version>
+    <jacoco.skip>true</jacoco.skip>
+    <shade.skip>true</shade.skip>
+  </properties>
+
+  <modules>
+    <module>fabric-kdc</module>
+    <module>fabric-mcp</module>
+    <module>fabric-api</module>
+    <module>fabric-api-mongodb</module>
+    <module>fabric-api-hdfs</module>
+    <module>fabric-api-impala</module>
+    <module>fabric-api-kafka</module>
+    <module>fabric-api-aeron</module>
+    <module>fabric-api-ami</module>
+    <module>fabric-config</module>
+    <module>fabric-archive</module>
+    <module>fabric-stitch</module>
+    <module>fabric-stitch-studio</module>
+    <module>fabric-controller</module>
+    <module>fabric-shell</module>
+    <module>fabric-test-basic</module>
+    <module>fabric-test-oc</module>
+    <module>fabric-test-lab</module>
+  </modules>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>io.grpc</groupId>
+        <artifactId>grpc-bom</artifactId>
+        <version>1.66.0</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>net.bytebuddy</groupId>
+        <artifactId>byte-buddy</artifactId>
+        <version>${bytebuddy.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>net.bytebuddy</groupId>
+        <artifactId>byte-buddy-agent</artifactId>
+        <version>${bytebuddy.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.google.protobuf</groupId>
+        <artifactId>protobuf-java</artifactId>
+        <version>${protobuf.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.google.protobuf</groupId>
+        <artifactId>protobuf-java-util</artifactId>
+        <version>${protobuf.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.google.protobuf</groupId>
+        <artifactId>protobuf-javalite</artifactId>
+        <version>${protobuf.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+      </plugins>
+    </pluginManagement>
+    <plugins>
+      <plugin>
+        <artifactId>maven-antrun-plugin</artifactId>
+        <version>3.1.0</version>
+        <executions>
+          <execution>
+            <id>fabric-build-id</id>
+            <phase>process-resources</phase>
+            <goals>
+              <goal>run</goal>
+            </goals>
+            <configuration>
+              <exportAntProperties>true</exportAntProperties>
+              <target>
+                <property name="fabric.build.file" value="${project.basedir}/.build/build-info.properties" />
+                <mkdir dir="${project.basedir}/.build" />
+                <propertyfile file="${fabric.build.file}" comment="Fabric build metadata">
+                  <entry key="build.projectVersion" type="string" value="${project.version}" />
+                  <entry key="build.number" type="int" operation="+" value="1" />
+                </propertyfile>
+                <property file="${fabric.build.file}" />
+                <tstamp>
+                  <format
+                      property="fabric.build.timestamp"
+                      pattern="yyyy-MM-dd'T'HH:mm:ss'Z'"
+                      timezone="UTC" />
+                </tstamp>
+                <property name="fabric.build.number" value="${build.number}" />
+                <property name="fabric.build.id" value="${project.version}.${fabric.build.number}" />
+                <mkdir dir="${project.build.outputDirectory}" />
+                <echo file="${project.build.outputDirectory}/build-info.properties">
+build.id=${fabric.build.id}
+build.number=${fabric.build.number}
+build.timestamp=${fabric.build.timestamp}
+build.projectVersion=${project.version}
+</echo>
+              </target>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <!-- Java 21 -->
+      <plugin>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.11.0</version>
+        <configuration>
+          <release>${maven.compiler.release}</release>
+          <showDeprecation>true</showDeprecation>
+          <showWarnings>true</showWarnings>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.jacoco</groupId>
+        <artifactId>jacoco-maven-plugin</artifactId>
+        <version>${jacoco.plugin.version}</version>
+        <configuration>
+          <skip>${jacoco.skip}</skip>
+        </configuration>
+        <executions>
+          <execution>
+            <id>prepare-agent</id>
+            <goals>
+              <goal>prepare-agent</goal>
+            </goals>
+          </execution>
+          <execution>
+            <id>report</id>
+            <phase>verify</phase>
+            <goals>
+              <goal>report</goal>
+            </goals>
+          </execution>
+          <execution>
+            <id>jacoco-check</id>
+            <phase>verify</phase>
+            <goals>
+              <goal>check</goal>
+            </goals>
+            <configuration>
+              <rules>
+                <rule>
+                  <element>BUNDLE</element>
+                  <limits>
+                    <limit>
+                      <counter>LINE</counter>
+                      <value>COVEREDRATIO</value>
+                      <minimum>0.90</minimum>
+                    </limit>
+                  </limits>
+                </rule>
+              </rules>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+    </plugins>
+  </build>
+
+  <profiles>
+    <profile>
+      <id>fast</id>
+      <modules>
+        <module>fabric-api</module>
+      </modules>
+    </profile>
+    <profile>
+      <id>meta-ci</id>
+      <activation>
+        <activeByDefault>false</activeByDefault>
+      </activation>
+      <properties>
+        <skipITs>true</skipITs>
+        <maven.test.skip>true</maven.test.skip>
+        <protobuf.skip>true</protobuf.skip>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <version>${surefire.plugin.version}</version>
+            <configuration>
+              <includes>
+                <include>**/fabric/config/**/*Test.java</include>
+                <include>**/fabric/config/demo/**/*Test.java</include>
+                <include>**/MetaManagerStitchControllerTest.java</include>
+              </includes>
+              <excludes>
+                <exclude>**/*ConnectionManager*Test.java</exclude>
+                <exclude>**/*Kerberos*Test.java</exclude>
+                <exclude>**/*Duckdb*Test.java</exclude>
+                <exclude>**/*DuckDB*Test.java</exclude>
+                <exclude>**/*ResultSetManagerRemoteTest.java</exclude>
+                <exclude>**/*TabularRemoteTest.java</exclude>
+                <exclude>**/*GrpcPepIntegrationTest.java</exclude>
+                <exclude>**/*DataEntitlementsParityIntegrationTest.java</exclude>
+                <exclude>**/*MaterializedServiceTest.java</exclude>
+                <exclude>**/*Feed*Test.java</exclude>
+                <exclude>**/*FileFeed*Test.java</exclude>
+                <exclude>**/*ParquetFeed*Test.java</exclude>
+                <exclude>**/*ImpalaFeed*Test.java</exclude>
+                <exclude>**/*LegacyFabricDataServiceCatalogTest.java</exclude>
+                <exclude>**/*DataNameResolverTest.java</exclude>
+                <exclude>**/*ResultSetManagerTest.java</exclude>
+                <exclude>**/*TabularStreamEngineTest.java</exclude>
+                <exclude>**/*DefaultHotCacheManagerTest.java</exclude>
+                <exclude>**/*ConfigCacheLastGoodTest.java</exclude>
+                <exclude>**/*Asset*Test.java</exclude>
+                <exclude>**/*CompactionExecutorManifestTest.java</exclude>
+              </excludes>
+              <failIfNoTests>false</failIfNoTests>
+            </configuration>
+          </plugin>
+          <plugin>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <version>${surefire.plugin.version}</version>
+            <configuration>
+              <skipTests>true</skipTests>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+</project>
+
+
