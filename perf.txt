@@ -1,1058 +1,1050 @@
-package org.pronzato.fabric.api.connections.manager;
+package org.pronzato.fabric.api.configs.presentation;
 
-import com.crankuptheamps.client.HAClient;
-import java.io.IOException;
-import java.io.InputStream;
-import java.lang.reflect.Method;
-import java.net.URI;
-import java.net.URISyntaxException;
-import java.net.http.HttpClient;
-import java.nio.file.Path;
-import java.time.Duration;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.Deque;
+import java.util.LinkedHashMap;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Supplier;
-import org.pronzato.fabric.api.connections.ConnectionManager;
-import org.pronzato.fabric.api.connections.ConnectionOptions;
-import org.pronzato.fabric.api.connectors.amps.AmpsConfig;
-import org.pronzato.fabric.api.connectors.amps.AmpsConnection;
-import org.pronzato.fabric.api.connectors.amps.AmpsFactory;
-import org.pronzato.fabric.api.connectors.amps.factory.AmpsFactoryOptions;
-import org.pronzato.fabric.api.connectors.http.HttpConnection;
-import org.pronzato.fabric.api.connectors.odbc.OdbcConnection;
-import org.pronzato.fabric.api.connectors.s3.S3Connection;
-import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConnection;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
-import org.pronzato.fabric.api.control.discovery.definitions.common.LifecycleStatus;
-import org.pronzato.fabric.api.data.duckdb.DuckdbEngine;
-import org.pronzato.fabric.api.data.duckdb.DuckdbSession;
-import org.pronzato.fabric.api.data.duckdb.OdbcRuntimeGuard;
-import org.pronzato.fabric.api.data.duckdb.OdbcSessionSupport;
-import org.pronzato.fabric.api.control.plugins.ConnectionProvider;
-import org.pronzato.fabric.api.control.plugins.ConnectionProviderContext;
-import org.pronzato.fabric.api.control.plugins.ConnectionRequest;
-import org.pronzato.fabric.api.control.plugins.FabricPlugins;
-import org.pronzato.fabric.api.control.security.secrets.SecretCrypto;
-import org.pronzato.fabric.api.control.security.secrets.SessionSecrets;
-import org.pronzato.fabric.api.control.session.SessionContext;
-import org.pronzato.fabric.api.control.session.SessionImpl;
-import org.pronzato.fabric.api.util.CloseSupport;
-import org.pronzato.fabric.api.util.IdentityParsingSupport;
-import org.pronzato.fabric.api.util.Strings;
+import java.util.Set;
+import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
+import org.pronzato.fabric.api.configs.presentation.ConfigSchemaDoc.Field;
+import org.pronzato.fabric.api.configs.presentation.ConfigSchemaDoc.FieldType;
+import org.pronzato.fabric.api.configs.presentation.ConfigSchemaDoc.Group;
+import org.pronzato.fabric.api.configs.presentation.ConfigSchemaDoc.Struct;
+import org.pronzato.fabric.api.configs.presentation.ConfigSchemaDoc.ValidationIssue;
 
-public final class ConnectionManagerImpl implements ConnectionManager, AutoCloseable {
-  private static final String PLATFORM_GROUP = "platform";
-  private static final CacheOptions NO_OPTIONS = new CacheOptions(null, -1L, 0, null);
+public final class ConfigSchemaCodec {
 
-  private final Supplier<DiscoveryCache> configCacheSupplier;
-  private final Supplier<String> groupSupplier;
-  private final Supplier<SessionContext> sessionContextSupplier;
-  private final SessionImpl.SessionConfig sessionConfig;
-  private final SessionSecretDecryptor secretDecryptor;
-  private final FabricPlugins plugins;
-  private final ConcurrentHashMap<CacheKey, AutoCloseable> cache = new ConcurrentHashMap<>();
+  private static final Set<String> ROOT_KEYS =
+      Set.of("displayName", "description", "groups", "structs", "fields", "requiredKeys");
+  private static final Set<String> GROUP_KEYS = Set.of("id", "label", "description", "order");
+  private static final Set<String> STRUCT_KEYS = Set.of("id", "label", "description", "fields");
+  private static final Set<String> FIELD_KEYS =
+      Set.of(
+          "key",
+          "label",
+          "description",
+          "groupId",
+          "order",
+          "type",
+          "required",
+          "editable",
+          "enum",
+          "default",
+          "min",
+          "max",
+          "pattern",
+          "fields",
+          "itemType",
+          "itemsEnum",
+          "structRef",
+          "minItems",
+          "maxItems");
 
-  public ConnectionManagerImpl(
-      Supplier<DiscoveryCache> configCacheSupplier,
-      Supplier<String> groupSupplier,
-      Supplier<SessionContext> sessionContextSupplier,
-      SessionImpl.SessionConfig sessionConfig) {
-    this(
-        configCacheSupplier,
-        groupSupplier,
-        sessionContextSupplier,
-        sessionConfig,
-        (alias, encryptedValue) -> {
-          String normalizedAlias = Strings.firstNonBlank(alias, SessionSecrets.DEFAULT_KEK_ALIAS);
-          throw new IllegalStateException(
-              "S3 credentials are encrypted but no KEK was provided (alias=" + normalizedAlias + ")");
-        });
-  }
+  private static final Comparator<Group> GROUP_ORDER =
+      Comparator.comparingInt((Group group) -> group.order() == null ? Integer.MAX_VALUE : group.order())
+          .thenComparing(group -> group.id() == null ? "" : group.id());
 
-  public ConnectionManagerImpl(
-      Supplier<DiscoveryCache> configCacheSupplier,
-      Supplier<String> groupSupplier,
-      Supplier<SessionContext> sessionContextSupplier,
-      SessionImpl.SessionConfig sessionConfig,
-      SessionSecretDecryptor secretDecryptor) {
-    this.configCacheSupplier = Objects.requireNonNull(configCacheSupplier, "configCacheSupplier");
-    this.groupSupplier = Objects.requireNonNull(groupSupplier, "groupSupplier");
-    this.sessionContextSupplier =
-        Objects.requireNonNull(sessionContextSupplier, "sessionContextSupplier");
-    this.sessionConfig = Objects.requireNonNull(sessionConfig, "sessionConfig");
-    this.secretDecryptor = Objects.requireNonNull(secretDecryptor, "secretDecryptor");
-    this.plugins = FabricPlugins.system();
-  }
+  private static final Comparator<Struct> STRUCT_ORDER =
+      Comparator.comparing((Struct struct) -> struct.id() == null ? "" : struct.id())
+          .thenComparing(struct -> struct.label() == null ? "" : struct.label());
 
-  @Override
-  public AmpsConnection amps(String connectionName) {
-    return amps(connectionName, ConnectionOptions.defaults());
-  }
+  private static final Comparator<Field> FIELD_ORDER =
+      Comparator.comparing(
+              (Field field) -> isBlank(field.groupId()) ? null : field.groupId(),
+              Comparator.nullsLast(String::compareTo))
+          .thenComparingInt((Field field) -> field.order() == null ? Integer.MAX_VALUE : field.order())
+          .thenComparing(field -> field.key() == null ? "" : field.key());
 
-  @Override
-  public AmpsConnection amps(String connectionName, ConnectionOptions options) {
-    String normalizedName = requireConnectionName(connectionName);
-    ConnectionOptions normalizedOptions = normalizeOptions(options);
-    CacheKey key =
-        new CacheKey(
-            ConnectionKind.AMPS, normalizedName, normalizeCacheOptions(normalizedOptions));
-    return getOrCreate(key, () -> createAmpsConnection(normalizedName, normalizedOptions));
-  }
+  private ConfigSchemaCodec() {}
 
-  @Override
-  public HttpConnection http(String connectionName) {
-    return http(connectionName, ConnectionOptions.defaults());
-  }
-
-  @Override
-  public HttpConnection http(String connectionName, ConnectionOptions options) {
-    String normalizedName = requireConnectionName(connectionName);
-    ConnectionOptions normalizedOptions = normalizeOptions(options);
-    if (normalizedOptions.maxInflight() > 0) {
-      throw new IllegalArgumentException("maxInflight is only supported for AMPS connections");
+  public static ConfigSchemaDoc parse(String schemaJson) {
+    if (schemaJson == null || schemaJson.isBlank()) {
+      throw validation("schema text is required", List.of(new ValidationIssue("schema", "schema text is required")));
     }
-    CacheKey key =
-        new CacheKey(
-            ConnectionKind.HTTP, normalizedName, normalizeCacheOptions(normalizedOptions));
-    return getOrCreate(key, () -> createHttpConnection(normalizedName, normalizedOptions));
-  }
-
-  @Override
-  public S3Connection s3(String connectionName) {
-    String normalizedName = requireConnectionName(connectionName);
-    CacheKey key = new CacheKey(ConnectionKind.S3, normalizedName, NO_OPTIONS);
-    return getOrCreate(key, () -> createS3Connection(normalizedName));
-  }
-
-  @Override
-  public OdbcConnection odbc(String connectionName) {
-    return odbc(connectionName, ConnectionOptions.defaults());
-  }
-
-  @Override
-  public OdbcConnection odbc(String connectionName, ConnectionOptions options) {
-    String normalizedName = requireConnectionName(connectionName);
-    ConnectionOptions normalizedOptions = normalizeOptions(options);
-    if (normalizedOptions.maxInflight() > 0) {
-      throw new IllegalArgumentException("maxInflight is only supported for AMPS connections");
-    }
-    CacheKey key =
-        new CacheKey(
-            ConnectionKind.ODBC, normalizedName, normalizeCacheOptions(normalizedOptions));
-    return getOrCreate(key, () -> createOdbcConnection(normalizedName));
-  }
-
-  @Override
-  public <H> H get(ConnectionRequest<H> request) throws Exception {
-    Objects.requireNonNull(request, "request");
-    Class<H> handleType = Objects.requireNonNull(request.handleType(), "request.handleType");
-
-    Object builder = request.builder();
-    String connectionName = Strings.trimToNull(request.connectionName());
-    if (connectionName == null) {
-      connectionName = extractConnectionName(builder);
-    }
-    String normalizedName = requireConnectionName(connectionName);
-    ConnectionOptions options = normalizeOptions(request.options());
-
-    DefinitionConnection model = resolveDefinitionConnection(normalizedName, null);
-    String providerId =
-        Strings.firstNonBlank(
-            Strings.trimToNull(request.providerId()),
-            Strings.trimToNull(model.providerId()),
-            defaultProviderId(model.connectionType()));
-    if (providerId == null) {
-      throw new IllegalStateException(
-          "Connection '" + scopedName(normalizedName) + "' does not define a provider id");
-    }
-
-    String normalizedProviderId = providerId.trim().toLowerCase(Locale.ROOT);
-    if ("odbc".equals(normalizedProviderId)) {
-      OdbcRuntimeGuard.failConnectionRuntime(normalizedName, model.odbc());
-    }
-    if ("amps".equals(normalizedProviderId)) {
-      if (!handleType.isAssignableFrom(AmpsConnection.class)) {
-        throw new IllegalArgumentException(
-            "AMPS provider handle type "
-                + AmpsConnection.class.getName()
-                + " is incompatible with requested "
-                + handleType.getName());
-      }
-      return handleType.cast(amps(normalizedName, options));
-    }
-    if ("http".equals(normalizedProviderId)) {
-      if (!handleType.isAssignableFrom(HttpConnection.class)) {
-        throw new IllegalArgumentException(
-            "HTTP provider handle type "
-                + HttpConnection.class.getName()
-                + " is incompatible with requested "
-                + handleType.getName());
-      }
-      return handleType.cast(http(normalizedName, options));
-    }
-    if ("s3".equals(normalizedProviderId)) {
-      if (!handleType.isAssignableFrom(S3Connection.class)) {
-        throw new IllegalArgumentException(
-            "S3 provider handle type "
-                + S3Connection.class.getName()
-                + " is incompatible with requested "
-                + handleType.getName());
-      }
-      return handleType.cast(s3(normalizedName));
-    }
-
-    ConnectionProvider provider = plugins.findConnectionProvider(providerId);
-    if (provider == null) {
-      throw new IllegalStateException(
-          "No connection provider registered for '" + providerId + "'");
-    }
-
-    Class<?> providerHandleType = provider.handleType();
-    if (providerHandleType == null) {
-      throw new IllegalStateException(
-          "Connection provider '" + provider.providerId() + "' reports no handle type");
-    }
-    if (!handleType.isAssignableFrom(providerHandleType)) {
-      throw new IllegalArgumentException(
-          "Connection provider '"
-              + provider.providerId()
-              + "' returns "
-              + providerHandleType.getName()
-              + " which is incompatible with requested "
-              + handleType.getName());
-    }
-
-    Class<?> builderType = provider.builderType();
-    if (builder != null && builderType != null && builderType != Object.class && !builderType.isInstance(builder)) {
-      throw new IllegalArgumentException(
-          "Connection builder type "
-              + builder.getClass().getName()
-              + " is not supported by provider '"
-              + provider.providerId()
-              + "' (expects "
-              + builderType.getName()
-              + ")");
-    }
-
-    ConnectionProviderContext context =
-        new ConnectionProviderContext(
-            this,
-            model,
-            builder,
-            connectionName,
-            normalizedName,
-            options,
-            sessionContextSupplier.get(),
-            Strings.trimToNull(groupSupplier.get()));
-    Object handle = provider.open(context);
-    if (handle == null) {
-      throw new IllegalStateException(
-          "Connection provider '" + provider.providerId() + "' returned null");
-    }
-    if (!handleType.isInstance(handle)) {
-      throw new IllegalStateException(
-          "Connection provider '"
-              + provider.providerId()
-              + "' returned "
-              + handle.getClass().getName()
-              + " which is incompatible with "
-              + handleType.getName());
-    }
-    return handleType.cast(handle);
-  }
-
-  public void evictS3Connection(String connectionName) {
-    String normalizedName = requireConnectionName(connectionName);
-    CacheKey key = new CacheKey(ConnectionKind.S3, normalizedName, NO_OPTIONS);
-    AutoCloseable removed = cache.remove(key);
-    closeCachedHandle(removed);
-  }
-
-  @Override
-  public void close() {
-    List<AutoCloseable> handles = new ArrayList<>(cache.values());
-    cache.clear();
-    for (AutoCloseable handle : handles) {
-      closeCachedHandle(handle);
-    }
-  }
-
-  private AmpsConnection createAmpsConnection(String connectionName, ConnectionOptions options) {
-    DefinitionConnection definition =
-        resolveDefinitionConnection(connectionName, DefinitionConnection.ConnectionType.AMPS);
-    List<String> endpoints = resolveAmpsEndpoints(definition, options);
-    String clientName = resolveAmpsClientName(connectionName, options);
-    AmpsFactoryOptions factoryOptions = buildAmpsFactoryOptions(connectionName, definition, options);
-
-    HAClient client = null;
     try {
-      client = AmpsFactory.create(clientName, factoryOptions);
-      AmpsFactory.connect(client, endpoints, factoryOptions);
-      AmpsFactory.logon(client, factoryOptions);
-      // Return a shared handle so user close() does not tear down the cached connection.
-      return AmpsConnection.shared(client);
-    } catch (Exception ex) {
-      closeHaClient(client);
-      throw new IllegalStateException("Failed to open AMPS connection '" + connectionName + "'", ex);
-    }
-  }
-
-  private HttpConnection createHttpConnection(String connectionName, ConnectionOptions options) {
-    DefinitionConnection definition =
-        resolveDefinitionConnection(connectionName, DefinitionConnection.ConnectionType.HTTP);
-    DefinitionConnection.Http http =
-        Objects.requireNonNull(
-            definition.http(),
-            "Connection '" + scopedName(connectionName) + "' is missing http configuration");
-    DefinitionConnection.Http.Auth auth =
-        http.auth() == null ? DefinitionConnection.Http.Auth.NONE : http.auth();
-    if (auth != DefinitionConnection.Http.Auth.NONE) {
-      throw new IllegalArgumentException(
-          "Connection '"
-              + scopedName(connectionName)
-              + "' has unsupported HTTP auth mode "
-              + auth
-              + " (only NONE is supported)");
-    }
-
-    URI baseUri = resolveHttpBaseUri(connectionName, definition);
-    HttpClient.Builder builder = HttpClient.newBuilder();
-    if (options.timeout() != null) {
-      builder.connectTimeout(options.timeout());
-    }
-    HttpClient client = builder.build();
-    return new HttpConnection(baseUri, client, options.timeout());
-  }
-
-  private S3Connection createS3Connection(String connectionName) {
-    DefinitionConnection definition =
-        resolveDefinitionConnection(connectionName, DefinitionConnection.ConnectionType.S3);
-    DefinitionConnection.S3 s3 =
-        Objects.requireNonNull(
-            definition.s3(),
-            "Connection '" + scopedName(connectionName) + "' is missing s3 configuration");
-    ensureNoPlaintextS3Credentials(connectionName, definition, s3);
-
-    String region = Strings.requireNonBlank(s3.region(), "s3.region");
-    String bucket = Strings.requireNonBlank(s3.bucket(), "s3.bucket");
-    String accessKeyIdEnc = Strings.trimToNull(s3.accessKeyIdEnc());
-    String secretAccessKeyEnc = Strings.trimToNull(s3.secretAccessKeyEnc());
-    String sessionTokenEnc = Strings.trimToNull(s3.sessionTokenEnc());
-    if (accessKeyIdEnc == null || secretAccessKeyEnc == null) {
-      throw new IllegalStateException(
-          "S3 connection '" + scopedName(connectionName) + "' is missing encrypted credentials");
-    }
-    String encFormat = Strings.firstNonBlank(s3.encFormat(), SecretCrypto.ENCRYPTION_FORMAT);
-    if (!SecretCrypto.ENCRYPTION_FORMAT.equals(encFormat)) {
-      throw new IllegalArgumentException("Unsupported S3 credential encryption format: " + encFormat);
-    }
-    String kekAlias = Strings.firstNonBlank(s3.kekAlias(), SessionSecrets.DEFAULT_KEK_ALIAS);
-    String accessKeyId = decryptS3Credential(kekAlias, accessKeyIdEnc);
-    String secretAccessKey = decryptS3Credential(kekAlias, secretAccessKeyEnc);
-    String sessionToken = sessionTokenEnc == null ? null : decryptS3Credential(kekAlias, sessionTokenEnc);
-
-    return new S3Connection(
-            connectionName,
-            region,
-            bucket,
-            Strings.trimToNull(s3.endpoint()),
-            s3.pathStyleAccess(),
-            Strings.trimToNull(s3.basePrefix()),
-            s3.attributes(),
-            accessKeyId,
-            secretAccessKey,
-            sessionToken)
-        .shared();
-  }
-
-  private OdbcConnection createOdbcConnection(String connectionName) {
-    return new OdbcConnectionImpl(connectionName);
-  }
-
-  private OdbcSessionSupport.OdbcConnectionHealth testOdbcConnection(String connectionName) {
-    String normalizedName = requireConnectionName(connectionName);
-    OdbcSessionSupport.OdbcConnectionSpec spec;
-    try {
-      spec = resolveOdbcConnectionSpec(normalizedName);
-    } catch (RuntimeException ex) {
-      return new OdbcSessionSupport.OdbcConnectionHealth(
-          false,
-          normalizedName,
-          DefinitionConnection.Odbc.DatabaseType.OTHER,
-          null,
-          false,
-          false,
-          null,
-          Strings.firstNonBlank(Strings.trimToNull(ex.getMessage()), "ODBC_CONNECTION_TEST_FAILED"),
-          null,
-          null,
-          0L,
-          List.of(),
-          false);
-    }
-    try (DuckdbEngine engine = new DuckdbEngine();
-        DuckdbSession session = engine.openSession()) {
-      return OdbcSessionSupport.probeConnection(session, spec);
-    } catch (RuntimeException ex) {
-      return new OdbcSessionSupport.OdbcConnectionHealth(
-          false,
-          spec.connectionName(),
-          spec.databaseType(),
-          null,
-          false,
-          false,
-          null,
-          Strings.firstNonBlank(Strings.trimToNull(ex.getMessage()), "ODBC_CONNECTION_TEST_FAILED"),
-          null,
-          null,
-          0L,
-          List.of(),
-          false);
-    }
-  }
-
-  private OdbcSessionSupport.OdbcSchemaInspection inspectOdbcSchema(
-      String connectionName, String remoteSql) {
-    String normalizedName = requireConnectionName(connectionName);
-    String resolvedRemoteSql = Strings.requireNonBlank(remoteSql, "remoteSql");
-    OdbcSessionSupport.OdbcConnectionSpec spec;
-    try {
-      spec = resolveOdbcConnectionSpec(normalizedName);
-    } catch (RuntimeException ex) {
-      return new OdbcSessionSupport.OdbcSchemaInspection(
-          false,
-          normalizedName,
-          DefinitionConnection.Odbc.DatabaseType.OTHER,
-          null,
-          Strings.firstNonBlank(Strings.trimToNull(ex.getMessage()), "ODBC_SCHEMA_INSPECT_FAILED"),
-          List.of(),
-          0L,
-          List.of());
-    }
-    try (DuckdbEngine engine = new DuckdbEngine();
-        DuckdbSession session = engine.openSession()) {
-      return OdbcSessionSupport.inspectSchema(session, spec, resolvedRemoteSql);
-    } catch (RuntimeException ex) {
-      return new OdbcSessionSupport.OdbcSchemaInspection(
-          false,
-          spec.connectionName(),
-          spec.databaseType(),
-          null,
-          Strings.firstNonBlank(Strings.trimToNull(ex.getMessage()), "ODBC_SCHEMA_INSPECT_FAILED"),
-          List.of(),
-          0L,
-          List.of());
-    }
-  }
-
-  private String decryptS3Credential(String kekAlias, String encryptedValue) {
-    try {
-      return secretDecryptor.decrypt(kekAlias, encryptedValue);
-    } catch (IllegalStateException ex) {
+      return parse(DiscoveryCodec.mapper().readTree(schemaJson));
+    } catch (ValidationException ex) {
       throw ex;
-    } catch (RuntimeException ex) {
-      throw new IllegalStateException(
-          "Unable to decrypt S3 credential with provided KEK (alias=" + kekAlias + ")");
+    } catch (Exception ex) {
+      throw validation(
+          "invalid JSON: " + ex.getMessage(),
+          List.of(new ValidationIssue("schema", "invalid JSON: " + ex.getMessage())),
+          ex);
     }
   }
 
-  private static void ensureNoPlaintextS3Credentials(
-      String connectionName, DefinitionConnection definition, DefinitionConnection.S3 s3) {
-    if (hasAnyPlaintextCredential(definition.properties()) || hasAnyPlaintextCredential(s3.attributes())) {
-      throw new IllegalArgumentException(
-          "Plaintext S3 credentials are not supported for connection '" + connectionName + "'");
+  public static ConfigSchemaDoc parse(JsonNode schemaNode) {
+    List<ValidationIssue> issues = new ArrayList<>();
+    ConfigSchemaDoc doc = parseNode(schemaNode, issues);
+    issues.addAll(validate(doc));
+    if (!issues.isEmpty()) {
+      throw validation(issues.get(0).message(), issues);
     }
+    return doc;
   }
 
-  private static boolean hasAnyPlaintextCredential(Map<String, String> map) {
-    if (map == null || map.isEmpty()) {
-      return false;
+  public static List<ValidationIssue> validate(ConfigSchemaDoc doc) {
+    List<ValidationIssue> issues = new ArrayList<>();
+    if (doc == null) {
+      issues.add(new ValidationIssue("schema", "schema is required"));
+      return List.copyOf(issues);
     }
-    return hasCredentialValue(map, "accessKeyId")
-        || hasCredentialValue(map, "secretAccessKey")
-        || hasCredentialValue(map, "sessionToken")
-        || hasCredentialValue(map, "aws_access_key_id")
-        || hasCredentialValue(map, "aws_secret_access_key")
-        || hasCredentialValue(map, "aws_session_token")
-        || hasCredentialValue(map, "s3_access_key_id")
-        || hasCredentialValue(map, "s3_secret_access_key")
-        || hasCredentialValue(map, "s3_session_token");
-  }
+    if (isBlank(doc.displayName())) {
+      issues.add(new ValidationIssue("schema.displayName", "displayName is required"));
+    }
 
-  private static boolean hasCredentialValue(Map<String, String> map, String key) {
-    return Strings.trimToNull(map.get(key)) != null;
-  }
+    List<Group> groups = list(doc.groups());
+    List<Struct> structs = list(doc.structs());
+    List<Field> fields = list(doc.fields());
+    List<String> requiredKeys = normalizedStrings(doc.requiredKeys(), "schema.requiredKeys", issues);
 
-  private DefinitionConnection resolveDefinitionConnection(
-      String connectionName, DefinitionConnection.ConnectionType expectedType) {
-    DiscoveryCache cache = configCacheSupplier.get();
-    if (cache == null) {
-      throw new IllegalStateException("Session DiscoveryCache is not available");
-    }
-    String group = Strings.trimToNull(groupSupplier.get());
-    if (group == null) {
-      throw new IllegalStateException("Session group is not resolved");
-    }
-    Optional<DefinitionConnection> optional = cache.get(DefinitionConnection.class, group, connectionName);
-    if (optional.isEmpty()) {
-      optional = cache.get(DefinitionConnection.class, PLATFORM_GROUP, connectionName);
-    }
-    if (optional.isEmpty()) {
-      throw new IllegalArgumentException(
-          "Connection '"
-              + group
-              + "/"
-              + connectionName
-              + "' or '"
-              + PLATFORM_GROUP
-              + "/"
-              + connectionName
-              + "' was not found");
-    }
-    DefinitionConnection definition = optional.get();
-    ensureConnectionEnabled(group, connectionName, definition);
-    if (expectedType != null) {
-      DefinitionConnection.ConnectionType actualType = definition.connectionType();
-      if (actualType != expectedType) {
-        throw new IllegalArgumentException(
-            "Connection '"
-                + group
-                + "/"
-                + connectionName
-                + "' has type "
-                + actualType
-                + ", expected "
-                + expectedType);
+    Set<String> groupIds = new HashSet<>();
+    for (int i = 0; i < groups.size(); i++) {
+      Group group = groups.get(i);
+      String path = "schema.groups[" + i + "]";
+      if (group == null) {
+        issues.add(new ValidationIssue(path, "group is required"));
+        continue;
+      }
+      if (isBlank(group.id())) {
+        issues.add(new ValidationIssue(path + ".id", "id is required"));
+      } else if (!groupIds.add(group.id())) {
+        issues.add(new ValidationIssue(path + ".id", "duplicate group id: " + group.id()));
+      }
+      if (isBlank(group.label())) {
+        issues.add(new ValidationIssue(path + ".label", "label is required"));
+      }
+      if (group.order() == null) {
+        issues.add(new ValidationIssue(path + ".order", "order is required"));
       }
     }
-    return definition;
-  }
 
-  private OdbcSessionSupport.OdbcConnectionSpec resolveOdbcConnectionSpec(String connectionName) {
-    DefinitionConnection definition =
-        resolveDefinitionConnection(connectionName, DefinitionConnection.ConnectionType.ODBC);
-    DefinitionConnection.Odbc odbc =
-        Objects.requireNonNull(
-            definition.odbc(),
-            "Connection '" + scopedName(connectionName) + "' is missing ODBC configuration");
-    String group = Strings.trimToNull(groupSupplier.get());
-    String normalizedGroup = group == null ? PLATFORM_GROUP : group;
-    return OdbcSessionSupport.resolveConnection(
-        configCacheSupplier.get(),
-        normalizedGroup,
-        connectionName,
-        odbc.databaseType(),
-        "connection:" + scopedName(connectionName));
-  }
-
-  private URI resolveHttpBaseUri(String connectionName, DefinitionConnection definition) {
-    DefinitionConnection.Http http = definition.http();
-    String endpoint =
-        firstNonBlank(
-            http == null ? null : http.endpoints(), definition.properties(), "endpoint", "url", "baseUrl");
-    if (endpoint == null) {
-      throw new IllegalArgumentException(
-          "HTTP connection '" + scopedName(connectionName) + "' is missing endpoints");
-    }
-
-    boolean httpsRequired =
-        (http != null && http.transport() == DefinitionConnection.Http.Transport.HTTPS)
-            || (http != null && http.tls() != null && http.tls().enabled());
-    URI uri = parseHttpEndpoint(endpoint, httpsRequired, connectionName);
-    return ensureTrailingSlash(uri);
-  }
-
-  private AmpsFactoryOptions buildAmpsFactoryOptions(
-      String connectionName, DefinitionConnection definition, ConnectionOptions options) {
-    AmpsFactoryOptions factoryOptions = AmpsFactoryOptions.fromSystemProperties();
-    if (factoryOptions == null) {
-      factoryOptions = new AmpsFactoryOptions();
-    }
-    configureKerberos(factoryOptions);
-    SessionContext context = sessionContextSupplier.get();
-    String sessionId = context == null ? null : Strings.trimToNull(context.getSessionId());
-    if (sessionId != null) {
-      factoryOptions.kerberos().cacheKeyPrefix("session:" + sessionId + ":connection:" + connectionName);
-    }
-    if (options.timeout() != null) {
-      factoryOptions.connection().connectTimeout(options.timeout());
-    }
-    DefinitionConnection.Amps amps = definition.amps();
-    if (amps != null && amps.kerberosEnabled()) {
-      factoryOptions.kerberos().enabled(true);
-      String service = Strings.trimToNull(amps.kerberosService());
-      if (service != null) {
-        factoryOptions.kerberos().service(service);
+    Map<String, Struct> structById = new LinkedHashMap<>();
+    for (int i = 0; i < structs.size(); i++) {
+      Struct struct = structs.get(i);
+      String path = "schema.structs[" + i + "]";
+      if (struct == null) {
+        issues.add(new ValidationIssue(path, "struct is required"));
+        continue;
       }
-      String host = Strings.trimToNull(amps.kerberosHost());
-      if (host != null) {
-        factoryOptions.kerberos().saslHost(host);
+      if (isBlank(struct.id())) {
+        issues.add(new ValidationIssue(path + ".id", "id is required"));
+      } else if (structById.putIfAbsent(struct.id(), struct) != null) {
+        issues.add(new ValidationIssue(path + ".id", "duplicate struct id: " + struct.id()));
+      }
+      if (isBlank(struct.label())) {
+        issues.add(new ValidationIssue(path + ".label", "label is required"));
       }
     }
-    return factoryOptions;
-  }
 
-  private void configureKerberos(AmpsFactoryOptions options) {
-    if (options == null) {
-      return;
-    }
-    AmpsFactoryOptions.Kerberos kerberos = options.kerberos();
-    if (Strings.isNotBlank(sessionConfig.kerberosPrincipal()) || sessionConfig.kerberosKeytab() != null) {
-      kerberos.enabled(true);
-    }
-    if (Strings.isNotBlank(sessionConfig.kerberosPrincipal())) {
-      kerberos.principal(sessionConfig.kerberosPrincipal());
-    }
-    Path keytab = sessionConfig.kerberosKeytab();
-    if (keytab != null) {
-      kerberos.keytab(keytab.toAbsolutePath().toString());
-    }
-    maybeApplyClasspathKrb5Conf(kerberos);
-  }
+    Set<String> structIds = Set.copyOf(structById.keySet());
 
-  private static void maybeApplyClasspathKrb5Conf(AmpsFactoryOptions.Kerberos kerberos) {
-    if (kerberos == null || !kerberos.isEnabled()) {
-      return;
-    }
-    if (Strings.isNotBlank(kerberos.getKrb5ConfPath())) {
-      return;
-    }
-    byte[] existingData = kerberos.getKrb5ConfData();
-    if (existingData != null && existingData.length > 0) {
-      return;
-    }
-    try (InputStream input = ConnectionManagerImpl.class.getClassLoader().getResourceAsStream("krb5.conf")) {
-      if (input == null) {
-        return;
-      }
-      byte[] data = input.readAllBytes();
-      if (data.length > 0) {
-        kerberos.krb5ConfData(data);
-      }
-    } catch (IOException ignore) {
-      // keep default kerberos config lookup if classpath file cannot be loaded
-    }
-  }
+    Set<String> topLevelKeys = new HashSet<>();
+    validateFieldScope(fields, "schema.fields", groupIds, structIds, topLevelKeys, issues);
 
-  private List<String> resolveAmpsEndpoints(DefinitionConnection definition, ConnectionOptions options) {
-    DefinitionConnection.Amps amps = definition == null ? null : definition.amps();
-    String pinnedInstance = options == null ? null : Strings.trimToNull(options.pinnedInstance());
-    if (pinnedInstance != null) {
-      if (amps == null || amps.instances() == null || amps.instances().isEmpty()) {
-        throw new IllegalArgumentException(
-            "AMPS connection '"
-                + scopedName(definition == null || definition.envelope() == null ? null : definition.envelope().name())
-                + "' does not define instances; cannot pin to instance '"
-                + pinnedInstance
-                + "'");
+    for (int i = 0; i < structs.size(); i++) {
+      Struct struct = structs.get(i);
+      if (struct == null || isBlank(struct.id())) {
+        continue;
       }
-      DefinitionConnection.Amps.AmpsInstanceSpec matched = null;
-      List<String> names = new ArrayList<>();
-      for (DefinitionConnection.Amps.AmpsInstanceSpec instance : amps.instances()) {
-        if (instance == null) {
-          continue;
-        }
-        String name = Strings.trimToNull(instance.name());
-        if (name != null) {
-          names.add(name);
-        }
-        if (name != null && name.equalsIgnoreCase(pinnedInstance)) {
-          matched = instance;
-        }
-      }
-      if (matched == null) {
-        throw new IllegalArgumentException(
-            "AMPS connection '"
-                + scopedName(definition == null || definition.envelope() == null ? null : definition.envelope().name())
-                + "' does not define instance '"
-                + pinnedInstance
-                + "'. Available instances="
-                + names);
-      }
-      List<String> matchedUris = normalizedList(matched.uris());
-      if (!matchedUris.isEmpty()) {
-        return matchedUris;
-      }
-      throw new IllegalArgumentException(
-          "AMPS connection instance '"
-              + Strings.trimToNull(matched.name())
-              + "' for connection '"
-              + scopedName(definition == null || definition.envelope() == null ? null : definition.envelope().name())
-              + "' has no URIs configured");
+      validateFieldScope(struct.fields(), "schema.structs[" + i + "].fields", groupIds, structIds, null, issues);
     }
 
-    List<String> uris = normalizedList(amps == null ? null : amps.uris());
-    if (!uris.isEmpty()) {
-      return uris;
-    }
-    String fromProperties =
-        firstNonBlank(null, definition.properties(), "uris", "uri", "endpoints", "endpoint", "brokers");
-    if (fromProperties == null) {
-      throw new IllegalArgumentException(
-          "AMPS connection '"
-              + scopedName(definition.envelope() == null ? null : definition.envelope().name())
-              + "' is missing endpoints");
-    }
-    List<String> resolved = new ArrayList<>();
-    for (String value : fromProperties.split(",")) {
-      String trimmed = Strings.trimToNull(value);
-      if (trimmed != null) {
-        resolved.add(trimmed);
+    Set<String> seenRequired = new HashSet<>();
+    for (int i = 0; i < requiredKeys.size(); i++) {
+      String key = requiredKeys.get(i);
+      String path = "schema.requiredKeys[" + i + "]";
+      if (!seenRequired.add(key)) {
+        issues.add(new ValidationIssue(path, "duplicate required key: " + key));
+      }
+      if (!topLevelKeys.contains(key)) {
+        issues.add(new ValidationIssue(path, "required key not found in top-level fields: " + key));
       }
     }
-    if (resolved.isEmpty()) {
-      throw new IllegalArgumentException(
-          "AMPS connection '"
-              + scopedName(definition.envelope() == null ? null : definition.envelope().name())
-              + "' is missing endpoints");
-    }
-    return List.copyOf(resolved);
+
+    detectCircularStructReferences(structById, issues);
+    return List.copyOf(issues);
   }
 
-  private String resolveAmpsClientName(String connectionName, ConnectionOptions options) {
-    String explicit = Strings.trimToNull(options == null ? null : options.clientName());
-    if (explicit != null) {
-      return explicit;
-    }
-    SessionContext context = Objects.requireNonNull(sessionContextSupplier.get(), "session context");
-    String group = IdentityParsingSupport.requireGroup(groupSupplier.get());
-    String app = Strings.requireNonBlank(context.getAppName(), "session.appName");
-    String instance = Strings.requireNonBlank(context.getInstance(), "session.instance");
-    String base =
-        AmpsConfig.buildCpClientId(group, app, instance);
-    String token = sanitizeClientToken(connectionName);
-    String pinnedInstance = Strings.trimToNull(options == null ? null : options.pinnedInstance());
-    if (pinnedInstance != null) {
-      token = token + "-inst-" + sanitizeClientToken(pinnedInstance);
-    }
-    return base + "-conn-" + token;
-  }
-
-  private String scopedName(String connectionName) {
-    String group = IdentityParsingSupport.requireGroup(groupSupplier.get());
-    String name = IdentityParsingSupport.requireName(connectionName, "connectionName");
-    return group + "/" + name;
-  }
-
-  private static String defaultProviderId(DefinitionConnection.ConnectionType connectionType) {
-    if (connectionType == null) {
-      return null;
-    }
-    return switch (connectionType) {
-      case AMPS -> "amps";
-      case HTTP -> "http";
-      case S3 -> "s3";
-      case UNKNOWN -> null;
-      default -> connectionType.name().toLowerCase(Locale.ROOT);
-    };
-  }
-
-  private static ConnectionOptions normalizeOptions(ConnectionOptions options) {
-    return options == null ? ConnectionOptions.defaults() : options;
-  }
-
-  private static String extractConnectionName(Object builder) {
-    if (builder == null) {
-      return null;
-    }
-    for (String methodName : List.of("connectionName", "name", "getConnectionName", "getName")) {
-      String value = invokeNameMethod(builder, methodName);
-      if (value != null) {
-        return value;
-      }
-    }
-    return null;
-  }
-
-  private static String invokeNameMethod(Object target, String methodName) {
+  public static String toCanonicalJson(ConfigSchemaDoc doc) {
     try {
-      Method method = target.getClass().getMethod(methodName);
-      if (method.getParameterCount() != 0 || method.getReturnType() != String.class) {
-        return null;
-      }
-      return Strings.trimToNull((String) method.invoke(target));
-    } catch (ReflectiveOperationException ex) {
-      return null;
+      return DiscoveryCodec.mapper().writeValueAsString(toCanonicalJsonNode(doc));
+    } catch (ValidationException ex) {
+      throw ex;
+    } catch (Exception ex) {
+      throw new IllegalStateException("failed to serialize config schema", ex);
     }
   }
 
-  private static String requireConnectionName(String value) {
-    String normalized = Strings.trimToNull(value);
-    if (normalized == null) {
-      throw new IllegalArgumentException("connectionName is required");
+  public static JsonNode toCanonicalJsonNode(ConfigSchemaDoc doc) {
+    List<ValidationIssue> issues = validate(doc);
+    if (!issues.isEmpty()) {
+      throw validation(issues.get(0).message(), issues);
     }
-    return normalized;
+    ObjectMapper mapper = DiscoveryCodec.mapper();
+    ObjectNode root = mapper.createObjectNode();
+    root.put("displayName", doc.displayName());
+    if (!isBlank(doc.description())) {
+      root.put("description", doc.description());
+    }
+    ArrayNode groups = root.putArray("groups");
+    sortedGroups(doc.groups()).forEach(group -> groups.add(toCanonicalGroup(group, mapper)));
+    List<Struct> structs = sortedStructs(doc.structs());
+    if (!structs.isEmpty()) {
+      ArrayNode structNodes = root.putArray("structs");
+      structs.forEach(struct -> structNodes.add(toCanonicalStruct(struct, mapper)));
+    }
+    ArrayNode fields = root.putArray("fields");
+    sortedFields(doc.fields()).forEach(field -> fields.add(toCanonicalField(field, mapper)));
+    List<String> requiredKeys = sortedDistinctStrings(doc.requiredKeys());
+    if (!requiredKeys.isEmpty()) {
+      ArrayNode requiredNode = root.putArray("requiredKeys");
+      requiredKeys.forEach(requiredNode::add);
+    }
+    return root;
   }
 
-  private static URI ensureTrailingSlash(URI uri) {
-    String path = Strings.trimToNull(uri.getPath());
-    if (path == null) {
-      path = "/";
-    } else if (!path.endsWith("/")) {
-      path = path + "/";
-    }
+  public static String schemaHashBase64Sha256(String schemaJson) {
     try {
-      return new URI(uri.getScheme(), uri.getUserInfo(), uri.getHost(), uri.getPort(), path, null, null);
-    } catch (URISyntaxException ex) {
-      throw new IllegalArgumentException("Invalid HTTP endpoint URI: " + uri, ex);
+      MessageDigest digest = MessageDigest.getInstance("SHA-256");
+      byte[] hashed = digest.digest(schemaJson == null ? new byte[0] : schemaJson.getBytes(StandardCharsets.UTF_8));
+      return Base64.getEncoder().encodeToString(hashed);
+    } catch (Exception ex) {
+      throw new IllegalStateException("failed to compute schema hash", ex);
     }
   }
 
-  private static URI parseHttpEndpoint(String endpoint, boolean httpsRequired, String connectionName) {
-    String normalized = Strings.trimToNull(endpoint);
-    if (normalized == null) {
-      throw new IllegalArgumentException("HTTP endpoint is required for connection '" + connectionName + "'");
+  private static ConfigSchemaDoc parseNode(JsonNode node, List<ValidationIssue> issues) {
+    if (node == null || !node.isObject()) {
+      issues.add(new ValidationIssue("schema", "schema must be a JSON object"));
+      return new ConfigSchemaDoc(null, null, List.of(), List.of(), List.of(), List.of());
     }
 
-    URI parsed;
-    try {
-      if (normalized.contains("://")) {
-        parsed = URI.create(normalized);
-      } else {
-        String scheme = httpsRequired ? "https://" : "http://";
-        parsed = URI.create(scheme + normalized);
-      }
-    } catch (IllegalArgumentException ex) {
-      throw new IllegalArgumentException(
-          "Invalid HTTP endpoint for connection '" + connectionName + "': " + endpoint, ex);
-    }
-
-    String scheme = Strings.trimToNull(parsed.getScheme());
-    if (scheme == null || parsed.getHost() == null) {
-      throw new IllegalArgumentException(
-          "HTTP endpoint must be an absolute URI for connection '" + connectionName + "'");
-    }
-    if (httpsRequired && "http".equalsIgnoreCase(scheme)) {
-      try {
-        parsed =
-            new URI(
-                "https",
-                parsed.getUserInfo(),
-                parsed.getHost(),
-                parsed.getPort(),
-                parsed.getPath(),
-                parsed.getQuery(),
-                parsed.getFragment());
-      } catch (URISyntaxException ex) {
-        throw new IllegalArgumentException(
-            "Invalid HTTPS endpoint for connection '" + connectionName + "'", ex);
-      }
-    }
-    if (!"http".equalsIgnoreCase(parsed.getScheme()) && !"https".equalsIgnoreCase(parsed.getScheme())) {
-      throw new IllegalArgumentException(
-          "HTTP endpoint must use http or https scheme for connection '" + connectionName + "'");
-    }
-    return parsed;
+    unknownKeys(node, ROOT_KEYS, "schema", issues);
+    String displayName = requiredText(node, "displayName", "schema.displayName", issues);
+    String description = optionalText(node, "description", "schema.description", issues);
+    List<Group> groups = parseGroups(node.get("groups"), "schema.groups", issues);
+    List<Struct> structs = parseStructs(node.get("structs"), "schema.structs", issues);
+    List<Field> fields = parseFields(node.get("fields"), "schema.fields", issues);
+    List<String> requiredKeys = stringArray(node.get("requiredKeys"), "schema.requiredKeys", false, issues);
+    return new ConfigSchemaDoc(displayName, description, groups, structs, fields, requiredKeys);
   }
 
-  private static String sanitizeClientToken(String value) {
-    String normalized = Strings.requireNonBlank(value, "connection token");
-    StringBuilder builder = new StringBuilder(normalized.length());
-    for (int i = 0; i < normalized.length(); i++) {
-      char ch = normalized.charAt(i);
-      boolean allowed =
-          (ch >= 'a' && ch <= 'z')
-              || (ch >= 'A' && ch <= 'Z')
-              || (ch >= '0' && ch <= '9')
-              || ch == '-'
-              || ch == '_'
-              || ch == '.';
-      builder.append(allowed ? ch : '-');
-    }
-    String token = Strings.trimToNull(builder.toString());
-    if (token == null) {
-      throw new IllegalArgumentException("connection token must contain at least one non-blank character");
-    }
-    return token;
-  }
-
-  private static CacheOptions normalizeCacheOptions(ConnectionOptions options) {
-    Duration timeout = options.timeout();
-    long timeoutMillis = timeout == null ? -1L : timeout.toMillis();
-    return new CacheOptions(
-        options.clientName(),
-        timeoutMillis,
-        options.maxInflight(),
-        Strings.trimToNull(options.pinnedInstance()));
-  }
-
-  private static void ensureConnectionEnabled(
-      String group, String connectionName, DefinitionConnection connection) {
-    DefinitionEnvelope envelope = connection == null ? null : connection.envelope();
-    if (Boolean.FALSE.equals(envelope == null ? null : envelope.enabled())) {
-      throw new IllegalArgumentException("Connection '" + group + "/" + connectionName + "' is disabled");
-    }
-    LifecycleStatus status = lifecycleStatus(envelope);
-    if (status != LifecycleStatus.ACTIVE) {
-      throw new IllegalArgumentException(
-          "Connection '"
-              + group
-              + "/"
-              + connectionName
-              + "' is not active (lifecycleStatus="
-              + status
-              + ")");
-    }
-  }
-
-  private static LifecycleStatus lifecycleStatus(DefinitionEnvelope envelope) {
-    if (envelope == null) {
-      return LifecycleStatus.ACTIVE;
-    }
-    String status = Strings.trimToNull(envelope.lifecycleStatus());
-    if (status == null) {
-      return LifecycleStatus.ACTIVE;
-    }
-    try {
-      return LifecycleStatus.valueOf(status.trim().toUpperCase(Locale.ROOT));
-    } catch (IllegalArgumentException ex) {
-      throw new IllegalArgumentException("Unsupported lifecycleStatus '" + status + "'", ex);
-    }
-  }
-
-  private static List<String> normalizedList(List<String> values) {
-    if (values == null || values.isEmpty()) {
+  private static List<Group> parseGroups(JsonNode node, String path, List<ValidationIssue> issues) {
+    if (node == null || node.isNull()) {
+      issues.add(new ValidationIssue(path, "groups is required"));
       return List.of();
     }
-    List<String> result = new ArrayList<>(values.size());
-    for (String value : values) {
-      String trimmed = Strings.trimToNull(value);
-      if (trimmed != null) {
-        result.add(trimmed);
-      }
+    if (!node.isArray()) {
+      issues.add(new ValidationIssue(path, "groups must be an array"));
+      return List.of();
     }
-    return result.isEmpty() ? List.of() : List.copyOf(result);
+    List<Group> groups = new ArrayList<>();
+    for (int i = 0; i < node.size(); i++) {
+      JsonNode row = node.get(i);
+      String rowPath = path + "[" + i + "]";
+      if (row == null || !row.isObject()) {
+        issues.add(new ValidationIssue(rowPath, "group must be a JSON object"));
+        continue;
+      }
+      unknownKeys(row, GROUP_KEYS, rowPath, issues);
+      groups.add(
+          new Group(
+              requiredText(row, "id", rowPath + ".id", issues),
+              requiredText(row, "label", rowPath + ".label", issues),
+              optionalText(row, "description", rowPath + ".description", issues),
+              requiredInteger(row, "order", rowPath + ".order", issues)));
+    }
+    return List.copyOf(groups);
   }
 
-  private static String firstNonBlank(
-      List<String> preferredValues, Map<String, String> fallbackMap, String... fallbackKeys) {
-    if (preferredValues != null) {
-      for (String value : preferredValues) {
-        String trimmed = Strings.trimToNull(value);
-        if (trimmed != null) {
-          return trimmed;
+  private static List<Struct> parseStructs(JsonNode node, String path, List<ValidationIssue> issues) {
+    if (node == null || node.isNull() || node.isMissingNode()) {
+      return List.of();
+    }
+    if (!node.isArray()) {
+      issues.add(new ValidationIssue(path, "structs must be an array"));
+      return List.of();
+    }
+    List<Struct> structs = new ArrayList<>();
+    for (int i = 0; i < node.size(); i++) {
+      JsonNode row = node.get(i);
+      String rowPath = path + "[" + i + "]";
+      if (row == null || !row.isObject()) {
+        issues.add(new ValidationIssue(rowPath, "struct must be a JSON object"));
+        continue;
+      }
+      unknownKeys(row, STRUCT_KEYS, rowPath, issues);
+      structs.add(
+          new Struct(
+              requiredText(row, "id", rowPath + ".id", issues),
+              requiredText(row, "label", rowPath + ".label", issues),
+              optionalText(row, "description", rowPath + ".description", issues),
+              parseFields(row.get("fields"), rowPath + ".fields", issues)));
+    }
+    return List.copyOf(structs);
+  }
+
+  private static List<Field> parseFields(JsonNode node, String path, List<ValidationIssue> issues) {
+    if (node == null || node.isNull()) {
+      issues.add(new ValidationIssue(path, "fields is required"));
+      return List.of();
+    }
+    if (!node.isArray()) {
+      issues.add(new ValidationIssue(path, "fields must be an array"));
+      return List.of();
+    }
+    List<Field> fields = new ArrayList<>();
+    for (int i = 0; i < node.size(); i++) {
+      fields.add(parseField(node.get(i), path + "[" + i + "]", issues));
+    }
+    return List.copyOf(fields);
+  }
+
+  private static Field parseField(JsonNode node, String path, List<ValidationIssue> issues) {
+    if (node == null || !node.isObject()) {
+      issues.add(new ValidationIssue(path, "field must be a JSON object"));
+      return emptyField();
+    }
+    unknownKeys(node, FIELD_KEYS, path, issues);
+    return new Field(
+        requiredText(node, "key", path + ".key", issues),
+        requiredText(node, "label", path + ".label", issues),
+        optionalText(node, "description", path + ".description", issues),
+        optionalText(node, "groupId", path + ".groupId", issues),
+        requiredInteger(node, "order", path + ".order", issues),
+        requiredType(node, "type", path + ".type", issues, true),
+        requiredBoolean(node, "required", path + ".required", issues),
+        optionalBooleanDefaultTrue(node, "editable", path + ".editable", issues),
+        stringArray(node.get("enum"), path + ".enum", false, issues),
+        node.has("default") ? copy(node.get("default")) : null,
+        optionalNumber(node, "min", path + ".min", issues),
+        optionalNumber(node, "max", path + ".max", issues),
+        optionalText(node, "pattern", path + ".pattern", issues),
+        nestedFields(node.get("fields"), path + ".fields", issues),
+        requiredType(node, "itemType", path + ".itemType", issues, false),
+        stringArray(node.get("itemsEnum"), path + ".itemsEnum", false, issues),
+        optionalText(node, "structRef", path + ".structRef", issues),
+        optionalInteger(node, "minItems", path + ".minItems", issues),
+        optionalInteger(node, "maxItems", path + ".maxItems", issues));
+  }
+
+  private static List<Field> nestedFields(JsonNode node, String path, List<ValidationIssue> issues) {
+    if (node == null || node.isNull() || node.isMissingNode()) {
+      return List.of();
+    }
+    if (!node.isArray()) {
+      issues.add(new ValidationIssue(path, "must be an array"));
+      return List.of();
+    }
+    List<Field> fields = new ArrayList<>();
+    for (int i = 0; i < node.size(); i++) {
+      fields.add(parseField(node.get(i), path + "[" + i + "]", issues));
+    }
+    return List.copyOf(fields);
+  }
+
+  private static void validateFieldScope(
+      List<Field> fields,
+      String scopePath,
+      Set<String> groupIds,
+      Set<String> structIds,
+      Set<String> keysOut,
+      List<ValidationIssue> issues) {
+    Set<String> keysInScope = new HashSet<>();
+    for (int i = 0; i < list(fields).size(); i++) {
+      Field field = list(fields).get(i);
+      String path = scopePath + "[" + i + "]";
+      if (field == null) {
+        issues.add(new ValidationIssue(path, "field is required"));
+        continue;
+      }
+      validateField(field, path, groupIds, structIds, issues);
+      if (isBlank(field.key())) {
+        continue;
+      }
+      if (!keysInScope.add(field.key())) {
+        issues.add(new ValidationIssue(path + ".key", "duplicate key in scope: " + field.key()));
+      }
+      if (keysOut != null) {
+        keysOut.add(field.key());
+      }
+
+      if (field.type() == FieldType.STRUCT && !list(field.fields()).isEmpty()) {
+        validateFieldScope(field.fields(), path + ".fields", groupIds, structIds, null, issues);
+      }
+      if (field.type() == FieldType.ARRAY && field.itemType() == FieldType.STRUCT && !list(field.fields()).isEmpty()) {
+        validateFieldScope(field.fields(), path + ".fields", groupIds, structIds, null, issues);
+      }
+    }
+  }
+
+  private static void validateField(
+      Field field,
+      String path,
+      Set<String> groupIds,
+      Set<String> structIds,
+      List<ValidationIssue> issues) {
+    if (isBlank(field.key())) {
+      issues.add(new ValidationIssue(path + ".key", "key is required"));
+    }
+    if (isBlank(field.label())) {
+      issues.add(new ValidationIssue(path + ".label", "label is required"));
+    }
+    if (field.order() == null) {
+      issues.add(new ValidationIssue(path + ".order", "order is required"));
+    }
+    if (field.type() == null) {
+      issues.add(new ValidationIssue(path + ".type", "type is required"));
+      return;
+    }
+    if (field.required() == null) {
+      issues.add(new ValidationIssue(path + ".required", "required is required"));
+    }
+    if (field.editable() == null) {
+      issues.add(new ValidationIssue(path + ".editable", "editable is required"));
+    }
+    if (!isBlank(field.groupId()) && !groupIds.contains(field.groupId())) {
+      issues.add(new ValidationIssue(path + ".groupId", "unknown groupId: " + field.groupId()));
+    }
+    if (field.min() != null && field.max() != null && field.min().compareTo(field.max()) > 0) {
+      issues.add(new ValidationIssue(path, "min cannot be greater than max"));
+    }
+    if (field.minItems() != null && field.maxItems() != null && field.minItems() > field.maxItems()) {
+      issues.add(new ValidationIssue(path, "minItems cannot be greater than maxItems"));
+    }
+
+    boolean hasStructRef = !isBlank(field.structRef());
+    boolean hasInlineFields = !list(field.fields()).isEmpty();
+
+    switch (field.type()) {
+      case STRING -> {
+        rejectPresent(field.min(), path + ".min", "min is only allowed for INTEGER/NUMBER", issues);
+        rejectPresent(field.max(), path + ".max", "max is only allowed for INTEGER/NUMBER", issues);
+        if (field.defaultValue() != null && !field.defaultValue().isTextual()) {
+          issues.add(new ValidationIssue(path + ".default", "default must be a string"));
+        }
+        if (!field.enumValues().isEmpty()
+            && field.defaultValue() != null
+            && !field.enumValues().contains(field.defaultValue().asText())) {
+          issues.add(new ValidationIssue(path + ".default", "default must be one of enum values"));
+        }
+      }
+      case INTEGER -> {
+        rejectPresent(field.enumValues(), path + ".enum", "enum is only allowed for STRING", issues);
+        rejectPresent(field.pattern(), path + ".pattern", "pattern is only allowed for STRING", issues);
+        if (field.defaultValue() != null && !field.defaultValue().isIntegralNumber()) {
+          issues.add(new ValidationIssue(path + ".default", "default must be an integer"));
+        }
+      }
+      case NUMBER -> {
+        rejectPresent(field.enumValues(), path + ".enum", "enum is only allowed for STRING", issues);
+        rejectPresent(field.pattern(), path + ".pattern", "pattern is only allowed for STRING", issues);
+        if (field.defaultValue() != null && !field.defaultValue().isNumber()) {
+          issues.add(new ValidationIssue(path + ".default", "default must be numeric"));
+        }
+      }
+      case BOOLEAN -> {
+        rejectPresent(field.enumValues(), path + ".enum", "enum is only allowed for STRING", issues);
+        rejectPresent(field.pattern(), path + ".pattern", "pattern is only allowed for STRING", issues);
+        rejectPresent(field.min(), path + ".min", "min is only allowed for INTEGER/NUMBER", issues);
+        rejectPresent(field.max(), path + ".max", "max is only allowed for INTEGER/NUMBER", issues);
+        if (field.defaultValue() != null && !field.defaultValue().isBoolean()) {
+          issues.add(new ValidationIssue(path + ".default", "default must be boolean"));
+        }
+      }
+      case STRUCT -> {
+        rejectPresent(field.enumValues(), path + ".enum", "enum is only allowed for STRING", issues);
+        rejectPresent(field.pattern(), path + ".pattern", "pattern is only allowed for STRING", issues);
+        rejectPresent(field.min(), path + ".min", "min is only allowed for INTEGER/NUMBER", issues);
+        rejectPresent(field.max(), path + ".max", "max is only allowed for INTEGER/NUMBER", issues);
+        rejectPresent(field.itemType(), path + ".itemType", "itemType is only allowed for ARRAY", issues);
+        rejectPresent(field.itemsEnum(), path + ".itemsEnum", "itemsEnum is only allowed for ARRAY<STRING>", issues);
+        rejectPresent(field.minItems(), path + ".minItems", "minItems is only allowed for ARRAY", issues);
+        rejectPresent(field.maxItems(), path + ".maxItems", "maxItems is only allowed for ARRAY", issues);
+        if (hasStructRef && hasInlineFields) {
+          issues.add(new ValidationIssue(path, "Cannot define both structRef and fields on the same field"));
+        }
+        if (!hasStructRef && !hasInlineFields) {
+          issues.add(new ValidationIssue(path, "STRUCT must define either structRef or fields"));
+        }
+        if (hasStructRef && !structIds.contains(field.structRef().trim())) {
+          issues.add(new ValidationIssue(path + ".structRef", "unknown structRef: " + field.structRef()));
+        }
+        if (field.defaultValue() != null && !field.defaultValue().isObject()) {
+          issues.add(new ValidationIssue(path + ".default", "default must be an object"));
+        }
+      }
+      case ARRAY -> {
+        rejectPresent(field.enumValues(), path + ".enum", "enum is only allowed for STRING", issues);
+        rejectPresent(field.pattern(), path + ".pattern", "pattern is only allowed for STRING", issues);
+        rejectPresent(field.min(), path + ".min", "min is only allowed for INTEGER/NUMBER", issues);
+        rejectPresent(field.max(), path + ".max", "max is only allowed for INTEGER/NUMBER", issues);
+
+        FieldType itemType = field.itemType();
+        if (itemType == null) {
+          issues.add(new ValidationIssue(path + ".itemType", "itemType is required for ARRAY"));
+        } else {
+          if (itemType == FieldType.ARRAY) {
+            issues.add(new ValidationIssue(path + ".itemType", "ARRAY itemType cannot be ARRAY"));
+          }
+          if (!list(field.itemsEnum()).isEmpty() && itemType != FieldType.STRING) {
+            issues.add(new ValidationIssue(path + ".itemsEnum", "itemsEnum is only allowed when itemType=STRING"));
+          }
+          if (itemType == FieldType.STRUCT) {
+            if (hasStructRef && hasInlineFields) {
+              issues.add(new ValidationIssue(path, "Cannot define both structRef and fields on the same field"));
+            }
+            if (!hasStructRef && !hasInlineFields) {
+              issues.add(new ValidationIssue(path, "ARRAY with itemType STRUCT must define either structRef or fields"));
+            }
+            if (hasStructRef && !structIds.contains(field.structRef().trim())) {
+              issues.add(new ValidationIssue(path + ".structRef", "unknown structRef: " + field.structRef()));
+            }
+          } else {
+            rejectPresent(field.structRef(), path + ".structRef", "structRef is only allowed when itemType=STRUCT", issues);
+            rejectPresent(field.fields(), path + ".fields", "fields is only allowed when itemType=STRUCT", issues);
+          }
+        }
+        validateArrayDefault(field, path + ".default", issues);
+      }
+    }
+
+    if (field.type() != FieldType.STRING) {
+      rejectPresent(field.pattern(), path + ".pattern", "pattern is only allowed for STRING", issues);
+    }
+
+    if (field.type() != FieldType.STRUCT
+        && !(field.type() == FieldType.ARRAY && field.itemType() == FieldType.STRUCT)) {
+      rejectPresent(field.fields(), path + ".fields", "fields is only allowed for STRUCT or ARRAY<STRUCT>", issues);
+      rejectPresent(field.structRef(), path + ".structRef", "structRef is only allowed for STRUCT or ARRAY<STRUCT>", issues);
+    }
+
+    if (field.type() != FieldType.ARRAY) {
+      rejectPresent(field.itemType(), path + ".itemType", "itemType is only allowed for ARRAY", issues);
+      rejectPresent(field.itemsEnum(), path + ".itemsEnum", "itemsEnum is only allowed for ARRAY<STRING>", issues);
+      rejectPresent(field.minItems(), path + ".minItems", "minItems is only allowed for ARRAY", issues);
+      rejectPresent(field.maxItems(), path + ".maxItems", "maxItems is only allowed for ARRAY", issues);
+    }
+  }
+
+  private static void validateArrayDefault(Field field, String path, List<ValidationIssue> issues) {
+    if (field.defaultValue() == null) {
+      return;
+    }
+    if (!field.defaultValue().isArray()) {
+      issues.add(new ValidationIssue(path, "default must be an array"));
+      return;
+    }
+    if (field.itemType() == null) {
+      return;
+    }
+    for (int i = 0; i < field.defaultValue().size(); i++) {
+      JsonNode item = field.defaultValue().get(i);
+      String itemPath = path + "[" + i + "]";
+      switch (field.itemType()) {
+        case STRING -> {
+          if (!item.isTextual()) {
+            issues.add(new ValidationIssue(itemPath, "item must be a string"));
+          } else if (!list(field.itemsEnum()).isEmpty() && !field.itemsEnum().contains(item.asText())) {
+            issues.add(new ValidationIssue(itemPath, "item must be one of itemsEnum"));
+          }
+        }
+        case INTEGER -> {
+          if (!item.isIntegralNumber()) {
+            issues.add(new ValidationIssue(itemPath, "item must be an integer"));
+          }
+        }
+        case NUMBER -> {
+          if (!item.isNumber()) {
+            issues.add(new ValidationIssue(itemPath, "item must be numeric"));
+          }
+        }
+        case BOOLEAN -> {
+          if (!item.isBoolean()) {
+            issues.add(new ValidationIssue(itemPath, "item must be boolean"));
+          }
+        }
+        case STRUCT -> {
+          if (!item.isObject()) {
+            issues.add(new ValidationIssue(itemPath, "item must be an object"));
+          }
+        }
+        case ARRAY -> issues.add(new ValidationIssue(itemPath, "ARRAY itemType cannot be ARRAY"));
+      }
+    }
+  }
+
+  private static void detectCircularStructReferences(Map<String, Struct> structById, List<ValidationIssue> issues) {
+    if (structById.isEmpty()) {
+      return;
+    }
+    Set<String> visiting = new LinkedHashSet<>();
+    Set<String> visited = new HashSet<>();
+    Deque<String> stack = new ArrayDeque<>();
+    for (String id : structById.keySet()) {
+      if (visited.contains(id)) {
+        continue;
+      }
+      List<String> cycle = findCycle(id, structById, visiting, visited, stack);
+      if (!cycle.isEmpty()) {
+        issues.add(
+            new ValidationIssue(
+                "schema.structs",
+                "Circular STRUCT reference detected: " + String.join(" -> ", cycle)));
+        return;
+      }
+    }
+  }
+
+  private static List<String> findCycle(
+      String current,
+      Map<String, Struct> structById,
+      Set<String> visiting,
+      Set<String> visited,
+      Deque<String> stack) {
+    if (visiting.contains(current)) {
+      List<String> path = new ArrayList<>(stack);
+      int index = path.indexOf(current);
+      if (index < 0) {
+        return List.of(current, current);
+      }
+      List<String> cycle = new ArrayList<>(path.subList(index, path.size()));
+      cycle.add(current);
+      return List.copyOf(cycle);
+    }
+    if (visited.contains(current)) {
+      return List.of();
+    }
+
+    visiting.add(current);
+    stack.addLast(current);
+
+    Struct struct = structById.get(current);
+    if (struct != null) {
+      for (String ref : referencedStructIds(struct.fields())) {
+        if (!structById.containsKey(ref)) {
+          continue;
+        }
+        List<String> cycle = findCycle(ref, structById, visiting, visited, stack);
+        if (!cycle.isEmpty()) {
+          return cycle;
         }
       }
     }
-    if (fallbackMap == null || fallbackMap.isEmpty() || fallbackKeys == null) {
-      return null;
-    }
-    for (String key : fallbackKeys) {
-      String value = Strings.trimToNull(fallbackMap.get(key));
-      if (value != null) {
-        return value;
+
+    stack.removeLast();
+    visiting.remove(current);
+    visited.add(current);
+    return List.of();
+  }
+
+  private static List<String> referencedStructIds(List<Field> fields) {
+    List<String> refs = new ArrayList<>();
+    collectStructRefs(fields, refs);
+    return List.copyOf(refs);
+  }
+
+  private static void collectStructRefs(List<Field> fields, List<String> refs) {
+    for (Field field : list(fields)) {
+      if (field == null || field.type() == null) {
+        continue;
+      }
+      if (field.type() == FieldType.STRUCT) {
+        if (!isBlank(field.structRef())) {
+          refs.add(field.structRef().trim());
+        } else {
+          collectStructRefs(field.fields(), refs);
+        }
+        continue;
+      }
+      if (field.type() == FieldType.ARRAY && field.itemType() == FieldType.STRUCT) {
+        if (!isBlank(field.structRef())) {
+          refs.add(field.structRef().trim());
+        } else {
+          collectStructRefs(field.fields(), refs);
+        }
       }
     }
-    return null;
   }
 
-  private static void closeHaClient(HAClient client) {
-    if (client == null) {
-      return;
+  private static ObjectNode toCanonicalGroup(Group group, ObjectMapper mapper) {
+    ObjectNode node = mapper.createObjectNode();
+    node.put("id", group.id());
+    node.put("label", group.label());
+    if (!isBlank(group.description())) {
+      node.put("description", group.description());
     }
-    try {
-      client.disconnect();
-    } catch (Exception ignore) {
-    }
-    try {
-      client.close();
-    } catch (Exception ignore) {
-    }
+    node.put("order", group.order());
+    return node;
   }
 
-  @SuppressWarnings("unchecked")
-  private <T extends AutoCloseable> T getOrCreate(CacheKey key, ThrowingSupplier<T> supplier) {
-    AutoCloseable existing = cache.get(key);
-    if (existing != null) {
-      return (T) existing;
+  private static ObjectNode toCanonicalStruct(Struct struct, ObjectMapper mapper) {
+    ObjectNode node = mapper.createObjectNode();
+    node.put("id", struct.id());
+    node.put("label", struct.label());
+    if (!isBlank(struct.description())) {
+      node.put("description", struct.description());
     }
-    T created;
+    ArrayNode fields = node.putArray("fields");
+    sortedFields(struct.fields()).forEach(field -> fields.add(toCanonicalField(field, mapper)));
+    return node;
+  }
+
+  private static ObjectNode toCanonicalField(Field field, ObjectMapper mapper) {
+    ObjectNode node = mapper.createObjectNode();
+    node.put("key", field.key());
+    node.put("label", field.label());
+    if (!isBlank(field.description())) {
+      node.put("description", field.description());
+    }
+    if (!isBlank(field.groupId())) {
+      node.put("groupId", field.groupId());
+    }
+    node.put("order", field.order());
+    node.put("type", field.type().name());
+    node.put("required", Boolean.TRUE.equals(field.required()));
+    node.put("editable", !Boolean.FALSE.equals(field.editable()));
+    if (!list(field.enumValues()).isEmpty()) {
+      ArrayNode enumNode = node.putArray("enum");
+      field.enumValues().forEach(enumNode::add);
+    }
+    if (field.defaultValue() != null) {
+      node.set("default", copy(field.defaultValue()));
+    }
+    if (field.min() != null) {
+      node.put("min", field.min());
+    }
+    if (field.max() != null) {
+      node.put("max", field.max());
+    }
+    if (!isBlank(field.pattern())) {
+      node.put("pattern", field.pattern());
+    }
+
+    if (field.type() == FieldType.STRUCT) {
+      if (!isBlank(field.structRef())) {
+        node.put("structRef", field.structRef().trim());
+      } else {
+        ArrayNode fields = node.putArray("fields");
+        sortedFields(field.fields()).forEach(child -> fields.add(toCanonicalField(child, mapper)));
+      }
+    }
+
+    if (field.type() == FieldType.ARRAY) {
+      node.put("itemType", field.itemType().name());
+      if (field.itemType() == FieldType.STRING && !list(field.itemsEnum()).isEmpty()) {
+        ArrayNode itemsEnum = node.putArray("itemsEnum");
+        field.itemsEnum().forEach(itemsEnum::add);
+      }
+      if (field.itemType() == FieldType.STRUCT) {
+        if (!isBlank(field.structRef())) {
+          node.put("structRef", field.structRef().trim());
+        } else {
+          ArrayNode fields = node.putArray("fields");
+          sortedFields(field.fields()).forEach(child -> fields.add(toCanonicalField(child, mapper)));
+        }
+      }
+      if (field.minItems() != null) {
+        node.put("minItems", field.minItems());
+      }
+      if (field.maxItems() != null) {
+        node.put("maxItems", field.maxItems());
+      }
+    }
+    return node;
+  }
+
+  private static void unknownKeys(JsonNode node, Set<String> allowed, String path, List<ValidationIssue> issues) {
+    node.fieldNames().forEachRemaining(key -> {
+      if (!allowed.contains(key)) {
+        issues.add(new ValidationIssue(path + "." + key, "unknown property"));
+      }
+    });
+  }
+
+  private static String requiredText(JsonNode node, String key, String path, List<ValidationIssue> issues) {
+    JsonNode value = node.get(key);
+    if (value == null || value.isNull()) {
+      issues.add(new ValidationIssue(path, key + " is required"));
+      return null;
+    }
+    if (!value.isTextual() || value.asText().trim().isEmpty()) {
+      issues.add(new ValidationIssue(path, key + " must be a non-empty string"));
+      return null;
+    }
+    return value.asText().trim();
+  }
+
+  private static String optionalText(JsonNode node, String key, String path, List<ValidationIssue> issues) {
+    if (!node.has(key)) {
+      return null;
+    }
+    JsonNode value = node.get(key);
+    if (value == null || value.isNull()) {
+      return null;
+    }
+    if (!value.isTextual()) {
+      issues.add(new ValidationIssue(path, key + " must be a string"));
+      return null;
+    }
+    String normalized = value.asText().trim();
+    return normalized.isEmpty() ? null : normalized;
+  }
+
+  private static Integer requiredInteger(JsonNode node, String key, String path, List<ValidationIssue> issues) {
+    JsonNode value = node.get(key);
+    if (value == null || value.isNull()) {
+      issues.add(new ValidationIssue(path, key + " is required"));
+      return null;
+    }
+    if (!value.isIntegralNumber()) {
+      issues.add(new ValidationIssue(path, key + " must be an integer"));
+      return null;
+    }
+    return value.asInt();
+  }
+
+  private static Integer optionalInteger(JsonNode node, String key, String path, List<ValidationIssue> issues) {
+    if (!node.has(key)) {
+      return null;
+    }
+    JsonNode value = node.get(key);
+    if (value == null || value.isNull()) {
+      return null;
+    }
+    if (!value.isIntegralNumber()) {
+      issues.add(new ValidationIssue(path, key + " must be an integer"));
+      return null;
+    }
+    return value.asInt();
+  }
+
+  private static BigDecimal optionalNumber(JsonNode node, String key, String path, List<ValidationIssue> issues) {
+    if (!node.has(key)) {
+      return null;
+    }
+    JsonNode value = node.get(key);
+    if (value == null || value.isNull()) {
+      return null;
+    }
+    if (!value.isNumber()) {
+      issues.add(new ValidationIssue(path, key + " must be numeric"));
+      return null;
+    }
+    return value.decimalValue();
+  }
+
+  private static Boolean requiredBoolean(JsonNode node, String key, String path, List<ValidationIssue> issues) {
+    JsonNode value = node.get(key);
+    if (value == null || value.isNull()) {
+      issues.add(new ValidationIssue(path, key + " is required"));
+      return null;
+    }
+    if (!value.isBoolean()) {
+      issues.add(new ValidationIssue(path, key + " must be boolean"));
+      return null;
+    }
+    return value.asBoolean();
+  }
+
+  private static Boolean optionalBooleanDefaultTrue(
+      JsonNode node, String key, String path, List<ValidationIssue> issues) {
+    if (!node.has(key)) {
+      return Boolean.TRUE;
+    }
+    JsonNode value = node.get(key);
+    if (value == null || value.isNull()) {
+      return Boolean.TRUE;
+    }
+    if (!value.isBoolean()) {
+      issues.add(new ValidationIssue(path, key + " must be boolean"));
+      return Boolean.TRUE;
+    }
+    return value.asBoolean();
+  }
+
+  private static FieldType requiredType(
+      JsonNode node, String key, String path, List<ValidationIssue> issues, boolean required) {
+    if (!node.has(key)) {
+      if (required) {
+        issues.add(new ValidationIssue(path, key + " is required"));
+      }
+      return null;
+    }
+    JsonNode value = node.get(key);
+    if (value == null || value.isNull()) {
+      if (required) {
+        issues.add(new ValidationIssue(path, key + " is required"));
+      }
+      return null;
+    }
+    if (!value.isTextual()) {
+      issues.add(new ValidationIssue(path, key + " must be a supported type"));
+      return null;
+    }
     try {
-      created = supplier.get();
-    } catch (RuntimeException ex) {
-      throw ex;
+      FieldType type = FieldType.valueOf(value.asText().trim());
+      if ("itemType".equals(key) && type == FieldType.ARRAY) {
+        issues.add(new ValidationIssue(path, "ARRAY itemType cannot be ARRAY"));
+        return null;
+      }
+      return type;
     } catch (Exception ex) {
-      throw new IllegalStateException("Failed to create connection", ex);
+      issues.add(new ValidationIssue(path, "unsupported type: " + value.asText()));
+      return null;
     }
-    AutoCloseable prior = cache.putIfAbsent(key, created);
-    if (prior != null) {
-      closeCachedHandle(created);
-      return (T) prior;
-    }
-    return created;
   }
 
-  private static void closeCachedHandle(AutoCloseable handle) {
-    if (handle == null) {
+  private static List<String> stringArray(
+      JsonNode node, String path, boolean required, List<ValidationIssue> issues) {
+    if (node == null || node.isNull() || node.isMissingNode()) {
+      if (required) {
+        issues.add(new ValidationIssue(path, "value is required"));
+      }
+      return List.of();
+    }
+    if (!node.isArray()) {
+      issues.add(new ValidationIssue(path, "value must be an array"));
+      return List.of();
+    }
+    List<String> values = new ArrayList<>();
+    for (int i = 0; i < node.size(); i++) {
+      JsonNode item = node.get(i);
+      String itemPath = path + "[" + i + "]";
+      if (item == null || item.isNull() || !item.isTextual() || item.asText().trim().isEmpty()) {
+        issues.add(new ValidationIssue(itemPath, "value must be a non-empty string"));
+      } else {
+        values.add(item.asText().trim());
+      }
+    }
+    return List.copyOf(values);
+  }
+
+  private static List<String> normalizedStrings(List<String> values, String path, List<ValidationIssue> issues) {
+    if (values == null) {
+      return List.of();
+    }
+    List<String> normalized = new ArrayList<>();
+    for (int i = 0; i < values.size(); i++) {
+      String value = values.get(i);
+      if (isBlank(value)) {
+        issues.add(new ValidationIssue(path + "[" + i + "]", "value must be a non-empty string"));
+      } else {
+        normalized.add(value.trim());
+      }
+    }
+    return List.copyOf(normalized);
+  }
+
+  private static List<Group> sortedGroups(List<Group> groups) {
+    List<Group> sorted = new ArrayList<>(list(groups));
+    sorted.sort(GROUP_ORDER);
+    return List.copyOf(sorted);
+  }
+
+  private static List<Struct> sortedStructs(List<Struct> structs) {
+    List<Struct> sorted = new ArrayList<>(list(structs));
+    sorted.sort(STRUCT_ORDER);
+    return List.copyOf(sorted);
+  }
+
+  private static List<Field> sortedFields(List<Field> fields) {
+    List<Field> sorted = new ArrayList<>(list(fields));
+    sorted.sort(FIELD_ORDER);
+    return List.copyOf(sorted);
+  }
+
+  private static List<String> sortedDistinctStrings(List<String> values) {
+    LinkedHashSet<String> deduped = new LinkedHashSet<>();
+    list(values).stream().filter(Objects::nonNull).map(String::trim).filter(v -> !v.isEmpty()).forEach(deduped::add);
+    List<String> sorted = new ArrayList<>(deduped);
+    sorted.sort(String::compareTo);
+    return List.copyOf(sorted);
+  }
+
+  private static Field emptyField() {
+    return new Field(
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        List.of(),
+        null,
+        null,
+        null,
+        null,
+        List.of(),
+        null,
+        List.of(),
+        null,
+        null,
+        null);
+  }
+
+  private static JsonNode copy(JsonNode node) {
+    return node == null ? null : node.deepCopy();
+  }
+
+  private static void rejectPresent(Object value, String path, String message, List<ValidationIssue> issues) {
+    if (value == null) {
       return;
     }
-    if (handle instanceof AmpsConnection ampsConnection) {
-      closeHaClient(ampsConnection.client());
+    if (value instanceof Collection<?> collection && collection.isEmpty()) {
       return;
     }
-    if (handle instanceof S3Connection s3Connection) {
-      CloseSupport.closeQuietly(s3Connection.admin());
+    if (value instanceof String text && text.isBlank()) {
       return;
     }
-    CloseSupport.closeQuietly(handle);
+    issues.add(new ValidationIssue(path, message));
   }
 
-  @FunctionalInterface
-  private interface ThrowingSupplier<T> {
-    T get() throws Exception;
+  private static boolean isBlank(String value) {
+    return value == null || value.trim().isEmpty();
   }
 
-  @FunctionalInterface
-  public interface SessionSecretDecryptor {
-    String decrypt(String alias, String encryptedValue);
+  private static <T> List<T> list(List<T> values) {
+    return values == null ? List.of() : values;
   }
 
-  private enum ConnectionKind {
-    AMPS,
-    HTTP,
-    ODBC,
-    S3
+  private static ValidationException validation(String message, List<ValidationIssue> issues) {
+    return new ValidationException(message, issues, null);
   }
 
-  private final class OdbcConnectionImpl implements OdbcConnection {
-    private final String connectionName;
+  private static ValidationException validation(String message, List<ValidationIssue> issues, Throwable cause) {
+    return new ValidationException(message, issues, cause);
+  }
 
-    private OdbcConnectionImpl(String connectionName) {
-      this.connectionName = requireConnectionName(connectionName);
+  public static final class ValidationException extends IllegalArgumentException {
+    private final List<ValidationIssue> issues;
+
+    private ValidationException(String message, List<ValidationIssue> issues, Throwable cause) {
+      super(message, cause);
+      this.issues = issues == null ? List.of() : List.copyOf(issues);
     }
 
-    @Override
-    public OdbcSessionSupport.OdbcConnectionHealth test() {
-      return testOdbcConnection(connectionName);
-    }
-
-    @Override
-    public OdbcSessionSupport.OdbcSchemaInspection inspectSchema(String remoteSql) {
-      return inspectOdbcSchema(connectionName, remoteSql);
-    }
-
-    @Override
-    public void close() {
-      // ODBC connector methods are one-shot and do not hold pooled handles.
+    public List<ValidationIssue> issues() {
+      return issues;
     }
   }
-
-  private record CacheKey(ConnectionKind kind, String name, CacheOptions options) {}
-
-  private record CacheOptions(
-      String clientName, long timeoutMillis, int maxInflight, String pinnedInstance) {}
 }
-
-
-
-
-
-
-
 
