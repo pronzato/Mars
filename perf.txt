@@ -1,1050 +1,997 @@
-package org.pronzato.fabric.api.configs.presentation;
+package org.pronzato.fabric.api.access.manager;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
-import java.math.BigDecimal;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.util.ArrayDeque;
+import org.pronzato.fabric.api.util.CloseSupport;
+import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Base64;
-import java.util.Collection;
 import java.util.Comparator;
-import java.util.Deque;
-import java.util.LinkedHashMap;
+import java.util.EnumMap;
+import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
-import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
-import org.pronzato.fabric.api.configs.presentation.ConfigSchemaDoc.Field;
-import org.pronzato.fabric.api.configs.presentation.ConfigSchemaDoc.FieldType;
-import org.pronzato.fabric.api.configs.presentation.ConfigSchemaDoc.Group;
-import org.pronzato.fabric.api.configs.presentation.ConfigSchemaDoc.Struct;
-import org.pronzato.fabric.api.configs.presentation.ConfigSchemaDoc.ValidationIssue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Supplier;
+import org.pronzato.fabric.api.access.AccessManager;
+import org.pronzato.fabric.api.control.ControlConnection;
+import org.pronzato.fabric.api.control.discovery.CanonicalIds;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionService;
+import org.pronzato.fabric.api.control.status.service.ServiceStatusCache;
+import org.pronzato.fabric.api.control.status.service.ServiceStatusRow;
+import org.pronzato.fabric.api.data.DataOptions;
+import org.pronzato.fabric.api.data.TabularTableMetadata;
+import org.pronzato.fabric.api.data.manager.RemoteTabularManager;
+import org.pronzato.fabric.api.control.entitlements.core.data.DataEntitlements;
+import org.pronzato.fabric.api.control.entitlements.core.services.ServiceEntitlements;
+import org.pronzato.fabric.api.control.entitlements.manager.EntitlementsManagerImpl;
+import org.pronzato.fabric.api.control.security.UserContext;
+import org.pronzato.fabric.api.control.security.UserPrincipal;
+import org.pronzato.fabric.api.services.ServiceRunOptions;
+import org.pronzato.fabric.api.services.common.ServiceInstanceResolver;
+import org.pronzato.fabric.api.control.session.SessionContext;
+import org.pronzato.fabric.api.control.session.SessionImpl;
+import org.pronzato.fabric.api.util.Strings;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-public final class ConfigSchemaCodec {
+public final class AccessManagerImpl implements AccessManager, AutoCloseable {
+  private static final Logger LOGGER = LoggerFactory.getLogger(AccessManagerImpl.class);
+  private static final String DIRECT_QUERY_SERVICE_ID = "direct";
+  private static final String DIRECT_QUERY_SERVICE_DISPLAY = "DIRECT";
+  private static final long SERVICE_TABLE_CACHE_TTL_MILLIS = 60_000L;
+  private static final long SERVICE_TABLE_FAILURE_COOLDOWN_MILLIS = 20_000L;
 
-  private static final Set<String> ROOT_KEYS =
-      Set.of("displayName", "description", "groups", "structs", "fields", "requiredKeys");
-  private static final Set<String> GROUP_KEYS = Set.of("id", "label", "description", "order");
-  private static final Set<String> STRUCT_KEYS = Set.of("id", "label", "description", "fields");
-  private static final Set<String> FIELD_KEYS =
-      Set.of(
-          "key",
-          "label",
-          "description",
-          "groupId",
-          "order",
-          "type",
-          "required",
-          "editable",
-          "enum",
-          "default",
-          "min",
-          "max",
-          "pattern",
-          "fields",
-          "itemType",
-          "itemsEnum",
-          "structRef",
-          "minItems",
-          "maxItems");
+  private final SessionImpl session;
+  private final Supplier<EntitlementsManagerImpl> entitlementsSupplier;
+  private final Supplier<DiscoveryCache> discoveryCacheSupplier;
+  private final Supplier<ServiceStatusCache> serviceStatusCacheSupplier;
+  private final Map<String, CachedServiceTables> serviceTableCache = new ConcurrentHashMap<>();
+  private final Map<String, Long> serviceTableFailureCooldownUntilMs = new ConcurrentHashMap<>();
+  private volatile ServiceInstanceResolver dynamicServiceResolver;
+  private volatile boolean ownsDynamicServiceResolver;
 
-  private static final Comparator<Group> GROUP_ORDER =
-      Comparator.comparingInt((Group group) -> group.order() == null ? Integer.MAX_VALUE : group.order())
-          .thenComparing(group -> group.id() == null ? "" : group.id());
-
-  private static final Comparator<Struct> STRUCT_ORDER =
-      Comparator.comparing((Struct struct) -> struct.id() == null ? "" : struct.id())
-          .thenComparing(struct -> struct.label() == null ? "" : struct.label());
-
-  private static final Comparator<Field> FIELD_ORDER =
-      Comparator.comparing(
-              (Field field) -> isBlank(field.groupId()) ? null : field.groupId(),
-              Comparator.nullsLast(String::compareTo))
-          .thenComparingInt((Field field) -> field.order() == null ? Integer.MAX_VALUE : field.order())
-          .thenComparing(field -> field.key() == null ? "" : field.key());
-
-  private ConfigSchemaCodec() {}
-
-  public static ConfigSchemaDoc parse(String schemaJson) {
-    if (schemaJson == null || schemaJson.isBlank()) {
-      throw validation("schema text is required", List.of(new ValidationIssue("schema", "schema text is required")));
-    }
-    try {
-      return parse(DiscoveryCodec.mapper().readTree(schemaJson));
-    } catch (ValidationException ex) {
-      throw ex;
-    } catch (Exception ex) {
-      throw validation(
-          "invalid JSON: " + ex.getMessage(),
-          List.of(new ValidationIssue("schema", "invalid JSON: " + ex.getMessage())),
-          ex);
-    }
+  public AccessManagerImpl(
+      SessionImpl session,
+      Supplier<EntitlementsManagerImpl> entitlementsSupplier,
+      Supplier<DiscoveryCache> discoveryCacheSupplier,
+      Supplier<ServiceStatusCache> serviceStatusCacheSupplier) {
+    this.session = Objects.requireNonNull(session, "session");
+    this.entitlementsSupplier = Objects.requireNonNull(entitlementsSupplier, "entitlementsSupplier");
+    this.discoveryCacheSupplier = Objects.requireNonNull(discoveryCacheSupplier, "discoveryCacheSupplier");
+    this.serviceStatusCacheSupplier =
+        Objects.requireNonNull(serviceStatusCacheSupplier, "serviceStatusCacheSupplier");
   }
 
-  public static ConfigSchemaDoc parse(JsonNode schemaNode) {
-    List<ValidationIssue> issues = new ArrayList<>();
-    ConfigSchemaDoc doc = parseNode(schemaNode, issues);
-    issues.addAll(validate(doc));
-    if (!issues.isEmpty()) {
-      throw validation(issues.get(0).message(), issues);
+  @Override
+  public void close() {
+    serviceTableCache.clear();
+    serviceTableFailureCooldownUntilMs.clear();
+    ServiceInstanceResolver resolver = dynamicServiceResolver;
+    dynamicServiceResolver = null;
+    if (ownsDynamicServiceResolver) {
+      CloseSupport.closeQuietly(resolver);
     }
-    return doc;
+    ownsDynamicServiceResolver = false;
   }
 
-  public static List<ValidationIssue> validate(ConfigSchemaDoc doc) {
-    List<ValidationIssue> issues = new ArrayList<>();
-    if (doc == null) {
-      issues.add(new ValidationIssue("schema", "schema is required"));
-      return List.copyOf(issues);
-    }
-    if (isBlank(doc.displayName())) {
-      issues.add(new ValidationIssue("schema.displayName", "displayName is required"));
-    }
-
-    List<Group> groups = list(doc.groups());
-    List<Struct> structs = list(doc.structs());
-    List<Field> fields = list(doc.fields());
-    List<String> requiredKeys = normalizedStrings(doc.requiredKeys(), "schema.requiredKeys", issues);
-
-    Set<String> groupIds = new HashSet<>();
-    for (int i = 0; i < groups.size(); i++) {
-      Group group = groups.get(i);
-      String path = "schema.groups[" + i + "]";
-      if (group == null) {
-        issues.add(new ValidationIssue(path, "group is required"));
-        continue;
-      }
-      if (isBlank(group.id())) {
-        issues.add(new ValidationIssue(path + ".id", "id is required"));
-      } else if (!groupIds.add(group.id())) {
-        issues.add(new ValidationIssue(path + ".id", "duplicate group id: " + group.id()));
-      }
-      if (isBlank(group.label())) {
-        issues.add(new ValidationIssue(path + ".label", "label is required"));
-      }
-      if (group.order() == null) {
-        issues.add(new ValidationIssue(path + ".order", "order is required"));
-      }
-    }
-
-    Map<String, Struct> structById = new LinkedHashMap<>();
-    for (int i = 0; i < structs.size(); i++) {
-      Struct struct = structs.get(i);
-      String path = "schema.structs[" + i + "]";
-      if (struct == null) {
-        issues.add(new ValidationIssue(path, "struct is required"));
-        continue;
-      }
-      if (isBlank(struct.id())) {
-        issues.add(new ValidationIssue(path + ".id", "id is required"));
-      } else if (structById.putIfAbsent(struct.id(), struct) != null) {
-        issues.add(new ValidationIssue(path + ".id", "duplicate struct id: " + struct.id()));
-      }
-      if (isBlank(struct.label())) {
-        issues.add(new ValidationIssue(path + ".label", "label is required"));
-      }
-    }
-
-    Set<String> structIds = Set.copyOf(structById.keySet());
-
-    Set<String> topLevelKeys = new HashSet<>();
-    validateFieldScope(fields, "schema.fields", groupIds, structIds, topLevelKeys, issues);
-
-    for (int i = 0; i < structs.size(); i++) {
-      Struct struct = structs.get(i);
-      if (struct == null || isBlank(struct.id())) {
-        continue;
-      }
-      validateFieldScope(struct.fields(), "schema.structs[" + i + "].fields", groupIds, structIds, null, issues);
-    }
-
-    Set<String> seenRequired = new HashSet<>();
-    for (int i = 0; i < requiredKeys.size(); i++) {
-      String key = requiredKeys.get(i);
-      String path = "schema.requiredKeys[" + i + "]";
-      if (!seenRequired.add(key)) {
-        issues.add(new ValidationIssue(path, "duplicate required key: " + key));
-      }
-      if (!topLevelKeys.contains(key)) {
-        issues.add(new ValidationIssue(path, "required key not found in top-level fields: " + key));
-      }
-    }
-
-    detectCircularStructReferences(structById, issues);
-    return List.copyOf(issues);
+  @Override
+  public String defaultSubject() {
+    return resolveSubject(null);
   }
 
-  public static String toCanonicalJson(ConfigSchemaDoc doc) {
-    try {
-      return DiscoveryCodec.mapper().writeValueAsString(toCanonicalJsonNode(doc));
-    } catch (ValidationException ex) {
-      throw ex;
-    } catch (Exception ex) {
-      throw new IllegalStateException("failed to serialize config schema", ex);
-    }
+  @Override
+  public List<DatasetAccess> datasets() {
+    return datasets(null);
   }
 
-  public static JsonNode toCanonicalJsonNode(ConfigSchemaDoc doc) {
-    List<ValidationIssue> issues = validate(doc);
-    if (!issues.isEmpty()) {
-      throw validation(issues.get(0).message(), issues);
-    }
-    ObjectMapper mapper = DiscoveryCodec.mapper();
-    ObjectNode root = mapper.createObjectNode();
-    root.put("displayName", doc.displayName());
-    if (!isBlank(doc.description())) {
-      root.put("description", doc.description());
-    }
-    ArrayNode groups = root.putArray("groups");
-    sortedGroups(doc.groups()).forEach(group -> groups.add(toCanonicalGroup(group, mapper)));
-    List<Struct> structs = sortedStructs(doc.structs());
-    if (!structs.isEmpty()) {
-      ArrayNode structNodes = root.putArray("structs");
-      structs.forEach(struct -> structNodes.add(toCanonicalStruct(struct, mapper)));
-    }
-    ArrayNode fields = root.putArray("fields");
-    sortedFields(doc.fields()).forEach(field -> fields.add(toCanonicalField(field, mapper)));
-    List<String> requiredKeys = sortedDistinctStrings(doc.requiredKeys());
-    if (!requiredKeys.isEmpty()) {
-      ArrayNode requiredNode = root.putArray("requiredKeys");
-      requiredKeys.forEach(requiredNode::add);
-    }
-    return root;
-  }
-
-  public static String schemaHashBase64Sha256(String schemaJson) {
-    try {
-      MessageDigest digest = MessageDigest.getInstance("SHA-256");
-      byte[] hashed = digest.digest(schemaJson == null ? new byte[0] : schemaJson.getBytes(StandardCharsets.UTF_8));
-      return Base64.getEncoder().encodeToString(hashed);
-    } catch (Exception ex) {
-      throw new IllegalStateException("failed to compute schema hash", ex);
-    }
-  }
-
-  private static ConfigSchemaDoc parseNode(JsonNode node, List<ValidationIssue> issues) {
-    if (node == null || !node.isObject()) {
-      issues.add(new ValidationIssue("schema", "schema must be a JSON object"));
-      return new ConfigSchemaDoc(null, null, List.of(), List.of(), List.of(), List.of());
-    }
-
-    unknownKeys(node, ROOT_KEYS, "schema", issues);
-    String displayName = requiredText(node, "displayName", "schema.displayName", issues);
-    String description = optionalText(node, "description", "schema.description", issues);
-    List<Group> groups = parseGroups(node.get("groups"), "schema.groups", issues);
-    List<Struct> structs = parseStructs(node.get("structs"), "schema.structs", issues);
-    List<Field> fields = parseFields(node.get("fields"), "schema.fields", issues);
-    List<String> requiredKeys = stringArray(node.get("requiredKeys"), "schema.requiredKeys", false, issues);
-    return new ConfigSchemaDoc(displayName, description, groups, structs, fields, requiredKeys);
-  }
-
-  private static List<Group> parseGroups(JsonNode node, String path, List<ValidationIssue> issues) {
-    if (node == null || node.isNull()) {
-      issues.add(new ValidationIssue(path, "groups is required"));
+  @Override
+  public List<DatasetAccess> datasets(String subject) {
+    String resolvedSubject = resolveSubject(subject);
+    List<DatasetDescriptor> datasetDescriptors = listDatasetDescriptors();
+    if (datasetDescriptors.isEmpty()) {
       return List.of();
     }
-    if (!node.isArray()) {
-      issues.add(new ValidationIssue(path, "groups must be an array"));
-      return List.of();
-    }
-    List<Group> groups = new ArrayList<>();
-    for (int i = 0; i < node.size(); i++) {
-      JsonNode row = node.get(i);
-      String rowPath = path + "[" + i + "]";
-      if (row == null || !row.isObject()) {
-        issues.add(new ValidationIssue(rowPath, "group must be a JSON object"));
-        continue;
+    Map<String, DatasetServiceRoute> routes = resolveDatasetRoutes(resolvedSubject, datasetDescriptors);
+    DataEntitlements dataEntitlements = requireDataEntitlements();
+    List<DatasetAccess> rows = new ArrayList<>(datasetDescriptors.size());
+    for (DatasetDescriptor descriptor : datasetDescriptors) {
+      EnumSet<DatasetAction> allowed = EnumSet.noneOf(DatasetAction.class);
+      DataEntitlements.Identity identity = new DataEntitlements.Identity(resolvedSubject, null);
+      if (isAllowed(dataEntitlements.authorizeRead(identity, descriptor.datasetId()))) {
+        allowed.add(DatasetAction.READ);
       }
-      unknownKeys(row, GROUP_KEYS, rowPath, issues);
-      groups.add(
-          new Group(
-              requiredText(row, "id", rowPath + ".id", issues),
-              requiredText(row, "label", rowPath + ".label", issues),
-              optionalText(row, "description", rowPath + ".description", issues),
-              requiredInteger(row, "order", rowPath + ".order", issues)));
+      if (isAllowed(dataEntitlements.authorizeWrite(identity, descriptor.datasetId()))) {
+        allowed.add(DatasetAction.WRITE);
+      }
+      rows.add(
+          new DatasetAccess(
+              descriptor.datasetId(),
+              descriptor.group(),
+              descriptor.namespace(),
+              descriptor.name(),
+              allowed.isEmpty() ? Set.of() : Set.copyOf(allowed),
+              allowed.contains(DatasetAction.READ) ? routes.get(descriptor.datasetId()) : null));
     }
-    return List.copyOf(groups);
+    return List.copyOf(rows);
   }
 
-  private static List<Struct> parseStructs(JsonNode node, String path, List<ValidationIssue> issues) {
-    if (node == null || node.isNull() || node.isMissingNode()) {
-      return List.of();
-    }
-    if (!node.isArray()) {
-      issues.add(new ValidationIssue(path, "structs must be an array"));
-      return List.of();
-    }
-    List<Struct> structs = new ArrayList<>();
-    for (int i = 0; i < node.size(); i++) {
-      JsonNode row = node.get(i);
-      String rowPath = path + "[" + i + "]";
-      if (row == null || !row.isObject()) {
-        issues.add(new ValidationIssue(rowPath, "struct must be a JSON object"));
-        continue;
-      }
-      unknownKeys(row, STRUCT_KEYS, rowPath, issues);
-      structs.add(
-          new Struct(
-              requiredText(row, "id", rowPath + ".id", issues),
-              requiredText(row, "label", rowPath + ".label", issues),
-              optionalText(row, "description", rowPath + ".description", issues),
-              parseFields(row.get("fields"), rowPath + ".fields", issues)));
-    }
-    return List.copyOf(structs);
+  @Override
+  public List<String> queryableDatasets() {
+    return queryableDatasets(null);
   }
 
-  private static List<Field> parseFields(JsonNode node, String path, List<ValidationIssue> issues) {
-    if (node == null || node.isNull()) {
-      issues.add(new ValidationIssue(path, "fields is required"));
-      return List.of();
+  @Override
+  public List<String> queryableDatasets(String subject) {
+    List<String> allowed = new ArrayList<>();
+    for (DatasetAccess access : datasets(subject)) {
+      if (access != null && access.allowedActions().contains(DatasetAction.READ)) {
+        allowed.add(access.datasetId());
+      }
     }
-    if (!node.isArray()) {
-      issues.add(new ValidationIssue(path, "fields must be an array"));
-      return List.of();
-    }
-    List<Field> fields = new ArrayList<>();
-    for (int i = 0; i < node.size(); i++) {
-      fields.add(parseField(node.get(i), path + "[" + i + "]", issues));
-    }
-    return List.copyOf(fields);
+    return List.copyOf(allowed);
   }
 
-  private static Field parseField(JsonNode node, String path, List<ValidationIssue> issues) {
-    if (node == null || !node.isObject()) {
-      issues.add(new ValidationIssue(path, "field must be a JSON object"));
-      return emptyField();
-    }
-    unknownKeys(node, FIELD_KEYS, path, issues);
-    return new Field(
-        requiredText(node, "key", path + ".key", issues),
-        requiredText(node, "label", path + ".label", issues),
-        optionalText(node, "description", path + ".description", issues),
-        optionalText(node, "groupId", path + ".groupId", issues),
-        requiredInteger(node, "order", path + ".order", issues),
-        requiredType(node, "type", path + ".type", issues, true),
-        requiredBoolean(node, "required", path + ".required", issues),
-        optionalBooleanDefaultTrue(node, "editable", path + ".editable", issues),
-        stringArray(node.get("enum"), path + ".enum", false, issues),
-        node.has("default") ? copy(node.get("default")) : null,
-        optionalNumber(node, "min", path + ".min", issues),
-        optionalNumber(node, "max", path + ".max", issues),
-        optionalText(node, "pattern", path + ".pattern", issues),
-        nestedFields(node.get("fields"), path + ".fields", issues),
-        requiredType(node, "itemType", path + ".itemType", issues, false),
-        stringArray(node.get("itemsEnum"), path + ".itemsEnum", false, issues),
-        optionalText(node, "structRef", path + ".structRef", issues),
-        optionalInteger(node, "minItems", path + ".minItems", issues),
-        optionalInteger(node, "maxItems", path + ".maxItems", issues));
+  @Override
+  public boolean canQueryDataset(String datasetId) {
+    return canQueryDataset(null, datasetId);
   }
 
-  private static List<Field> nestedFields(JsonNode node, String path, List<ValidationIssue> issues) {
-    if (node == null || node.isNull() || node.isMissingNode()) {
-      return List.of();
-    }
-    if (!node.isArray()) {
-      issues.add(new ValidationIssue(path, "must be an array"));
-      return List.of();
-    }
-    List<Field> fields = new ArrayList<>();
-    for (int i = 0; i < node.size(); i++) {
-      fields.add(parseField(node.get(i), path + "[" + i + "]", issues));
-    }
-    return List.copyOf(fields);
+  @Override
+  public boolean canQueryDataset(String subject, String datasetId) {
+    String canonicalDataset = DataEntitlements.requireDatasetResourceId(datasetId);
+    DataEntitlements dataEntitlements = requireDataEntitlements();
+    DataEntitlements.Decision decision =
+        dataEntitlements.authorizeRead(
+            new DataEntitlements.Identity(resolveSubject(subject), null), canonicalDataset);
+    return isAllowed(decision);
   }
 
-  private static void validateFieldScope(
-      List<Field> fields,
-      String scopePath,
-      Set<String> groupIds,
-      Set<String> structIds,
-      Set<String> keysOut,
-      List<ValidationIssue> issues) {
-    Set<String> keysInScope = new HashSet<>();
-    for (int i = 0; i < list(fields).size(); i++) {
-      Field field = list(fields).get(i);
-      String path = scopePath + "[" + i + "]";
-      if (field == null) {
-        issues.add(new ValidationIssue(path, "field is required"));
-        continue;
-      }
-      validateField(field, path, groupIds, structIds, issues);
-      if (isBlank(field.key())) {
-        continue;
-      }
-      if (!keysInScope.add(field.key())) {
-        issues.add(new ValidationIssue(path + ".key", "duplicate key in scope: " + field.key()));
-      }
-      if (keysOut != null) {
-        keysOut.add(field.key());
-      }
-
-      if (field.type() == FieldType.STRUCT && !list(field.fields()).isEmpty()) {
-        validateFieldScope(field.fields(), path + ".fields", groupIds, structIds, null, issues);
-      }
-      if (field.type() == FieldType.ARRAY && field.itemType() == FieldType.STRUCT && !list(field.fields()).isEmpty()) {
-        validateFieldScope(field.fields(), path + ".fields", groupIds, structIds, null, issues);
-      }
-    }
+  @Override
+  public Optional<DatasetServiceRoute> datasetQueryRoute(String datasetId) {
+    return datasetQueryRoute(null, datasetId);
   }
 
-  private static void validateField(
-      Field field,
-      String path,
-      Set<String> groupIds,
-      Set<String> structIds,
-      List<ValidationIssue> issues) {
-    if (isBlank(field.key())) {
-      issues.add(new ValidationIssue(path + ".key", "key is required"));
+  @Override
+  public Optional<DatasetServiceRoute> datasetQueryRoute(String subject, String datasetId) {
+    String canonicalDataset = DataEntitlements.requireDatasetResourceId(datasetId);
+    String resolvedSubject = resolveSubject(subject);
+    if (!canQueryDataset(resolvedSubject, canonicalDataset)) {
+      return Optional.empty();
     }
-    if (isBlank(field.label())) {
-      issues.add(new ValidationIssue(path + ".label", "label is required"));
+    List<DatasetDescriptor> descriptors = listDatasetDescriptors();
+    for (DatasetDescriptor descriptor : descriptors) {
+      if (canonicalDataset.equals(descriptor.datasetId())) {
+        return Optional.ofNullable(
+            resolveDatasetRoutes(resolvedSubject, List.of(descriptor)).get(canonicalDataset));
+      }
     }
-    if (field.order() == null) {
-      issues.add(new ValidationIssue(path + ".order", "order is required"));
-    }
-    if (field.type() == null) {
-      issues.add(new ValidationIssue(path + ".type", "type is required"));
-      return;
-    }
-    if (field.required() == null) {
-      issues.add(new ValidationIssue(path + ".required", "required is required"));
-    }
-    if (field.editable() == null) {
-      issues.add(new ValidationIssue(path + ".editable", "editable is required"));
-    }
-    if (!isBlank(field.groupId()) && !groupIds.contains(field.groupId())) {
-      issues.add(new ValidationIssue(path + ".groupId", "unknown groupId: " + field.groupId()));
-    }
-    if (field.min() != null && field.max() != null && field.min().compareTo(field.max()) > 0) {
-      issues.add(new ValidationIssue(path, "min cannot be greater than max"));
-    }
-    if (field.minItems() != null && field.maxItems() != null && field.minItems() > field.maxItems()) {
-      issues.add(new ValidationIssue(path, "minItems cannot be greater than maxItems"));
-    }
+    return Optional.empty();
+  }
 
-    boolean hasStructRef = !isBlank(field.structRef());
-    boolean hasInlineFields = !list(field.fields()).isEmpty();
+  @Override
+  public List<ServiceAccess> services() {
+    return services(null);
+  }
 
-    switch (field.type()) {
-      case STRING -> {
-        rejectPresent(field.min(), path + ".min", "min is only allowed for INTEGER/NUMBER", issues);
-        rejectPresent(field.max(), path + ".max", "max is only allowed for INTEGER/NUMBER", issues);
-        if (field.defaultValue() != null && !field.defaultValue().isTextual()) {
-          issues.add(new ValidationIssue(path + ".default", "default must be a string"));
-        }
-        if (!field.enumValues().isEmpty()
-            && field.defaultValue() != null
-            && !field.enumValues().contains(field.defaultValue().asText())) {
-          issues.add(new ValidationIssue(path + ".default", "default must be one of enum values"));
-        }
-      }
-      case INTEGER -> {
-        rejectPresent(field.enumValues(), path + ".enum", "enum is only allowed for STRING", issues);
-        rejectPresent(field.pattern(), path + ".pattern", "pattern is only allowed for STRING", issues);
-        if (field.defaultValue() != null && !field.defaultValue().isIntegralNumber()) {
-          issues.add(new ValidationIssue(path + ".default", "default must be an integer"));
-        }
-      }
-      case NUMBER -> {
-        rejectPresent(field.enumValues(), path + ".enum", "enum is only allowed for STRING", issues);
-        rejectPresent(field.pattern(), path + ".pattern", "pattern is only allowed for STRING", issues);
-        if (field.defaultValue() != null && !field.defaultValue().isNumber()) {
-          issues.add(new ValidationIssue(path + ".default", "default must be numeric"));
-        }
-      }
-      case BOOLEAN -> {
-        rejectPresent(field.enumValues(), path + ".enum", "enum is only allowed for STRING", issues);
-        rejectPresent(field.pattern(), path + ".pattern", "pattern is only allowed for STRING", issues);
-        rejectPresent(field.min(), path + ".min", "min is only allowed for INTEGER/NUMBER", issues);
-        rejectPresent(field.max(), path + ".max", "max is only allowed for INTEGER/NUMBER", issues);
-        if (field.defaultValue() != null && !field.defaultValue().isBoolean()) {
-          issues.add(new ValidationIssue(path + ".default", "default must be boolean"));
-        }
-      }
-      case STRUCT -> {
-        rejectPresent(field.enumValues(), path + ".enum", "enum is only allowed for STRING", issues);
-        rejectPresent(field.pattern(), path + ".pattern", "pattern is only allowed for STRING", issues);
-        rejectPresent(field.min(), path + ".min", "min is only allowed for INTEGER/NUMBER", issues);
-        rejectPresent(field.max(), path + ".max", "max is only allowed for INTEGER/NUMBER", issues);
-        rejectPresent(field.itemType(), path + ".itemType", "itemType is only allowed for ARRAY", issues);
-        rejectPresent(field.itemsEnum(), path + ".itemsEnum", "itemsEnum is only allowed for ARRAY<STRING>", issues);
-        rejectPresent(field.minItems(), path + ".minItems", "minItems is only allowed for ARRAY", issues);
-        rejectPresent(field.maxItems(), path + ".maxItems", "maxItems is only allowed for ARRAY", issues);
-        if (hasStructRef && hasInlineFields) {
-          issues.add(new ValidationIssue(path, "Cannot define both structRef and fields on the same field"));
-        }
-        if (!hasStructRef && !hasInlineFields) {
-          issues.add(new ValidationIssue(path, "STRUCT must define either structRef or fields"));
-        }
-        if (hasStructRef && !structIds.contains(field.structRef().trim())) {
-          issues.add(new ValidationIssue(path + ".structRef", "unknown structRef: " + field.structRef()));
-        }
-        if (field.defaultValue() != null && !field.defaultValue().isObject()) {
-          issues.add(new ValidationIssue(path + ".default", "default must be an object"));
-        }
-      }
-      case ARRAY -> {
-        rejectPresent(field.enumValues(), path + ".enum", "enum is only allowed for STRING", issues);
-        rejectPresent(field.pattern(), path + ".pattern", "pattern is only allowed for STRING", issues);
-        rejectPresent(field.min(), path + ".min", "min is only allowed for INTEGER/NUMBER", issues);
-        rejectPresent(field.max(), path + ".max", "max is only allowed for INTEGER/NUMBER", issues);
-
-        FieldType itemType = field.itemType();
-        if (itemType == null) {
-          issues.add(new ValidationIssue(path + ".itemType", "itemType is required for ARRAY"));
-        } else {
-          if (itemType == FieldType.ARRAY) {
-            issues.add(new ValidationIssue(path + ".itemType", "ARRAY itemType cannot be ARRAY"));
-          }
-          if (!list(field.itemsEnum()).isEmpty() && itemType != FieldType.STRING) {
-            issues.add(new ValidationIssue(path + ".itemsEnum", "itemsEnum is only allowed when itemType=STRING"));
-          }
-          if (itemType == FieldType.STRUCT) {
-            if (hasStructRef && hasInlineFields) {
-              issues.add(new ValidationIssue(path, "Cannot define both structRef and fields on the same field"));
-            }
-            if (!hasStructRef && !hasInlineFields) {
-              issues.add(new ValidationIssue(path, "ARRAY with itemType STRUCT must define either structRef or fields"));
-            }
-            if (hasStructRef && !structIds.contains(field.structRef().trim())) {
-              issues.add(new ValidationIssue(path + ".structRef", "unknown structRef: " + field.structRef()));
-            }
-          } else {
-            rejectPresent(field.structRef(), path + ".structRef", "structRef is only allowed when itemType=STRUCT", issues);
-            rejectPresent(field.fields(), path + ".fields", "fields is only allowed when itemType=STRUCT", issues);
+  @Override
+  public List<ServiceAccess> services(String subject) {
+    String resolvedSubject = resolveSubject(subject);
+    List<ServiceAccess> rows = new ArrayList<>();
+    for (ServiceDescriptor descriptor : listServiceDescriptors()) {
+      Map<ServiceEntitlements.Transport, Set<ServiceAction>> byTransport =
+          new EnumMap<>(ServiceEntitlements.Transport.class);
+      for (ServiceEntitlements.Transport transport : transportsForService(descriptor.serviceType())) {
+        EnumSet<ServiceAction> allowed = EnumSet.noneOf(ServiceAction.class);
+        for (ServiceAction action : ServiceAction.values()) {
+          if (isServiceActionAllowed(resolvedSubject, descriptor.serviceId(), transport, action)) {
+            allowed.add(action);
           }
         }
-        validateArrayDefault(field, path + ".default", issues);
+        if (!allowed.isEmpty()) {
+          byTransport.put(transport, Set.copyOf(allowed));
+        }
       }
+      rows.add(
+          new ServiceAccess(
+              descriptor.serviceId(),
+              descriptor.group(),
+              descriptor.name(),
+              descriptor.serviceType() == null ? null : descriptor.serviceType().name(),
+              descriptor.online(),
+              byTransport.isEmpty() ? Map.of() : Map.copyOf(byTransport)));
     }
-
-    if (field.type() != FieldType.STRING) {
-      rejectPresent(field.pattern(), path + ".pattern", "pattern is only allowed for STRING", issues);
-    }
-
-    if (field.type() != FieldType.STRUCT
-        && !(field.type() == FieldType.ARRAY && field.itemType() == FieldType.STRUCT)) {
-      rejectPresent(field.fields(), path + ".fields", "fields is only allowed for STRUCT or ARRAY<STRUCT>", issues);
-      rejectPresent(field.structRef(), path + ".structRef", "structRef is only allowed for STRUCT or ARRAY<STRUCT>", issues);
-    }
-
-    if (field.type() != FieldType.ARRAY) {
-      rejectPresent(field.itemType(), path + ".itemType", "itemType is only allowed for ARRAY", issues);
-      rejectPresent(field.itemsEnum(), path + ".itemsEnum", "itemsEnum is only allowed for ARRAY<STRING>", issues);
-      rejectPresent(field.minItems(), path + ".minItems", "minItems is only allowed for ARRAY", issues);
-      rejectPresent(field.maxItems(), path + ".maxItems", "maxItems is only allowed for ARRAY", issues);
-    }
+    return List.copyOf(rows);
   }
 
-  private static void validateArrayDefault(Field field, String path, List<ValidationIssue> issues) {
-    if (field.defaultValue() == null) {
-      return;
-    }
-    if (!field.defaultValue().isArray()) {
-      issues.add(new ValidationIssue(path, "default must be an array"));
-      return;
-    }
-    if (field.itemType() == null) {
-      return;
-    }
-    for (int i = 0; i < field.defaultValue().size(); i++) {
-      JsonNode item = field.defaultValue().get(i);
-      String itemPath = path + "[" + i + "]";
-      switch (field.itemType()) {
-        case STRING -> {
-          if (!item.isTextual()) {
-            issues.add(new ValidationIssue(itemPath, "item must be a string"));
-          } else if (!list(field.itemsEnum()).isEmpty() && !field.itemsEnum().contains(item.asText())) {
-            issues.add(new ValidationIssue(itemPath, "item must be one of itemsEnum"));
-          }
-        }
-        case INTEGER -> {
-          if (!item.isIntegralNumber()) {
-            issues.add(new ValidationIssue(itemPath, "item must be an integer"));
-          }
-        }
-        case NUMBER -> {
-          if (!item.isNumber()) {
-            issues.add(new ValidationIssue(itemPath, "item must be numeric"));
-          }
-        }
-        case BOOLEAN -> {
-          if (!item.isBoolean()) {
-            issues.add(new ValidationIssue(itemPath, "item must be boolean"));
-          }
-        }
-        case STRUCT -> {
-          if (!item.isObject()) {
-            issues.add(new ValidationIssue(itemPath, "item must be an object"));
-          }
-        }
-        case ARRAY -> issues.add(new ValidationIssue(itemPath, "ARRAY itemType cannot be ARRAY"));
-      }
-    }
+  @Override
+  public List<String> callableServices() {
+    return callableServices(null);
   }
 
-  private static void detectCircularStructReferences(Map<String, Struct> structById, List<ValidationIssue> issues) {
-    if (structById.isEmpty()) {
-      return;
-    }
-    Set<String> visiting = new LinkedHashSet<>();
-    Set<String> visited = new HashSet<>();
-    Deque<String> stack = new ArrayDeque<>();
-    for (String id : structById.keySet()) {
-      if (visited.contains(id)) {
+  @Override
+  public List<String> callableServices(String subject) {
+    List<String> allowed = new ArrayList<>();
+    for (ServiceAccess access : services(subject)) {
+      if (access == null || access.allowedActionsByTransport().isEmpty()) {
         continue;
       }
-      List<String> cycle = findCycle(id, structById, visiting, visited, stack);
-      if (!cycle.isEmpty()) {
-        issues.add(
-            new ValidationIssue(
-                "schema.structs",
-                "Circular STRUCT reference detected: " + String.join(" -> ", cycle)));
-        return;
+      boolean callable = false;
+      for (Set<ServiceAction> actions : access.allowedActionsByTransport().values()) {
+        if (actions != null && actions.contains(ServiceAction.INVOKE)) {
+          callable = true;
+          break;
+        }
+      }
+      if (callable) {
+        allowed.add(access.serviceId());
       }
     }
+    return List.copyOf(allowed);
   }
 
-  private static List<String> findCycle(
-      String current,
-      Map<String, Struct> structById,
-      Set<String> visiting,
-      Set<String> visited,
-      Deque<String> stack) {
-    if (visiting.contains(current)) {
-      List<String> path = new ArrayList<>(stack);
-      int index = path.indexOf(current);
-      if (index < 0) {
-        return List.of(current, current);
+  @Override
+  public boolean canCallService(String serviceId) {
+    return canCallService(null, serviceId);
+  }
+
+  @Override
+  public boolean canCallService(String subject, String serviceId) {
+    String canonicalService = ServiceEntitlements.requireServiceResourceId(serviceId);
+    String resolvedSubject = resolveSubject(subject);
+    Set<ServiceEntitlements.Transport> transports = transportsForService(resolveServiceType(canonicalService));
+    if (transports.isEmpty()) {
+      transports = Set.of(ServiceEntitlements.Transport.values());
+    }
+    for (ServiceEntitlements.Transport transport : transports) {
+      if (isServiceActionAllowed(resolvedSubject, canonicalService, transport, ServiceAction.INVOKE)) {
+        return true;
       }
-      List<String> cycle = new ArrayList<>(path.subList(index, path.size()));
-      cycle.add(current);
-      return List.copyOf(cycle);
     }
-    if (visited.contains(current)) {
-      return List.of();
+    return false;
+  }
+
+  @Override
+  public boolean canCallService(
+      String subject,
+      String serviceId,
+      ServiceEntitlements.Transport transport,
+      ServiceAction action) {
+    if (transport == null || action == null) {
+      throw new IllegalArgumentException("transport and action are required");
+    }
+    String canonicalService = ServiceEntitlements.requireServiceResourceId(serviceId);
+    return isServiceActionAllowed(resolveSubject(subject), canonicalService, transport, action);
+  }
+
+  @Override
+  public boolean isServiceOnline(String serviceId) {
+    return onlineServiceKeys().contains(serviceKeyFromResourceId(serviceId));
+  }
+
+  private Map<String, DatasetServiceRoute> resolveDatasetRoutes(
+      String subject, List<DatasetDescriptor> datasets) {
+    if (datasets == null || datasets.isEmpty()) {
+      return Map.of();
+    }
+    Map<String, DatasetServiceRoute> selections = new LinkedHashMap<>();
+    Map<String, List<DatasetDescriptor>> byNamespaceAndName = new HashMap<>();
+    Map<String, List<DatasetDescriptor>> byGroupNamespaceAndName = new HashMap<>();
+    for (DatasetDescriptor dataset : datasets) {
+      if (dataset == null || dataset.datasetId() == null) {
+        continue;
+      }
+      if (dataset.directQuery()) {
+        selections.put(
+            dataset.datasetId(),
+            new DatasetServiceRoute(
+                dataset.datasetId(),
+                DIRECT_QUERY_SERVICE_ID,
+                DIRECT_QUERY_SERVICE_DISPLAY,
+                DIRECT_QUERY_SERVICE_DISPLAY,
+                1,
+                true));
+        continue;
+      }
+      String key = datasetKey(dataset.namespace(), dataset.name());
+      if (key == null) {
+        continue;
+      }
+      byNamespaceAndName.computeIfAbsent(key, ignored -> new ArrayList<>()).add(dataset);
+      String grouped = groupedDatasetKey(dataset.group(), dataset.namespace(), dataset.name());
+      if (grouped != null) {
+        byGroupNamespaceAndName.computeIfAbsent(grouped, ignored -> new ArrayList<>()).add(dataset);
+      }
+    }
+    if (byNamespaceAndName.isEmpty()) {
+      return selections;
     }
 
-    visiting.add(current);
-    stack.addLast(current);
-
-    Struct struct = structById.get(current);
-    if (struct != null) {
-      for (String ref : referencedStructIds(struct.fields())) {
-        if (!structById.containsKey(ref)) {
+    Map<String, Map<String, DatasetServiceCandidate>> candidatesByDatasetId = new HashMap<>();
+    for (ServiceReference serviceRef : listAvailableArrowServices(subject)) {
+      Set<String> supportedKeys = fetchSupportedDatasetKeys(subject, serviceRef);
+      if (supportedKeys.isEmpty()) {
+        continue;
+      }
+      for (String key : supportedKeys) {
+        List<DatasetDescriptor> matches =
+            byGroupNamespaceAndName.get(groupedDatasetKey(serviceRef.group(), key));
+        if (matches == null || matches.isEmpty()) {
+          matches = byNamespaceAndName.get(key);
+        }
+        if (matches == null || matches.isEmpty()) {
           continue;
         }
-        List<String> cycle = findCycle(ref, structById, visiting, visited, stack);
-        if (!cycle.isEmpty()) {
-          return cycle;
+        for (DatasetDescriptor match : matches) {
+          Map<String, DatasetServiceCandidate> perDataset =
+              candidatesByDatasetId.computeIfAbsent(match.datasetId(), ignored -> new LinkedHashMap<>());
+          perDataset.putIfAbsent(
+              serviceRef.serviceId(),
+              new DatasetServiceCandidate(
+                  serviceRef.serviceId(),
+                  serviceRef.serviceDisplay(),
+                  serviceRef.serviceType(),
+                  Strings.trimToNull(match.group()) != null
+                      && Strings.trimToNull(match.group()).equalsIgnoreCase(serviceRef.group()),
+                  serviceRef.online()));
         }
       }
     }
-
-    stack.removeLast();
-    visiting.remove(current);
-    visited.add(current);
-    return List.of();
-  }
-
-  private static List<String> referencedStructIds(List<Field> fields) {
-    List<String> refs = new ArrayList<>();
-    collectStructRefs(fields, refs);
-    return List.copyOf(refs);
-  }
-
-  private static void collectStructRefs(List<Field> fields, List<String> refs) {
-    for (Field field : list(fields)) {
-      if (field == null || field.type() == null) {
+    for (Map.Entry<String, Map<String, DatasetServiceCandidate>> entry :
+        candidatesByDatasetId.entrySet()) {
+      String datasetId = entry.getKey();
+      List<DatasetServiceCandidate> candidates = List.copyOf(entry.getValue().values());
+      if (candidates.isEmpty()) {
         continue;
       }
-      if (field.type() == FieldType.STRUCT) {
-        if (!isBlank(field.structRef())) {
-          refs.add(field.structRef().trim());
-        } else {
-          collectStructRefs(field.fields(), refs);
-        }
+      DatasetServiceCandidate selected =
+          candidates.stream().min(this::compareServiceCandidates).orElse(null);
+      if (selected == null) {
         continue;
       }
-      if (field.type() == FieldType.ARRAY && field.itemType() == FieldType.STRUCT) {
-        if (!isBlank(field.structRef())) {
-          refs.add(field.structRef().trim());
-        } else {
-          collectStructRefs(field.fields(), refs);
+      int serviceCount = candidates.size();
+      String display =
+          serviceCount > 1
+              ? selected.serviceDisplay() + " (+" + (serviceCount - 1) + ")"
+              : selected.serviceDisplay();
+      selections.put(
+          datasetId,
+          new DatasetServiceRoute(
+              datasetId,
+              selected.serviceId(),
+              display,
+              selected.serviceType() == null ? null : selected.serviceType().name(),
+              serviceCount,
+              selected.online()));
+    }
+    return selections;
+  }
+
+  private List<ServiceReference> listAvailableArrowServices(String subject) {
+    Set<String> onlineKeys = onlineServiceKeys();
+    if (onlineKeys.isEmpty()) {
+      return List.of();
+    }
+    List<ServiceReference> resolved = new ArrayList<>();
+    for (ServiceDescriptor descriptor : listServiceDescriptors()) {
+      if (descriptor == null || descriptor.serviceType() == null) {
+        continue;
+      }
+      if (descriptor.serviceType() != DefinitionService.ServiceType.ARROW_FLIGHT_SQL
+          && descriptor.serviceType() != DefinitionService.ServiceType.ARROW_FLIGHT) {
+        continue;
+      }
+      if (!onlineKeys.contains(serviceKey(descriptor.group(), descriptor.name()))) {
+        continue;
+      }
+      ServiceEntitlements.Transport requiredTransport =
+          descriptor.serviceType() == DefinitionService.ServiceType.ARROW_FLIGHT_SQL
+              ? ServiceEntitlements.Transport.ARROW_FLIGHT_SQL
+              : ServiceEntitlements.Transport.ARROW_FLIGHT;
+      if (!isServiceActionAllowed(subject, descriptor.serviceId(), requiredTransport, ServiceAction.INVOKE)) {
+        continue;
+      }
+      resolved.add(
+          new ServiceReference(
+              descriptor.group(),
+              descriptor.name(),
+              descriptor.serviceId(),
+              descriptor.serviceType(),
+              descriptor.group() + "/" + descriptor.name(),
+              descriptor.online()));
+    }
+    resolved.sort(
+        Comparator.comparing(
+                (ServiceReference value) -> Strings.firstNonBlank(value.group(), ""),
+                String.CASE_INSENSITIVE_ORDER)
+            .thenComparing(
+                value -> Strings.firstNonBlank(value.serviceName(), ""),
+                String.CASE_INSENSITIVE_ORDER));
+    return List.copyOf(resolved);
+  }
+
+  private Set<String> fetchSupportedDatasetKeys(String subject, ServiceReference serviceRef) {
+    if (serviceRef == null
+        || serviceRef.serviceType() != DefinitionService.ServiceType.ARROW_FLIGHT_SQL) {
+      return Set.of();
+    }
+    String serviceKey = serviceKey(serviceRef.group(), serviceRef.serviceName());
+    if (serviceKey == null) {
+      return Set.of();
+    }
+    String cacheKey = tableCacheKey(serviceKey, subject);
+    long nowMs = System.currentTimeMillis();
+    CachedServiceTables cached = cachedServiceTables(cacheKey, nowMs);
+    if (cached != null) {
+      return cached.datasetKeys();
+    }
+    if (isServiceTableLookupCoolingDown(cacheKey, nowMs)) {
+      return Set.of();
+    }
+    try (RemoteTabularManager tabular = newRemoteTabularManager(serviceRef)) {
+      List<TabularTableMetadata> tables = runAsSubject(resolveSubject(subject), tabular::listTables);
+      Set<String> supported = new HashSet<>();
+      if (tables != null) {
+        for (TabularTableMetadata table : tables) {
+          if (table == null) {
+            continue;
+          }
+          String key = datasetKey(table.schemaName(), table.tableName());
+          if (key != null) {
+            supported.add(key);
+          }
         }
       }
-    }
-  }
-
-  private static ObjectNode toCanonicalGroup(Group group, ObjectMapper mapper) {
-    ObjectNode node = mapper.createObjectNode();
-    node.put("id", group.id());
-    node.put("label", group.label());
-    if (!isBlank(group.description())) {
-      node.put("description", group.description());
-    }
-    node.put("order", group.order());
-    return node;
-  }
-
-  private static ObjectNode toCanonicalStruct(Struct struct, ObjectMapper mapper) {
-    ObjectNode node = mapper.createObjectNode();
-    node.put("id", struct.id());
-    node.put("label", struct.label());
-    if (!isBlank(struct.description())) {
-      node.put("description", struct.description());
-    }
-    ArrayNode fields = node.putArray("fields");
-    sortedFields(struct.fields()).forEach(field -> fields.add(toCanonicalField(field, mapper)));
-    return node;
-  }
-
-  private static ObjectNode toCanonicalField(Field field, ObjectMapper mapper) {
-    ObjectNode node = mapper.createObjectNode();
-    node.put("key", field.key());
-    node.put("label", field.label());
-    if (!isBlank(field.description())) {
-      node.put("description", field.description());
-    }
-    if (!isBlank(field.groupId())) {
-      node.put("groupId", field.groupId());
-    }
-    node.put("order", field.order());
-    node.put("type", field.type().name());
-    node.put("required", Boolean.TRUE.equals(field.required()));
-    node.put("editable", !Boolean.FALSE.equals(field.editable()));
-    if (!list(field.enumValues()).isEmpty()) {
-      ArrayNode enumNode = node.putArray("enum");
-      field.enumValues().forEach(enumNode::add);
-    }
-    if (field.defaultValue() != null) {
-      node.set("default", copy(field.defaultValue()));
-    }
-    if (field.min() != null) {
-      node.put("min", field.min());
-    }
-    if (field.max() != null) {
-      node.put("max", field.max());
-    }
-    if (!isBlank(field.pattern())) {
-      node.put("pattern", field.pattern());
-    }
-
-    if (field.type() == FieldType.STRUCT) {
-      if (!isBlank(field.structRef())) {
-        node.put("structRef", field.structRef().trim());
-      } else {
-        ArrayNode fields = node.putArray("fields");
-        sortedFields(field.fields()).forEach(child -> fields.add(toCanonicalField(child, mapper)));
-      }
-    }
-
-    if (field.type() == FieldType.ARRAY) {
-      node.put("itemType", field.itemType().name());
-      if (field.itemType() == FieldType.STRING && !list(field.itemsEnum()).isEmpty()) {
-        ArrayNode itemsEnum = node.putArray("itemsEnum");
-        field.itemsEnum().forEach(itemsEnum::add);
-      }
-      if (field.itemType() == FieldType.STRUCT) {
-        if (!isBlank(field.structRef())) {
-          node.put("structRef", field.structRef().trim());
-        } else {
-          ArrayNode fields = node.putArray("fields");
-          sortedFields(field.fields()).forEach(child -> fields.add(toCanonicalField(child, mapper)));
-        }
-      }
-      if (field.minItems() != null) {
-        node.put("minItems", field.minItems());
-      }
-      if (field.maxItems() != null) {
-        node.put("maxItems", field.maxItems());
-      }
-    }
-    return node;
-  }
-
-  private static void unknownKeys(JsonNode node, Set<String> allowed, String path, List<ValidationIssue> issues) {
-    node.fieldNames().forEachRemaining(key -> {
-      if (!allowed.contains(key)) {
-        issues.add(new ValidationIssue(path + "." + key, "unknown property"));
-      }
-    });
-  }
-
-  private static String requiredText(JsonNode node, String key, String path, List<ValidationIssue> issues) {
-    JsonNode value = node.get(key);
-    if (value == null || value.isNull()) {
-      issues.add(new ValidationIssue(path, key + " is required"));
-      return null;
-    }
-    if (!value.isTextual() || value.asText().trim().isEmpty()) {
-      issues.add(new ValidationIssue(path, key + " must be a non-empty string"));
-      return null;
-    }
-    return value.asText().trim();
-  }
-
-  private static String optionalText(JsonNode node, String key, String path, List<ValidationIssue> issues) {
-    if (!node.has(key)) {
-      return null;
-    }
-    JsonNode value = node.get(key);
-    if (value == null || value.isNull()) {
-      return null;
-    }
-    if (!value.isTextual()) {
-      issues.add(new ValidationIssue(path, key + " must be a string"));
-      return null;
-    }
-    String normalized = value.asText().trim();
-    return normalized.isEmpty() ? null : normalized;
-  }
-
-  private static Integer requiredInteger(JsonNode node, String key, String path, List<ValidationIssue> issues) {
-    JsonNode value = node.get(key);
-    if (value == null || value.isNull()) {
-      issues.add(new ValidationIssue(path, key + " is required"));
-      return null;
-    }
-    if (!value.isIntegralNumber()) {
-      issues.add(new ValidationIssue(path, key + " must be an integer"));
-      return null;
-    }
-    return value.asInt();
-  }
-
-  private static Integer optionalInteger(JsonNode node, String key, String path, List<ValidationIssue> issues) {
-    if (!node.has(key)) {
-      return null;
-    }
-    JsonNode value = node.get(key);
-    if (value == null || value.isNull()) {
-      return null;
-    }
-    if (!value.isIntegralNumber()) {
-      issues.add(new ValidationIssue(path, key + " must be an integer"));
-      return null;
-    }
-    return value.asInt();
-  }
-
-  private static BigDecimal optionalNumber(JsonNode node, String key, String path, List<ValidationIssue> issues) {
-    if (!node.has(key)) {
-      return null;
-    }
-    JsonNode value = node.get(key);
-    if (value == null || value.isNull()) {
-      return null;
-    }
-    if (!value.isNumber()) {
-      issues.add(new ValidationIssue(path, key + " must be numeric"));
-      return null;
-    }
-    return value.decimalValue();
-  }
-
-  private static Boolean requiredBoolean(JsonNode node, String key, String path, List<ValidationIssue> issues) {
-    JsonNode value = node.get(key);
-    if (value == null || value.isNull()) {
-      issues.add(new ValidationIssue(path, key + " is required"));
-      return null;
-    }
-    if (!value.isBoolean()) {
-      issues.add(new ValidationIssue(path, key + " must be boolean"));
-      return null;
-    }
-    return value.asBoolean();
-  }
-
-  private static Boolean optionalBooleanDefaultTrue(
-      JsonNode node, String key, String path, List<ValidationIssue> issues) {
-    if (!node.has(key)) {
-      return Boolean.TRUE;
-    }
-    JsonNode value = node.get(key);
-    if (value == null || value.isNull()) {
-      return Boolean.TRUE;
-    }
-    if (!value.isBoolean()) {
-      issues.add(new ValidationIssue(path, key + " must be boolean"));
-      return Boolean.TRUE;
-    }
-    return value.asBoolean();
-  }
-
-  private static FieldType requiredType(
-      JsonNode node, String key, String path, List<ValidationIssue> issues, boolean required) {
-    if (!node.has(key)) {
-      if (required) {
-        issues.add(new ValidationIssue(path, key + " is required"));
-      }
-      return null;
-    }
-    JsonNode value = node.get(key);
-    if (value == null || value.isNull()) {
-      if (required) {
-        issues.add(new ValidationIssue(path, key + " is required"));
-      }
-      return null;
-    }
-    if (!value.isTextual()) {
-      issues.add(new ValidationIssue(path, key + " must be a supported type"));
-      return null;
-    }
-    try {
-      FieldType type = FieldType.valueOf(value.asText().trim());
-      if ("itemType".equals(key) && type == FieldType.ARRAY) {
-        issues.add(new ValidationIssue(path, "ARRAY itemType cannot be ARRAY"));
-        return null;
-      }
-      return type;
+      cacheServiceTables(cacheKey, supported, nowMs);
+      clearServiceTableFailureCooldown(cacheKey, nowMs);
+      return supported;
     } catch (Exception ex) {
-      issues.add(new ValidationIssue(path, "unsupported type: " + value.asText()));
+      markServiceTableFailure(cacheKey, nowMs);
+      CachedServiceTables fallback = cachedServiceTables(cacheKey, nowMs);
+      LOGGER.debug(
+          "[Access][ServiceTables][LookupFailed] service={} subject={} message={} fallbackDatasetCount={}",
+          serviceRef.serviceId(),
+          resolveSubject(subject),
+          Strings.firstNonBlank(ex.getMessage(), ex.getClass().getSimpleName()),
+          fallback == null ? 0 : fallback.datasetKeys().size());
+      return fallback == null ? Set.of() : fallback.datasetKeys();
+    }
+  }
+
+  private RemoteTabularManager newRemoteTabularManager(ServiceReference serviceRef) {
+    Objects.requireNonNull(serviceRef, "serviceRef");
+    DiscoveryCache cache = requireDiscoveryCache();
+    SessionContext context = session.context();
+    String sessionGroup = Strings.firstNonBlank(context == null ? null : context.getGroup(), "platform");
+    String sessionApp = Strings.firstNonBlank(context == null ? null : context.getAppName(), "app");
+    String sessionInstance =
+        Strings.firstNonBlank(context == null ? null : context.getInstance(), "instance");
+    String sessionEnv = Strings.trimToNull(context == null ? null : context.getEnv());
+    String sessionRegion = Strings.trimToNull(context == null ? null : context.getRegion());
+    String sessionSite = Strings.trimToNull(context == null ? null : context.getSite());
+    DataOptions.ServiceOptions serviceOptions = serviceOptionsFor(serviceRef, sessionGroup);
+    ServiceInstanceResolver resolver = resolveDynamicServiceResolver();
+    return new RemoteTabularManager(
+        session,
+        cache,
+        sessionGroup,
+        sessionApp,
+        sessionInstance,
+        sessionEnv,
+        sessionRegion,
+        sessionSite,
+        serviceOptions,
+        session.kerberosPrincipal(),
+        session.kerberosKeytab(),
+        resolver);
+  }
+
+  private DataOptions.ServiceOptions serviceOptionsFor(
+      ServiceReference serviceRef, String defaultGroup) {
+    String group = Strings.firstNonBlank(serviceRef.group(), defaultGroup);
+    ServiceRunOptions.Builder optionsBuilder = ServiceRunOptions.builder();
+    if (group != null) {
+      optionsBuilder.withGroup(group);
+    }
+    Path trustCert = session.trustCert();
+    if (trustCert != null) {
+      optionsBuilder.withTlsTrustCert(trustCert).withTlsClientTrustCert(trustCert);
+    }
+    return DataOptions.ServiceOptions.builder()
+        .withEnabled(true)
+        .withQueryService(serviceRef.serviceName())
+        .withServiceOptions(optionsBuilder.build())
+        .build();
+  }
+
+  private ServiceInstanceResolver resolveDynamicServiceResolver() {
+    ServiceInstanceResolver existing = dynamicServiceResolver;
+    if (existing != null) {
+      return existing;
+    }
+    synchronized (this) {
+      existing = dynamicServiceResolver;
+      if (existing != null) {
+        return existing;
+      }
+      ServiceInstanceResolver fromSession = session.serviceInstanceResolverIfInitialized();
+      if (fromSession != null) {
+        dynamicServiceResolver = fromSession;
+        ownsDynamicServiceResolver = false;
+        return fromSession;
+      }
+      ControlConnection control = session.controlPlaneConnection();
+      if (control == null) {
+        throw new IllegalStateException("Session control plane is not initialized");
+      }
+      ServiceInstanceResolver created = new ServiceInstanceResolver(control, session.statusScheduler());
+      dynamicServiceResolver = created;
+      ownsDynamicServiceResolver = true;
+      return created;
+    }
+  }
+
+  private boolean isServiceActionAllowed(
+      String subject,
+      String serviceResourceId,
+      ServiceEntitlements.Transport transport,
+      ServiceAction action) {
+    try {
+      ServiceEntitlements entitlements = requireServiceEntitlements();
+      ServiceEntitlements.Identity identity = new ServiceEntitlements.Identity(subject, null);
+      ServiceEntitlements.Request request =
+          new ServiceEntitlements.Request(
+              transport,
+              toCoreAction(action),
+              ServiceEntitlements.requireServiceResourceId(serviceResourceId),
+              null,
+              null,
+              null,
+              Map.of(),
+              Map.of());
+      ServiceEntitlements.Decision decision = entitlements.authorize(identity, request);
+      return decision != null && decision.allowed();
+    } catch (Exception ex) {
+      return false;
+    }
+  }
+
+  private static ServiceEntitlements.Action toCoreAction(ServiceAction action) {
+    return switch (action) {
+      case START -> ServiceEntitlements.Action.START;
+      case INVOKE -> ServiceEntitlements.Action.INVOKE;
+      case READ -> ServiceEntitlements.Action.READ;
+      case WRITE -> ServiceEntitlements.Action.WRITE;
+    };
+  }
+
+  private DefinitionService.ServiceType resolveServiceType(String serviceResourceId) {
+    String canonical = ServiceEntitlements.requireServiceResourceId(serviceResourceId);
+    CanonicalIds.ParsedId parsed = CanonicalIds.parse(canonical);
+    if (!parsed.isService()) {
       return null;
     }
+    DiscoveryCache cache = discoveryCacheSupplier.get();
+    if (cache == null) {
+      return null;
+    }
+    DefinitionService definition =
+        cache.get(DefinitionService.class, parsed.group(), parsed.name()).orElse(null);
+    return definition == null ? null : definition.serviceType();
   }
 
-  private static List<String> stringArray(
-      JsonNode node, String path, boolean required, List<ValidationIssue> issues) {
-    if (node == null || node.isNull() || node.isMissingNode()) {
-      if (required) {
-        issues.add(new ValidationIssue(path, "value is required"));
+  private Set<ServiceEntitlements.Transport> transportsForService(
+      DefinitionService.ServiceType serviceType) {
+    if (serviceType == null) {
+      return Set.of();
+    }
+    return switch (serviceType) {
+      case GRPC -> Set.of(ServiceEntitlements.Transport.GRPC);
+      case AMPS -> Set.of(ServiceEntitlements.Transport.AMPS);
+      case ARROW_FLIGHT -> Set.of(ServiceEntitlements.Transport.ARROW_FLIGHT);
+      case ARROW_FLIGHT_INGEST -> Set.of(ServiceEntitlements.Transport.ARROW_FLIGHT_INGEST);
+      case ARROW_FLIGHT_SQL -> Set.of(ServiceEntitlements.Transport.ARROW_FLIGHT_SQL);
+      case UNKNOWN -> Set.of();
+    };
+  }
+
+  private List<DatasetDescriptor> listDatasetDescriptors() {
+    DiscoveryCache cache = discoveryCacheSupplier.get();
+    if (cache == null) {
+      return List.of();
+    }
+    List<DatasetDescriptor> rows = new ArrayList<>();
+    for (DefinitionDataset definition : cache.list(DefinitionDataset.class)) {
+      if (definition == null || definition.envelope() == null) {
+        continue;
       }
+      if (Boolean.FALSE.equals(definition.envelope().enabled())) {
+        continue;
+      }
+      String group = Strings.trimToNull(definition.envelope().group());
+      String namespace =
+          Strings.firstNonBlank(
+              Strings.trimToNull(definition.namespace()), namespaceFromEnvelopeName(definition.envelope()));
+      String name = datasetName(definition);
+      if (group == null || namespace == null || name == null) {
+        continue;
+      }
+      String datasetId;
+      try {
+        datasetId = DataEntitlements.canonicalDatasetResourceId(group, namespace, name);
+      } catch (Exception ex) {
+        continue;
+      }
+      rows.add(
+          new DatasetDescriptor(
+              datasetId, group, namespace, name, prefersDirectQuery(definition)));
+    }
+    rows.sort(
+        Comparator.comparing(DatasetDescriptor::group, String.CASE_INSENSITIVE_ORDER)
+            .thenComparing(DatasetDescriptor::namespace, String.CASE_INSENSITIVE_ORDER)
+            .thenComparing(DatasetDescriptor::name, String.CASE_INSENSITIVE_ORDER));
+    return List.copyOf(rows);
+  }
+
+  private List<ServiceDescriptor> listServiceDescriptors() {
+    DiscoveryCache cache = discoveryCacheSupplier.get();
+    if (cache == null) {
       return List.of();
     }
-    if (!node.isArray()) {
-      issues.add(new ValidationIssue(path, "value must be an array"));
-      return List.of();
+    Set<String> online = onlineServiceKeys();
+    List<ServiceDescriptor> rows = new ArrayList<>();
+    for (DefinitionService service : cache.list(DefinitionService.class)) {
+      if (service == null || service.envelope() == null) {
+        continue;
+      }
+      if (Boolean.FALSE.equals(service.envelope().enabled())) {
+        continue;
+      }
+      String group = Strings.trimToNull(service.envelope().group());
+      String name = Strings.trimToNull(service.envelope().name());
+      if (group == null || name == null) {
+        continue;
+      }
+      String canonical = Strings.firstNonBlank(service.resourceId(), "service:" + group + "/" + name);
+      String serviceId;
+      try {
+        serviceId = ServiceEntitlements.requireServiceResourceId(canonical);
+      } catch (Exception ex) {
+        continue;
+      }
+      rows.add(
+          new ServiceDescriptor(
+              serviceId,
+              group,
+              name,
+              service.serviceType(),
+              online.contains(serviceKey(group, name))));
     }
-    List<String> values = new ArrayList<>();
-    for (int i = 0; i < node.size(); i++) {
-      JsonNode item = node.get(i);
-      String itemPath = path + "[" + i + "]";
-      if (item == null || item.isNull() || !item.isTextual() || item.asText().trim().isEmpty()) {
-        issues.add(new ValidationIssue(itemPath, "value must be a non-empty string"));
+    rows.sort(
+        Comparator.comparing(ServiceDescriptor::group, String.CASE_INSENSITIVE_ORDER)
+            .thenComparing(ServiceDescriptor::name, String.CASE_INSENSITIVE_ORDER));
+    return List.copyOf(rows);
+  }
+
+  private Set<String> onlineServiceKeys() {
+    ServiceStatusCache cache = serviceStatusCacheSupplier.get();
+    if (cache == null) {
+      return Set.of();
+    }
+    Set<String> keys = new HashSet<>();
+    for (ServiceStatusRow row : cache.snapshot()) {
+      if (row == null) {
+        continue;
+      }
+      if (!"ONLINE".equalsIgnoreCase(Strings.trimToNull(row.state()))) {
+        continue;
+      }
+      String key = serviceKey(row.group(), row.name());
+      if (key != null) {
+        keys.add(key);
+      }
+    }
+    return keys;
+  }
+
+  private String resolveSubject(String requestedSubject) {
+    String explicit = Strings.trimToNull(requestedSubject);
+    if (explicit != null) {
+      return explicit;
+    }
+    String current =
+        UserContext.get().map(UserPrincipal::username).map(Strings::trimToNull).orElse(null);
+    if (current != null) {
+      return current;
+    }
+    SessionContext context = session.context();
+    String group = Strings.trimToNull(context == null ? null : context.getGroup());
+    String appName = Strings.trimToNull(context == null ? null : context.getAppName());
+    if (group != null && appName != null) {
+      try {
+        return CanonicalIds.appPrincipal(group, appName);
+      } catch (Exception ignored) {
+      }
+    }
+    return "app:unknown/unknown";
+  }
+
+  private DiscoveryCache requireDiscoveryCache() {
+    DiscoveryCache cache = discoveryCacheSupplier.get();
+    if (cache == null) {
+      throw new IllegalStateException("DiscoveryCache is not initialized");
+    }
+    return cache;
+  }
+
+  private EntitlementsManagerImpl requireEntitlementsManager() {
+    EntitlementsManagerImpl manager = entitlementsSupplier.get();
+    if (manager == null) {
+      throw new IllegalStateException("Entitlements manager is not initialized");
+    }
+    return manager;
+  }
+
+  private DataEntitlements requireDataEntitlements() {
+    return requireEntitlementsManager().dataEntitlements();
+  }
+
+  private ServiceEntitlements requireServiceEntitlements() {
+    return requireEntitlementsManager().serviceEntitlements();
+  }
+
+  private int compareServiceCandidates(DatasetServiceCandidate left, DatasetServiceCandidate right) {
+    int leftGroup = left.sameGroup() ? 0 : 1;
+    int rightGroup = right.sameGroup() ? 0 : 1;
+    if (leftGroup != rightGroup) {
+      return Integer.compare(leftGroup, rightGroup);
+    }
+    int leftType = serviceTypeRank(left.serviceType());
+    int rightType = serviceTypeRank(right.serviceType());
+    if (leftType != rightType) {
+      return Integer.compare(leftType, rightType);
+    }
+    return Strings.firstNonBlank(left.serviceDisplay(), "")
+        .compareToIgnoreCase(Strings.firstNonBlank(right.serviceDisplay(), ""));
+  }
+
+  private static int serviceTypeRank(DefinitionService.ServiceType serviceType) {
+    if (serviceType == null) {
+      return 99;
+    }
+    return switch (serviceType) {
+      case ARROW_FLIGHT_SQL -> 0;
+      case ARROW_FLIGHT -> 1;
+      default -> 99;
+    };
+  }
+
+  private CachedServiceTables cachedServiceTables(String cacheKey, long nowMs) {
+    if (cacheKey == null) {
+      return null;
+    }
+    CachedServiceTables cached = serviceTableCache.get(cacheKey);
+    if (cached == null) {
+      return null;
+    }
+    if (nowMs - cached.loadedAtMs() > SERVICE_TABLE_CACHE_TTL_MILLIS) {
+      serviceTableCache.remove(cacheKey, cached);
+      return null;
+    }
+    return cached;
+  }
+
+  private boolean isServiceTableLookupCoolingDown(String cacheKey, long nowMs) {
+    if (cacheKey == null) {
+      return false;
+    }
+    Long cooldownUntil = serviceTableFailureCooldownUntilMs.get(cacheKey);
+    if (cooldownUntil == null) {
+      return false;
+    }
+    if (cooldownUntil <= nowMs) {
+      serviceTableFailureCooldownUntilMs.remove(cacheKey, cooldownUntil);
+      return false;
+    }
+    return true;
+  }
+
+  private void cacheServiceTables(String cacheKey, Set<String> datasetKeys, long nowMs) {
+    if (cacheKey == null || datasetKeys == null) {
+      return;
+    }
+    Set<String> normalized =
+        new LinkedHashSet<>(datasetKeys.stream().sorted(String.CASE_INSENSITIVE_ORDER).toList());
+    serviceTableCache.put(cacheKey, new CachedServiceTables(normalized, nowMs));
+  }
+
+  private void markServiceTableFailure(String cacheKey, long nowMs) {
+    if (cacheKey == null) {
+      return;
+    }
+    serviceTableFailureCooldownUntilMs.put(
+        cacheKey, nowMs + SERVICE_TABLE_FAILURE_COOLDOWN_MILLIS);
+  }
+
+  private void clearServiceTableFailureCooldown(String cacheKey, long nowMs) {
+    if (cacheKey == null) {
+      return;
+    }
+    Long cooldownUntil = serviceTableFailureCooldownUntilMs.get(cacheKey);
+    if (cooldownUntil != null && cooldownUntil <= nowMs) {
+      serviceTableFailureCooldownUntilMs.remove(cacheKey, cooldownUntil);
+      return;
+    }
+    serviceTableFailureCooldownUntilMs.remove(cacheKey);
+  }
+
+  private static String tableCacheKey(String serviceKey, String subject) {
+    String normalizedService = Strings.trimToNull(serviceKey);
+    if (normalizedService == null) {
+      return null;
+    }
+    String normalizedSubject = Strings.trimToNull(subject);
+    if (normalizedSubject == null) {
+      return normalizedService;
+    }
+    return normalizedService + "|" + normalizedSubject.toLowerCase(Locale.ROOT);
+  }
+
+  private static <T> T runAsSubject(String subject, Supplier<T> callback) {
+    Objects.requireNonNull(callback, "callback");
+    String normalizedSubject = Strings.trimToNull(subject);
+    if (normalizedSubject == null) {
+      return callback.get();
+    }
+    UserPrincipal previous = UserContext.get().orElse(null);
+    UserContext.set(new UserPrincipal(normalizedSubject, Map.of()));
+    try {
+      return callback.get();
+    } finally {
+      if (previous == null) {
+        UserContext.clear();
       } else {
-        values.add(item.asText().trim());
+        UserContext.set(previous);
       }
     }
-    return List.copyOf(values);
   }
 
-  private static List<String> normalizedStrings(List<String> values, String path, List<ValidationIssue> issues) {
-    if (values == null) {
-      return List.of();
+  private static boolean isAllowed(DataEntitlements.Decision decision) {
+    return decision != null && decision.allowed();
+  }
+
+  private static String datasetName(DefinitionDataset definition) {
+    if (definition == null) {
+      return null;
     }
-    List<String> normalized = new ArrayList<>();
-    for (int i = 0; i < values.size(); i++) {
-      String value = values.get(i);
-      if (isBlank(value)) {
-        issues.add(new ValidationIssue(path + "[" + i + "]", "value must be a non-empty string"));
-      } else {
-        normalized.add(value.trim());
-      }
+    DefinitionEnvelope envelope = definition.envelope();
+    String name = Strings.trimToNull(envelope == null ? null : envelope.name());
+    if (name == null) {
+      return null;
     }
-    return List.copyOf(normalized);
-  }
-
-  private static List<Group> sortedGroups(List<Group> groups) {
-    List<Group> sorted = new ArrayList<>(list(groups));
-    sorted.sort(GROUP_ORDER);
-    return List.copyOf(sorted);
-  }
-
-  private static List<Struct> sortedStructs(List<Struct> structs) {
-    List<Struct> sorted = new ArrayList<>(list(structs));
-    sorted.sort(STRUCT_ORDER);
-    return List.copyOf(sorted);
-  }
-
-  private static List<Field> sortedFields(List<Field> fields) {
-    List<Field> sorted = new ArrayList<>(list(fields));
-    sorted.sort(FIELD_ORDER);
-    return List.copyOf(sorted);
-  }
-
-  private static List<String> sortedDistinctStrings(List<String> values) {
-    LinkedHashSet<String> deduped = new LinkedHashSet<>();
-    list(values).stream().filter(Objects::nonNull).map(String::trim).filter(v -> !v.isEmpty()).forEach(deduped::add);
-    List<String> sorted = new ArrayList<>(deduped);
-    sorted.sort(String::compareTo);
-    return List.copyOf(sorted);
-  }
-
-  private static Field emptyField() {
-    return new Field(
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        List.of(),
-        null,
-        null,
-        null,
-        null,
-        List.of(),
-        null,
-        List.of(),
-        null,
-        null,
-        null);
-  }
-
-  private static JsonNode copy(JsonNode node) {
-    return node == null ? null : node.deepCopy();
-  }
-
-  private static void rejectPresent(Object value, String path, String message, List<ValidationIssue> issues) {
-    if (value == null) {
-      return;
+    int slash = name.indexOf('/');
+    if (slash < 0 || slash == name.length() - 1) {
+      return name;
     }
-    if (value instanceof Collection<?> collection && collection.isEmpty()) {
-      return;
+    return name.substring(slash + 1);
+  }
+
+  private static String namespaceFromEnvelopeName(DefinitionEnvelope envelope) {
+    String name = Strings.trimToNull(envelope == null ? null : envelope.name());
+    if (name == null) {
+      return null;
     }
-    if (value instanceof String text && text.isBlank()) {
-      return;
+    int slash = name.indexOf('/');
+    if (slash <= 0) {
+      return null;
     }
-    issues.add(new ValidationIssue(path, message));
+    return name.substring(0, slash);
   }
 
-  private static boolean isBlank(String value) {
-    return value == null || value.trim().isEmpty();
-  }
-
-  private static <T> List<T> list(List<T> values) {
-    return values == null ? List.of() : values;
-  }
-
-  private static ValidationException validation(String message, List<ValidationIssue> issues) {
-    return new ValidationException(message, issues, null);
-  }
-
-  private static ValidationException validation(String message, List<ValidationIssue> issues, Throwable cause) {
-    return new ValidationException(message, issues, cause);
-  }
-
-  public static final class ValidationException extends IllegalArgumentException {
-    private final List<ValidationIssue> issues;
-
-    private ValidationException(String message, List<ValidationIssue> issues, Throwable cause) {
-      super(message, cause);
-      this.issues = issues == null ? List.of() : List.copyOf(issues);
+  private static String datasetKey(String namespace, String name) {
+    String normalizedNamespace = Strings.trimToNull(namespace);
+    String normalizedName = Strings.trimToNull(name);
+    if (normalizedNamespace == null || normalizedName == null) {
+      return null;
     }
+    return normalizedNamespace.toLowerCase(Locale.ROOT) + "/" + normalizedName.toLowerCase(Locale.ROOT);
+  }
 
-    public List<ValidationIssue> issues() {
-      return issues;
+  private static String groupedDatasetKey(String group, String namespace, String name) {
+    String normalizedGroup = Strings.trimToNull(group);
+    String key = datasetKey(namespace, name);
+    if (normalizedGroup == null || key == null) {
+      return null;
+    }
+    return normalizedGroup.toLowerCase(Locale.ROOT) + "|" + key;
+  }
+
+  private static String groupedDatasetKey(String group, String datasetKey) {
+    String normalizedGroup = Strings.trimToNull(group);
+    String normalizedKey = Strings.trimToNull(datasetKey);
+    if (normalizedGroup == null || normalizedKey == null) {
+      return null;
+    }
+    return normalizedGroup.toLowerCase(Locale.ROOT) + "|" + normalizedKey;
+  }
+
+  private static String serviceKey(String group, String name) {
+    String normalizedGroup = Strings.trimToNull(group);
+    String normalizedName = Strings.trimToNull(name);
+    if (normalizedGroup == null || normalizedName == null) {
+      return null;
+    }
+    return normalizedGroup.toLowerCase(Locale.ROOT) + "/" + normalizedName.toLowerCase(Locale.ROOT);
+  }
+
+  private static String serviceKeyFromResourceId(String serviceResourceId) {
+    String normalized = Strings.trimToNull(serviceResourceId);
+    if (normalized == null || isDirectServiceId(normalized)) {
+      return null;
+    }
+    String token =
+        normalized.regionMatches(true, 0, "service:", 0, "service:".length())
+            ? normalized.substring("service:".length())
+            : normalized;
+    int slash = token.indexOf('/');
+    if (slash <= 0 || slash >= token.length() - 1) {
+      return null;
+    }
+    String group = Strings.trimToNull(token.substring(0, slash));
+    String name = Strings.trimToNull(token.substring(slash + 1));
+    return serviceKey(group, name);
+  }
+
+  private static boolean prefersDirectQuery(DefinitionDataset definition) {
+    return definition != null && definition.binding() != null && definition.binding().parquet() != null;
+  }
+
+  private static boolean isDirectServiceId(String serviceId) {
+    String normalized = Strings.trimToNull(serviceId);
+    return normalized != null
+        && (DIRECT_QUERY_SERVICE_ID.equalsIgnoreCase(normalized)
+            || DIRECT_QUERY_SERVICE_DISPLAY.equalsIgnoreCase(normalized));
+  }
+
+  private record DatasetDescriptor(
+      String datasetId, String group, String namespace, String name, boolean directQuery) {}
+
+  private record ServiceDescriptor(
+      String serviceId,
+      String group,
+      String name,
+      DefinitionService.ServiceType serviceType,
+      boolean online) {}
+
+  private record ServiceReference(
+      String group,
+      String serviceName,
+      String serviceId,
+      DefinitionService.ServiceType serviceType,
+      String serviceDisplay,
+      boolean online) {}
+
+  private record DatasetServiceCandidate(
+      String serviceId,
+      String serviceDisplay,
+      DefinitionService.ServiceType serviceType,
+      boolean sameGroup,
+      boolean online) {}
+
+  private record CachedServiceTables(Set<String> datasetKeys, long loadedAtMs) {
+    private CachedServiceTables {
+      datasetKeys = datasetKeys == null ? Set.of() : Set.copyOf(datasetKeys);
     }
   }
 }
+
+
 
