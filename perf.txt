@@ -1,1207 +1,1228 @@
-package org.pronzato.fabric.api.configs.workflow;
+package org.pronzato.fabric.api.control.discovery.cache;
 
+import com.crankuptheamps.client.Command;
+import com.crankuptheamps.client.Message;
+import com.crankuptheamps.client.MessageStream;
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
-import java.time.Instant;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
-import java.util.UUID;
+import java.util.Optional;
+import java.util.Set;
+import java.util.function.BiConsumer;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.pronzato.fabric.api.control.ControlConnection;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryTopics;
 import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
+import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec.DefinitionDecodeException;
 import org.pronzato.fabric.api.control.discovery.definitions.Definition;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfigLayer;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfigChange;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionSchema;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionService;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
+import org.pronzato.fabric.api.control.discovery.definitions.common.SchemaReference;
+import org.pronzato.fabric.api.control.discovery.scope.DiscoveryScope;
 import org.pronzato.fabric.api.util.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public final class ConfigWorkflowService implements ConfigAdminService.Workflow {
-  private static final Logger LOGGER = LoggerFactory.getLogger(ConfigWorkflowService.class);
-  private static final int AUDIT_MAX = 100;
-  private static final int HISTORY_MAX = ConfigHistoryUtil.DEFAULT_HISTORY_LIMIT;
-  private static final String SCHEMA_FORMAT = "FABRIC_SCHEMA_CONFIG";
+public final class DiscoveryCache implements AutoCloseable {
+  private static final Logger LOGGER = LoggerFactory.getLogger(DiscoveryCache.class);
 
-  private final Store store;
+  private static final Map<DefinitionType, Class<? extends Definition>> CACHEABLE_DEFINITIONS = cacheableDefinitions();
+  private static final Map<Class<? extends Definition>, DefinitionType> CLASS_TO_TYPE = classToType();
+  private static final Set<String> UNMAPPED_DEFINITION_CLASSES = ConcurrentHashMap.newKeySet();
+  private static final long DECODE_ERROR_WINDOW_MS = 30_000L;
+  private static final ConcurrentHashMap<String, Long> DECODE_ERROR_LAST_LOG =
+      new ConcurrentHashMap<>();
+  private static final Comparator<DefinitionSchema> SCHEMA_NAME_ORDER =
+      Comparator
+          .comparing(DiscoveryCache::schemaName, String.CASE_INSENSITIVE_ORDER)
+          .thenComparing(DiscoveryCache::schemaName)
+          .thenComparing(DiscoveryCache::schemaTypeName);
+  private static final Comparator<Key> TX_KEY_ORDER =
+      Comparator.comparing(DiscoveryCache::txTypeToken, String.CASE_INSENSITIVE_ORDER)
+          .thenComparing(DiscoveryCache::txTypeToken)
+          .thenComparing(DiscoveryCache::txGroupToken, String.CASE_INSENSITIVE_ORDER)
+          .thenComparing(DiscoveryCache::txGroupToken)
+          .thenComparing(DiscoveryCache::txNameToken, String.CASE_INSENSITIVE_ORDER)
+          .thenComparing(DiscoveryCache::txNameToken);
+  private static final String PLATFORM_GROUP = "platform";
+  private static final String ENTITLEMENT_TYPE = DefinitionType.ENTITLEMENT.name();
 
-  public ConfigWorkflowService(Store store) {
-    this.store = Objects.requireNonNull(store, "store");
+  private final ControlConnection control;
+  private final String sessionGroup;
+  private final boolean adminMode;
+  private final boolean verbose;
+  private final boolean offlineMode;
+  private final Object subscriptionLock = new Object();
+  private final ConcurrentHashMap<Key, Definition> definitions = new ConcurrentHashMap<>();
+  private final ConcurrentHashMap<Key, CompletableFuture<Optional<Definition>>> inFlightFetches =
+      new ConcurrentHashMap<>();
+  private final CopyOnWriteArrayList<DiscoveryListener> listeners = new CopyOnWriteArrayList<>();
+  private final ConcurrentHashMap<DefinitionType, CopyOnWriteArrayList<BiConsumer<ConfigKey, Definition>>>
+      typedUpsertListeners = new ConcurrentHashMap<>();
+  private final AtomicBoolean started = new AtomicBoolean(false);
+  private final AtomicBoolean recovered = new AtomicBoolean(false);
+  private volatile CountDownLatch recoveryLatch = new CountDownLatch(1);
+  private volatile DiscoveryScope discoveryScope;
+  private volatile ControlConnection.Subscription subscription;
+
+  public DiscoveryCache(ControlConnection control) {
+    this(control, null, true, false, false);
   }
 
-  @Override
-  public DefinitionConfigChange workflow(String group, String configId, String layerId, int auditLimit) {
-    String requiredGroup = required(group, "group");
-    String requiredconfigId = required(configId, "configId");
-    String requiredLayerId = required(layerId, "layerId");
-
-    DefinitionConfigLayer published = published(requiredGroup, requiredconfigId, requiredLayerId);
-    DefinitionConfigChange change = loadChange(requiredGroup, requiredconfigId, requiredLayerId);
-    if (change == null) {
-      return emptyChange(requiredGroup, requiredconfigId, requiredLayerId, published);
-    }
-    return clampAudit(change, auditLimit);
+  public DiscoveryCache(ControlConnection control, String sessionGroup, boolean adminMode) {
+    this(control, sessionGroup, adminMode, false, false);
   }
 
-  @Override
-  public JsonNode draft(String group, String configId, String layerId) {
-    DefinitionConfigChange change = requiredChange(group, configId, layerId);
-    JsonNode draft = change.draftDeclared();
-    if (draft == null || !draft.isObject()) {
-      throw new WorkflowDraftNotFoundException("draft not found");
-    }
-    return draft.deepCopy();
+  public DiscoveryCache(
+      ControlConnection control, String sessionGroup, boolean adminMode, boolean verbose) {
+    this(control, sessionGroup, adminMode, verbose, false);
   }
 
-  @Override
-  public DefinitionConfigChange propose(
-      String group,
-      String configId,
-      String layerId,
-      JsonNode declaredPayload,
-      DefinitionConfigChange.ChangeMode mode,
-      Instant effectiveAt,
-      Instant expiresAt,
-      String comment,
-      String subject) {
-    String requiredGroup = required(group, "group");
-    String requiredconfigId = required(configId, "configId");
-    String requiredLayerId = required(layerId, "layerId");
-    String resolvedSubject = resolveSubject(subject);
-    JsonNode draft = requireObject(declaredPayload, "declaredPayload").deepCopy();
-
-    DefinitionConfigLayer published = published(requiredGroup, requiredconfigId, requiredLayerId);
-    validateDraft(requiredGroup, published, draft);
-
-    DefinitionConfigChange existing = loadChange(requiredGroup, requiredconfigId, requiredLayerId);
-    DefinitionConfigChange.ChangeState from = stateOf(existing);
-    DefinitionConfigChange.ChangeMode resolvedMode =
-        mode == null ? DefinitionConfigChange.ChangeMode.IMMEDIATE : mode;
-    Window window = validateWindow(resolvedMode, effectiveAt, expiresAt, Instant.now());
-    String now = Instant.now().toString();
-    String normalizedComment = Strings.trimToNull(comment);
-    String baseCreatedAt = now;
-    String baseCreatedBy = resolvedSubject;
-    String previousPublishedConfigId = existing == null ? null : Strings.trimToNull(existing.lastPublishedConfigId());
-
-    DefinitionConfigChange.ChangeEntry nextEntry =
-        new DefinitionConfigChange.ChangeEntry(
-            UUID.randomUUID().toString(),
-            DefinitionConfigChange.ChangeState.PROPOSED,
-            resolvedMode,
-            window.effectiveAtUtc(),
-            window.expiresAtUtc(),
-            draft,
-            Strings.trimToNull(published.configId()),
-            Strings.trimToNull(published.effectiveConfigId()),
-            previousPublishedConfigId,
-            baseCreatedAt,
-            baseCreatedBy,
-            now,
-            resolvedSubject,
-            normalizedComment,
-            null,
-            appendAudit(
-                activeAudit(existing),
-                now,
-                resolvedSubject,
-                DefinitionConfigChange.DecisionAction.PROPOSE,
-                normalizedComment,
-                from,
-                DefinitionConfigChange.ChangeState.PROPOSED,
-                null));
-
-    DefinitionConfigChange next =
-        new DefinitionConfigChange(
-            nextEnvelope(existing, requiredGroup, requiredconfigId, requiredLayerId, now, resolvedSubject),
-            requiredGroup,
-            requiredconfigId,
-            requiredLayerId,
-            schemaKey(published),
-            nextEntry.state(),
-            nextEntry.mode(),
-            nextEntry.effectiveAtUtc(),
-            nextEntry.expiresAtUtc(),
-            nextEntry.draftDeclared(),
-            nextEntry.baseConfigId(),
-            nextEntry.baseEffectiveConfigId(),
-            nextEntry.lastPublishedConfigId(),
-            nextEntry.createdTimeUtc(),
-            nextEntry.createdBySubject(),
-            nextEntry.updatedTimeUtc(),
-            nextEntry.updatedBySubject(),
-            nextEntry.rationale(),
-            nextEntry.decisionMessage(),
-            nextEntry.audit(),
-            prependEntry(existing, nextEntry));
-    upsertChange(next);
-    LOGGER.info("[ConfigWorkflow][Propose] group={} configId={} layerId={} mode={} effectiveAt={} expiresAt={} subject={}", requiredGroup, requiredconfigId, requiredLayerId, resolvedMode, window.effectiveAtUtc() == null ? "IMMEDIATE" : window.effectiveAtUtc(), window.expiresAtUtc() == null ? "NEVER" : window.expiresAtUtc(), resolvedSubject);
-    return next;
-  }
-
-  @Override
-  public DefinitionConfigChange approve(
-      String group, String configId, String layerId, String comment, String subject) {
-    DefinitionConfigChange approved =
-        adminTransition(
-            "APPROVE",
-            group,
-            configId,
-            layerId,
-            comment,
-            subject,
-            List.of(
-                DefinitionConfigChange.ChangeState.PROPOSED,
-                DefinitionConfigChange.ChangeState.DRAFT),
-            DefinitionConfigChange.ChangeState.APPROVED,
-            DefinitionConfigChange.DecisionAction.APPROVE);
-    LOGGER.info("[ConfigWorkflow][Approve] group={} configId={} layerId={} effectiveAt={} expiresAt={} subject={}", approved.group(), approved.configId(), approved.layerId(), Strings.trimToNull(approved.effectiveAtUtc()) == null ? "IMMEDIATE" : approved.effectiveAtUtc(), Strings.trimToNull(approved.expiresAtUtc()) == null ? "NEVER" : approved.expiresAtUtc(), resolveSubject(subject));
-    return approved;
-  }
-
-  @Override
-  public DefinitionConfigChange reject(
-      String group, String configId, String layerId, String comment, String subject) {
-    return adminTransition(
-        "REJECT",
-        group,
-        configId,
-        layerId,
-        comment,
-        subject,
-        List.of(
-            DefinitionConfigChange.ChangeState.PROPOSED,
-            DefinitionConfigChange.ChangeState.DRAFT,
-            DefinitionConfigChange.ChangeState.APPROVED),
-        DefinitionConfigChange.ChangeState.REJECTED,
-        DefinitionConfigChange.DecisionAction.REJECT);
-  }
-
-  @Override
-  public DefinitionConfigChange cancel(
-      String group, String configId, String layerId, String comment, String subject) {
-    String requiredGroup = required(group, "group");
-    String requiredconfigId = required(configId, "configId");
-    String requiredLayerId = required(layerId, "layerId");
-    String resolvedSubject = resolveSubject(subject);
-
-    DefinitionConfigChange existing =
-        requiredChange(requiredGroup, requiredconfigId, requiredLayerId);
-    DefinitionConfigChange.ChangeState existingState = stateOf(existing);
-    boolean scheduledPending = isScheduledPending(existing);
-    if (!List.of(
-                DefinitionConfigChange.ChangeState.PROPOSED,
-                DefinitionConfigChange.ChangeState.DRAFT,
-                DefinitionConfigChange.ChangeState.APPROVED)
-            .contains(existingState)
-        && !scheduledPending) {
-      throw new WorkflowStateException(
-          "cancel requires PROPOSED, DRAFT, APPROVED, or a pending scheduled publish");
-    }
-    if (scheduledPending) {
-      cancelScheduledEffective(requiredGroup, requiredconfigId, requiredLayerId, existing);
-    }
-
-    String now = Instant.now().toString();
-    String normalizedComment = Strings.trimToNull(comment);
-    DefinitionConfigChange.ChangeEntry currentEntry = activeEntry(existing);
-    DefinitionConfigChange.ChangeEntry nextEntry =
-        new DefinitionConfigChange.ChangeEntry(
-            currentEntry == null ? UUID.randomUUID().toString() : currentEntry.changeId(),
-            DefinitionConfigChange.ChangeState.NONE,
-            scheduledPending
-                ? DefinitionConfigChange.ChangeMode.SCHEDULED
-                : DefinitionConfigChange.ChangeMode.IMMEDIATE,
-            null,
-            null,
-            scheduledPending ? deepCopy(existing.draftDeclared()) : null,
-            existing.baseConfigId(),
-            existing.baseEffectiveConfigId(),
-            existing.lastPublishedConfigId(),
-            existing.createdTimeUtc(),
-            existing.createdBySubject(),
-            now,
-            resolvedSubject,
-            existing.rationale(),
-            normalizedComment,
-            appendAudit(
-                activeAudit(existing),
-                now,
-                resolvedSubject,
-                DefinitionConfigChange.DecisionAction.CANCEL,
-                normalizedComment,
-                existingState,
-                DefinitionConfigChange.ChangeState.NONE,
-                null));
-    DefinitionConfigChange next =
-        new DefinitionConfigChange(
-            nextEnvelope(existing, requiredGroup, requiredconfigId, requiredLayerId, now, resolvedSubject),
-            requiredGroup,
-            requiredconfigId,
-            requiredLayerId,
-            existing.schemaKey(),
-            nextEntry.state(),
-            nextEntry.mode(),
-            nextEntry.effectiveAtUtc(),
-            nextEntry.expiresAtUtc(),
-            nextEntry.draftDeclared(),
-            nextEntry.baseConfigId(),
-            nextEntry.baseEffectiveConfigId(),
-            nextEntry.lastPublishedConfigId(),
-            nextEntry.createdTimeUtc(),
-            nextEntry.createdBySubject(),
-            nextEntry.updatedTimeUtc(),
-            nextEntry.updatedBySubject(),
-            nextEntry.rationale(),
-            nextEntry.decisionMessage(),
-            nextEntry.audit(),
-            replaceEntry(existing, nextEntry));
-    upsertChange(next);
-    return next;
-  }
-
-  @Override
-  public DefinitionConfigLayer publish(
-      String group,
-      String configId,
-      String layerId,
-      DefinitionConfigChange.ChangeMode modeOverride,
-      Instant effectiveAtOverride,
-      Instant expiresAtOverride,
-      String comment,
-      String subject) {
-    String requiredGroup = required(group, "group");
-    String requiredconfigId = required(configId, "configId");
-    String requiredLayerId = required(layerId, "layerId");
-    String resolvedSubject = resolveSubject(subject);
-
-    DefinitionConfigChange change = requiredChange(requiredGroup, requiredconfigId, requiredLayerId);
-    DefinitionConfigChange.ChangeState changeState = stateOf(change);
-    if (changeState != DefinitionConfigChange.ChangeState.APPROVED) {
-      throw new WorkflowStateException("publish requires APPROVED state");
-    }
-
-    JsonNode draft = requireObject(change.draftDeclared(), "draftDeclared");
-    DefinitionConfigLayer current = published(requiredGroup, requiredconfigId, requiredLayerId);
-    validatePublish(requiredGroup, current, draft);
-
-    DefinitionConfigChange.ChangeMode publishMode =
-        modeOverride == null ? modeOf(change) : modeOverride;
-    Instant publishedAt = Instant.now();
-    Instant configuredEffectiveAt = parseInstantOrNull(change.effectiveAtUtc(), "effectiveAtUtc");
-    Instant configuredExpiresAt = parseInstantOrNull(change.expiresAtUtc(), "expiresAtUtc");
-    Instant publishEffectiveAt;
-    Instant publishExpiresAt;
-    if (publishMode == DefinitionConfigChange.ChangeMode.SCHEDULED) {
-      publishEffectiveAt = effectiveAtOverride == null ? configuredEffectiveAt : effectiveAtOverride;
-      if (publishEffectiveAt == null) {
-        throw new IllegalArgumentException("effectiveAt is required for SCHEDULED publish");
-      }
-      publishExpiresAt = expiresAtOverride == null ? configuredExpiresAt : expiresAtOverride;
-      validateWindow(DefinitionConfigChange.ChangeMode.SCHEDULED, publishEffectiveAt, publishExpiresAt, publishedAt);
+  private DiscoveryCache(
+      ControlConnection control,
+      String sessionGroup,
+      boolean adminMode,
+      boolean verbose,
+      boolean offlineMode) {
+    if (!offlineMode) {
+      this.control = Objects.requireNonNull(control, "control");
     } else {
-      if (effectiveAtOverride != null) {
-        throw new IllegalArgumentException("effectiveAt must be null for IMMEDIATE publish");
-      }
-      publishEffectiveAt = null;
-      publishExpiresAt = expiresAtOverride == null ? configuredExpiresAt : expiresAtOverride;
-      validateWindow(DefinitionConfigChange.ChangeMode.IMMEDIATE, null, publishExpiresAt, publishedAt);
+      this.control = control;
     }
-
-    DefinitionConfigLayer updated =
-        publishDefinition(
-            current, draft.deepCopy(), publishMode, publishEffectiveAt, publishExpiresAt, publishedAt, resolvedSubject);
-    store.upsert(updated);
-    DefinitionConfigLayer persisted = published(requiredGroup, requiredconfigId, requiredLayerId);
-
-    String now = publishedAt.toString();
-    String publishEffectiveAtUtc = publishEffectiveAt == null ? null : publishEffectiveAt.toString();
-    String publishExpiresAtUtc = publishExpiresAt == null ? null : publishExpiresAt.toString();
-    String clearedEffectiveAtUtc =
-        publishMode == DefinitionConfigChange.ChangeMode.SCHEDULED
-            ? publishEffectiveAtUtc
-            : publishExpiresAt == null ? null : now;
-    String normalizedComment = Strings.trimToNull(comment);
-    DefinitionConfigChange.ChangeEntry activeEntry = activeEntry(change);
-    DefinitionConfigChange.ChangeEntry clearedEntry =
-        new DefinitionConfigChange.ChangeEntry(
-            activeEntry == null ? UUID.randomUUID().toString() : activeEntry.changeId(),
-            DefinitionConfigChange.ChangeState.NONE,
-            publishMode == DefinitionConfigChange.ChangeMode.SCHEDULED
-                ? DefinitionConfigChange.ChangeMode.SCHEDULED
-                : DefinitionConfigChange.ChangeMode.IMMEDIATE,
-            clearedEffectiveAtUtc,
-            publishExpiresAtUtc,
-            publishMode == DefinitionConfigChange.ChangeMode.SCHEDULED ? draft.deepCopy() : null,
-            change.baseConfigId(),
-            change.baseEffectiveConfigId(),
-            Strings.trimToNull(persisted.configId()),
-            change.createdTimeUtc(),
-            change.createdBySubject(),
-            now,
-            resolvedSubject,
-            change.rationale(),
-            normalizedComment,
-            appendAudit(
-                activeAudit(change),
-                now,
-                resolvedSubject,
-                DefinitionConfigChange.DecisionAction.PUBLISH,
-                normalizedComment,
-                changeState,
-                DefinitionConfigChange.ChangeState.NONE,
-                Strings.trimToNull(persisted.configId())));
-    DefinitionConfigChange cleared =
-        new DefinitionConfigChange(
-            nextEnvelope(change, requiredGroup, requiredconfigId, requiredLayerId, now, resolvedSubject),
-            requiredGroup,
-            requiredconfigId,
-            requiredLayerId,
-            change.schemaKey(),
-            clearedEntry.state(),
-            clearedEntry.mode(),
-            clearedEntry.effectiveAtUtc(),
-            clearedEntry.expiresAtUtc(),
-            clearedEntry.draftDeclared(),
-            clearedEntry.baseConfigId(),
-            clearedEntry.baseEffectiveConfigId(),
-            clearedEntry.lastPublishedConfigId(),
-            clearedEntry.createdTimeUtc(),
-            clearedEntry.createdBySubject(),
-            clearedEntry.updatedTimeUtc(),
-            clearedEntry.updatedBySubject(),
-            clearedEntry.rationale(),
-            clearedEntry.decisionMessage(),
-            clearedEntry.audit(),
-            replaceEntry(change, clearedEntry));
-    upsertChange(cleared);
-    LOGGER.info("[ConfigWorkflow][Publish] group={} configId={} layerId={} mode={} effectiveAt={} expiresAt={} subject={}", requiredGroup, requiredconfigId, requiredLayerId, publishMode, publishMode == DefinitionConfigChange.ChangeMode.IMMEDIATE ? "IMMEDIATE" : publishEffectiveAtUtc, publishExpiresAtUtc == null ? "NEVER" : publishExpiresAtUtc, resolvedSubject);
-    return persisted;
+    this.sessionGroup = normalize(sessionGroup);
+    this.adminMode = adminMode;
+    this.verbose = verbose;
+    this.offlineMode = offlineMode;
+    this.discoveryScope = defaultScope();
   }
 
-  private void cancelScheduledEffective(
-      String group, String configId, String layerId, DefinitionConfigChange existing) {
-    String effectiveAtUtc = Strings.trimToNull(existing == null ? null : existing.effectiveAtUtc());
-    if (effectiveAtUtc == null) {
-      throw new WorkflowStateException("pending scheduled publish effectiveAt is missing");
-    }
-    Instant effectiveAt;
-    try {
-      effectiveAt = Instant.parse(effectiveAtUtc);
-    } catch (Exception ex) {
-      throw new WorkflowStateException("pending scheduled publish effectiveAt is invalid");
-    }
-    if (!effectiveAt.isAfter(Instant.now())) {
-      throw new WorkflowStateException("scheduled publish is already effective");
-    }
-
-    DefinitionConfigLayer current = published(group, configId, layerId);
-    DefinitionConfigLayer payload = ConfigPayload(current);
-    List<DefinitionConfigLayer.Effective> baseline = payload.effective();
-    if (baseline == null || baseline.isEmpty()) {
-      throw new WorkflowStateException("scheduled publish entry not found");
-    }
-    List<DefinitionConfigLayer.Effective> rewritten = new ArrayList<>();
-    boolean removed = false;
-    for (DefinitionConfigLayer.Effective entry : baseline) {
-      if (entry == null) {
-        continue;
-      }
-      if (effectiveAtUtc.equals(entry.effectiveTimeUtc())) {
-        removed = true;
-        continue;
-      }
-      rewritten.add(entry);
-    }
-    if (!removed) {
-      throw new WorkflowStateException("scheduled publish entry not found");
-    }
-    DefinitionConfigLayer rewrittenPayload =
-        new DefinitionConfigLayer(
-            current.envelope(),
-            payload.resourceId(),
-            payload.parentId(),
-            payload.shortName(),
-            payload.configType(),
-            payload.schemaKey(),
-            payload.displayName(),
-            deepCopy(payload.declared()),
-            List.copyOf(rewritten),
-            payload.history(),
-            current.configId(),
-            current.effectiveConfigId());
-    DefinitionConfigLayer updated = rewrittenPayload;
-    store.upsert(updated);
+  public static DiscoveryCache recoveredSnapshotCache(
+      String sessionGroup, boolean adminMode, boolean verbose, List<Definition> definitions) {
+    DiscoveryCache cache = new DiscoveryCache(null, sessionGroup, adminMode, verbose, true);
+    cache.replaceWithRecoveredSnapshot(definitions);
+    return cache;
   }
 
-  private DefinitionConfigChange adminTransition(
-      String action,
-      String group,
-      String configId,
-      String layerId,
-      String comment,
-      String subject,
-      List<DefinitionConfigChange.ChangeState> fromStates,
-      DefinitionConfigChange.ChangeState toState,
-      DefinitionConfigChange.DecisionAction decisionAction) {
-    String requiredGroup = required(group, "group");
-    String requiredconfigId = required(configId, "configId");
-    String requiredLayerId = required(layerId, "layerId");
-    String resolvedSubject = resolveSubject(subject);
-
-    DefinitionConfigChange existing =
-        requiredChange(requiredGroup, requiredconfigId, requiredLayerId);
-    DefinitionConfigChange.ChangeState fromState = stateOf(existing);
-    if (!fromStates.contains(fromState)) {
-      throw new WorkflowStateException(action + " not allowed from " + fromState);
+  public void start() throws Exception {
+    if (offlineMode) {
+      started.set(true);
+      recovered.set(true);
+      recoveryLatch.countDown();
+      return;
     }
-
-    String now = Instant.now().toString();
-    String normalizedComment = Strings.trimToNull(comment);
-    DefinitionConfigChange.ChangeEntry currentEntry = activeEntry(existing);
-    DefinitionConfigChange.ChangeEntry nextEntry =
-        new DefinitionConfigChange.ChangeEntry(
-            currentEntry == null ? UUID.randomUUID().toString() : currentEntry.changeId(),
-            toState,
-            modeOf(existing),
-            existing.effectiveAtUtc(),
-            existing.expiresAtUtc(),
-            existing.draftDeclared(),
-            existing.baseConfigId(),
-            existing.baseEffectiveConfigId(),
-            existing.lastPublishedConfigId(),
-            existing.createdTimeUtc(),
-            existing.createdBySubject(),
-            now,
-            resolvedSubject,
-            existing.rationale(),
-            normalizedComment,
-            appendAudit(
-                activeAudit(existing),
-                now,
-                resolvedSubject,
-                decisionAction,
-                normalizedComment,
-                fromState,
-                toState,
-                null));
-    DefinitionConfigChange next =
-        new DefinitionConfigChange(
-            nextEnvelope(existing, requiredGroup, requiredconfigId, requiredLayerId, now, resolvedSubject),
-            requiredGroup,
-            requiredconfigId,
-            requiredLayerId,
-            existing.schemaKey(),
-            nextEntry.state(),
-            nextEntry.mode(),
-            nextEntry.effectiveAtUtc(),
-            nextEntry.expiresAtUtc(),
-            nextEntry.draftDeclared(),
-            nextEntry.baseConfigId(),
-            nextEntry.baseEffectiveConfigId(),
-            nextEntry.lastPublishedConfigId(),
-            nextEntry.createdTimeUtc(),
-            nextEntry.createdBySubject(),
-            nextEntry.updatedTimeUtc(),
-            nextEntry.updatedBySubject(),
-            nextEntry.rationale(),
-            nextEntry.decisionMessage(),
-            nextEntry.audit(),
-            replaceEntry(existing, nextEntry));
-    upsertChange(next);
-    return next;
+    if (!started.compareAndSet(false, true)) {
+      awaitRecovery(Duration.ofSeconds(30));
+      return;
+    }
+    openSubscription(Duration.ofSeconds(30), true);
   }
 
-  private DefinitionConfigLayer publishDefinition(
-      DefinitionConfigLayer current,
-      JsonNode draft,
-      DefinitionConfigChange.ChangeMode mode,
-      Instant effectiveAt,
-      Instant expiresAt,
-      Instant publishedAt,
-      String subject) {
-    DefinitionConfigLayer payload = ConfigPayload(current);
-    Instant snapshotEffectiveAt = mode == DefinitionConfigChange.ChangeMode.IMMEDIATE ? publishedAt : effectiveAt;
-    DefinitionConfigLayer.History currentSnapshot =
-        ConfigHistoryUtil.snapshotFromCurrent(current, mode.name(), snapshotEffectiveAt, subject);
-    List<DefinitionConfigLayer.History> rewrittenHistory =
-        ConfigHistoryUtil.appendSnapshot(payload.history(), currentSnapshot, HISTORY_MAX);
-
-    DefinitionConfigLayer rewrittenPayload;
-    if (mode == DefinitionConfigChange.ChangeMode.SCHEDULED) {
-      List<DefinitionConfigLayer.Effective> effective =
-          upsertScheduledEffective(payload.effective(), effectiveAt, expiresAt, draft);
-      rewrittenPayload =
-          new DefinitionConfigLayer(
-              current.envelope(),
-              payload.resourceId(),
-              payload.parentId(),
-              payload.shortName(),
-              payload.configType(),
-              payload.schemaKey(),
-              payload.displayName(),
-              deepCopy(payload.declared()),
-              effective,
-              rewrittenHistory,
-              current.configId(),
-              current.effectiveConfigId());
-    } else {
-      if (expiresAt != null) {
-        List<DefinitionConfigLayer.Effective> effective =
-            upsertScheduledEffective(payload.effective(), publishedAt, expiresAt, draft);
-        rewrittenPayload =
-            new DefinitionConfigLayer(
-                current.envelope(),
-                payload.resourceId(),
-                payload.parentId(),
-                payload.shortName(),
-                payload.configType(),
-                payload.schemaKey(),
-                payload.displayName(),
-                deepCopy(payload.declared()),
-                effective,
-                rewrittenHistory,
-                current.configId(),
-                current.effectiveConfigId());
-      } else {
-        rewrittenPayload =
-            new DefinitionConfigLayer(
-                current.envelope(),
-                payload.resourceId(),
-                payload.parentId(),
-                payload.shortName(),
-                payload.configType(),
-                payload.schemaKey(),
-                payload.displayName(),
-                draft,
-                ConfigHistoryUtil.copyEffective(payload.effective()),
-                rewrittenHistory,
-                current.configId(),
-                current.effectiveConfigId());
-      }
-    }
-    return rewrittenPayload;
+  public boolean recovered() {
+    return recovered.get();
   }
 
-  private static List<DefinitionConfigLayer.Effective> upsertScheduledEffective(
-      List<DefinitionConfigLayer.Effective> baseline,
-      Instant effectiveAt,
-      Instant expiresAt,
-      JsonNode declaredPayload) {
-    if (effectiveAt == null) {
-      throw new IllegalArgumentException("effectiveAt is required for SCHEDULED publish");
-    }
-    String effectiveUtc = effectiveAt.toString();
-    String expiresUtc = expiresAt == null ? null : expiresAt.toString();
-    List<DefinitionConfigLayer.Effective> rewritten = new ArrayList<>();
-    if (baseline != null) {
-      for (DefinitionConfigLayer.Effective entry : baseline) {
-        if (entry == null) {
+  public boolean offlineMode() {
+    return offlineMode;
+  }
+
+  public int replaceWithRecoveredSnapshot(List<Definition> snapshotDefinitions) {
+    List<Definition> source = snapshotDefinitions == null ? List.of() : snapshotDefinitions;
+    synchronized (subscriptionLock) {
+      closeSubscriptionQuietly();
+      definitions.clear();
+      int loaded = 0;
+      for (Definition definition : source) {
+        if (definition == null) {
+          throw new IllegalArgumentException("Snapshot contains a null definition");
+        }
+        if (!shouldAcceptDefinition(definition)) {
           continue;
         }
-        if (!effectiveUtc.equals(entry.effectiveTimeUtc())) {
-          rewritten.add(entry);
-        }
+        Key key = requireDefinitionKey(definition);
+        cacheUpsert(key, definition);
+        loaded++;
       }
-    }
-    rewritten.add(new DefinitionConfigLayer.Effective(effectiveUtc, expiresUtc, declaredPayload.deepCopy()));
-    rewritten.sort(Comparator.comparing(entry -> Instant.parse(entry.effectiveTimeUtc())));
-    return List.copyOf(rewritten);
-  }
-
-  private void validateDraft(String group, DefinitionConfigLayer published, JsonNode draftDeclared) {
-    if (draftDeclared == null || !draftDeclared.isObject()) {
-      throw new IllegalArgumentException("declaredPayload must be a JSON object");
-    }
-    resolveSchema(group, schemaKey(published));
-  }
-
-  private void validatePublish(String group, DefinitionConfigLayer published, JsonNode draftDeclared) {
-    DefinitionSchema schema = resolveSchema(group, schemaKey(published));
-    ObjectNode draft = requireObject(draftDeclared, "draftDeclared");
-    for (String key : ConfigSchemaRequiredKeys.explicitRequiredKeys(schema)) {
-      if (!draft.has(key)) {
-        draft.set(key, DiscoveryCodec.mapper().nullNode());
-      }
+      started.set(true);
+      recovered.set(true);
+      recoveryLatch.countDown();
+      return loaded;
     }
   }
 
-  private DefinitionSchema resolveSchema(String group, String schemaKey) {
-    Definition definition = store.get(DefinitionType.SCHEMA, group, schemaKey);
-    if (!(definition instanceof DefinitionSchema schema)) {
-      throw new IllegalStateException("schema not found for group=" + group + " key=" + schemaKey);
-    }
-    if (schema.schemaType() != DefinitionSchema.SchemaType.CONFIG) {
-      throw new IllegalStateException("schemaType must be CONFIG");
-    }
-    if (!SCHEMA_FORMAT.equals(schema.format())) {
-      throw new IllegalStateException(
-          "schema format must be " + SCHEMA_FORMAT + " but was " + schema.format());
-    }
-    return schema;
+  public int size() {
+    return definitions.size();
   }
 
-  private DefinitionConfigLayer published(String group, String configId, String layerId) {
-    Definition definition = store.get(DefinitionType.CONFIG_LAYER, group, configLayerDefinitionName(configId, layerId));
-    if (definition instanceof DefinitionConfigLayer config) {
-      return config;
-    }
-    throw new ConfigNotFoundException("config layer not found: " + configId + "/" + layerId);
+  public DiscoveryScope discoveryScope() {
+    return discoveryScope;
   }
 
-  private DefinitionConfigChange requiredChange(String group, String configId, String layerId) {
-    String requiredGroup = required(group, "group");
-    String requiredconfigId = required(configId, "configId");
-    String requiredLayerId = required(layerId, "layerId");
-    DefinitionConfigChange change = loadChange(requiredGroup, requiredconfigId, requiredLayerId);
-    if (change == null) {
-      throw new WorkflowDraftNotFoundException("workflow change not found");
+  public DiscoveryScope updateDiscoveryScope(DiscoveryScope nextScope) {
+    DiscoveryScope resolvedScope = nextScope == null ? defaultScope() : nextScope;
+    DiscoveryScope previous = discoveryScope;
+    if (Objects.equals(previous, resolvedScope)) {
+      return previous;
     }
-    return change;
+    discoveryScope = resolvedScope;
+    evictOutOfScopeDefinitions(resolvedScope);
+    if (started.get() && !offlineMode) {
+      openSubscription(Duration.ofSeconds(10), false);
+    }
+    return previous;
   }
 
-  private DefinitionConfigChange loadChange(String group, String configId, String layerId) {
-    Definition definition = store.get(DefinitionType.CONFIG_CHANGE, group, changeName(configId, layerId));
-    if (!(definition instanceof DefinitionConfigChange change)) {
-      return null;
-    }
-    return normalizeChange(change);
+  public List<Definition> allDefinitions() {
+    return new ArrayList<>(definitions.values());
   }
 
-  private void upsertChange(DefinitionConfigChange change) {
-    DefinitionConfigChange normalized = normalizeChange(change);
-    if (normalized == null || normalized.envelope() == null) {
-      throw new IllegalArgumentException("change envelope is required");
-    }
-    String expectedName = changeName(normalized.configId(), normalized.layerId());
-    if (!expectedName.equals(normalized.envelope().name())) {
-      throw new IllegalArgumentException("CONFIG_CHANGE name must be " + expectedName);
-    }
-    if (!Objects.equals(normalized.group(), normalized.envelope().group())) {
-      throw new IllegalArgumentException("CONFIG_CHANGE group mismatch");
-    }
-    store.upsert(normalized);
+  public <T extends Definition> List<T> list(Class<T> clazz) {
+    return list(clazz, null);
   }
 
-  private DefinitionConfigChange emptyChange(
-      String group, String configId, String layerId, DefinitionConfigLayer published) {
-    String now = Instant.now().toString();
-    return new DefinitionConfigChange(
-        new DefinitionEnvelope(
-            group,
-            DefinitionType.CONFIG_CHANGE,
-            changeName(configId, layerId),
-            null,
-            true,
-            "ACTIVE",
-            now,
-            resolveSubject(null),
-            now,
-            resolveSubject(null)),
-        group,
-        configId,
-        layerId,
-        schemaKey(published),
-        DefinitionConfigChange.ChangeState.NONE,
-        DefinitionConfigChange.ChangeMode.IMMEDIATE,
-        null,
-        null,
-        null,
-        Strings.trimToNull(published.configId()),
-        Strings.trimToNull(published.effectiveConfigId()),
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        List.of());
-  }
-
-  private DefinitionConfigChange clampAudit(DefinitionConfigChange change, int limitRaw) {
-    int limit = limitRaw <= 0 ? 20 : Math.min(limitRaw, AUDIT_MAX);
-    List<DefinitionConfigChange.AuditEntry> audit =
-        change.audit() == null ? List.of() : change.audit();
-    if (audit.size() <= limit) {
-      return change;
-    }
-    DefinitionConfigChange.ChangeEntry activeEntry = activeEntry(change);
-    List<DefinitionConfigChange.ChangeEntry> changes = change.changes();
-    if (activeEntry != null && changes != null && !changes.isEmpty()) {
-      DefinitionConfigChange.ChangeEntry clampedEntry =
-          new DefinitionConfigChange.ChangeEntry(
-              activeEntry.changeId(),
-              activeEntry.state(),
-              activeEntry.mode(),
-              activeEntry.effectiveAtUtc(),
-              activeEntry.expiresAtUtc(),
-              activeEntry.draftDeclared(),
-              activeEntry.baseConfigId(),
-              activeEntry.baseEffectiveConfigId(),
-              activeEntry.lastPublishedConfigId(),
-              activeEntry.createdTimeUtc(),
-              activeEntry.createdBySubject(),
-              activeEntry.updatedTimeUtc(),
-              activeEntry.updatedBySubject(),
-              activeEntry.rationale(),
-              activeEntry.decisionMessage(),
-              List.copyOf(audit.subList(0, limit)));
-      changes = replaceEntry(change, clampedEntry);
-    }
-    return new DefinitionConfigChange(
-        change.envelope(),
-        change.group(),
-        change.configId(),
-        change.layerId(),
-        change.schemaKey(),
-        change.state(),
-        change.mode(),
-        change.effectiveAtUtc(),
-        change.expiresAtUtc(),
-        change.draftDeclared(),
-        change.baseConfigId(),
-        change.baseEffectiveConfigId(),
-        change.lastPublishedConfigId(),
-        change.createdTimeUtc(),
-        change.createdBySubject(),
-        change.updatedTimeUtc(),
-        change.updatedBySubject(),
-        change.rationale(),
-        change.decisionMessage(),
-        List.copyOf(audit.subList(0, limit)),
-        changes == null ? List.of() : changes);
-  }
-
-  private DefinitionEnvelope nextEnvelope(
-      DefinitionConfigChange existing,
-      String group,
-      String configId,
-      String layerId,
-      String now,
-      String subject) {
-    DefinitionEnvelope previous = existing == null ? null : existing.envelope();
-    String uuid = Strings.trimToNull(previous == null ? null : previous.uuid());
-    return new DefinitionEnvelope(
-        group,
-        DefinitionType.CONFIG_CHANGE,
-        changeName(configId, layerId),
-        uuid == null ? UUID.randomUUID().toString() : uuid,
-        true,
-        "ACTIVE",
-        previous == null ? now : previous.createdTimeUtc(),
-        previous == null ? subject : previous.createdBy(),
-        now,
-        subject);
-  }
-
-  private static List<DefinitionConfigChange.AuditEntry> appendAudit(
-      List<DefinitionConfigChange.AuditEntry> existing,
-      String timeUtc,
-      String subject,
-      DefinitionConfigChange.DecisionAction action,
-      String message,
-      DefinitionConfigChange.ChangeState from,
-      DefinitionConfigChange.ChangeState to,
-      String targetConfigId) {
-    List<DefinitionConfigChange.AuditEntry> audit = new ArrayList<>();
-    audit.add(
-        new DefinitionConfigChange.AuditEntry(
-            timeUtc,
-            subject,
-            action,
-            message,
-            (from == null ? DefinitionConfigChange.ChangeState.NONE : from).name(),
-            (to == null ? DefinitionConfigChange.ChangeState.NONE : to).name(),
-            targetConfigId));
-    if (existing != null) {
-      for (DefinitionConfigChange.AuditEntry entry : existing) {
-        if (entry != null) {
-          audit.add(entry);
-        }
-        if (audit.size() >= AUDIT_MAX) {
-          break;
-        }
-      }
-    }
-    return List.copyOf(audit);
-  }
-
-  private static DefinitionConfigChange normalizeChange(DefinitionConfigChange change) {
-    if (change == null) {
-      return null;
-    }
-    List<DefinitionConfigChange.ChangeEntry> normalizedEntries = normalizedEntries(change.changes());
-    if (normalizedEntries.isEmpty()) {
-      if (!hasLegacyEntryPayload(change)) {
-        return new DefinitionConfigChange(
-            change.envelope(),
-            change.group(),
-            change.configId(),
-            change.layerId(),
-            change.schemaKey(),
-            change.state(),
-            change.mode(),
-            change.effectiveAtUtc(),
-            change.expiresAtUtc(),
-            change.draftDeclared(),
-            change.baseConfigId(),
-            change.baseEffectiveConfigId(),
-            change.lastPublishedConfigId(),
-            change.createdTimeUtc(),
-            change.createdBySubject(),
-            change.updatedTimeUtc(),
-            change.updatedBySubject(),
-            change.rationale(),
-            change.decisionMessage(),
-            change.audit(),
-            List.of());
-      }
-      DefinitionConfigChange.ChangeEntry legacy = legacyEntry(change);
-      return projectChange(change, legacy, List.of(legacy));
-    }
-    DefinitionConfigChange.ChangeEntry latest = firstEntry(normalizedEntries);
-    return projectChange(change, latest, normalizedEntries);
-  }
-
-  private static DefinitionConfigChange.ChangeEntry activeEntry(DefinitionConfigChange change) {
-    if (change == null) {
-      return null;
-    }
-    DefinitionConfigChange.ChangeEntry latest = firstEntry(change.changes());
-    if (latest != null) {
-      return latest;
-    }
-    return hasLegacyEntryPayload(change) ? legacyEntry(change) : null;
-  }
-
-  private static List<DefinitionConfigChange.AuditEntry> activeAudit(DefinitionConfigChange change) {
-    DefinitionConfigChange.ChangeEntry entry = activeEntry(change);
-    if (entry != null && entry.audit() != null) {
-      return entry.audit();
-    }
-    return change == null ? List.of() : change.audit();
-  }
-
-  private static List<DefinitionConfigChange.ChangeEntry> prependEntry(
-      DefinitionConfigChange existing, DefinitionConfigChange.ChangeEntry nextEntry) {
-    List<DefinitionConfigChange.ChangeEntry> entries = new ArrayList<>();
-    if (nextEntry != null) {
-      entries.add(nextEntry);
-    }
-    for (DefinitionConfigChange.ChangeEntry entry : normalizedEntries(existing == null ? null : existing.changes())) {
-      if (entry != null) {
-        entries.add(entry);
-      }
-    }
-    return entries.isEmpty() ? List.of() : List.copyOf(entries);
-  }
-
-  private static List<DefinitionConfigChange.ChangeEntry> replaceEntry(
-      DefinitionConfigChange existing, DefinitionConfigChange.ChangeEntry replacement) {
-    if (replacement == null) {
-      return normalizedEntries(existing == null ? null : existing.changes());
-    }
-    List<DefinitionConfigChange.ChangeEntry> entries =
-        new ArrayList<>(normalizedEntries(existing == null ? null : existing.changes()));
-    String replacementId = Strings.trimToNull(replacement.changeId());
-    int replaceIndex = -1;
-    if (replacementId != null) {
-      for (int i = 0; i < entries.size(); i++) {
-        DefinitionConfigChange.ChangeEntry current = entries.get(i);
-        if (current != null && Objects.equals(replacementId, Strings.trimToNull(current.changeId()))) {
-          replaceIndex = i;
-          break;
-        }
-      }
-    }
-    if (replaceIndex < 0 && !entries.isEmpty()) {
-      replaceIndex = 0;
-    }
-    if (replaceIndex < 0) {
-      entries.add(replacement);
-    } else {
-      entries.set(replaceIndex, replacement);
-    }
-    return List.copyOf(entries);
-  }
-
-  private static DefinitionConfigChange projectChange(
-      DefinitionConfigChange base,
-      DefinitionConfigChange.ChangeEntry latest,
-      List<DefinitionConfigChange.ChangeEntry> entries) {
-    if (base == null) {
-      return null;
-    }
-    List<DefinitionConfigChange.ChangeEntry> normalizedEntries = normalizedEntries(entries);
-    if (latest == null) {
-      return new DefinitionConfigChange(
-          base.envelope(),
-          base.group(),
-          base.configId(),
-          base.layerId(),
-          base.schemaKey(),
-          base.state(),
-          base.mode(),
-          base.effectiveAtUtc(),
-          base.expiresAtUtc(),
-          base.draftDeclared(),
-          base.baseConfigId(),
-          base.baseEffectiveConfigId(),
-          base.lastPublishedConfigId(),
-          base.createdTimeUtc(),
-          base.createdBySubject(),
-          base.updatedTimeUtc(),
-          base.updatedBySubject(),
-          base.rationale(),
-          base.decisionMessage(),
-          base.audit(),
-          normalizedEntries);
-    }
-    return new DefinitionConfigChange(
-        base.envelope(),
-        base.group(),
-        base.configId(),
-        base.layerId(),
-        base.schemaKey(),
-        latest.state(),
-        latest.mode(),
-        latest.effectiveAtUtc(),
-        latest.expiresAtUtc(),
-        latest.draftDeclared(),
-        latest.baseConfigId(),
-        latest.baseEffectiveConfigId(),
-        latest.lastPublishedConfigId(),
-        latest.createdTimeUtc(),
-        latest.createdBySubject(),
-        latest.updatedTimeUtc(),
-        latest.updatedBySubject(),
-        latest.rationale(),
-        latest.decisionMessage(),
-        latest.audit(),
-        normalizedEntries);
-  }
-
-  private static DefinitionConfigChange.ChangeEntry legacyEntry(DefinitionConfigChange change) {
-    String fallbackId = Strings.trimToNull(change == null ? null : change.updatedTimeUtc());
-    return new DefinitionConfigChange.ChangeEntry(
-        fallbackId == null ? UUID.randomUUID().toString() : fallbackId,
-        change == null || change.state() == null ? DefinitionConfigChange.ChangeState.NONE : change.state(),
-        change == null || change.mode() == null ? DefinitionConfigChange.ChangeMode.IMMEDIATE : change.mode(),
-        change == null ? null : change.effectiveAtUtc(),
-        change == null ? null : change.expiresAtUtc(),
-        change == null ? null : change.draftDeclared(),
-        change == null ? null : change.baseConfigId(),
-        change == null ? null : change.baseEffectiveConfigId(),
-        change == null ? null : change.lastPublishedConfigId(),
-        change == null ? null : change.createdTimeUtc(),
-        change == null ? null : change.createdBySubject(),
-        change == null ? null : change.updatedTimeUtc(),
-        change == null ? null : change.updatedBySubject(),
-        change == null ? null : change.rationale(),
-        change == null ? null : change.decisionMessage(),
-        change == null ? List.of() : change.audit());
-  }
-
-  private static boolean hasLegacyEntryPayload(DefinitionConfigChange change) {
-    if (change == null) {
-      return false;
-    }
-    if (change.state() != null && change.state() != DefinitionConfigChange.ChangeState.NONE) {
-      return true;
-    }
-    if (change.draftDeclared() != null) {
-      return true;
-    }
-    if (change.audit() != null && !change.audit().isEmpty()) {
-      return true;
-    }
-    if (Strings.trimToNull(change.createdTimeUtc()) != null || Strings.trimToNull(change.createdBySubject()) != null) {
-      return true;
-    }
-    if (Strings.trimToNull(change.updatedTimeUtc()) != null || Strings.trimToNull(change.updatedBySubject()) != null) {
-      return true;
-    }
-    if (Strings.trimToNull(change.effectiveAtUtc()) != null || Strings.trimToNull(change.expiresAtUtc()) != null) {
-      return true;
-    }
-    if (Strings.trimToNull(change.rationale()) != null || Strings.trimToNull(change.decisionMessage()) != null) {
-      return true;
-    }
-    return Strings.trimToNull(change.lastPublishedConfigId()) != null;
-  }
-
-  private static DefinitionConfigChange.ChangeEntry firstEntry(
-      List<DefinitionConfigChange.ChangeEntry> entries) {
-    if (entries == null || entries.isEmpty()) {
-      return null;
-    }
-    for (DefinitionConfigChange.ChangeEntry entry : entries) {
-      if (entry != null) {
-        return entry;
-      }
-    }
-    return null;
-  }
-
-  private static List<DefinitionConfigChange.ChangeEntry> normalizedEntries(
-      List<DefinitionConfigChange.ChangeEntry> entries) {
-    if (entries == null || entries.isEmpty()) {
+  public <T extends Definition> List<T> list(Class<T> clazz, String group) {
+    if (clazz == null) {
       return List.of();
     }
-    List<DefinitionConfigChange.ChangeEntry> copy = new ArrayList<>();
-    for (DefinitionConfigChange.ChangeEntry entry : entries) {
-      if (entry != null) {
-        copy.add(entry);
+    DefinitionType type = toType(clazz);
+    if (type == DefinitionType.UNKNOWN) {
+      return List.of();
+    }
+    String normalizedGroup = normalize(group);
+    List<T> result = new ArrayList<>();
+    for (Definition definition : definitions.values()) {
+      if (definition == null || definitionType(definition) != type) {
+        continue;
+      }
+      if (normalizedGroup != null && !normalizedGroup.equals(normalize(definitionGroup(definition)))) {
+        continue;
+      }
+      if (clazz.isInstance(definition)) {
+        result.add(clazz.cast(definition));
       }
     }
-    return copy.isEmpty() ? List.of() : List.copyOf(copy);
+    return result;
   }
 
-  private static Window validateWindow(
-      DefinitionConfigChange.ChangeMode mode, Instant effectiveAt, Instant expiresAt, Instant now) {
-    DefinitionConfigChange.ChangeMode resolvedMode =
-        mode == null ? DefinitionConfigChange.ChangeMode.IMMEDIATE : mode;
-    Instant referenceNow = now == null ? Instant.now() : now;
-    if (resolvedMode == DefinitionConfigChange.ChangeMode.SCHEDULED) {
-      if (effectiveAt == null) {
-        throw new IllegalArgumentException("effectiveAt is required for SCHEDULED mode");
-      }
-      if (expiresAt != null && !expiresAt.isAfter(effectiveAt)) {
-        throw new IllegalArgumentException("expiresAt must be after effectiveAt for SCHEDULED mode");
-      }
-      return new Window(effectiveAt.toString(), expiresAt == null ? null : expiresAt.toString());
-    }
-    if (effectiveAt != null) {
-      throw new IllegalArgumentException("effectiveAt must be null for IMMEDIATE mode");
-    }
-    if (expiresAt != null && !expiresAt.isAfter(referenceNow)) {
-      throw new IllegalArgumentException("expiresAt must be after now for IMMEDIATE mode");
-    }
-    return new Window(null, expiresAt == null ? null : expiresAt.toString());
+  public Definition get(DefinitionType type, String group, String name) {
+    return definitions.get(new Key(type, normalize(group), normalize(name)));
   }
 
-  private static Instant parseInstantOrNull(String value, String field) {
-    String normalized = Strings.trimToNull(value);
-    if (normalized == null) {
+  public <T extends Definition> Optional<T> get(Class<T> clazz, String group, String name) {
+    return getOrFetch(clazz, group, name);
+  }
+
+  <T extends Definition> Optional<T> getOrFetch(Class<T> clazz, String group, String name) {
+    if (clazz == null) {
+      return Optional.empty();
+    }
+    DefinitionType type = toType(clazz);
+    if (type == DefinitionType.UNKNOWN) {
+      return Optional.empty();
+    }
+    String normalizedGroup = normalize(group);
+    String normalizedName = normalize(name);
+    if (normalizedGroup == null || normalizedName == null) {
+      return Optional.empty();
+    }
+    Definition definition = get(type, normalizedGroup, normalizedName);
+    if (definition == null) {
+      Optional<Definition> fetched = fetchOnMiss(type, normalizedGroup, normalizedName);
+      if (fetched.isEmpty()) {
+        return Optional.empty();
+      }
+      definition = fetched.get();
+    }
+    if (!clazz.isInstance(definition)) {
+      return Optional.empty();
+    }
+    return Optional.of(clazz.cast(definition));
+  }
+
+  public Optional<DefinitionSchema> getSchema(SchemaReference ref) {
+    if (ref == null) {
+      return Optional.empty();
+    }
+    String group = normalize(ref.group());
+    String name = normalize(ref.name());
+    if (group == null || name == null) {
+      return Optional.empty();
+    }
+    Definition definition = get(DefinitionType.SCHEMA, group, name);
+    if (definition instanceof DefinitionSchema schema) {
+      return Optional.of(schema);
+    }
+    return Optional.empty();
+  }
+
+  public List<DefinitionSchema> listSchemas(String group) {
+    List<DefinitionSchema> schemas = new ArrayList<>();
+    for (DefinitionSchema schema : list(DefinitionSchema.class, group)) {
+      if (schema == null || schema.schemaType() == null) {
+        continue;
+      }
+      schemas.add(schema);
+    }
+    schemas.sort(SCHEMA_NAME_ORDER);
+    return List.copyOf(schemas);
+  }
+
+  public List<DefinitionSchema> listSchemas(String group, DefinitionSchema.SchemaType type) {
+    DefinitionSchema.SchemaType normalizedType = Objects.requireNonNull(type, "schemaType");
+    List<DefinitionSchema> filtered = new ArrayList<>();
+    for (DefinitionSchema schema : listSchemas(group)) {
+      if (schema.schemaType() == normalizedType) {
+        filtered.add(schema);
+      }
+    }
+    return List.copyOf(filtered);
+  }
+
+  public void addListener(DiscoveryListener listener) {
+    if (listener == null) {
+      return;
+    }
+    listeners.addIfAbsent(listener);
+  }
+
+  public void removeListener(DiscoveryListener listener) {
+    if (listener == null) {
+      return;
+    }
+    listeners.remove(listener);
+  }
+
+  public AutoCloseable registerListener(
+      DefinitionType type, BiConsumer<ConfigKey, Definition> listener) {
+    Objects.requireNonNull(type, "type");
+    Objects.requireNonNull(listener, "listener");
+    if (type == DefinitionType.UNKNOWN) {
+      throw new IllegalArgumentException("type is required");
+    }
+    typedUpsertListeners
+        .computeIfAbsent(type, ignored -> new CopyOnWriteArrayList<>())
+        .add(listener);
+    return () -> unregisterListener(type, listener);
+  }
+
+  public ConfigCacheTx beginTx(String context) {
+    return new ConfigCacheTx(this, Strings.requireNonBlank(context, "context"));
+  }
+
+  public void upsertTx(ConfigCacheTx tx, Definition definition) {
+    Objects.requireNonNull(definition, "definition");
+    ConfigCacheTx activeTx = requireTx(tx);
+    Key key = requireDefinitionKey(definition);
+    activeTx.stageUpsert(key, definitions.get(key), definition);
+  }
+
+  public void removeTx(
+      ConfigCacheTx tx, Class<? extends Definition> type, String group, String name) {
+    ConfigCacheTx activeTx = requireTx(tx);
+    Key key = requireKey(type, group, name);
+    activeTx.stageDelete(key, definitions.get(key));
+  }
+
+  public void commitTx(ConfigCacheTx tx) {
+    ConfigCacheTx activeTx = requireTx(tx);
+    activeTx.requireCommittable();
+    List<ConfigCacheTx.WriteOp> ordered = activeTx.orderedWrites(TX_KEY_ORDER);
+    if (ordered.isEmpty()) {
+      activeTx.markCommitted();
+      return;
+    }
+    RuntimeException originalFailure = null;
+    for (ConfigCacheTx.WriteOp op : ordered) {
+      try {
+        applyWriteOp(op);
+        activeTx.markApplied(op.key());
+      } catch (RuntimeException ex) {
+        originalFailure = txCommitFailure(activeTx.context(), op.key(), ex);
+        break;
+      }
+    }
+    if (originalFailure == null) {
+      activeTx.markCommitted();
+      return;
+    }
+    try {
+      rollbackApplied(activeTx);
+    } catch (RuntimeException rollbackFailure) {
+      originalFailure.addSuppressed(rollbackFailure);
+    }
+    throw originalFailure;
+  }
+
+  public void rollbackTx(ConfigCacheTx tx) {
+    ConfigCacheTx activeTx = requireTx(tx);
+    if (activeTx.isCompleted()) {
+      return;
+    }
+    rollbackApplied(activeTx);
+  }
+
+  public void upsert(Definition definition) {
+    Objects.requireNonNull(definition, "definition");
+    DefinitionType type = definitionType(definition);
+    if (type == null || type == DefinitionType.UNKNOWN) {
+      type = toType(definition.getClass());
+    }
+    if (type == null || type == DefinitionType.UNKNOWN) {
+      throw new IllegalArgumentException("Unsupported definition type: " + definition.getClass().getName());
+    }
+    String group = normalize(definitionGroup(definition));
+    String name = normalize(definitionName(definition));
+    if (group == null || name == null) {
+      throw new IllegalArgumentException("definition envelope requires group/name");
+    }
+    String payload = serializeDefinition(definition);
+    try {
+      ControlConnection activeControl = requireControlConnection("upsert");
+      activeControl.amps().publish(DiscoveryTopics.DISCOVERY, payload);
+      if (shouldAcceptDefinition(definition)) {
+        Key key = new Key(type, group, name);
+        cacheUpsert(key, definition);
+      }
+    } catch (Exception ex) {
+      throw new IllegalStateException(
+          "Failed to publish definition " + type + " " + group + "/" + name, ex);
+    }
+  }
+
+  public void delete(DefinitionType type, String group, String name) {
+    Objects.requireNonNull(type, "type");
+    if (type == DefinitionType.UNKNOWN) {
+      throw new IllegalArgumentException("type is required");
+    }
+    String normalizedGroup = normalize(group);
+    String normalizedName = normalize(name);
+    if (normalizedGroup == null || normalizedName == null) {
+      throw new IllegalArgumentException("group/name are required");
+    }
+    Command command = new Command("sow_delete");
+    command.setTopic(DiscoveryTopics.DISCOVERY);
+    command.setFilter(
+        "(/envelope/group='"
+            + escape(normalizedGroup)
+            + "' AND /envelope/type='"
+            + escape(type.name())
+            + "' AND /envelope/name='"
+            + escape(normalizedName)
+            + "')");
+    ControlConnection activeControl = requireControlConnection("delete");
+    try (MessageStream ignored = activeControl.amps().client().execute(command)) {
+      Key key = new Key(type, normalizedGroup, normalizedName);
+      definitions.remove(key);
+      logDefinitionChange("delete", key);
+      notifyDelete(
+          new DefinitionEnvelope(
+              normalizedGroup,
+              type,
+              normalizedName,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null));
+    } catch (Exception ex) {
+      throw new IllegalStateException(
+          "Failed to delete definition " + type + " " + normalizedGroup + "/" + normalizedName, ex);
+    }
+  }
+
+  public void stop() {
+    synchronized (subscriptionLock) {
+      closeSubscriptionQuietly();
+    }
+  }
+
+  @Override
+  public void close() {
+    stop();
+  }
+
+  private DiscoveryScope defaultScope() {
+    return DiscoveryScope.primaryOnly(sessionGroup, null, null);
+  }
+
+  private void openSubscription(Duration timeout, boolean failOnTimeout) {
+    synchronized (subscriptionLock) {
+      ControlConnection activeControl = requireControlConnection("subscription");
+      recovered.set(false);
+      recoveryLatch = new CountDownLatch(1);
+      String filter = subscriptionFilter();
+      boolean replaced = false;
+      if (subscription != null) {
+        try {
+          subscription.replaceFilter(filter);
+          replaced = true;
+          if (verbose) {
+            LOGGER.info("[DiscoveryCache] context=scope-refresh mode=replace filter={}", safe(filter));
+          }
+        } catch (Exception ex) {
+          if (verbose) {
+            LOGGER.warn(
+                "[DiscoveryCache] context=scope-refresh mode=replace-failed reason={}",
+                Strings.firstNonBlank(ex.getMessage(), ex.getClass().getSimpleName()));
+          }
+          closeSubscriptionQuietly();
+        }
+      }
+      if (!replaced) {
+        closeSubscriptionQuietly();
+        Command command = new Command(Message.Command.SOWAndSubscribe);
+        command.setTopic(DiscoveryTopics.DISCOVERY);
+        command.setOptions("oof");
+        if (filter != null) {
+          command.setFilter(filter);
+        }
+        try {
+          subscription =
+              activeControl.sowAndSubscribe(
+                  command.getTopic(),
+                  command.getOptions(),
+                  command.getFilter(),
+                  message -> handleMessage(message.raw()));
+        } catch (Exception ex) {
+          throw new IllegalStateException(
+              "Failed to subscribe discovery cache topic with scope filter", ex);
+        }
+      }
+    }
+    if (failOnTimeout) {
+      awaitRecovery(timeout);
+      return;
+    }
+    try {
+      awaitRecovery(timeout);
+    } catch (RuntimeException ex) {
+      if (verbose) {
+        LOGGER.warn("[DiscoveryCache] scope subscription refresh timed out: {}", Strings.firstNonBlank(ex.getMessage(), ex.getClass().getSimpleName()));
+      }
+    }
+  }
+
+  private void closeSubscriptionQuietly() {
+    ControlConnection.Subscription id = subscription;
+    if (id == null) {
+      return;
+    }
+    try {
+      id.close();
+    } catch (Exception ignore) {
+    }
+    subscription = null;
+  }
+
+  private void awaitRecovery(Duration timeout) {
+    long millis = timeout == null ? 30000L : Math.max(1L, timeout.toMillis());
+    try {
+      boolean done = recoveryLatch.await(millis, TimeUnit.MILLISECONDS);
+      if (!done) {
+        throw new IllegalStateException(
+            "DiscoveryCache initial recovery did not complete (GroupEnd not observed)");
+      }
+    } catch (InterruptedException ex) {
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException("Interrupted while waiting for DiscoveryCache recovery", ex);
+    }
+  }
+
+  private void handleMessage(Message message) {
+    if (message == null) {
+      return;
+    }
+    int command = message.getCommand();
+    if (command == Message.Command.GroupEnd) {
+      recovered.set(true);
+      recoveryLatch.countDown();
+      if (verbose) {
+        LOGGER.info("[DiscoveryCache] context=recovered definitions={}", definitions.size());
+      }
+      return;
+    }
+    if (command != Message.Command.SOW
+        && command != Message.Command.Publish
+        && command != Message.Command.OOF) {
+      return;
+    }
+    String payload = message.getData();
+    if (Strings.isBlank(payload)) {
+      return;
+    }
+    final Definition definition;
+    try {
+      definition = DiscoveryCodec.decode(payload);
+    } catch (DefinitionDecodeException ex) {
+      logDecodeFailureWithDedupe(ex);
+      return;
+    } catch (RuntimeException ex) {
+      return;
+    }
+    if (definition == null || !shouldAcceptDefinition(definition)) {
+      return;
+    }
+    DefinitionType type = definitionType(definition);
+    if (type == null || type == DefinitionType.UNKNOWN) {
+      type = toType(definition.getClass());
+    }
+    if (type == null || type == DefinitionType.UNKNOWN) {
+      return;
+    }
+    Key key = new Key(type, normalize(definitionGroup(definition)), normalize(definitionName(definition)));
+    if (key.group() == null || key.name() == null) {
+      return;
+    }
+    if (command == Message.Command.OOF) {
+      definitions.remove(key);
+      logDefinitionChange("remove", key);
+      notifyDelete(definition.envelope());
+      return;
+    }
+    cacheUpsert(key, definition);
+  }
+
+  private void logDecodeFailureWithDedupe(DefinitionDecodeException ex) {
+    if (ex == null) {
+      return;
+    }
+    DefinitionEnvelope env = ex.getEnvelope();
+    String key =
+        safe(env == null ? null : env.group())
+            + "|"
+            + safe(env == null ? null : env.type())
+            + "|"
+            + safe(env == null ? null : env.name())
+            + "|"
+            + Integer.toHexString(Objects.hashCode(ex.getMessage()));
+    long now = System.currentTimeMillis();
+    Long last = DECODE_ERROR_LAST_LOG.get(key);
+    if (last != null && now - last <= DECODE_ERROR_WINDOW_MS) {
+      return;
+    }
+    DECODE_ERROR_LAST_LOG.put(key, now);
+    String payloadPretty = pretty(ex.getPayload());
+    LOGGER.error("[DiscoveryCache][DecodeFailed] group={} type={} name={} uuid={} payload=\n{}", safe(env == null ? null : env.group()), safe(env == null ? null : env.type()), safe(env == null ? null : env.name()), safe(env == null ? null : env.uuid()), payloadPretty, ex);
+  }
+
+  private boolean shouldAcceptDefinition(Definition definition) {
+    if (definition == null) {
+      return false;
+    }
+    DefinitionType type = definitionType(definition);
+    if (type == null || type == DefinitionType.UNKNOWN) {
+      type = toType(definition.getClass());
+    }
+    if (!isCacheableType(type)) {
+      return false;
+    }
+    if (adminMode) {
+      return true;
+    }
+    if (type == DefinitionType.ENTITLEMENT) {
+      return true;
+    }
+    return isGroupVisible(normalize(definitionGroup(definition)), discoveryScope);
+  }
+
+  private String subscriptionFilter() {
+    if (adminMode) {
       return null;
     }
+    DiscoveryScope scope = discoveryScope == null ? defaultScope() : discoveryScope;
+    List<String> groups = new ArrayList<>(scope.visibleGroups());
+    if (groups.stream().noneMatch(value -> PLATFORM_GROUP.equalsIgnoreCase(value))) {
+      groups.add(PLATFORM_GROUP);
+    }
+    StringBuilder groupFilter = new StringBuilder();
+    for (String group : groups) {
+      String normalized = normalize(group);
+      if (normalized == null) {
+        continue;
+      }
+      if (groupFilter.length() > 0) {
+        groupFilter.append(" OR ");
+      }
+      groupFilter.append("(/envelope/group='").append(escape(normalized)).append("')");
+    }
+    if (groupFilter.length() == 0) {
+      return "(/envelope/type='" + ENTITLEMENT_TYPE + "')";
+    }
+    return "(/envelope/type='" + ENTITLEMENT_TYPE + "' OR " + groupFilter + ")";
+  }
+
+  private void evictOutOfScopeDefinitions(DiscoveryScope scope) {
+    if (adminMode || scope == null) {
+      return;
+    }
+    List<Key> evictions = new ArrayList<>();
+    for (Map.Entry<Key, Definition> entry : definitions.entrySet()) {
+      Definition definition = entry.getValue();
+      if (definition == null) {
+        continue;
+      }
+      if (shouldRetainDefinition(definition, scope)) {
+        continue;
+      }
+      evictions.add(entry.getKey());
+    }
+    for (Key key : evictions) {
+      removeCached(key);
+    }
+  }
+
+  private boolean shouldRetainDefinition(Definition definition, DiscoveryScope scope) {
+    DefinitionType type = definitionType(definition);
+    if (type == null || type == DefinitionType.UNKNOWN) {
+      type = toType(definition.getClass());
+    }
+    if (type == DefinitionType.ENTITLEMENT) {
+      return true;
+    }
+    return isGroupVisible(normalize(definitionGroup(definition)), scope);
+  }
+
+  private boolean isGroupVisible(String group, DiscoveryScope scope) {
+    if (group == null) {
+      return false;
+    }
+    DiscoveryScope effectiveScope = scope == null ? defaultScope() : scope;
+    return effectiveScope.includesGroup(group);
+  }
+
+  private static DefinitionType toType(Class<?> clazz) {
+    return DiscoveryCacheType.toType(clazz, CLASS_TO_TYPE, UNMAPPED_DEFINITION_CLASSES, LOGGER);
+  }
+
+  private static boolean isCacheableType(DefinitionType type) {
+    return DiscoveryCacheType.isCacheableType(type, CACHEABLE_DEFINITIONS);
+  }
+
+  private static DefinitionType definitionType(Definition definition) {
+    return DiscoveryCacheType.definitionType(definition);
+  }
+
+  private static String definitionGroup(Definition definition) {
+    return DiscoveryCacheType.definitionGroup(definition);
+  }
+
+  private static String definitionName(Definition definition) {
+    return DiscoveryCacheType.definitionName(definition);
+  }
+
+  private static DefinitionEnvelope definitionEnvelope(Definition definition) {
+    return DiscoveryCacheType.definitionEnvelope(definition);
+  }
+
+  private static String normalize(String value) {
+    return DiscoveryCacheType.normalize(value);
+  }
+
+  private static String safe(Object value) {
+    return DiscoveryCacheType.safe(value);
+  }
+
+  private static String pretty(JsonNode node) {
+    if (node == null) {
+      return "";
+    }
     try {
-      return Instant.parse(normalized);
+      return DiscoveryCodec.mapper().writerWithDefaultPrettyPrinter().writeValueAsString(node);
     } catch (Exception ex) {
-      throw new IllegalArgumentException(field + " must be an ISO-8601 UTC instant", ex);
+      return node.toString();
     }
   }
 
-  private static DefinitionConfigChange.ChangeState stateOf(DefinitionConfigChange change) {
-    DefinitionConfigChange.ChangeState state = change == null ? null : change.state();
-    return state == null ? DefinitionConfigChange.ChangeState.NONE : state;
-  }
-
-  private static DefinitionConfigChange.ChangeMode modeOf(DefinitionConfigChange change) {
-    DefinitionConfigChange.ChangeMode mode = change == null ? null : change.mode();
-    return mode == null ? DefinitionConfigChange.ChangeMode.IMMEDIATE : mode;
-  }
-
-  private static boolean isScheduledPending(DefinitionConfigChange change) {
-    if (change == null || modeOf(change) != DefinitionConfigChange.ChangeMode.SCHEDULED) {
-      return false;
-    }
-    String effectiveAtUtc = Strings.trimToNull(change.effectiveAtUtc());
-    if (effectiveAtUtc == null) {
-      return false;
-    }
+  private static String serializeDefinition(Definition definition) {
     try {
-      Instant effectiveAt = Instant.parse(effectiveAtUtc);
-      Instant now = Instant.now();
-      Instant expiresAt = parseInstantOrNull(change.expiresAtUtc(), "expiresAtUtc");
-      if (expiresAt != null && !expiresAt.isAfter(effectiveAt)) {
-        return false;
+      return DiscoveryCodec.mapper().writerWithDefaultPrettyPrinter().writeValueAsString(definition);
+    } catch (Exception ex) {
+      throw new IllegalArgumentException("Unable to serialize definition", ex);
+    }
+  }
+
+  private static String escape(String value) {
+    return value == null ? "" : value.replace("'", "''");
+  }
+
+  private static String schemaName(DefinitionSchema schema) {
+    return DiscoveryCacheType.schemaName(schema);
+  }
+
+  private static String schemaTypeName(DefinitionSchema schema) {
+    return DiscoveryCacheType.schemaTypeName(schema);
+  }
+
+  private static String txTypeToken(Key key) {
+    return key == null || key.type() == null ? "" : key.type().name();
+  }
+
+  private static String txGroupToken(Key key) {
+    return key == null ? "" : Strings.firstNonBlank(key.group(), "");
+  }
+
+  private static String txNameToken(Key key) {
+    return key == null ? "" : Strings.firstNonBlank(key.name(), "");
+  }
+
+  private void logDefinitionChange(String context, Key key) {
+    if (!verbose) {
+      return;
+    }
+    LOGGER.info("[DiscoveryCache] context={} definitions={} key={}", context, definitions.size(), formatKey(key));
+  }
+
+  private static String formatKey(Key key) {
+    if (key == null) {
+      return "unknown";
+    }
+    return key.type() + ":" + key.group() + "/" + key.name();
+  }
+
+  private void notifyUpsert(Definition definition) {
+    if (definition == null || listeners.isEmpty()) {
+      return;
+    }
+    for (DiscoveryListener listener : listeners) {
+      try {
+        listener.onUpsert(definition);
+      } catch (Exception ex) {
+        LOGGER.warn("[DiscoveryCache] listener upsert failed: {}", ex.toString());
       }
-      if (expiresAt != null && !now.isBefore(expiresAt)) {
-        return false;
+    }
+  }
+
+  private void notifyDelete(DefinitionEnvelope envelope) {
+    if (envelope == null || listeners.isEmpty()) {
+      return;
+    }
+    for (DiscoveryListener listener : listeners) {
+      try {
+        listener.onDelete(envelope);
+      } catch (Exception ex) {
+        LOGGER.warn("[DiscoveryCache] listener delete failed: {}", ex.toString());
       }
-      return effectiveAt.isAfter(now);
-    } catch (Exception ignored) {
-      return false;
     }
   }
 
-  private static String schemaKey(DefinitionConfigLayer config) {
-    DefinitionConfigLayer payload =
-        config == null  ? null : config;
-    return Strings.trimToNull(payload == null ? null : payload.schemaKey());
-  }
-
-  private static DefinitionConfigLayer ConfigPayload(DefinitionConfigLayer definition) {
-    if (definition == null) {
-      throw new IllegalStateException("config payload is required");
+  private void unregisterListener(
+      DefinitionType type, BiConsumer<ConfigKey, Definition> listener) {
+    CopyOnWriteArrayList<BiConsumer<ConfigKey, Definition>> registered = typedUpsertListeners.get(type);
+    if (registered == null) {
+      return;
     }
-    return definition;
-  }
-
-  private static String required(String value, String field) {
-    String normalized = Strings.trimToNull(value);
-    if (normalized == null) {
-      throw new IllegalArgumentException(field + " is required");
-    }
-    return normalized;
-  }
-
-  private static ObjectNode requireObject(JsonNode node, String field) {
-    if (node == null || !node.isObject()) {
-      throw new IllegalArgumentException(field + " must be a JSON object");
-    }
-    return (ObjectNode) node;
-  }
-
-  private static String configLayerDefinitionName(String configId, String layerId) {
-    return "config__" + configId + "__" + layerId;
-  }
-
-  private static String changeName(String configId, String layerId) {
-    return "config_change__" + configId + "__" + layerId;
-  }
-
-  private static String resolveSubject(String subject) {
-    String normalized = Strings.trimToNull(subject);
-    return normalized == null ? "service:config-client" : normalized;
-  }
-
-  private static JsonNode deepCopy(JsonNode node) {
-    return node == null ? null : node.deepCopy();
-  }
-
-  private record Window(String effectiveAtUtc, String expiresAtUtc) {}
-
-  public interface Store {
-    List<DefinitionConfigLayer> listConfigLayers(String group);
-
-    Definition get(DefinitionType type, String group, String name);
-
-    void upsert(Definition definition);
-  }
-
-  public static final class WorkflowDraftNotFoundException extends RuntimeException {
-    public WorkflowDraftNotFoundException(String message) {
-      super(message);
+    registered.remove(listener);
+    if (registered.isEmpty()) {
+      typedUpsertListeners.remove(type, registered);
     }
   }
 
-  public static final class WorkflowStateException extends IllegalStateException {
-    public WorkflowStateException(String message) {
-      super(message);
+  private void notifyTypedUpsert(Key key, Definition definition) {
+    if (key == null || definition == null) {
+      return;
+    }
+    List<BiConsumer<ConfigKey, Definition>> listenersByType = typedUpsertListeners.get(key.type());
+    if (listenersByType == null || listenersByType.isEmpty()) {
+      return;
+    }
+    ConfigKey configKey = new ConfigKey(key.type(), key.group(), key.name());
+    for (BiConsumer<ConfigKey, Definition> listener : listenersByType) {
+      try {
+        listener.accept(configKey, definition);
+      } catch (Exception ex) {
+        LOGGER.warn("[DiscoveryCache] typed listener upsert failed type={} key={} message={}", key.type(), formatKey(key), ex.toString());
+      }
     }
   }
 
-  public static final class ConfigNotFoundException extends RuntimeException {
-    public ConfigNotFoundException(String message) {
-      super(message);
+  private Optional<Definition> fetchOnMiss(DefinitionType type, String group, String name) {
+    Key key = new Key(type, group, name);
+    Definition cached = definitions.get(key);
+    if (cached != null) {
+      return Optional.of(cached);
+    }
+
+    CompletableFuture<Optional<Definition>> mine = new CompletableFuture<>();
+    CompletableFuture<Optional<Definition>> inFlight = inFlightFetches.putIfAbsent(key, mine);
+    if (inFlight != null) {
+      try {
+        return inFlight.join();
+      } catch (RuntimeException ex) {
+        return Optional.empty();
+      }
+    }
+
+    try {
+      Optional<Definition> fetched = fetchSingle(type, group, name);
+      mine.complete(fetched);
+      return fetched;
+    } catch (Exception ex) {
+      mine.complete(Optional.empty());
+      LOGGER.warn("[DiscoveryCache] context=fetch-miss key={} message={}", formatKey(key), ex.toString());
+      return Optional.empty();
+    } finally {
+      inFlightFetches.remove(key, mine);
     }
   }
+
+  private Optional<Definition> fetchSingle(DefinitionType type, String group, String name) throws Exception {
+    Key requestedKey = new Key(type, group, name);
+    Definition cached = definitions.get(requestedKey);
+    if (cached != null) {
+      return Optional.of(cached);
+    }
+
+    Command command = new Command(Message.Command.SOW);
+    command.setTopic(DiscoveryTopics.DISCOVERY);
+    command.setFilter(
+        "(/envelope/group='"
+            + escape(group)
+            + "' AND /envelope/type='"
+            + escape(type.name())
+            + "' AND /envelope/name='"
+            + escape(name)
+            + "')");
+
+    ControlConnection activeControl = requireControlConnection("fetch-single");
+    try (MessageStream stream = activeControl.amps().client().execute(command)) {
+      for (Message message : stream) {
+        if (message == null) {
+          continue;
+        }
+        int commandType = message.getCommand();
+        if (commandType != Message.Command.SOW && commandType != Message.Command.Publish) {
+          continue;
+        }
+        String payload = message.getData();
+        if (Strings.isBlank(payload)) {
+          continue;
+        }
+        Definition definition;
+        try {
+          definition = DiscoveryCodec.decode(payload);
+        } catch (DefinitionDecodeException ex) {
+          logDecodeFailureWithDedupe(ex);
+          continue;
+        } catch (RuntimeException ex) {
+          continue;
+        }
+        if (definition == null || !shouldAcceptDefinition(definition)) {
+          continue;
+        }
+        DefinitionType foundType = definitionType(definition);
+        if (foundType == null || foundType == DefinitionType.UNKNOWN) {
+          foundType = toType(definition.getClass());
+        }
+        if (foundType != type) {
+          continue;
+        }
+        String foundGroup = normalize(definitionGroup(definition));
+        String foundName = normalize(definitionName(definition));
+        if (!group.equals(foundGroup) || !name.equals(foundName)) {
+          continue;
+        }
+        Key foundKey = new Key(foundType, foundGroup, foundName);
+        cacheUpsert(foundKey, definition);
+        return Optional.of(definition);
+      }
+    }
+    return Optional.ofNullable(definitions.get(requestedKey));
+  }
+
+  private void cacheUpsert(Key key, Definition definition) {
+    definitions.put(key, definition);
+    logDefinitionChange("upsert", key);
+    notifyUpsert(definition);
+    notifyTypedUpsert(key, definition);
+  }
+
+  private void removeCached(Key key) {
+    Definition removed = definitions.remove(key);
+    if (removed == null) {
+      return;
+    }
+    logDefinitionChange("remove", key);
+    DefinitionEnvelope envelope = definitionEnvelope(removed);
+    if (envelope != null) {
+      notifyDelete(envelope);
+      return;
+    }
+    notifyDelete(
+        new DefinitionEnvelope(
+            key.group(),
+            key.type(),
+            key.name(),
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null));
+  }
+
+  private ConfigCacheTx requireTx(ConfigCacheTx tx) {
+    ConfigCacheTx activeTx = Objects.requireNonNull(tx, "tx");
+    activeTx.requireOwner(this);
+    return activeTx;
+  }
+
+  private void applyWriteOp(ConfigCacheTx.WriteOp op) {
+    if (op.delete()) {
+      delete(op.key().type(), op.key().group(), op.key().name());
+      return;
+    }
+    upsert(op.newValue());
+  }
+
+  private void rollbackApplied(ConfigCacheTx tx) {
+    RuntimeException failure = null;
+    List<ConfigCacheTx.WriteOp> ordered = tx.orderedWrites(TX_KEY_ORDER);
+    for (ConfigCacheTx.WriteOp op : ordered) {
+      if (!tx.wasApplied(op.key())) {
+        continue;
+      }
+      try {
+        Definition snapshot = op.oldValueSnapshot();
+        if (snapshot == null) {
+          removeCached(op.key());
+        } else {
+          cacheUpsert(op.key(), snapshot);
+        }
+      } catch (RuntimeException ex) {
+        if (failure == null) {
+          failure =
+              new IllegalStateException(
+                  "DiscoveryCache tx rollback failed context="
+                      + tx.context()
+                      + " key="
+                      + formatKey(op.key()),
+                  ex);
+        } else {
+          failure.addSuppressed(ex);
+        }
+      }
+    }
+    tx.markRolledBack();
+    if (failure != null) {
+      throw failure;
+    }
+  }
+
+  private static RuntimeException txCommitFailure(
+      String context, Key key, RuntimeException original) {
+    String message =
+        "DiscoveryCache tx commit failed context="
+            + context
+            + " key="
+            + formatKey(key)
+            + " reason="
+            + Strings.firstNonBlank(
+                Strings.trimToNull(original.getMessage()),
+                original.getClass().getSimpleName());
+    if (original instanceof IllegalStateException
+        && message.equals(Strings.trimToNull(original.getMessage()))) {
+      return original;
+    }
+    return new IllegalStateException(message, original);
+  }
+
+  private static Key requireKey(
+      Class<? extends Definition> clazz, String group, String name) {
+    Class<? extends Definition> normalizedClass = Objects.requireNonNull(clazz, "type");
+    DefinitionType type = toType(normalizedClass);
+    if (type == DefinitionType.UNKNOWN) {
+      throw new IllegalArgumentException(
+          "Unsupported definition class: " + normalizedClass.getName());
+    }
+    String normalizedGroup = normalize(group);
+    String normalizedName = normalize(name);
+    if (normalizedGroup == null || normalizedName == null) {
+      throw new IllegalArgumentException("group/name are required");
+    }
+    return new Key(type, normalizedGroup, normalizedName);
+  }
+
+  private Key requireDefinitionKey(Definition definition) {
+    Objects.requireNonNull(definition, "definition");
+    DefinitionType type = definitionType(definition);
+    if (type == null || type == DefinitionType.UNKNOWN) {
+      type = toType(definition.getClass());
+    }
+    if (type == null || type == DefinitionType.UNKNOWN) {
+      throw new IllegalArgumentException(
+          "Unsupported definition type: " + definition.getClass().getName());
+    }
+    String group = normalize(definitionGroup(definition));
+    String name = normalize(definitionName(definition));
+    if (group == null || name == null) {
+      throw new IllegalArgumentException("definition envelope requires group/name");
+    }
+    return new Key(type, group, name);
+  }
+
+  private static Map<DefinitionType, Class<? extends Definition>> cacheableDefinitions() {
+    return DiscoveryCacheType.cacheableDefinitions();
+  }
+
+  private ControlConnection requireControlConnection(String operation) {
+    ControlConnection active = control;
+    if (active != null) {
+      return active;
+    }
+    throw new IllegalStateException(
+        "DiscoveryCache control connection is unavailable for "
+            + Strings.firstNonBlank(operation, "operation")
+            + " (recovered snapshot mode)");
+  }
+
+  private static Map<Class<? extends Definition>, DefinitionType> classToType() {
+    return DiscoveryCacheType.classToType(CACHEABLE_DEFINITIONS);
+  }
+
+  public static final class ConfigCacheTx implements AutoCloseable {
+    private final DiscoveryCache owner;
+    private final String context;
+    private final LinkedHashMap<Key, WriteOp> writesByKey = new LinkedHashMap<>();
+    private final Set<Key> appliedKeys = new HashSet<>();
+    private boolean committed;
+    private boolean rolledBack;
+
+    private ConfigCacheTx(DiscoveryCache owner, String context) {
+      this.owner = Objects.requireNonNull(owner, "owner");
+      this.context = Strings.requireNonBlank(context, "context");
+    }
+
+    @Override
+    public void close() {
+      if (isCompleted()) {
+        return;
+      }
+      owner.rollbackTx(this);
+    }
+
+    private void requireOwner(DiscoveryCache expected) {
+      if (owner != expected) {
+        throw new IllegalArgumentException("DiscoveryCache tx owner mismatch context=" + context);
+      }
+    }
+
+    private void requireCommittable() {
+      if (committed) {
+        throw new IllegalStateException("DiscoveryCache tx is already committed context=" + context);
+      }
+      if (rolledBack) {
+        throw new IllegalStateException("DiscoveryCache tx is already rolled back context=" + context);
+      }
+    }
+
+    private boolean isCompleted() {
+      return committed || rolledBack;
+    }
+
+    private String context() {
+      return context;
+    }
+
+    private void markCommitted() {
+      committed = true;
+      rolledBack = false;
+      writesByKey.clear();
+      appliedKeys.clear();
+    }
+
+    private void markRolledBack() {
+      rolledBack = true;
+      committed = false;
+      writesByKey.clear();
+      appliedKeys.clear();
+    }
+
+    private void markApplied(Key key) {
+      appliedKeys.add(key);
+    }
+
+    private boolean wasApplied(Key key) {
+      return appliedKeys.contains(key);
+    }
+
+    private void stageUpsert(Key key, Definition oldSnapshot, Definition newValue) {
+      requireCommittable();
+      Objects.requireNonNull(key, "key");
+      Objects.requireNonNull(newValue, "definition");
+      WriteOp existing = writesByKey.get(key);
+      Definition snapshot = existing == null ? oldSnapshot : existing.oldValueSnapshot();
+      writesByKey.put(key, new WriteOp(key, snapshot, newValue, false));
+    }
+
+    private void stageDelete(Key key, Definition oldSnapshot) {
+      requireCommittable();
+      Objects.requireNonNull(key, "key");
+      WriteOp existing = writesByKey.get(key);
+      Definition snapshot = existing == null ? oldSnapshot : existing.oldValueSnapshot();
+      writesByKey.put(key, new WriteOp(key, snapshot, null, true));
+    }
+
+    private List<WriteOp> orderedWrites(Comparator<Key> comparator) {
+      List<WriteOp> ordered = new ArrayList<>(writesByKey.values());
+      ordered.sort((left, right) -> comparator.compare(left.key(), right.key()));
+      return ordered;
+    }
+
+    public static final class WriteOp {
+      private final Key key;
+      private final Definition oldValueSnapshot;
+      private final Definition newValue;
+      private final boolean delete;
+
+      private WriteOp(Key key, Definition oldValueSnapshot, Definition newValue, boolean delete) {
+        this.key = key;
+        this.oldValueSnapshot = oldValueSnapshot;
+        this.newValue = newValue;
+        this.delete = delete;
+      }
+
+      private Key key() {
+        return key;
+      }
+
+      private Definition oldValueSnapshot() {
+        return oldValueSnapshot;
+      }
+
+      private Definition newValue() {
+        return newValue;
+      }
+
+      private boolean delete() {
+        return delete;
+      }
+    }
+  }
+
+  private record Key(DefinitionType type, String group, String name) {}
+
+  public record ConfigKey(DefinitionType type, String group, String name) {}
 }
+
+
+
+
+
 
 
 
