@@ -1,511 +1,520 @@
-package org.pronzato.fabric.api.services.grpc;
+package org.pronzato.fabric.api.control.status.service;
 
-import io.grpc.ClientCall;
-import io.grpc.ClientInterceptor;
-import io.grpc.ManagedChannel;
-import io.grpc.MethodDescriptor;
-import io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts;
-import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
-import io.grpc.netty.shaded.io.netty.handler.ssl.SslContext;
-import io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder;
-import java.io.File;
-import java.util.ArrayList;
+import com.crankuptheamps.client.Message;
+import java.io.Closeable;
+import java.time.Duration;
+import java.util.ArrayDeque;
+import java.util.Comparator;
+import java.util.Deque;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import org.pronzato.fabric.api.control.status.service.ServiceHbCache;
-import org.pronzato.fabric.api.control.security.UserContext;
-import org.pronzato.fabric.api.control.security.UserPrincipal;
-import org.pronzato.fabric.api.control.security.identity.CallerAppContext;
-import org.pronzato.fabric.api.control.security.kerberos.KerberosClient;
-import org.pronzato.fabric.api.control.security.kerberos.KerberosConfig;
-import org.pronzato.fabric.api.control.security.kerberos.KerberosKrb5Source;
-import org.pronzato.fabric.api.control.security.kerberos.KerberosSpn;
-import org.pronzato.fabric.api.services.common.ServiceAdvertise;
-import org.pronzato.fabric.api.services.common.ServiceEndpointSelector;
-import org.pronzato.fabric.api.services.common.ServiceInstanceResolver;
-import org.pronzato.fabric.api.services.common.routing.ServiceRoutingContext;
-import org.pronzato.fabric.api.services.common.routing.ServiceRoutingMode;
-import org.pronzato.fabric.api.services.common.routing.ServiceRoutingState;
+import java.util.function.Consumer;
+import java.util.regex.Pattern;
+import org.pronzato.fabric.api.control.ControlConnection;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryTopics;
+import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionHbService;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
 import org.pronzato.fabric.api.util.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public final class GrpcClientRuntime {
-  private static final Logger LOGGER = LoggerFactory.getLogger(GrpcClientRuntime.class);
-  private GrpcClientRuntime() {}
+public final class ServiceHbCache implements Closeable {
+  private static final Logger LOGGER = LoggerFactory.getLogger(ServiceHbCache.class);
+  private static final String FABRIC_HB_TOPIC = DiscoveryTopics.HEARTBEAT;
 
-  public static ManagedChannel createChannel(
-      Config cfg, List<ClientInterceptor> extraInterceptors) throws Exception {
-    Objects.requireNonNull(cfg, "cfg");
-    cfg.validate();
+  public static final class Target {
+    public final String instanceId;
+    public final String host;
+    public final int port;
+    public final boolean tls;
+    public final String authorityOverride;
 
-    String host = ServiceAdvertise.requireRoutableHost(cfg.host, "grpc target host");
-    NettyChannelBuilder builder = NettyChannelBuilder.forAddress(host, cfg.port);
-
-    if (cfg.tlsEnabled) {
-      SslContextBuilder sslBuilder = GrpcSslContexts.forClient();
-      if (cfg.trustCertPem != null) {
-        sslBuilder.trustManager(cfg.trustCertPem);
-      }
-      SslContext context = sslBuilder.build();
-      builder.sslContext(context);
-    } else {
-      if (cfg.kerberosEnabled && cfg.kerberosRequireTls) {
-        throw new IllegalStateException("Kerberos requires TLS but grpc.tls.enabled=false");
-      }
-      builder.usePlaintext();
+    public Target(String instanceId, String host, int port, boolean tls, String authorityOverride) {
+      this.instanceId = Strings.emptyToNull(instanceId);
+      this.host = host;
+      this.port = port;
+      this.tls = tls;
+      this.authorityOverride = Strings.emptyToNull(authorityOverride);
     }
 
-    KerberosClient ownedKerberosContext = null;
-    List<ClientInterceptor> interceptors = new ArrayList<>();
-    if (cfg.kerberosEnabled) {
-      ownedKerberosContext = startKerberos(cfg);
-      String realm = KerberosSpn.resolveRealm(cfg.kerberosRealm, ownedKerberosContext.getSubject());
-      String baseSpn = KerberosSpn.resolveSpn(cfg.kerberosSpn, host);
-      String normalizedSpn = KerberosSpn.normalizeSpnWithRealm(baseSpn, realm);
-      interceptors.add(
-          new GrpcKerberosClientInterceptor(
-              ownedKerberosContext, normalizedSpn, cfg.useDelegatedSubjectIfPresent));
+    @Override
+    public String toString() {
+      String id = instanceId == null ? "" : instanceId + " ";
+      String base = id + host + ":" + port + (tls ? " (TLS)" : "");
+      return authorityOverride == null ? base : base + " auth=" + authorityOverride;
     }
-
-    if (extraInterceptors != null) {
-      for (ClientInterceptor interceptor : extraInterceptors) {
-        if (interceptor != null) {
-          interceptors.add(interceptor);
-        }
-      }
-    }
-    if (!interceptors.isEmpty()) {
-      builder.intercept(interceptors);
-    }
-
-    ManagedChannel channel = builder.build();
-    if (ownedKerberosContext == null) {
-      return channel;
-    }
-    return new ManagedChannelWithCleanup(channel, ownedKerberosContext);
   }
 
-  public static ManagedChannel createRoutingChannel(
-      RoutingConfig cfg, List<ClientInterceptor> extraInterceptors) throws Exception {
-    Objects.requireNonNull(cfg, "cfg");
-    cfg.validate();
-    return new RoutingManagedChannel(cfg, extraInterceptors);
-  }
-
-  private static KerberosClient startKerberos(Config cfg) {
-    KerberosConfig kerberosConfig =
-        new KerberosConfig(
-            KerberosConfig.DEFAULT_CONTEXT_NAME,
-            true,
-            cfg.kerberosPrincipal,
-            cfg.kerberosKeytab.toPath(),
-            null,
-            KerberosKrb5Source.DEFAULT,
-            cfg.kerberosRealm,
-            false,
-            true);
-    return new KerberosClient(kerberosConfig).start();
-  }
-
-  public static final class RoutingConfig {
-    public String serviceId;
-    public ServiceHbCache statusCache;
-    public ServiceInstanceResolver instanceResolver;
-    public String serviceGroup;
-    public String serviceName;
-    public boolean tlsEnabled;
-    public File trustCertPem;
-    public boolean kerberosEnabled;
-    public boolean kerberosRequireTls = true;
-    public String kerberosSpn;
-    public String kerberosPrincipal;
-    public File kerberosKeytab;
-    public String kerberosRealm;
-    public boolean useDelegatedSubjectIfPresent;
-    public boolean logRoutingSelections;
-    public boolean closeInstanceResolverOnCleanup = true;
-    public long shutdownTimeoutMillis = 2000L;
-    public ServiceRoutingMode routingMode = ServiceRoutingMode.ROUND_ROBIN;
-    public String defaultEffectiveSubject;
-    public String callerAppSubject;
-    public String routingKey;
-
-    public void validate() {
-      serviceId = Strings.trimToNull(serviceId);
-      serviceGroup = Strings.trimToNull(serviceGroup);
-      serviceName = Strings.trimToNull(serviceName);
-      defaultEffectiveSubject = Strings.trimToNull(defaultEffectiveSubject);
-      callerAppSubject = Strings.trimToNull(callerAppSubject);
-      routingKey = Strings.trimToNull(routingKey);
-      if (statusCache == null && instanceResolver == null) {
-        throw new IllegalArgumentException("routing status cache is required");
-      }
-      if (instanceResolver != null) {
-        if (serviceGroup == null) {
-          throw new IllegalArgumentException("routing service group is required");
-        }
-        if (serviceName == null) {
-          throw new IllegalArgumentException("routing service name is required");
-        }
-      }
-      if (kerberosEnabled) {
-        kerberosPrincipal = Strings.trimToNull(kerberosPrincipal);
-        if (kerberosPrincipal == null) {
-          throw new IllegalArgumentException(
-              "Kerberos principal is required when grpc.kerberos.enabled=true");
-        }
-        if (kerberosKeytab == null) {
-          throw new IllegalArgumentException(
-              "Kerberos keytab is required when grpc.kerberos.enabled=true");
-        }
-        if (!kerberosKeytab.isFile()) {
-          throw new IllegalArgumentException(
-              "Kerberos keytab does not exist: " + kerberosKeytab.getAbsolutePath());
-        }
-        kerberosSpn = Strings.trimToNull(kerberosSpn);
-        kerberosRealm = Strings.trimToNull(kerberosRealm);
-      }
-      if (routingMode == null) {
-        routingMode = ServiceRoutingMode.ROUND_ROBIN;
-      }
-    }
+  public enum AlertType {
+    FIRST_SEEN,
+    GONE,
+    FLAP_SUSPECT,
+    DEADMAN_TIMEOUT
   }
 
   public static final class Config {
-    public String host;
-    public int port;
-    public boolean tlsEnabled;
-    public File trustCertPem;
-    public boolean kerberosEnabled;
-    public boolean kerberosRequireTls = true;
-    public String kerberosSpn;
-    public String kerberosPrincipal;
-    public File kerberosKeytab;
-    public String kerberosRealm;
-    public boolean useDelegatedSubjectIfPresent;
+    private Duration flapWindow = Duration.ofSeconds(30);
+    private int flapThreshold = 4;
+    private Duration deadmanTimeout = Duration.ofSeconds(20);
+    private String regionFilter = null;
+    private boolean notifyOnTimestampOnly = false;
 
-    public void validate() {
-      host = Strings.trimToNull(host);
-      if (host == null) {
-        throw new IllegalArgumentException("grpc target host is required");
-      }
-      if (port <= 0) {
-        throw new IllegalArgumentException("grpc target port must be > 0");
-      }
-      if (kerberosEnabled) {
-        kerberosPrincipal = Strings.trimToNull(kerberosPrincipal);
-        if (kerberosPrincipal == null) {
-          throw new IllegalArgumentException(
-              "Kerberos principal is required when grpc.kerberos.enabled=true");
-        }
-        if (kerberosKeytab == null) {
-          throw new IllegalArgumentException(
-              "Kerberos keytab is required when grpc.kerberos.enabled=true");
-        }
-        if (!kerberosKeytab.isFile()) {
-          throw new IllegalArgumentException(
-              "Kerberos keytab does not exist: " + kerberosKeytab.getAbsolutePath());
-        }
-        kerberosSpn = Strings.trimToNull(kerberosSpn);
-        kerberosRealm = Strings.trimToNull(kerberosRealm);
-      }
+    public Config withFlapWindow(Duration w) {
+      this.flapWindow = w;
+      return this;
+    }
+
+    public Config withFlapThreshold(int t) {
+      this.flapThreshold = t;
+      return this;
+    }
+
+    public Config withDeadmanTimeout(Duration t) {
+      this.deadmanTimeout = t;
+      return this;
+    }
+
+    public Config withRegionFilter(String regionOrNull) {
+      this.regionFilter = Strings.isBlank(regionOrNull) ? null : regionOrNull;
+      return this;
+    }
+
+    public Config withNotifyOnTimestampOnly(boolean v) {
+      this.notifyOnTimestampOnly = v;
+      return this;
+    }
+
+    Duration flapWindow() {
+      return flapWindow;
+    }
+
+    int flapThreshold() {
+      return flapThreshold;
+    }
+
+    Duration deadmanTimeout() {
+      return deadmanTimeout;
+    }
+
+    String regionFilter() {
+      return regionFilter;
+    }
+
+    boolean notifyOnTimestampOnly() {
+      return notifyOnTimestampOnly;
     }
   }
 
-  private static final class RoutingManagedChannel extends ManagedChannel {
-    private final RoutingConfig cfg;
-    private final List<ClientInterceptor> interceptors;
-    private final ConcurrentMap<String, ManagedChannel> channels = new ConcurrentHashMap<>();
-    private final AtomicBoolean shutdown = new AtomicBoolean(false);
-    private final AtomicBoolean cleanupDone = new AtomicBoolean(false);
-    private final ServiceRoutingState routingState = new ServiceRoutingState();
-    private volatile String lastRouteKey;
+  private final String group;
+  private final String service;
+  private final Config cfg;
+  private final Pattern servicePattern;
+  private final ControlConnection control;
+  private final com.fasterxml.jackson.databind.ObjectMapper om = DiscoveryCodec.mapper();
+  private final ConcurrentMap<String, ServiceStatusInstance> byInstance = new ConcurrentHashMap<>();
+  private final ConcurrentMap<String, Long> lastSeen = new ConcurrentHashMap<>();
+  private final ConcurrentMap<String, String> lastStatus = new ConcurrentHashMap<>();
+  private final ConcurrentMap<String, Deque<Long>> flipTimes = new ConcurrentHashMap<>();
+  private final List<Consumer<List<ServiceStatusInstance>>> snapshotListeners = new CopyOnWriteArrayList<>();
+  private final List<Consumer<ServiceStatusAlert>> alertListeners = new CopyOnWriteArrayList<>();
+  private final RoundRobin rr = new RoundRobin();
+  private final ScheduledExecutorService ses;
+  private final boolean ownsScheduler;
+  private volatile boolean running = false;
+  private volatile ScheduledFuture<?> deadmanTask;
+  private volatile ControlConnection.Subscription subscription;
 
-    private RoutingManagedChannel(RoutingConfig cfg, List<ClientInterceptor> extraInterceptors) {
-      this.cfg = cfg;
-      if (extraInterceptors == null || extraInterceptors.isEmpty()) {
-        this.interceptors = List.of();
-      } else {
-        List<ClientInterceptor> normalized = new ArrayList<>();
-        for (ClientInterceptor interceptor : extraInterceptors) {
-          if (interceptor != null) {
-            normalized.add(interceptor);
-          }
-        }
-        this.interceptors = normalized.isEmpty() ? List.of() : List.copyOf(normalized);
-      }
-    }
-
-    @Override
-    public ManagedChannel shutdown() {
-      if (shutdown.compareAndSet(false, true)) {
-        for (ManagedChannel channel : channels.values()) {
-          if (channel != null) {
-            channel.shutdown();
-          }
-        }
-      }
-      if (channels.isEmpty()) {
-        cleanupRouting();
-      }
-      return this;
-    }
-
-    @Override
-    public boolean isShutdown() {
-      return shutdown.get();
-    }
-
-    @Override
-    public boolean isTerminated() {
-      if (!shutdown.get()) {
-        return false;
-      }
-      for (ManagedChannel channel : channels.values()) {
-        if (channel != null && !channel.isTerminated()) {
-          return false;
-        }
-      }
-      cleanupRouting();
-      return true;
-    }
-
-    @Override
-    public ManagedChannel shutdownNow() {
-      if (shutdown.compareAndSet(false, true)) {
-        for (ManagedChannel channel : channels.values()) {
-          if (channel != null) {
-            channel.shutdownNow();
-          }
-        }
-      }
-      cleanupRouting();
-      return this;
-    }
-
-    @Override
-    public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
-      long timeoutNanos = unit.toNanos(timeout);
-      long start = System.nanoTime();
-      for (ManagedChannel channel : channels.values()) {
-        if (channel == null) {
-          continue;
-        }
-        long elapsed = System.nanoTime() - start;
-        long remaining = timeoutNanos - elapsed;
-        if (remaining <= 0L) {
-          return false;
-        }
-        if (!channel.awaitTermination(remaining, TimeUnit.NANOSECONDS)) {
-          return false;
-        }
-      }
-      cleanupRouting();
-      return true;
-    }
-
-    @Override
-    public <RequestT, ResponseT> ClientCall<RequestT, ResponseT> newCall(
-        MethodDescriptor<RequestT, ResponseT> methodDescriptor, io.grpc.CallOptions callOptions) {
-      if (shutdown.get()) {
-        throw unavailable("Routing channel is closed");
-      }
-      ServiceRoutingContext routingContext = routingContext(methodDescriptor);
-      ServiceHbCache.Target target =
-          // Selection happens once per RPC; stream RPCs stay pinned to that selected endpoint.
-          cfg.instanceResolver != null
-              ? (cfg.routingMode == ServiceRoutingMode.ROUND_ROBIN
-                  ? cfg.instanceResolver.chooseRoundRobin(
-                      cfg.serviceGroup, cfg.serviceName, serviceId())
-                  : cfg.instanceResolver.choose(
-                      cfg.serviceGroup,
-                      cfg.serviceName,
-                      serviceId(),
-                      cfg.routingMode,
-                      routingContext,
-                      routingState))
-              : ServiceEndpointSelector.choose(
-                  cfg.statusCache,
-                  serviceId(),
-                  cfg.routingMode,
-                  routingContext,
-                  routingState);
-      if (target == null) {
-        throw unavailable("No available instances for service: " + serviceId());
-      }
-      String host = ServiceAdvertise.requireRoutableHost(target.host, "grpc target host");
-      int port = target.port;
-      String key = host + ":" + port + "|" + target.tls + "|" + Strings.nullToEmpty(target.authorityOverride);
-      ManagedChannel delegate;
-      try {
-        delegate =
-            channels.computeIfAbsent(
-                key, ignored -> createEndpointChannel(host, port, target.tls));
-      } catch (RuntimeException ex) {
-        if (ex.getCause() instanceof Exception cause) {
-          throw new IllegalStateException(
-              "Failed to create routed channel for service " + serviceId() + " endpoint " + host + ":" + port,
-              cause);
-        }
-        throw ex;
-      }
-      if (cfg.logRoutingSelections) {
-        LOGGER.info("[GrpcClient][routing] mode={} serviceId={} endpoint={} instance={} tls={} subject={} callerApp={} routingKey={} operation={}", cfg.routingMode, serviceId(), host + ":" + port, target.instanceId, target.tls, routingContext.effectiveSubject(), routingContext.callerAppSubject(), routingContext.routingKey(), routingContext.operation());
-      } else if (!key.equals(lastRouteKey)) {
-        lastRouteKey = key;
-      }
-      return delegate.newCall(methodDescriptor, callOptions);
-    }
-
-    private ServiceRoutingContext routingContext(MethodDescriptor<?, ?> methodDescriptor) {
-      String operation = methodDescriptor == null ? null : methodDescriptor.getFullMethodName();
-      String subject = resolveEffectiveSubject();
-      CallerAppContext.ContextValue callerContext = CallerAppContext.get().orElse(null);
-      String callerAppSubject =
-          Strings.firstNonBlank(
-              callerContext == null ? null : callerContext.callerAppSubject(),
-              cfg.callerAppSubject);
-      return new ServiceRoutingContext(
-          serviceId(),
-          "GRPC",
-          subject,
-          callerAppSubject,
-          cfg.routingKey,
-          callerContext == null ? null : callerContext.requestId(),
-          operation);
-    }
-
-    private String resolveEffectiveSubject() {
-      UserPrincipal principal = UserContext.get().orElse(null);
-      String userSubject = principal == null ? null : Strings.trimToNull(principal.username());
-      return Strings.firstNonBlank(userSubject, cfg.defaultEffectiveSubject);
-    }
-
-    @Override
-    public String authority() {
-      return "fabric-routing/" + serviceId();
-    }
-
-    private ManagedChannel createEndpointChannel(String host, int port, boolean routeTls) {
-      Config endpoint = new Config();
-      endpoint.host = host;
-      endpoint.port = port;
-      endpoint.tlsEnabled = cfg.tlsEnabled || routeTls;
-      endpoint.trustCertPem = cfg.trustCertPem;
-      endpoint.kerberosEnabled = cfg.kerberosEnabled;
-      endpoint.kerberosRequireTls = cfg.kerberosRequireTls;
-      endpoint.kerberosSpn = cfg.kerberosSpn;
-      endpoint.kerberosPrincipal = cfg.kerberosPrincipal;
-      endpoint.kerberosKeytab = cfg.kerberosKeytab;
-      endpoint.kerberosRealm = cfg.kerberosRealm;
-      endpoint.useDelegatedSubjectIfPresent = cfg.useDelegatedSubjectIfPresent;
-      try {
-        return createChannel(endpoint, interceptors);
-      } catch (Exception ex) {
-        throw new RuntimeException(ex);
-      }
-    }
-
-    private void cleanupRouting() {
-      if (!cleanupDone.compareAndSet(false, true)) {
-        return;
-      }
-      try {
-        if (cfg.statusCache != null) {
-          cfg.statusCache.close();
-        }
-      } catch (Exception ignore) {
-      }
-      try {
-        if (cfg.closeInstanceResolverOnCleanup && cfg.instanceResolver != null) {
-          cfg.instanceResolver.close();
-        }
-      } catch (Exception ignore) {
-      }
-    }
-
-    private String serviceId() {
-      return Strings.isBlank(cfg.serviceId) ? "<unknown>" : cfg.serviceId;
-    }
-
-    private IllegalStateException unavailable(String message) {
-      return new IllegalStateException(message);
+  public ServiceHbCache(
+      ControlConnection control,
+      String group,
+      String service,
+      Config cfg,
+      ScheduledExecutorService scheduler) {
+    this.control = Objects.requireNonNull(control, "control");
+    this.group = Objects.requireNonNull(group, "group");
+    this.service = Strings.isBlank(service) ? ".*" : service;
+    this.cfg = cfg == null ? new Config() : cfg;
+    this.servicePattern = compileServicePattern(this.service);
+    if (scheduler == null) {
+      this.ses = Executors.newScheduledThreadPool(1);
+      this.ownsScheduler = true;
+    } else {
+      this.ses = scheduler;
+      this.ownsScheduler = false;
     }
   }
 
-  private static final class ManagedChannelWithCleanup extends ManagedChannel {
-    private final ManagedChannel delegate;
-    private final AutoCloseable cleanup;
-    private final AtomicBoolean cleanupDone = new AtomicBoolean(false);
-
-    private ManagedChannelWithCleanup(ManagedChannel delegate, AutoCloseable cleanup) {
-      this.delegate = Objects.requireNonNull(delegate, "delegate");
-      this.cleanup = Objects.requireNonNull(cleanup, "cleanup");
+  public void start() throws Exception {
+    if (running) {
+      return;
     }
+    running = true;
+    subscribe();
+    deadmanTask = ses.scheduleAtFixedRate(this::deadmanScanSafe, 5, 5, TimeUnit.SECONDS);
+  }
 
-    @Override
-    public ManagedChannel shutdown() {
-      delegate.shutdown();
-      if (delegate.isTerminated()) {
-        cleanup();
-      }
-      return this;
-    }
+  private void subscribe() throws Exception {
+    String filter = filterExpression();
+    subscription =
+        control
+            .sowAndSubscribe(
+                FABRIC_HB_TOPIC,
+                "oof",
+                filter.isBlank() ? null : filter,
+                msg -> {
+                  try {
+                    int command = msg.raw().getCommand();
+                    switch (command) {
+                      case Message.Command.SOW:
+                      case Message.Command.Publish:
+                        onUpsert(msg.data());
+                        break;
+                      case Message.Command.SOWDelete:
+                        onDelete(msg.data());
+                        break;
+                      case Message.Command.OOF:
+                        notifySnapshot();
+                        break;
+                      default:
+                        break;
+                    }
+                  } catch (Exception e) {
+                    LOGGER.error("[ServiceHbCache] Unexpected failure processing status update", e);
+                  }
+                });
+  }
 
-    @Override
-    public boolean isShutdown() {
-      return delegate.isShutdown();
-    }
-
-    @Override
-    public boolean isTerminated() {
-      boolean terminated = delegate.isTerminated();
-      if (terminated) {
-        cleanup();
-      }
-      return terminated;
-    }
-
-    @Override
-    public ManagedChannel shutdownNow() {
-      delegate.shutdownNow();
-      cleanup();
-      return this;
-    }
-
-    @Override
-    public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
-      boolean terminated = delegate.awaitTermination(timeout, unit);
-      if (terminated) {
-        cleanup();
-      }
-      return terminated;
-    }
-
-    @Override
-    public <RequestT, ResponseT> ClientCall<RequestT, ResponseT> newCall(
-        MethodDescriptor<RequestT, ResponseT> methodDescriptor, io.grpc.CallOptions callOptions) {
-      return delegate.newCall(methodDescriptor, callOptions);
-    }
-
-    @Override
-    public String authority() {
-      return delegate.authority();
-    }
-
-    private void cleanup() {
-      if (!cleanupDone.compareAndSet(false, true)) {
-        return;
-      }
+  @Override
+  public void close() {
+    running = false;
+    ControlConnection.Subscription currentSubscription = subscription;
+    subscription = null;
+    if (currentSubscription != null) {
       try {
-        cleanup.close();
+        currentSubscription.close();
       } catch (Exception ignore) {
       }
+    }
+    ScheduledFuture<?> task = deadmanTask;
+    deadmanTask = null;
+    if (task != null) {
+      task.cancel(true);
+    }
+    if (ownsScheduler) {
+      ses.shutdownNow();
+    }
+  }
+
+  public AutoCloseable onSnapshot(Consumer<List<ServiceStatusInstance>> listener) {
+    Consumer<List<ServiceStatusInstance>> callback = Objects.requireNonNull(listener, "listener");
+    snapshotListeners.add(callback);
+    return () -> snapshotListeners.remove(callback);
+  }
+
+  public void onAlert(Consumer<ServiceStatusAlert> listener) {
+    alertListeners.add(Objects.requireNonNull(listener, "listener"));
+  }
+
+  public List<ServiceStatusInstance> listUp() {
+    pruneStaleInstances(System.currentTimeMillis(), false);
+    String rf = cfg.regionFilter();
+    return byInstance.values().stream()
+        .filter(i -> "ONLINE".equalsIgnoreCase(i.status))
+        .filter(i -> rf == null || rf.equalsIgnoreCase(i.region))
+        .sorted(Comparator.comparing(i -> i.instanceId))
+        .toList();
+  }
+
+  public Optional<ServiceStatusInstance> roundRobin() {
+    List<ServiceStatusInstance> list = listUp();
+    return list.isEmpty() ? Optional.empty() : Optional.of(list.get(rr.next(list.size())));
+  }
+
+  public Optional<Target> chooseTargetRoundRobin() {
+    return roundRobin().map(ServiceStatusInstance::asTarget);
+  }
+
+  private void onUpsert(String json) throws Exception {
+    DefinitionHbService heartbeat = om.readValue(json, DefinitionHbService.class);
+    if (!matchesScope(heartbeat)) {
+      return;
+    }
+    String instanceId = Strings.trimToNull(heartbeat.instance());
+    if (instanceId == null) {
+      return;
+    }
+    String host = Strings.trimToNull(heartbeat.advertiseHost());
+    int port = heartbeat.advertisePort() == null ? 0 : heartbeat.advertisePort();
+    String region = Strings.trimToNull(heartbeat.region());
+    String status = "ONLINE";
+    long ts =
+        heartbeat.heartbeatEpochMs() == null
+            ? System.currentTimeMillis()
+            : heartbeat.heartbeatEpochMs();
+    boolean tlsRequired = Boolean.TRUE.equals(heartbeat.tlsEnabled());
+    String routeHost = Strings.trimToNull(heartbeat.routeHost());
+    Integer routePort = heartbeat.routePort();
+    String routeAuthority = Strings.trimToNull(heartbeat.routeAuthority());
+    Map<String, String> attrs =
+        heartbeat.tags() == null || heartbeat.tags().isEmpty() ? Map.of() : Map.copyOf(heartbeat.tags());
+    ServiceStatusInstance newInstance =
+        new ServiceStatusInstance(
+            instanceId,
+            host,
+            port,
+            region == null ? "" : region,
+            ts,
+            status,
+            tlsRequired,
+            routeHost,
+            routePort,
+            routeAuthority,
+            attrs);
+    ServiceStatusInstance old = byInstance.put(instanceId, newInstance);
+    if (old == null) {
+      emitAlert(new ServiceStatusAlert(AlertType.FIRST_SEEN, instanceId, host + ":" + port + " " + status));
+    }
+    lastSeen.put(instanceId, ts);
+    handleFlip(instanceId, old == null ? null : old.status, status, ts);
+    boolean diff;
+    if (old == null) {
+      diff = true;
+    } else if (cfg.notifyOnTimestampOnly()) {
+      diff = !old.equals(newInstance);
+    } else {
+      ServiceStatusInstance newNoTs =
+          new ServiceStatusInstance(
+              newInstance.instanceId,
+              newInstance.host,
+              newInstance.port,
+              newInstance.region,
+              old.tsEpochMs,
+              newInstance.status,
+              newInstance.tlsRequired,
+              newInstance.routeHost,
+              newInstance.routePort,
+              newInstance.routeAuthority,
+              newInstance.attrs);
+      diff = !old.equals(newNoTs);
+    }
+    if (diff) {
+      notifySnapshot();
+    }
+  }
+
+  private void onDelete(String json) throws Exception {
+    DefinitionHbService heartbeat = om.readValue(json, DefinitionHbService.class);
+    String instanceId = Strings.trimToNull(heartbeat.instance());
+    if (instanceId == null) {
+      return;
+    }
+    if (!matchesScope(heartbeat) && !byInstance.containsKey(instanceId)) {
+      return;
+    }
+    ServiceStatusInstance removed = byInstance.remove(instanceId);
+    lastSeen.remove(instanceId);
+    lastStatus.remove(instanceId);
+    flipTimes.remove(instanceId);
+    if (removed != null) {
+      emitAlert(new ServiceStatusAlert(AlertType.GONE, instanceId, "removed"));
+      notifySnapshot();
+    }
+  }
+
+  private void handleFlip(String instanceId, String prev, String cur, long whenMs) {
+    if (prev == null || Objects.equals(prev, cur)) {
+      lastStatus.put(instanceId, cur);
+      return;
+    }
+    lastStatus.put(instanceId, cur);
+    Deque<Long> q = flipTimes.computeIfAbsent(instanceId, ignored -> new ArrayDeque<>());
+    q.addLast(whenMs);
+    long cutoff = whenMs - cfg.flapWindow().toMillis();
+    while (!q.isEmpty() && q.peekFirst() < cutoff) {
+      q.removeFirst();
+    }
+    if (q.size() >= cfg.flapThreshold()) {
+      emitAlert(
+          new ServiceStatusAlert(
+              AlertType.FLAP_SUSPECT,
+              instanceId,
+              "flips=" + q.size() + " window=" + cfg.flapWindow().toSeconds() + "s"));
+    }
+  }
+
+  private void deadmanScanSafe() {
+    try {
+      deadmanScan();
+    } catch (Throwable t) {
+      LOGGER.error("[ServiceHbCache] Deadman scan failed", t);
+    }
+  }
+
+  private void deadmanScan() {
+    pruneStaleInstances(System.currentTimeMillis(), true);
+  }
+
+  private void pruneStaleInstances(long nowEpochMs, boolean emitTimeoutAlerts) {
+    long limitMs = cfg.deadmanTimeout().toMillis();
+    if (limitMs <= 0L) {
+      return;
+    }
+    boolean changed = false;
+    for (var entry : lastSeen.entrySet()) {
+      String instanceId = entry.getKey();
+      long lastSeenEpochMs = entry.getValue() == null ? 0L : entry.getValue();
+      long ageMs = nowEpochMs - lastSeenEpochMs;
+      if (ageMs <= limitMs) {
+        continue;
+      }
+      if (emitTimeoutAlerts) {
+        emitAlert(
+            new ServiceStatusAlert(
+                AlertType.DEADMAN_TIMEOUT, instanceId, "ageMs=" + ageMs + " > " + limitMs));
+      }
+      ServiceStatusInstance removed = byInstance.remove(instanceId);
+      lastSeen.remove(instanceId);
+      lastStatus.remove(instanceId);
+      flipTimes.remove(instanceId);
+      if (removed != null) {
+        if (emitTimeoutAlerts && LOGGER.isDebugEnabled()) {
+          LOGGER.debug(
+              "[ServiceHbCache][stale-evict] instance={} endpoint={}:{} ageMs={} limitMs={}",
+              instanceId,
+              removed.host,
+              removed.port,
+              ageMs,
+              limitMs);
+        }
+        changed = true;
+      }
+    }
+    if (changed) {
+      notifySnapshot();
+    }
+  }
+
+  private boolean matchesScope(DefinitionHbService heartbeat) {
+    if (heartbeat == null) {
+      return false;
+    }
+    if (heartbeat.type() != DefinitionType.HEARTBEAT_SERVICE) {
+      return false;
+    }
+    String messageGroup = Strings.trimToNull(heartbeat.group());
+    if (messageGroup == null || !messageGroup.equals(group)) {
+      return false;
+    }
+    String svc = Strings.trimToNull(heartbeat.name());
+    if (Strings.isBlank(svc)) {
+      return matchAllServices();
+    }
+    return matchesService(svc);
+  }
+
+  private String filterExpression() {
+    return "/group = '"
+        + escapeFilterValue(group)
+        + "' and /type = '"
+        + DefinitionType.HEARTBEAT_SERVICE.name()
+        + "'";
+  }
+
+  private static String escapeFilterValue(String value) {
+    return value == null ? "" : value.replace("'", "''");
+  }
+
+  private boolean matchesService(String value) {
+    String candidate = value == null ? "" : value;
+    return servicePattern.matcher(candidate).matches();
+  }
+
+  private boolean matchAllServices() {
+    return ".*".equals(servicePattern.pattern());
+  }
+
+  private static Pattern compileServicePattern(String raw) {
+    if (Strings.isBlank(raw) || raw.equals("*") || raw.equals(".*")) {
+      return Pattern.compile(".*");
+    }
+    if (raw.contains("*") || raw.contains("?")) {
+      return Pattern.compile(globToRegex(raw));
+    }
+    return Pattern.compile(Pattern.quote(raw));
+  }
+
+  private static String globToRegex(String glob) {
+    StringBuilder regex = new StringBuilder();
+    for (int i = 0; i < glob.length(); i++) {
+      char c = glob.charAt(i);
+      switch (c) {
+        case '*':
+          regex.append(".*");
+          break;
+        case '?':
+          regex.append('.');
+          break;
+        case '.':
+          regex.append("\\.");
+          break;
+        case '\\':
+          regex.append("\\\\");
+          break;
+        default:
+          if ("+()[]{}^$|".indexOf(c) >= 0) {
+            regex.append('\\');
+          }
+          regex.append(c);
+      }
+    }
+    return regex.toString();
+  }
+
+  private void notifySnapshot() {
+    if (snapshotListeners.isEmpty()) {
+      return;
+    }
+    List<ServiceStatusInstance> snapshot = List.copyOf(listUp());
+    for (Consumer<List<ServiceStatusInstance>> listener : snapshotListeners) {
+      safe(() -> listener.accept(snapshot));
+    }
+  }
+
+  private void emitAlert(ServiceStatusAlert alert) {
+    for (Consumer<ServiceStatusAlert> listener : alertListeners) {
+      safe(() -> listener.accept(alert));
+    }
+  }
+
+  private static void safe(Runnable runnable) {
+    try {
+      runnable.run();
+    } catch (Throwable ignore) {
+    }
+  }
+
+  private static final class RoundRobin {
+    private int index = -1;
+
+    synchronized int next(int size) {
+      index = (index + 1) % size;
+      return index;
     }
   }
 }
+
+
+
+
+
+
