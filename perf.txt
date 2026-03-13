@@ -1,1222 +1,1083 @@
-package org.pronzato.fabric.api.configs.manager;
+package org.pronzato.fabric.api.data.views;
 
 import org.pronzato.fabric.api.util.CloseSupport;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.SerializationFeature;
-import com.fasterxml.jackson.databind.node.NullNode;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.SQLException;
+import java.sql.Types;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executors;
-import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.BiConsumer;
-import org.pronzato.fabric.api.control.ControlConnection;
+import org.pronzato.fabric.api.Fabric;
+import org.pronzato.fabric.api.data.checkpoints.CheckpointStore;
+import org.pronzato.fabric.api.data.checkpoints.CheckpointStores;
 import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
-import org.pronzato.fabric.api.control.discovery.CanonicalIds;
-import org.pronzato.fabric.api.control.discovery.cache.DiscoveryTopics;
-import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
-import org.pronzato.fabric.api.control.discovery.definitions.Definition;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfigLayer;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvironment;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionSchema;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
-import org.pronzato.fabric.api.configs.ConfigManager.ConfigAdmin;
-import org.pronzato.fabric.api.configs.ConfigManager.ConfigCodegen;
-import org.pronzato.fabric.api.configs.ConfigDecoder;
-import org.pronzato.fabric.api.configs.ConfigManager.ConfigInfo;
-import org.pronzato.fabric.api.configs.audit.ConfigEventEnvelope;
-import org.pronzato.fabric.api.configs.audit.ConfigEventType;
-import org.pronzato.fabric.api.configs.audit.ConfigEventGenerated;
-import org.pronzato.fabric.api.configs.audit.ConfigEventResolved;
-import org.pronzato.fabric.api.configs.audit.ConfigEventSubscribed;
-import org.pronzato.fabric.api.configs.audit.ConfigEventUnsubscribed;
-import org.pronzato.fabric.api.configs.audit.ConfigEventUpdateCallback;
-import org.pronzato.fabric.api.configs.audit.ConfigEvent;
-import org.pronzato.fabric.api.configs.audit.ConfigPublisher;
-import org.pronzato.fabric.api.configs.audit.ConfigPublisherAmp;
-import org.pronzato.fabric.api.configs.audit.ConfigPublisherNoop;
-import org.pronzato.fabric.api.configs.admin.ConfigAdminImpl;
-import org.pronzato.fabric.api.configs.model.ConfigLayerLink;
-import org.pronzato.fabric.api.configs.ConfigManager.ConfigLineage;
-import org.pronzato.fabric.api.configs.ConfigManager;
-import org.pronzato.fabric.api.configs.ConfigManager.ConfigSubscription;
-import org.pronzato.fabric.api.configs.model.ConfigSummary;
-import org.pronzato.fabric.api.configs.ConfigManager.ConfigUpdate;
-import org.pronzato.fabric.api.configs.ConfigManager.ConfigUpdateListener;
-import org.pronzato.fabric.api.configs.model.ConfigResolved;
-import org.pronzato.fabric.api.configs.presentation.ConfigCodegenService;
-import org.pronzato.fabric.api.configs.presentation.ConfigPresentation;
-import org.pronzato.fabric.api.configs.presentation.ConfigSchemaCodec;
-import org.pronzato.fabric.api.configs.presentation.ConfigSchemaDoc;
-import org.pronzato.fabric.api.configs.workflow.ConfigAdminService;
-import org.pronzato.fabric.api.configs.workflow.ConfigHistoryEntry;
-import org.pronzato.fabric.api.configs.workflow.ConfigHistoryUtil;
-import org.pronzato.fabric.api.configs.workflow.ConfigRollbackRequest;
-import org.pronzato.fabric.api.configs.workflow.ConfigSnapshot;
-import org.pronzato.fabric.api.configs.workflow.ConfigWorkflowService;
-import org.pronzato.fabric.api.control.security.UserContext;
-import org.pronzato.fabric.api.control.security.identity.CallerAppContext;
+import org.pronzato.fabric.api.data.RowManager;
+import org.pronzato.fabric.api.data.ViewManager;
+import org.pronzato.fabric.api.data.dataset.DatasetId;
+import org.pronzato.fabric.api.data.dataset.DatasetType;
+import org.pronzato.fabric.api.data.duckdb.DuckdbSession;
+import org.pronzato.fabric.api.data.entitlements.NamespaceEntitlementDefaults;
+import org.pronzato.fabric.api.data.manager.RowManagerImpl;
+import org.pronzato.fabric.api.control.entitlements.core.data.DataWriteAuthorization;
+import org.pronzato.fabric.api.data.views.internal.ViewModelMapper;
+import org.pronzato.fabric.api.data.views.model.ViewModel;
+import org.pronzato.fabric.api.data.views.model.ViewRefreshModel;
+import org.pronzato.fabric.api.data.views.model.ViewRefreshState;
+import org.pronzato.fabric.api.data.views.model.ViewRefreshType;
+import org.pronzato.fabric.api.data.views.model.ViewTargetType;
+import org.pronzato.fabric.api.schemas.SchemaCompatibility;
+import org.pronzato.fabric.api.schemas.SchemaManager;
+import org.pronzato.fabric.api.schemas.SchemaModel;
+import org.pronzato.fabric.api.schemas.SchemaType;
+import org.pronzato.fabric.api.schemas.manager.SchemaManagerImpl;
+import org.pronzato.fabric.api.control.session.SessionImpl;
 import org.pronzato.fabric.api.util.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public final class ConfigManagerImpl implements ConfigManager, ConfigAdminService, AutoCloseable {
-  static final Logger LOGGER = LoggerFactory.getLogger(ConfigManagerImpl.class);
-  private static final String LAYER_BASE = "base";
-  static final String HASH_VERSION = "v1";
-  static final ObjectMapper HASH_MAPPER =
-      DiscoveryCodec.mapper().copy().configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
-  private static final AtomicInteger EXECUTOR_ID = new AtomicInteger(0);
-  private static final AtomicInteger SCHEDULER_ID = new AtomicInteger(0);
-  static final AtomicLong SUBSCRIPTION_ID = new AtomicLong(0L);
-  static final String CALLBACK_REASON_INITIAL = "INITIAL_SUBSCRIPTION";
-  static final String CALLBACK_REASON_UPSERT = "UPSERT";
-  static final String CALLBACK_REASON_RESOLVED_CHAIN_CHANGE = "RESOLVED_CHAIN_CHANGE";
-  static final String CALLBACK_REASON_SCHEDULED = "EFFECTIVE_OR_EXPIRE_TRANSITION";
-  private static final String DISCOVERY_CONNECTION_NAME = "amps-fabric-discovery";
+public final class ViewManagerImpl implements ViewManager, AutoCloseable {
+  private static final Logger LOGGER = LoggerFactory.getLogger(ViewManagerImpl.class);
+  private static final String DEFAULT_NAMESPACE = "default";
+  private static final String DEFAULT_ACTOR = "fabric-lite";
+  private static final String DEFAULT_PARQUET_GLOB = "**/*.parquet";
+  private static final String SNAPSHOT_FILE_NAME = "snapshot.parquet";
+  private static final int MAX_ERROR_CHARS = 500;
 
-  final ConfigView configView;
-  private final String defaultGroup;
-  final ObjectMapper mapper;
-  final ConfigResolver resolver;
-  private final ConfigWorkflowService workflowService;
-  private final ConfigCodegenService codegenService = new ConfigCodegenService();
-  private final String callerAppName;
-  private final String callerAppInstance;
-  private final String sessionId;
-  private final ConfigPublisher auditPublisher;
-  private final AtomicLong auditRequestSequence = new AtomicLong(0L);
-  final ExecutorService callbackExecutor;
-  final ScheduledExecutorService scheduleExecutor;
-  private volatile ConfigAdmin configAdmin;
-  final AtomicBoolean closed = new AtomicBoolean(false);
-  final CopyOnWriteArrayList<SubscriptionImpl> subscriptions = new CopyOnWriteArrayList<>();
+  private final RowManager rowManager;
+  private final RowManagerImpl localDataManager;
+  private final DiscoveryCache DiscoveryCache;
+  private final String group;
+  private final SchemaManager schemaManager;
+  private final ViewModelMapper modelMapper;
+  private final ViewGraphPlanner graphPlanner;
+  private final CheckpointStore checkpointStore;
+  private final ScheduledExecutorService scheduler;
+  private final boolean ownsScheduler;
+  private final ConcurrentMap<String, ViewRuntimeImpl> runtimes = new ConcurrentHashMap<>();
 
-  public ConfigManagerImpl(DiscoveryCache DiscoveryCache) {
+  public ViewManagerImpl(RowManager rowManager, DiscoveryCache DiscoveryCache, String group) {
     this(
-        new ConfigCacheView(Objects.requireNonNull(DiscoveryCache, "DiscoveryCache")),
+        rowManager,
+        DiscoveryCache,
+        group,
         null,
-        DiscoveryCodec.mapper(),
-        newExecutor(),
-        newScheduler(),
-        new ConfigResolver(DiscoveryCache),
-        null,
-        null,
-        null,
-        ConfigPublisherNoop.INSTANCE);
+        CheckpointStores.failFast(
+            "ViewManager checkpoint store is not configured. Configure session with withCheckpointPath(...)"));
   }
 
-  public ConfigManagerImpl(DiscoveryCache DiscoveryCache, String defaultGroup) {
+  public ViewManagerImpl(
+      RowManager rowManager, DiscoveryCache DiscoveryCache, String group, Fabric.Session session) {
     this(
-        new ConfigCacheView(Objects.requireNonNull(DiscoveryCache, "DiscoveryCache")),
-        defaultGroup,
-        DiscoveryCodec.mapper(),
-        newExecutor(),
-        newScheduler(),
-        new ConfigResolver(DiscoveryCache),
-        null,
-        null,
-        null,
-        ConfigPublisherNoop.INSTANCE);
+        rowManager,
+        DiscoveryCache,
+        group,
+        session,
+        CheckpointStores.failFast(
+            "ViewManager checkpoint store is not configured. Configure session with withCheckpointPath(...)"));
   }
 
-  public ConfigManagerImpl(
+  public ViewManagerImpl(
+      RowManager rowManager,
       DiscoveryCache DiscoveryCache,
-      String defaultGroup,
-      String callerAppName,
-      String callerAppInstance,
-      String sessionId,
-      ConfigPublisher auditPublisher) {
-    this(
-        new ConfigCacheView(Objects.requireNonNull(DiscoveryCache, "DiscoveryCache")),
-        defaultGroup,
-        DiscoveryCodec.mapper(),
-        newExecutor(),
-        newScheduler(),
-        new ConfigResolver(DiscoveryCache),
-        callerAppName,
-        callerAppInstance,
-        sessionId,
-        auditPublisher);
+      String group,
+      Fabric.Session session,
+      CheckpointStore checkpointStore) {
+    this.rowManager = Objects.requireNonNull(rowManager, "rowManager");
+    this.localDataManager = rowManager instanceof RowManagerImpl local ? local : null;
+    this.DiscoveryCache = Objects.requireNonNull(DiscoveryCache, "DiscoveryCache");
+    this.group = Strings.requireNonBlank(group, "session group");
+    this.schemaManager =
+        session == null
+            ? new SchemaManagerImpl(() -> this.DiscoveryCache, () -> this.group, () -> null)
+            : Objects.requireNonNull(session.schemas(), "session.schemas");
+    this.modelMapper = new ViewModelMapper();
+    this.graphPlanner = new ViewGraphPlanner();
+    this.checkpointStore = Objects.requireNonNull(checkpointStore, "checkpointStore");
+    if (session instanceof SessionImpl sessionImpl) {
+      this.scheduler = sessionImpl.statusScheduler();
+      this.ownsScheduler = false;
+    } else {
+      this.scheduler =
+          Executors.newSingleThreadScheduledExecutor(
+              runnable -> {
+                Thread thread = new Thread(runnable, "fabric-view-runtime");
+                thread.setDaemon(true);
+                return thread;
+              });
+      this.ownsScheduler = true;
+    }
   }
 
-  public ConfigManagerImpl(
-      DiscoveryCache DiscoveryCache,
-      String defaultGroup,
-      String callerAppName,
-      String callerAppInstance,
-      String sessionId,
-      ControlConnection controlConnection,
-      DefinitionEnvironment environmentDefinition) {
-    this(
-        new ConfigCacheView(Objects.requireNonNull(DiscoveryCache, "DiscoveryCache")),
-        defaultGroup,
-        DiscoveryCodec.mapper(),
-        newExecutor(),
-        newScheduler(),
-        new ConfigResolver(DiscoveryCache),
-        callerAppName,
-        callerAppInstance,
-        sessionId,
-        createAuditPublisher(controlConnection, environmentDefinition));
+  @Override
+  public void register(ViewModel model) {
+    ViewModel normalized = Objects.requireNonNull(model, "model");
+    String viewName = Strings.requireNonBlank(normalized.name(), "model.name");
+    String namespace = Strings.firstNonBlank(normalized.namespace(), DEFAULT_NAMESPACE);
+    String schemaName = modelMapper.deterministicSchemaName(namespace, viewName);
+
+    SchemaModel schemaToRegister =
+        Objects.requireNonNull(normalized.schema(), "model.schema")
+            .toBuilder()
+            .withName(schemaName)
+            .withType(SchemaType.TABULAR)
+            .withCompatibility(
+                normalized.schemaCompatibility() == null
+                    ? SchemaCompatibility.BACKWARDS
+                    : normalized.schemaCompatibility())
+            .build();
+    schemaManager.register(schemaName, SchemaType.TABULAR, schemaToRegister);
+
+    DefinitionDataset definition =
+        modelMapper.toDefinitionDataset(normalized, group, DEFAULT_ACTOR, schemaName);
+    try (DiscoveryCache.ConfigCacheTx tx =
+        DiscoveryCache.beginTx("view:" + group + "/" + namespace + "/" + viewName)) {
+      DiscoveryCache.upsertTx(tx, definition);
+      NamespaceEntitlementDefaults.ensureDefaultNamespaceAccess(
+          DiscoveryCache, tx, definition, DEFAULT_ACTOR);
+      DiscoveryCache.commitTx(tx);
+    }
+
+    String outputDatasetId = canonicalDatasetId(definition);
+    ViewRuntimeImpl runtime = runtimes.remove(outputDatasetId);
+    CloseSupport.closeQuietly(runtime);
   }
 
-  ConfigManagerImpl(
-      ConfigView configView,
-      String defaultGroup,
-      ObjectMapper mapper,
-      ExecutorService callbackExecutor,
-      ScheduledExecutorService scheduleExecutor,
-      ConfigResolver resolver) {
-    this(
-        configView,
-        defaultGroup,
-        mapper,
-        callbackExecutor,
-        scheduleExecutor,
-        resolver,
-        null,
-        null,
-        null,
-        ConfigPublisherNoop.INSTANCE);
+  @Override
+  public Optional<ViewModel> getModel(String viewName) {
+    DefinitionDataset definition = resolveViewDefinition(viewName);
+    String schemaName = requireSchemaName(definition);
+    SchemaModel schema =
+        schemaManager
+            .get(schemaName)
+            .orElseThrow(
+                () ->
+                    new IllegalStateException(
+                        "View schema not found: group="
+                            + group
+                            + " schemaName="
+                            + schemaName
+                            + " view="
+                            + canonicalDatasetId(definition)));
+    return Optional.of(modelMapper.fromDefinitionDataset(definition, schema));
   }
 
-  ConfigManagerImpl(
-      ConfigView configView,
-      String defaultGroup,
-      ObjectMapper mapper,
-      ExecutorService callbackExecutor,
-      ScheduledExecutorService scheduleExecutor,
-      ConfigResolver resolver,
-      String callerAppName,
-      String callerAppInstance,
-      String sessionId,
-      ConfigPublisher auditPublisher) {
-    this.configView = Objects.requireNonNull(configView, "configView");
-    this.defaultGroup = Strings.trimToNull(defaultGroup);
-    Objects.requireNonNull(mapper, "mapper");
-    this.mapper = DiscoveryCodec.mapper();
-    this.resolver = resolver;
-    this.callerAppName = Strings.trimToNull(callerAppName);
-    this.callerAppInstance = Strings.trimToNull(callerAppInstance);
-    this.sessionId =
-        ConfigManagerImplAudit.resolveAuditSessionId(
-            sessionId, this.callerAppName, this.callerAppInstance);
-    if (Strings.trimToNull(sessionId) == null) {
-      LOGGER.warn("[ConfigUsageAudit] missing sessionId; generated fallback sessionId={} app={} instance={}", this.sessionId, this.callerAppName, this.callerAppInstance);
-    }
-    this.auditPublisher =
-        auditPublisher == null ? ConfigPublisherNoop.INSTANCE : auditPublisher;
-    this.workflowService =
-        new ConfigWorkflowService(
-            new ConfigWorkflowService.Store() {
-              @Override
-              public List<DefinitionConfigLayer> listConfigLayers(String group) {
-                return ConfigManagerImpl.this.configView.listConfigLayers(group);
-              }
-
-              @Override
-              public Definition get(DefinitionType type, String group, String name) {
-                return ConfigManagerImpl.this.configView.get(type, group, name);
-              }
-
-              @Override
-              public void upsert(Definition definition) {
-                ConfigManagerImpl.this.configView.upsert(definition);
-              }
-            });
-    this.callbackExecutor = Objects.requireNonNull(callbackExecutor, "callbackExecutor");
-    this.scheduleExecutor = Objects.requireNonNull(scheduleExecutor, "scheduleExecutor");
-  }
-
-  ConfigManagerImpl(ConfigView configView, ObjectMapper mapper, ExecutorService callbackExecutor) {
-    this(
-        configView,
-        null,
-        mapper,
-        callbackExecutor,
-        newScheduler(),
-        null,
-        null,
-        null,
-        null,
-        ConfigPublisherNoop.INSTANCE);
-  }
-
-  private static ConfigPublisher createAuditPublisher(
-      ControlConnection controlConnection, DefinitionEnvironment environmentDefinition) {
-    ConfigUsageEventsSettings settings = ConfigUsageEventsSettings.fromEnvironment(environmentDefinition);
-    if (!settings.enabled() || settings.transport() == ConfigUsageEventsTransport.NOOP) {
-      return ConfigPublisherNoop.INSTANCE;
-    }
-    if (settings.transport() == ConfigUsageEventsTransport.S3) {
-      LOGGER.warn("[ConfigUsageAudit] transport=S3 is not implemented; using NOOP");
-      return ConfigPublisherNoop.INSTANCE;
-    }
-    if (settings.transport() != ConfigUsageEventsTransport.AMPS) {
-      LOGGER.warn("[ConfigUsageAudit] unsupported transport={} ; using NOOP", settings.transport());
-      return ConfigPublisherNoop.INSTANCE;
-    }
-    String connection = Strings.firstNonBlank(settings.connection(), DISCOVERY_CONNECTION_NAME);
-    if (!DISCOVERY_CONNECTION_NAME.equalsIgnoreCase(connection)) {
-      LOGGER.warn("[ConfigUsageAudit] unsupported AMPS connection={} expected={} ; using NOOP", connection, DISCOVERY_CONNECTION_NAME);
-      return ConfigPublisherNoop.INSTANCE;
-    }
-    if (controlConnection == null) {
-      LOGGER.warn("[ConfigUsageAudit] AMPS requested but ControlConnection is null; using NOOP");
-      return ConfigPublisherNoop.INSTANCE;
-    }
-    return new ConfigPublisherAmp(
-        controlConnection,
-        new ConfigPublisherAmp.Settings(
-            connection,
-            settings.topic(),
-            settings.maxRetries(),
-            settings.initialBackoffMillis(),
-            settings.maxBackoffMillis(),
-            settings.backoffMultiplier()));
-  }
-
-  private enum ConfigUsageEventsTransport {
-    NOOP,
-    AMPS,
-    S3;
-
-    static ConfigUsageEventsTransport fromWire(String raw) {
-      String normalized = Strings.trimToNull(raw);
-      if (normalized == null) {
-        return NOOP;
+  @Override
+  public List<ViewModel> listModels() {
+    List<DefinitionDataset> definitions = listViewDefinitions();
+    definitions.sort(
+        Comparator.comparing(
+            definition ->
+                Strings.requireNonBlank(
+                    definition.envelope() == null ? null : definition.envelope().name(),
+                    "view.envelope.name"),
+            String.CASE_INSENSITIVE_ORDER));
+    List<ViewModel> models = new ArrayList<>(definitions.size());
+    for (DefinitionDataset definition : definitions) {
+      try {
+        String schemaName = requireSchemaName(definition);
+        Optional<SchemaModel> schema = schemaManager.get(schemaName);
+        if (schema.isEmpty()) {
+          LOGGER.warn("[View][list][missing-schema] group={} datasetId={} schemaName={}", group, canonicalDatasetId(definition), schemaName);
+          continue;
+        }
+        models.add(modelMapper.fromDefinitionDataset(definition, schema.get()));
+      } catch (RuntimeException ex) {
+        LOGGER.warn("[View][list][skip] group={} datasetId={} reason={}", group, safeDatasetId(definition), ex.toString());
       }
-      return switch (normalized.toUpperCase(Locale.ROOT)) {
-        case "NOOP", "NONE" -> NOOP;
-        case "AMPS" -> AMPS;
-        case "S3" -> S3;
-        default -> NOOP;
-      };
     }
-  }
-
-  private record ConfigUsageEventsSettings(
-      boolean enabled,
-      ConfigUsageEventsTransport transport,
-      String connection,
-      String topic,
-      int maxRetries,
-      long initialBackoffMillis,
-      long maxBackoffMillis,
-      double backoffMultiplier) {
-
-    static ConfigUsageEventsSettings fromEnvironment(DefinitionEnvironment environmentDefinition) {
-      DefinitionEnvironment.Configs configs =
-          environmentDefinition == null ? null : environmentDefinition.configs();
-      return fromModel(configs == null ? null : configs.events());
-    }
-
-    static ConfigUsageEventsSettings fromModel(DefinitionEnvironment.Events events) {
-      if (events == null || !Boolean.TRUE.equals(events.enabled())) {
-        return disabled();
-      }
-      ConfigUsageEventsTransport transport = ConfigUsageEventsTransport.fromWire(events.transport());
-      DefinitionEnvironment.EventsAmps amps = events.amps();
-      String connection =
-          Strings.firstNonBlank(
-              amps == null ? null : Strings.trimToNull(amps.connection()),
-              DISCOVERY_CONNECTION_NAME);
-      String topic =
-          Strings.firstNonBlank(
-              amps == null ? null : Strings.trimToNull(amps.topic()),
-              DiscoveryTopics.EVENTS_CONFIG);
-      int maxRetries = amps == null || amps.maxRetries() == null ? 3 : Math.max(0, amps.maxRetries());
-      long initialBackoffMillis =
-          amps == null || amps.initialBackoffMillis() == null
-              ? 100L
-              : Math.max(1L, amps.initialBackoffMillis());
-      long maxBackoffMillis =
-          amps == null || amps.maxBackoffMillis() == null
-              ? 2_000L
-              : Math.max(initialBackoffMillis, amps.maxBackoffMillis());
-      double backoffMultiplier =
-          amps == null || amps.backoffMultiplier() == null
-              ? 2.0d
-              : amps.backoffMultiplier() <= 1.0d ? 2.0d : amps.backoffMultiplier();
-      return new ConfigUsageEventsSettings(
-          true,
-          transport,
-          connection,
-          topic,
-          maxRetries,
-          initialBackoffMillis,
-          maxBackoffMillis,
-          backoffMultiplier);
-    }
-
-    static ConfigUsageEventsSettings disabled() {
-      return new ConfigUsageEventsSettings(
-          false,
-          ConfigUsageEventsTransport.NOOP,
-          DISCOVERY_CONNECTION_NAME,
-          DiscoveryTopics.EVENTS_CONFIG,
-          0,
-          100L,
-          2_000L,
-          2.0d);
-    }
-  }
-
-  public List<ConfigSummary> list(String group) {
-    return ConfigManagerImplCrud.list(this, group);
-  }
-
-  public List<ConfigLayerLink> listLayerLinks(String group, String configId) {
-    return ConfigManagerImplCrud.listLayerLinks(this, group, configId);
-  }
-
-  public ConfigResolved resolve(String group, String configId, String layerIdOrNull) {
-    return ConfigManagerImplCrud.resolve(this, group, configId, layerIdOrNull);
-  }
-
-  public ConfigResolved resolve(
-      String group, String configId, String layerIdOrNull, Instant asOfOrNull) {
-    return ConfigManagerImplCrud.resolve(this, group, configId, layerIdOrNull, asOfOrNull);
+    return List.copyOf(models);
   }
 
   @Override
-  public ConfigAdmin admin() {
-    ensureOpen();
-    ConfigAdmin local = configAdmin;
-    if (local != null) {
-      return local;
-    }
-    synchronized (this) {
-      local = configAdmin;
-      if (local == null) {
-        local = new ConfigAdminImpl(requiredSessionGroup(), this, this);
-        configAdmin = local;
-      }
-      return local;
+  public ViewRuntime open(String viewName) {
+    DefinitionDataset definition = resolveViewDefinition(viewName);
+    String datasetId = canonicalDatasetId(definition);
+    return runtimes.computeIfAbsent(datasetId, key -> new ViewRuntimeImpl(key));
+  }
+
+  @Override
+  public ViewRuntime start(String viewName) {
+    ViewRuntime runtime = open(viewName);
+    runtime.start();
+    return runtime;
+  }
+
+  @Override
+  public void stop(String viewName) {
+    DefinitionDataset definition = resolveViewDefinition(viewName);
+    String datasetId = canonicalDatasetId(definition);
+    ViewRuntimeImpl runtime = runtimes.get(datasetId);
+    if (runtime != null) {
+      runtime.stop();
     }
   }
 
   @Override
-  public List<ConfigInfo> listConfigs() {
-    return ConfigManagerImplCrud.listConfigs(this);
+  public ViewRefreshResult refresh(String viewName) {
+    return open(viewName).refresh();
   }
 
   @Override
-  public List<String> listLayers(String configId) {
-    return ConfigManagerImplCrud.listLayers(this, configId);
-  }
-
-  public JsonNode resolveDeclared(String group, String configId, String layerId) {
-    return ConfigManagerImplCrud.resolveDeclared(this, group, configId, layerId);
-  }
-
-  public JsonNode resolveDeclaredAt(String group, String configId, String layerId, Instant at) {
-    return ConfigManagerImplCrud.resolveDeclaredAt(this, group, configId, layerId, at);
+  public ViewRefreshResult refreshGraph(String rootViewName) {
+    return open(rootViewName).refreshGraph();
   }
 
   @Override
-  public ConfigLineage lineage(String configId, String layerId) {
-    return ConfigManagerImplCrud.lineage(this, configId, layerId);
-  }
-
-  @Override
-  public ConfigLineage lineageAt(String configId, String layerId, Instant at) {
-    return ConfigManagerImplCrud.lineageAt(this, configId, layerId, at);
-  }
-
-  @Override
-  public <T> T resolve(String configId, String layerId, ConfigDecoder<T> decoder) {
-    return ConfigManagerImplCrud.resolve(this, configId, layerId, decoder);
-  }
-
-  @Override
-  public <T> T resolveAt(String configId, String layerId, Instant at, ConfigDecoder<T> decoder) {
-    return ConfigManagerImplCrud.resolveAt(this, configId, layerId, at, decoder);
-  }
-
-  public ConfigResolved resolveWithMetadata(String configId, String layerId) {
-    return ConfigManagerImplCrud.resolveWithMetadata(this, configId, layerId);
-  }
-
-  public ConfigResolved resolveWithMetadataAt(String configId, String layerId, Instant at) {
-    return ConfigManagerImplCrud.resolveWithMetadataAt(this, configId, layerId, at);
-  }
-
-  <T> T decode(
-      Resolution id,
-      LayerEntry layer,
-      JsonNode resolved,
-      Instant resolvedAtUtc,
-      Instant effectiveAtUtc,
-      ConfigDecoder<T> decoder) {
-    JsonNode payload = resolved == null ? NullNode.getInstance() : resolved;
-    payload = groupedPresentation(id, layer, payload, resolvedAtUtc, effectiveAtUtc);
-    try {
-      return decoder.decode(mapper, payload);
-    } catch (Exception ex) {
-      throw new IllegalArgumentException(
-          "Failed to decode payload for config "
-              + id.group()
-              + "/"
-              + id.configId()
-              + "/"
-              + id.layerId(),
-          ex);
-    }
-  }
-
-  private JsonNode groupedPresentation(
-      Resolution id,
-      LayerEntry layer,
-      JsonNode resolvedPayload,
-      Instant resolvedAtUtc,
-      Instant effectiveAtUtc) {
-    DefinitionConfigLayer definition = layer == null ? null : layer.definition();
-    DefinitionConfigLayer payload = definition;
-    String schemaKey = required(payload == null ? null : payload.schemaKey(), "schemaKey");
-    ConfigSchemaDoc schemaDoc = resolveSchemaDoc(id.group(), schemaKey);
-    ConfigPresentation.FabricMetadata fabric =
-        ConfigPresentation.fabricMetadata(
-            id.group(),
-            id.configId(),
-            id.layerId(),
-            schemaKey,
-            resolvedAtUtc,
-            effectiveAtUtc,
-            payload == null ? null : payload.effective(),
-            Strings.trimToNull(definition == null ? null : definition.configId()),
-            Strings.trimToNull(definition == null ? null : definition.effectiveConfigId()));
-    return ConfigPresentation.grouped(
-        schemaDoc, resolvedPayload, fabric, ConfigPresentation.Options.defaults());
-  }
-
-  @Override
-  public ConfigCodegen generate(
-      String configId, ConfigManager.Language language, String basePackageOrModule) {
-    return ConfigManagerImplCrud.generate(this, configId, language, basePackageOrModule);
-  }
-
-  @Override
-  public ConfigCodegen generate(
-      String configId, String layerId, ConfigManager.Language language, String basePackageOrModule) {
-    return ConfigManagerImplCrud.generate(this, configId, layerId, language, basePackageOrModule);
-  }
-
-  ConfigCodegen generateForLayer(
-      Resolution resolvedId,
-      LayerEntry layer,
-      ConfigManager.Language language,
-      String basePackageOrModule) {
-    AuditContext auditContext = captureAuditContext();
-    DefinitionConfigLayer payload = layer == null ? null : layer.definition();
-    String schemaName = required(payload == null ? null : payload.schemaKey(), "schemaName");
-    ConfigManager.Language requiredLanguage = Objects.requireNonNull(language, "language");
-    ConfigCodegen generated =
-        generateCodeZip(
-        resolvedId.group(), schemaName, requiredLanguage, Strings.trimToNull(basePackageOrModule));
-    ConfigResolved resolved =
-        resolver != null
-            ? resolver.resolve(
-                resolvedId.group(), resolvedId.configId(), resolvedId.layerId(), Instant.now())
-            : fallbackResolved(
-                resolvedId,
-                layer,
-                deepCopy(resolveDeclaredAt(layer.definition(), Instant.now())),
-                Instant.now());
-    publishAudit(
-        new ConfigEventGenerated(
-            envelope(
-                ConfigEventType.CONFIG_GENERATED,
-                resolvedId.group(),
-                resolvedId.configId(),
-                resolvedId.layerId(),
-                schemaName,
-                auditContext,
-                Instant.now()),
-            requiredLanguage.name().toLowerCase(),
-            Strings.trimToNull(basePackageOrModule),
-            generated.filename(),
-            generated.stats(),
-            resolved == null ? null : resolved.lineage()));
-    return generated;
-  }
-
-  @Override
-  public List<ConfigHistoryEntry> listHistory(
-      String group, String configId, String layerId, int limit) {
-    return ConfigManagerImplCrud.listHistory(this, group, configId, layerId, limit);
-  }
-
-  @Override
-  public ConfigSnapshot getSnapshot(
-      String group, String configId, String layerId, String snapshotConfigId) {
-    return ConfigManagerImplCrud.getSnapshot(this, group, configId, layerId, snapshotConfigId);
-  }
-
-  @Override
-  public ConfigUpdate rollback(ConfigRollbackRequest request) {
-    return ConfigManagerImplCrud.rollback(this, request);
-  }
-
-  @Override
-  public ConfigSubscription subscribe(String configId, String layerId, ConfigUpdateListener listener) {
-    return ConfigManagerImplSubscription.subscribe(this, configId, layerId, listener);
-  }
-
-  @Override
-  public ConfigAdminService.Workflow workflow() {
-    ensureOpen();
-    return workflowService;
+  public ViewStatus status(String viewName) {
+    return open(viewName).status();
   }
 
   @Override
   public void close() {
-    if (!closed.compareAndSet(false, true)) {
-      return;
+    for (ViewRuntimeImpl runtime : runtimes.values()) {
+      CloseSupport.closeQuietly(runtime);
     }
-    for (SubscriptionImpl subscription : subscriptions) {
+    runtimes.clear();
+    if (ownsScheduler) {
       try {
-        subscription.close();
+        scheduler.shutdownNow();
       } catch (Exception ignore) {
       }
     }
-    callbackExecutor.shutdownNow();
-    scheduleExecutor.shutdownNow();
-    CloseSupport.closeQuietly(auditPublisher);
   }
 
-  ConfigUpdate toUpdateAt(
-      DefinitionConfigLayer definition, ParsedLayerIdentity identity, Instant asOfUtc) {
-    return toUpdateSnapshotAt(definition, identity, asOfUtc).update();
+  private ViewRefreshResult refreshCanonicalDatasetId(String rootDatasetId, boolean includeGraph) {
+    DatasetId root = DatasetId.parse(rootDatasetId);
+    DefinitionDataset rootDefinition = resolveDatasetDefinition(root);
+    if (rootDefinition.view() == null) {
+      throw new IllegalStateException("Dataset is not a view: " + rootDatasetId);
+    }
+
+    List<String> ordered =
+        includeGraph
+            ? graphPlanner.plan(rootDatasetId, buildViewDependencyGraph())
+            : List.of(rootDatasetId);
+
+    return localDataManager.withDuckdbSession(
+        session -> {
+          ViewRefreshResult rootResult = null;
+          for (String candidateDatasetId : ordered) {
+            DefinitionDataset candidate = resolveDatasetDefinition(DatasetId.parse(candidateDatasetId));
+            if (candidate.view() == null) {
+              continue;
+            }
+            ViewRefreshResult result = refreshSingleView(candidate, session);
+            if (candidateDatasetId.equals(rootDatasetId)) {
+              rootResult = result;
+            }
+          }
+          if (rootResult == null) {
+            throw new IllegalStateException("View refresh did not include root view: " + rootDatasetId);
+          }
+          return rootResult;
+        });
   }
 
-  UpdateSnapshot toUpdateSnapshotAt(
-      DefinitionConfigLayer definition, ParsedLayerIdentity identity, Instant asOfUtc) {
-    DefinitionEnvelope envelope = definition == null ? null : definition.envelope();
-    DefinitionConfigLayer payload = definition;
-    List<DefinitionConfigLayer.Effective> copiedEffective = copyEffective(payload == null ? null : payload.effective());
-    Instant resolvedAt = asOfUtc == null ? Instant.now() : asOfUtc;
-    JsonNode changedPayload =
-        definition == null ? null : deepCopy(resolveDeclaredAt(definition, resolvedAt));
-    JsonNode declared;
-    ConfigLineage lineage;
-    if (resolver != null) {
-      ConfigResolved resolvedConfig =
-          resolver.resolve(identity.group(), identity.configId(), identity.layerId(), resolvedAt);
-      declared = deepCopy(resolvedPayloadAsJsonNode(resolvedConfig.payload()));
-      lineage = resolvedConfig == null ? null : resolvedConfig.lineage();
+  private ViewRefreshResult refreshSingleView(DefinitionDataset definition, DuckdbSession session) {
+    if (localDataManager == null) {
+      throw new IllegalStateException(
+          "View refresh requires DIRECT mode local RowManager implementation");
+    }
+
+    String datasetId = canonicalDatasetId(definition);
+    String viewName = datasetBaseName(definition);
+    DataWriteAuthorization.requireWrite(
+        localDataManager.dataEntitlementsForSqlPlanning(),
+        localDataManager.effectiveIdentityForSqlPlanning(),
+        datasetId,
+        "VIEW_REFRESH",
+        null);
+    DefinitionDataset.View view =
+        Objects.requireNonNull(definition.view(), "definition.view");
+    SchemaModel expectedSchema =
+        schemaManager
+            .get(requireSchemaName(definition))
+            .orElseThrow(
+                () ->
+                    new IllegalStateException(
+                        "View schema not found: group="
+                            + group
+                            + " datasetId="
+                            + datasetId
+                            + " schemaName="
+                            + view.schemaName()));
+
+    long startedEpochMs = System.currentTimeMillis();
+    String startedUtc = Instant.ofEpochMilli(startedEpochMs).toString();
+    DefinitionDataset running = withRunningRefresh(definition, startedUtc);
+    upsertDataset(running, "view-refresh-running:" + datasetId);
+    LOGGER.info("[View] refresh-start view={} mode={} dataset={}", viewName, "DIRECT", datasetId);
+    try {
+      List<DatasetId> dependencies = parseDependencies(view.dependencies(), datasetId);
+      List<DefinitionDataset> dependencyDefs = resolveDependencyDefinitions(dependencies);
+      for (int i = 0; i < dependencies.size(); i++) {
+        createDependencyAlias(session, dependencies.get(i), dependencyDefs.get(i));
+      }
+
+      String querySql = Strings.requireNonBlank(view.querySql(), "view.querySql");
+      validateResultSchema(session, querySql, expectedSchema, datasetId);
+      materializeViewTarget(session, definition, querySql);
+      long rowCount = queryRowCount(session, definition, querySql);
+
+      long durationMs = Math.max(0L, System.currentTimeMillis() - startedEpochMs);
+      String endedUtc = Instant.now().toString();
+      DefinitionDataset updated =
+          withTerminalRefresh(
+              running,
+              startedUtc,
+              endedUtc,
+              durationMs,
+              "SUCCESS",
+              null,
+              rowCount,
+              buildInputFingerprints(dependencies),
+              "schemaHash=" + Strings.firstNonBlank(expectedSchema.getHash(), "n/a"));
+      upsertDataset(updated, "view-refresh-success:" + datasetId);
+      writeViewCheckpoint(datasetId, "SUCCESS", endedUtc, durationMs, rowCount, null);
+      ViewStatus status = statusFromDefinition(updated, ViewRefreshState.STOPPED);
+      LOGGER.info("[View] refresh-success view={} rows={} durationMs={}", viewName, rowCount, durationMs);
+      return new ViewRefreshResult(viewName, datasetId, true, rowCount, durationMs, null, status);
+    } catch (RuntimeException ex) {
+      long durationMs = Math.max(0L, System.currentTimeMillis() - startedEpochMs);
+      String endedUtc = Instant.now().toString();
+      String truncatedError = truncateError(ex.getMessage());
+      DefinitionDataset failed =
+          withTerminalRefresh(
+              running,
+              startedUtc,
+              endedUtc,
+              durationMs,
+              "FAILED",
+              truncatedError,
+              null,
+              Map.of(),
+              null);
+      upsertDataset(failed, "view-refresh-failed:" + datasetId);
+      writeViewCheckpoint(datasetId, "FAILED", endedUtc, durationMs, null, truncatedError);
+      LOGGER.warn("[View] refresh-fail view={} error={}", viewName, truncatedError);
+      throw ex;
+    }
+  }
+
+  private void createDependencyAlias(
+      DuckdbSession session, DatasetId dependencyId, DefinitionDataset dependencyDefinition) {
+    localDataManager.prepareDatasetForQuery(dependencyId);
+    String alias = quoteIdentifier(dependencyId.name());
+    String fromExpression = queryFromExpression(dependencyDefinition);
+    session.exec("create or replace temp view " + alias + " as select * from " + fromExpression);
+  }
+
+  private String queryFromExpression(DefinitionDataset definition) {
+    if (definition.type() == DatasetType.DUCKDB
+        && definition.binding() != null
+        && definition.binding().duckdb() != null) {
+      return Strings.requireNonBlank(
+          definition.binding().duckdb().relationName(),
+          "dataset.duckdb.relationName");
+    }
+    if (definition.type() == DatasetType.PARQUET
+        && definition.binding() != null
+        && definition.binding().parquet() != null) {
+      DefinitionDataset.ParquetBinding parquet = definition.binding().parquet();
+      String uri = Strings.requireNonBlank(parquet.uri(), "dataset.parquet.uri");
+      if (isS3Uri(uri)) {
+        throw new IllegalStateException(
+            "View refresh in this prompt supports LOCAL parquet only: " + uri);
+      }
+      String glob = Strings.firstNonBlank(parquet.glob(), DEFAULT_PARQUET_GLOB);
+      String base = trimTrailingSlash(Path.of(uri).normalize().toString().replace('\\', '/'));
+      String parquetGlob = glob.startsWith("/") ? base + glob : base + "/" + glob;
+      StringBuilder sql =
+          new StringBuilder("read_parquet('")
+              .append(escapeSqlLiteral(parquetGlob))
+              .append("'");
+      if (Boolean.TRUE.equals(parquet.hivePartitioning())) {
+        sql.append(", hive_partitioning=true");
+      }
+      return sql.append(")").toString();
+    }
+    throw new IllegalStateException(
+        "View dependency dataset is not queryable: " + canonicalDatasetId(definition));
+  }
+
+  private void validateResultSchema(
+      DuckdbSession session,
+      String querySql,
+      SchemaModel expectedSchema,
+      String datasetId) {
+    String sql = "select * from (" + querySql + ") as __fabric_view_schema where 1=0";
+    List<SchemaModel.Field> actual = readSchemaFromQuery(session, sql, datasetId);
+    List<SchemaModel.Field> expected = expectedSchema.getFields();
+
+    if (expected.size() != actual.size()) {
+      throw new IllegalStateException(
+          "View schema mismatch dataset="
+              + datasetId
+              + " reason=FIELD_COUNT expected="
+              + expected.size()
+              + " actual="
+              + actual.size()
+              + " expectedFields="
+              + summarizeFields(expected)
+              + " actualFields="
+              + summarizeFields(actual));
+    }
+
+    for (int i = 0; i < expected.size(); i++) {
+      SchemaModel.Field expectedField = expected.get(i);
+      SchemaModel.Field actualField = actual.get(i);
+      if (!Objects.equals(expectedField.getName(), actualField.getName())
+          || expectedField.getType() != actualField.getType()
+          || expectedField.isNullable() != actualField.isNullable()) {
+        throw new IllegalStateException(
+            "View schema mismatch dataset="
+                + datasetId
+                + " index="
+                + i
+                + " expected="
+                + formatField(expectedField)
+                + " actual="
+                + formatField(actualField)
+                + " expectedFields="
+                + summarizeFields(expected)
+                + " actualFields="
+                + summarizeFields(actual));
+      }
+    }
+  }
+
+  private static List<SchemaModel.Field> readSchemaFromQuery(
+      DuckdbSession session, String sql, String datasetId) {
+    try (java.sql.Statement statement = session.createStatement();
+        ResultSet resultSet = statement.executeQuery(sql)) {
+      ResultSetMetaData metadata = resultSet.getMetaData();
+      int count = metadata.getColumnCount();
+      List<SchemaModel.Field> fields = new ArrayList<>(count);
+      for (int index = 1; index <= count; index++) {
+        String name = Strings.requireNonBlank(metadata.getColumnLabel(index), "columnLabel");
+        SchemaModel.FieldType type = toSchemaType(metadata.getColumnType(index), metadata.getColumnTypeName(index));
+        boolean nullable = metadata.isNullable(index) != ResultSetMetaData.columnNoNulls;
+        fields.add(
+            SchemaModel.Field.builder().withName(name).withType(type).withNullable(nullable).build());
+      }
+      return List.copyOf(fields);
+    } catch (SQLException ex) {
+      throw new IllegalStateException(
+          "Failed to inspect view query schema dataset=" + datasetId + " error=" + ex.getMessage(), ex);
+    }
+  }
+
+  private static SchemaModel.FieldType toSchemaType(int jdbcType, String typeName) {
+    return switch (jdbcType) {
+      case Types.CHAR,
+          Types.VARCHAR,
+          Types.LONGVARCHAR,
+          Types.NCHAR,
+          Types.NVARCHAR,
+          Types.LONGNVARCHAR -> SchemaModel.FieldType.STRING;
+      case Types.BIT, Types.BOOLEAN -> SchemaModel.FieldType.BOOL;
+      case Types.TINYINT, Types.SMALLINT, Types.INTEGER -> SchemaModel.FieldType.INT32;
+      case Types.BIGINT -> SchemaModel.FieldType.INT64;
+      case Types.REAL,
+          Types.FLOAT,
+          Types.DOUBLE,
+          Types.DECIMAL,
+          Types.NUMERIC -> SchemaModel.FieldType.FLOAT64;
+      case Types.DATE -> SchemaModel.FieldType.DATE;
+      case Types.TIMESTAMP, Types.TIMESTAMP_WITH_TIMEZONE -> SchemaModel.FieldType.TIMESTAMP;
+      case Types.BINARY,
+          Types.VARBINARY,
+          Types.LONGVARBINARY,
+          Types.BLOB -> SchemaModel.FieldType.BINARY;
+      default ->
+          throw new IllegalStateException(
+              "Unsupported JDBC type for view schema validation: jdbcType="
+                  + jdbcType
+                  + " typeName="
+                  + Strings.firstNonBlank(typeName, "n/a"));
+    };
+  }
+
+  private void materializeViewTarget(
+      DuckdbSession session, DefinitionDataset definition, String querySql) {
+    DefinitionDataset.Target target =
+        Objects.requireNonNull(definition.view().target(), "definition.view.target");
+    ViewTargetType targetType = parseTargetType(target.targetType());
+    String tableName = Strings.requireNonBlank(target.duckdbTableName(), "view.target.duckdbTableName");
+
+    if (targetType == ViewTargetType.DUCKDB_TABLE
+        || targetType == ViewTargetType.DUCKDB_TABLE_AND_PARQUET) {
+      session.exec("create or replace table " + quoteIdentifier(tableName) + " as " + querySql);
+    }
+
+    if (targetType == ViewTargetType.PARQUET_SNAPSHOT
+        || targetType == ViewTargetType.DUCKDB_TABLE_AND_PARQUET) {
+      Path snapshotFile = resolveSnapshotFile(target.parquetPath());
+      try {
+        Files.createDirectories(snapshotFile.getParent());
+        Files.deleteIfExists(snapshotFile);
+      } catch (Exception ex) {
+        throw new IllegalStateException(
+            "Failed to prepare view parquet snapshot path: " + snapshotFile, ex);
+      }
+      String sourceSql =
+          targetType == ViewTargetType.DUCKDB_TABLE_AND_PARQUET
+              ? "select * from " + quoteIdentifier(tableName)
+              : "select * from (" + querySql + ") as __fabric_view_snapshot";
+      session.exec(
+          "copy ("
+              + sourceSql
+              + ") to '"
+              + escapeSqlLiteral(snapshotFile.toString().replace('\\', '/'))
+              + "' (format parquet)");
+    }
+  }
+
+  private static Path resolveSnapshotFile(String parquetPath) {
+    String normalized = Strings.requireNonBlank(parquetPath, "view.target.parquetPath");
+    Path path = Path.of(normalized).toAbsolutePath().normalize();
+    String name = Strings.firstNonBlank(path.getFileName() == null ? null : path.getFileName().toString(), "");
+    if (name.toLowerCase(Locale.ROOT).endsWith(".parquet")) {
+      return path;
+    }
+    return path.resolve(SNAPSHOT_FILE_NAME);
+  }
+
+  private static long queryRowCount(
+      DuckdbSession session, DefinitionDataset definition, String querySql) {
+    DefinitionDataset.Target target = definition.view().target();
+    ViewTargetType targetType = parseTargetType(target == null ? null : target.targetType());
+    String sql;
+    if (targetType == ViewTargetType.DUCKDB_TABLE
+        || targetType == ViewTargetType.DUCKDB_TABLE_AND_PARQUET) {
+      String tableName =
+          Strings.requireNonBlank(
+              target == null ? null : target.duckdbTableName(), "view.target.duckdbTableName");
+      sql = "select count(*) as row_count from " + quoteIdentifier(tableName);
     } else {
-      declared = deepCopy(resolveDeclaredAt(definition, resolvedAt));
-      lineage = fallbackLineage(definition, identity.layerId(), declared);
+      sql = "select count(*) as row_count from (" + querySql + ") as __fabric_view_count";
     }
-    return new UpdateSnapshot(
-        new ConfigUpdate(
-            identity.group(),
-            identity.configId(),
-            identity.layerId(),
-            Strings.trimToNull(payload == null ? null : payload.schemaKey()),
-            Strings.trimToNull(definition == null ? null : definition.configId()),
-            Strings.trimToNull(definition == null ? null : definition.effectiveConfigId()),
-            Strings.trimToNull(envelope == null ? null : envelope.uuid()),
-            Strings.trimToNull(envelope == null ? null : envelope.updatedTimeUtc()),
-            declared,
-            copiedEffective),
-        lineage,
-        changedPayload);
-  }
 
-  ConfigResolved fallbackResolved(
-      Resolution resolvedId, LayerEntry layer, JsonNode declared, Instant resolvedAt) {
-    if (resolvedId == null) {
-      return null;
+    try (java.sql.Statement statement = session.createStatement();
+        ResultSet resultSet = statement.executeQuery(sql)) {
+      if (!resultSet.next()) {
+        return 0L;
+      }
+      return resultSet.getLong(1);
+    } catch (SQLException ex) {
+      throw new IllegalStateException("Failed to query view row count: " + ex.getMessage(), ex);
     }
-    DefinitionConfigLayer definition = layer == null ? null : layer.definition();
-    return new ConfigResolved(
-        resolvedId.configId(),
-        resolvedId.layerId(),
-        deepCopy(declared),
-        Strings.trimToNull(
-            definition == null || definition.envelope() == null
-                ? null
-                : definition.envelope().updatedTimeUtc()),
-        Map.of(),
-        fallbackLineage(definition, resolvedId.layerId(), declared));
   }
 
-  ConfigLineage fallbackLineage(DefinitionConfigLayer definition, String layerId, JsonNode declared) {
-    String configVersionId = Strings.trimToNull(definition == null ? null : definition.configId());
-    String payloadHash = ConfigManagerImplAudit.hashJson(HASH_MAPPER, declared);
-    return new ConfigLineage(
-        configVersionId,
-        1,
-        true,
-        configVersionId == null ? List.of() : List.of(configVersionId),
-        layerId == null ? List.of() : List.of(layerId),
-        payloadHash,
-        payloadHash,
-        HASH_VERSION);
+  private List<DatasetId> parseDependencies(List<String> dependencies, String datasetId) {
+    return ViewManagerImplRefresh.parseDependencies(
+        dependencies, datasetId, this::resolveDependencyDatasetId);
   }
 
-  String schemaKey(DefinitionConfigLayer definition) {
-    DefinitionConfigLayer payload = definition;
-    return Strings.trimToNull(payload == null ? null : payload.schemaKey());
+  private List<DefinitionDataset> resolveDependencyDefinitions(List<DatasetId> dependencies) {
+    if (dependencies == null || dependencies.isEmpty()) {
+      return List.of();
+    }
+    List<DefinitionDataset> resolved = new ArrayList<>(dependencies.size());
+    for (DatasetId dependency : dependencies) {
+      resolved.add(resolveDatasetDefinition(dependency));
+    }
+    return List.copyOf(resolved);
   }
 
-  ConfigLineage resolveLineage(String group, String configId, String layerId, Instant at) {
-    if (resolver == null
-        || Strings.isBlank(group)
-        || Strings.isBlank(configId)
-        || Strings.isBlank(layerId)
-        || at == null) {
-      return null;
+  private void upsertDataset(DefinitionDataset definition, String context) {
+    try (DiscoveryCache.ConfigCacheTx tx = DiscoveryCache.beginTx(context)) {
+      DiscoveryCache.upsertTx(tx, definition);
+      DiscoveryCache.commitTx(tx);
+    }
+  }
+
+  private DefinitionDataset withRunningRefresh(DefinitionDataset definition, String startedUtc) {
+    DefinitionDataset.View existingView = Objects.requireNonNull(definition.view(), "definition.view");
+    DefinitionDataset.LastRefresh lastRefresh =
+        new DefinitionDataset.LastRefresh(
+            startedUtc,
+            null,
+            null,
+            "RUNNING",
+            null,
+            null,
+            Map.of(),
+            null);
+    DefinitionDataset.View updatedView =
+        new DefinitionDataset.View(
+            existingView.querySql(),
+            existingView.dependencies(),
+            existingView.refresh(),
+            existingView.target(),
+            existingView.schemaName(),
+            existingView.schemaCompatibility(),
+            lastRefresh);
+    return new DefinitionDataset(
+        updatedEnvelope(definition.envelope(), DEFAULT_ACTOR),
+        definition.type(),
+        definition.namespace(),
+        definition.binding(),
+        updatedView);
+  }
+
+  private DefinitionDataset withTerminalRefresh(
+      DefinitionDataset definition,
+      String startedUtc,
+      String endedUtc,
+      long durationMillis,
+      String status,
+      String errorMessage,
+      Long rowCount,
+      Map<String, String> inputFingerprints,
+      String outputSnapshot) {
+    DefinitionDataset.View existingView = Objects.requireNonNull(definition.view(), "definition.view");
+    DefinitionDataset.LastRefresh lastRefresh =
+        new DefinitionDataset.LastRefresh(
+            startedUtc,
+            endedUtc,
+            durationMillis,
+            Strings.firstNonBlank(Strings.trimToNull(status), "FAILED"),
+            Strings.trimToNull(errorMessage),
+            rowCount,
+            inputFingerprints == null ? Map.of() : inputFingerprints,
+            Strings.trimToNull(outputSnapshot));
+    DefinitionDataset.View updatedView =
+        new DefinitionDataset.View(
+            existingView.querySql(),
+            existingView.dependencies(),
+            existingView.refresh(),
+            existingView.target(),
+            existingView.schemaName(),
+            existingView.schemaCompatibility(),
+            lastRefresh);
+    return new DefinitionDataset(
+        updatedEnvelope(definition.envelope(), DEFAULT_ACTOR),
+        definition.type(),
+        definition.namespace(),
+        definition.binding(),
+        updatedView);
+  }
+
+  private DatasetId resolveDependencyDatasetId(String dependency, String ownerDatasetId) {
+    try {
+      return DatasetId.parse(dependency);
+    } catch (RuntimeException ignored) {
     }
     try {
-      ConfigResolved resolved = resolver.resolve(group, configId, layerId, at);
-      return resolved == null ? null : resolved.lineage();
-    } catch (Exception ex) {
-      LOGGER.debug("[ConfigUsageAudit] resolve-lineage ignored group={} configId={} layerId={} message={}", group, configId, layerId, ex.toString());
-      return null;
+      DefinitionDataset resolvedView = resolveViewDefinition(dependency);
+      return DatasetId.parse(canonicalDatasetId(resolvedView));
+    } catch (RuntimeException ex) {
+      throw new IllegalStateException(
+          "Invalid view dependency value="
+              + dependency
+              + " viewDataset="
+              + ownerDatasetId
+              + " reason="
+              + ex.getMessage(),
+          ex);
     }
   }
 
-  AuditContext captureAuditContext() {
-    CallerAppContext.ContextValue caller = CallerAppContext.get().orElse(null);
-    String subject = Strings.trimToNull(UserContext.getUsernameOrDefault(null));
-    String delegatedUser =
-        ConfigManagerImplAudit.resolveDelegatedUser(UserContext.getAttributesOrEmpty());
-    String requestId = caller == null ? nextAuditRequestId() : caller.requestId();
-    return new AuditContext(
-        requestId,
-        caller == null ? null : caller.traceId(),
-        caller == null ? null : caller.callerAppSubject(),
-        subject,
-        delegatedUser);
-  }
-
-  private String nextAuditRequestId() {
-    return ConfigManagerImplAudit.nextAuditRequestId(auditRequestSequence, sessionId);
-  }
-
-  ConfigEventEnvelope envelope(
-      ConfigEventType eventType,
-      String group,
-      String configId,
-      String layerId,
-      String schemaKey,
-      AuditContext auditContext,
-      Instant eventTimeUtc) {
-    AuditContext resolved = auditContext == null ? captureAuditContext() : auditContext;
-    return new ConfigEventEnvelope(
-        ConfigEventEnvelope.SCHEMA_VERSION,
-        eventType,
-        (eventTimeUtc == null ? Instant.now() : eventTimeUtc).toString(),
-        resolved == null ? nextAuditRequestId() : resolved.requestId(),
-        resolved == null ? null : resolved.traceId(),
-        sessionId,
-        group,
-        callerAppName,
-        callerAppInstance,
-        resolved == null ? null : resolved.callerAppSubject(),
-        resolved == null ? null : resolved.subject(),
-        resolved == null ? null : resolved.delegatedUser(),
-        configId,
-        layerId,
-        schemaKey);
-  }
-
-  void publishAudit(ConfigEvent event) {
-    ConfigManagerImplAudit.publishAudit(auditPublisher, LOGGER, event);
-  }
-
-  LayerEntry requireLayer(String group, String configId, String layerId) {
-    String requiredGroup = required(group, "group");
-    String requiredconfigId = required(configId, "configId");
-    String requiredLayerId = required(layerId, "layerId");
-    List<LayerEntry> layers = findConfigLayers(requiredGroup, requiredconfigId);
-    for (LayerEntry layer : layers) {
-      if (requiredLayerId.equals(layer.identity().layerId())) {
-        return layer;
+  private Map<String, List<String>> buildViewDependencyGraph() {
+    List<DefinitionDataset> definitions = listViewDefinitions();
+    definitions.sort(Comparator.comparing(ViewManagerImpl::canonicalDatasetId, String.CASE_INSENSITIVE_ORDER));
+    LinkedHashMap<String, List<String>> graph = new LinkedHashMap<>();
+    for (DefinitionDataset definition : definitions) {
+      String datasetId = canonicalDatasetId(definition);
+      List<String> dependencies = new ArrayList<>();
+      for (DatasetId dependency : parseDependencies(definition.view().dependencies(), datasetId)) {
+        dependencies.add(dependency.toString());
       }
+      dependencies.sort(String.CASE_INSENSITIVE_ORDER);
+      graph.put(datasetId, List.copyOf(dependencies));
     }
-    throw new IllegalArgumentException(
-        "layer not found for config " + requiredconfigId + ": " + requiredLayerId);
+    return Map.copyOf(graph);
   }
 
-  List<LayerEntry> findConfigLayers(String group, String configId) {
-    List<LayerEntry> results = findConfigLayersOrEmpty(group, configId);
-    if (results.isEmpty()) {
-      throw new IllegalArgumentException("config not found: " + configId);
-    }
-    return results;
+  private Map<String, String> buildInputFingerprints(List<DatasetId> dependencies) {
+    return ViewManagerImplRefresh.buildInputFingerprints(dependencies, this::resolveDatasetDefinition);
   }
 
-  List<LayerEntry> findConfigLayersOrEmpty(String group, String configId) {
-    List<DefinitionConfigLayer> all = configView.listConfigLayers(group);
-    List<LayerEntry> results = new ArrayList<>();
-    for (DefinitionConfigLayer definition : all) {
-      ParsedLayerIdentity identity = parseLayerIdentity(definition, group);
-      if (identity == null) {
-        LOGGER.debug("[ConfigManager][Ignored] reason=identity-parse definition={}", definition);
-        continue;
+  private void writeViewCheckpoint(
+      String datasetId, String status, String refreshEndUtc, long durationMs, Long rowCount, String error) {
+    ViewManagerImplRefresh.writeViewCheckpoint(
+        checkpointStore, group, datasetId, status, refreshEndUtc, durationMs, rowCount, error);
+  }
+
+  private static String truncateError(String error) {
+    return ViewManagerImplRefresh.truncateError(error, MAX_ERROR_CHARS);
+  }
+
+  private static DefinitionEnvelope updatedEnvelope(DefinitionEnvelope envelope, String actor) {
+    String now = Instant.now().toString();
+    return new DefinitionEnvelope(
+        envelope.group(),
+        DefinitionType.DATASET,
+        envelope.name(),
+        envelope.uuid(),
+        envelope.enabled(),
+        envelope.lifecycleStatus(),
+        envelope.createdTimeUtc(),
+        envelope.createdBy(),
+        now,
+        Strings.firstNonBlank(actor, DEFAULT_ACTOR));
+  }
+
+  private DefinitionDataset resolveViewDefinition(String viewNameOrDatasetId) {
+    String normalized = Strings.requireNonBlank(viewNameOrDatasetId, "viewName");
+    if (normalized.regionMatches(true, 0, "dataset:", 0, "dataset:".length())) {
+      DefinitionDataset definition = resolveDatasetDefinition(DatasetId.parse(normalized));
+      if (definition.view() == null) {
+        throw new IllegalArgumentException("Dataset is not a view: " + normalized);
       }
-      if (!group.equals(identity.group()) || !configId.equals(identity.configId())) {
-        continue;
-      }
-      results.add(new LayerEntry(definition, identity));
+      return definition;
     }
-    return List.copyOf(results);
-  }
 
-  Map<String, List<LayerEntry>> groupByConfig(String group) {
-    List<DefinitionConfigLayer> all = configView.listConfigLayers(group);
-    Map<String, List<LayerEntry>> grouped = new LinkedHashMap<>();
-    for (DefinitionConfigLayer definition : all) {
-      ParsedLayerIdentity identity = parseLayerIdentity(definition, group);
-      if (identity == null || !group.equals(identity.group())) {
-        continue;
-      }
-      grouped.computeIfAbsent(identity.configId(), ignored -> new ArrayList<>())
-          .add(new LayerEntry(definition, identity));
-    }
-    return grouped;
-  }
-
-  static LayerEntry representativeLayer(List<LayerEntry> layers) {
-    if (layers == null || layers.isEmpty()) {
-      return null;
-    }
-    for (LayerEntry layer : layers) {
-      if (LAYER_BASE.equals(layer.identity().layerId())) {
-        return layer;
-      }
-    }
-    return layers.get(0);
-  }
-
-  static List<LayerEntry> sortLayers(List<LayerEntry> layers) {
-    List<LayerEntry> sorted = new ArrayList<>(layers == null ? List.of() : layers);
-    sorted.sort(
-        Comparator.comparing((LayerEntry entry) -> !LAYER_BASE.equals(entry.identity().layerId()))
-            .thenComparing(entry -> entry.identity().layerId(), Comparator.nullsLast(String::compareTo)));
-    return List.copyOf(sorted);
-  }
-
-  JsonNode resolveLiveDeclared(DefinitionConfigLayer definition) {
-    DefinitionConfigLayer payload = definition;
-    JsonNode declared = payload == null ? null : payload.declared();
-    if (declared == null || !declared.isObject()) {
-      throw new IllegalStateException("declared payload must be a JSON object");
-    }
-    return declared.deepCopy();
-  }
-
-  JsonNode resolveDeclaredAt(DefinitionConfigLayer definition, Instant at) {
-    JsonNode liveDeclared = resolveLiveDeclared(definition);
-    DefinitionConfigLayer payload = definition;
-    List<DefinitionConfigLayer.Effective> effectiveEntries = payload == null ? null : payload.effective();
-    if (effectiveEntries == null || effectiveEntries.isEmpty()) {
-      return liveDeclared;
-    }
-    List<TimedEffective> sorted = new ArrayList<>(effectiveEntries.size());
-    for (DefinitionConfigLayer.Effective entry : effectiveEntries) {
-      if (entry == null || Strings.trimToNull(entry.effectiveTimeUtc()) == null) {
-        continue;
-      }
-      JsonNode declared = entry.declared();
-      if (declared == null || !declared.isObject()) {
-        throw new IllegalStateException("effective declared payload must be a JSON object");
-      }
-      Instant expiresAt = null;
-      if (Strings.trimToNull(entry.expiresAtUtc()) != null) {
-        try {
-          expiresAt = Instant.parse(entry.expiresAtUtc());
-        } catch (Exception ex) {
-          throw new IllegalStateException("invalid expiresAtUtc: " + entry.expiresAtUtc(), ex);
+    List<DefinitionDataset> candidates = new ArrayList<>();
+    for (DefinitionDataset definition : listViewDefinitions()) {
+      String envelopeName =
+          Strings.requireNonBlank(
+              definition.envelope() == null ? null : definition.envelope().name(),
+              "view.envelope.name");
+      if (normalized.contains("/")) {
+        if (normalized.equals(envelopeName)) {
+          candidates.add(definition);
         }
-      }
-      Instant effectiveAt;
-      try {
-        effectiveAt = Instant.parse(entry.effectiveTimeUtc());
-      } catch (Exception ex) {
-        throw new IllegalStateException("invalid effectiveTimeUtc: " + entry.effectiveTimeUtc(), ex);
-      }
-      if (expiresAt != null && !expiresAt.isAfter(effectiveAt)) {
-        continue;
-      }
-      sorted.add(new TimedEffective(effectiveAt, expiresAt, entry));
-    }
-    sorted.sort(Comparator.comparing(TimedEffective::effectiveTime));
-    DefinitionConfigLayer.Effective winner = null;
-    for (TimedEffective timed : sorted) {
-      if (timed.effectiveTime().isAfter(at)) {
-        break;
-      }
-      if (timed.expiresAt() != null && !at.isBefore(timed.expiresAt())) {
-        continue;
-      }
-      winner = timed.entry();
-    }
-    if (winner == null) {
-      return liveDeclared;
-    }
-    return winner.declared().deepCopy();
-  }
-
-  List<DefinitionConfigLayer.Effective> copyEffective(List<DefinitionConfigLayer.Effective> values) {
-    if (values == null || values.isEmpty()) {
-      return List.of();
-    }
-    List<DefinitionConfigLayer.Effective> copied = new ArrayList<>(values.size());
-    for (DefinitionConfigLayer.Effective value : values) {
-      if (value == null) {
-        continue;
-      }
-      copied.add(
-          new DefinitionConfigLayer.Effective(
-              value.effectiveTimeUtc(), value.expiresAtUtc(), deepCopy(value.declared())));
-    }
-    return List.copyOf(copied);
-  }
-
-  static List<DefinitionConfigLayer.Effective> upsertScheduledEffective(
-      List<DefinitionConfigLayer.Effective> baseline,
-      Instant effectiveAt,
-      Instant expiresAt,
-      JsonNode declaredPayload) {
-    String effectiveUtc = effectiveAt.toString();
-    String expiresUtc = expiresAt == null ? null : expiresAt.toString();
-    List<DefinitionConfigLayer.Effective> rewritten = new ArrayList<>();
-    if (baseline != null) {
-      for (DefinitionConfigLayer.Effective entry : baseline) {
-        if (entry == null) {
-          continue;
-        }
-        if (!effectiveUtc.equals(entry.effectiveTimeUtc())) {
-          rewritten.add(entry);
-        }
+      } else if (normalized.equals(datasetBaseName(definition))) {
+        candidates.add(definition);
       }
     }
-    rewritten.add(new DefinitionConfigLayer.Effective(effectiveUtc, expiresUtc, declaredPayload.deepCopy()));
-    rewritten.sort(Comparator.comparing(entry -> Instant.parse(entry.effectiveTimeUtc())));
-    return List.copyOf(rewritten);
-  }
 
-  static DefinitionConfigLayer.History findHistorySnapshot(
-      List<DefinitionConfigLayer.History> history, String configId) {
-    if (history == null || history.isEmpty() || configId == null) {
-      return null;
+    if (candidates.isEmpty()) {
+      throw new IllegalArgumentException("Unknown view: " + group + "/" + normalized);
     }
-    for (DefinitionConfigLayer.History snapshot : history) {
-      if (snapshot == null) {
-        continue;
+    if (candidates.size() > 1) {
+      List<String> ids = new ArrayList<>();
+      for (DefinitionDataset candidate : candidates) {
+        ids.add(canonicalDatasetId(candidate));
       }
-      if (configId.equals(Strings.trimToNull(snapshot.configId()))) {
-        return snapshot;
-      }
-    }
-    return null;
-  }
-
-  static List<String> topLevelKeys(JsonNode declared) {
-    if (declared == null || !declared.isObject()) {
-      return List.of();
-    }
-    List<String> keys = new ArrayList<>();
-    declared.fieldNames().forEachRemaining(keys::add);
-    keys.sort(String::compareTo);
-    return List.copyOf(keys);
-  }
-
-  ParsedLayerIdentity parseLayerIdentity(DefinitionConfigLayer definition, String fallbackGroup) {
-    if (definition == null) {
-      return null;
-    }
-    DefinitionEnvelope envelope = definition.envelope();
-    String group = Strings.trimToNull(envelope == null ? null : envelope.group());
-    if (group == null) {
-      group = Strings.trimToNull(fallbackGroup);
-    }
-
-    String resourceId = Strings.trimToNull(definition.resourceId());
-    if (resourceId != null) {
-      try {
-        CanonicalIds.ParsedId parsed = CanonicalIds.parse(resourceId);
-        if ("config".equals(parsed.type())) {
-          String parsedGroup = Strings.trimToNull(parsed.group());
-          if (parsedGroup != null) {
-            group = parsedGroup;
-          }
-          String configId = Strings.trimToNull(parsed.namespace());
-          String layerId = Strings.trimToNull(parsed.name());
-          if (group != null && configId != null && layerId != null) {
-            return new ParsedLayerIdentity(group, configId, layerId, resourceId);
-          }
-        }
-      } catch (RuntimeException ex) {
-        LOGGER.debug("[ConfigManager][Ignored] reason=invalid-resource-id value={}", resourceId);
-      }
-    }
-    return null;
-  }
-
-  JsonNode deepCopy(JsonNode value) {
-    return value == null ? null : value.deepCopy();
-  }
-
-  JsonNode redactSensitiveAuditPayload(JsonNode payload) {
-    return ConfigManagerImplAudit.redactSensitiveAuditPayload(mapper, payload);
-  }
-
-  JsonNode resolvedPayloadAsJsonNode(Object payload) {
-    return ConfigManagerImplAudit.resolvedPayloadAsJsonNode(mapper, payload);
-  }
-
-  void ensureOpen() {
-    if (closed.get()) {
-      throw new IllegalStateException("ConfigManager is closed");
-    }
-  }
-
-  Resolution resolveId(String configId, String layerId) {
-    String group = requiredSessionGroup();
-    String requiredConfigId = required(configId, "configId");
-    String requiredLayerId = required(layerId, "layerId");
-    return new Resolution(group, requiredConfigId, requiredLayerId);
-  }
-
-  String requiredSessionGroup() {
-    String group = Strings.trimToNull(defaultGroup);
-    if (group == null) {
-      throw new IllegalStateException("Session group is required");
-    }
-    return group;
-  }
-
-  ConfigResolver resolver() {
-    if (resolver == null) {
-      throw new IllegalStateException("Config resolver is unavailable");
-    }
-    return resolver;
-  }
-
-  static String required(String value, String field) {
-    String normalized = Strings.trimToNull(value);
-    if (normalized == null) {
-      throw new IllegalArgumentException(field + " is required");
-    }
-    return normalized;
-  }
-
-  private static ExecutorService newExecutor() {
-    return Executors.newSingleThreadExecutor(
-        runnable -> {
-          Thread thread = new Thread(runnable, "config-client-" + EXECUTOR_ID.incrementAndGet());
-          thread.setDaemon(true);
-          return thread;
-        });
-  }
-
-  private static ScheduledExecutorService newScheduler() {
-    return Executors.newSingleThreadScheduledExecutor(
-        runnable -> {
-          Thread thread =
-              new Thread(runnable, "config-client-scheduler-" + SCHEDULER_ID.incrementAndGet());
-          thread.setDaemon(true);
-          return thread;
-        });
-  }
-
-  ConfigCodegen generateCodeZip(
-      String group,
-      String schemaName,
-      ConfigManager.Language language,
-      String basePackageOrModule) {
-    ensureOpen();
-    String requiredGroup = required(group, "group");
-    String requiredSchemaName = required(schemaName, "schemaName");
-    ConfigSchemaDoc schemaDoc = resolveSchemaDoc(requiredGroup, requiredSchemaName);
-    return codegenService.generate(
-        schemaDoc,
-        requiredGroup,
-        requiredSchemaName,
-        Objects.requireNonNull(language, "language"),
-        Strings.trimToNull(basePackageOrModule));
-  }
-
-  ConfigSchemaDoc resolveSchemaDoc(String group, String schemaName) {
-    String requiredGroup = required(group, "group");
-    String requiredSchemaName = required(schemaName, "schemaName");
-    Definition schemaDefinition = configView.get(DefinitionType.SCHEMA, requiredGroup, requiredSchemaName);
-    if (!(schemaDefinition instanceof DefinitionSchema resolved)) {
+      ids.sort(String.CASE_INSENSITIVE_ORDER);
       throw new IllegalArgumentException(
-          "schema not found for group='" + requiredGroup + "' name='" + requiredSchemaName + "'");
+          "Ambiguous view name '" + normalized + "'. Candidates=" + ids);
     }
-    String schemaJson = Strings.trimToNull(resolved.schema());
-    if (schemaJson == null) {
-      throw new IllegalStateException("schema text is required");
-    }
-    return ConfigSchemaCodec.parse(schemaJson);
+    return candidates.get(0);
   }
 
-  interface ConfigView {
-    List<DefinitionConfigLayer> listConfigLayers(String group);
-
-    Definition get(DefinitionType type, String group, String name);
-
-    void upsert(Definition definition);
-
-    AutoCloseable onUpsert(
-        DefinitionType type, BiConsumer<DiscoveryCache.ConfigKey, Definition> listener);
+  private List<DefinitionDataset> listViewDefinitions() {
+    List<DefinitionDataset> listed = new ArrayList<>(DiscoveryCache.list(DefinitionDataset.class, group));
+    List<DefinitionDataset> filtered = new ArrayList<>();
+    for (DefinitionDataset definition : listed) {
+      if (definition != null && definition.view() != null) {
+        filtered.add(definition);
+      }
+    }
+    return filtered;
   }
 
-  private static final class ConfigCacheView implements ConfigView {
-    private final DiscoveryCache cache;
-
-    private ConfigCacheView(DiscoveryCache cache) {
-      this.cache = Objects.requireNonNull(cache, "cache");
+  private DefinitionDataset resolveDatasetDefinition(DatasetId datasetId) {
+    for (DefinitionDataset definition : DiscoveryCache.list(DefinitionDataset.class, datasetId.group())) {
+      if (definition == null) {
+        continue;
+      }
+      DefinitionEnvelope envelope = definition.envelope();
+      if (envelope == null) {
+        continue;
+      }
+      if (!datasetId.group().equals(envelope.group())) {
+        continue;
+      }
+      if (!datasetId.namespace().equals(definition.namespace())) {
+        continue;
+      }
+      if (!datasetId.name().equals(datasetBaseName(definition))) {
+        continue;
+      }
+      return definition;
     }
+    throw new IllegalStateException("Dataset definition not found: " + datasetId);
+  }
 
-    @Override
-    public List<DefinitionConfigLayer> listConfigLayers(String group) {
-      return cache.list(DefinitionConfigLayer.class, group);
+  private static String requireSchemaName(DefinitionDataset definition) {
+    DefinitionDataset.View view = Objects.requireNonNull(definition.view(), "definition.view");
+    return Strings.requireNonBlank(view.schemaName(), "view.schemaName");
+  }
+
+  private static ViewStatus statusFromDefinition(DefinitionDataset definition, ViewRefreshState fallbackState) {
+    DefinitionDataset.View view = definition == null ? null : definition.view();
+    DefinitionDataset.LastRefresh last = view == null ? null : view.lastRefresh();
+    return new ViewStatus(
+        fallbackState,
+        last == null ? null : last.lastRefreshStartUtc(),
+        last == null ? null : last.lastRefreshEndUtc(),
+        last == null ? null : last.lastDurationMs(),
+        last == null ? null : last.lastStatus(),
+        last == null ? null : last.lastError(),
+        last == null ? null : last.lastRowCount(),
+        last == null ? Map.of() : last.lastInputFingerprints(),
+        last == null ? null : last.lastOutputSnapshot());
+  }
+
+  private static ViewTargetType parseTargetType(String token) {
+    String normalized = Strings.trimToNull(token);
+    if (normalized == null) {
+      return ViewTargetType.DUCKDB_TABLE;
     }
-
-    @Override
-    public Definition get(DefinitionType type, String group, String name) {
-      return cache.get(type, group, name);
-    }
-
-    @Override
-    public void upsert(Definition definition) {
-      cache.upsert(definition);
-    }
-
-    @Override
-    public AutoCloseable onUpsert(
-        DefinitionType type, BiConsumer<DiscoveryCache.ConfigKey, Definition> listener) {
-      return cache.registerListener(type, listener);
+    try {
+      return ViewTargetType.valueOf(normalized.toUpperCase(Locale.ROOT));
+    } catch (IllegalArgumentException ex) {
+      return ViewTargetType.DUCKDB_TABLE;
     }
   }
 
-  static final class SubscriptionImpl implements ConfigSubscription {
-    final ConfigManagerImpl manager;
-    final String subscriptionId;
-    final String group;
-    final String configId;
-    final String layerId;
-    final ConfigUpdateListener listener;
-    final AuditContext auditContext;
-    final AtomicLong callbackCount = new AtomicLong(0L);
-    final AtomicBoolean closed = new AtomicBoolean(false);
-    final ConcurrentHashMap<String, String> lastSeenByLayer = new ConcurrentHashMap<>();
-    final ConcurrentHashMap<String, CopyOnWriteArrayList<ScheduledFuture<?>>> scheduledByLayer =
-        new ConcurrentHashMap<>();
-    volatile AutoCloseable cacheHandle;
+  private static ViewRefreshType parseRefreshType(String token) {
+    String normalized = Strings.trimToNull(token);
+    if (normalized == null) {
+      return ViewRefreshType.MANUAL;
+    }
+    try {
+      return ViewRefreshType.valueOf(normalized.toUpperCase(Locale.ROOT));
+    } catch (IllegalArgumentException ex) {
+      return ViewRefreshType.MANUAL;
+    }
+  }
 
-    SubscriptionImpl(
-        ConfigManagerImpl manager,
-        String subscriptionId,
-        String group,
-        String configId,
-        String layerId,
-        ConfigUpdateListener listener,
-        AuditContext auditContext) {
-      this.manager = Objects.requireNonNull(manager, "manager");
-      this.subscriptionId = Strings.requireNonBlank(subscriptionId, "subscriptionId");
-      this.group = group;
-      this.configId = configId;
-      this.layerId = layerId;
-      this.listener = listener;
-      this.auditContext = auditContext;
+  private static String canonicalDatasetId(DefinitionDataset definition) {
+    DefinitionEnvelope envelope = Objects.requireNonNull(definition.envelope(), "definition.envelope");
+    String namespace = Strings.requireNonBlank(definition.namespace(), "definition.namespace");
+    String name = datasetBaseName(definition);
+    return DatasetId.of(envelope.group(), namespace, name).toString();
+  }
+
+  private static String datasetBaseName(DefinitionDataset definition) {
+    DefinitionEnvelope envelope = Objects.requireNonNull(definition.envelope(), "definition.envelope");
+    String namespace = Strings.requireNonBlank(definition.namespace(), "definition.namespace");
+    String envelopeName = Strings.requireNonBlank(envelope.name(), "definition.envelope.name");
+    String prefix = namespace + "/";
+    if (!envelopeName.startsWith(prefix)) {
+      throw new IllegalStateException(
+          "Dataset definition invalid envelope.name. Expected namespace/baseName with namespace='"
+              + namespace
+              + "' and envelope.name='"
+              + envelopeName
+              + "'");
+    }
+    String base = envelopeName.substring(prefix.length());
+    if (base.isBlank() || base.indexOf('/') >= 0) {
+      throw new IllegalStateException(
+          "Dataset definition invalid envelope.name. Expected namespace/baseName with namespace='"
+              + namespace
+              + "' and envelope.name='"
+              + envelopeName
+              + "'");
+    }
+    return base;
+  }
+
+  private static String safeDatasetId(DefinitionDataset definition) {
+    try {
+      return definition == null ? "<null>" : canonicalDatasetId(definition);
+    } catch (RuntimeException ex) {
+      return "<invalid>";
+    }
+  }
+
+  private static String summarizeFields(List<SchemaModel.Field> fields) {
+    List<String> parts = new ArrayList<>();
+    for (SchemaModel.Field field : fields) {
+      parts.add(formatField(field));
+    }
+    return parts.toString();
+  }
+
+  private static String formatField(SchemaModel.Field field) {
+    return field.getName() + ":" + field.getType() + ":" + (field.isNullable() ? "NULLABLE" : "NOT_NULL");
+  }
+
+  private static boolean isS3Uri(String value) {
+    return value.regionMatches(true, 0, "s3://", 0, "s3://".length())
+        || value.regionMatches(true, 0, "s3a://", 0, "s3a://".length());
+  }
+
+  private static String trimTrailingSlash(String value) {
+    int end = value.length();
+    while (end > 0 && value.charAt(end - 1) == '/') {
+      end--;
+    }
+    return end == value.length() ? value : value.substring(0, end);
+  }
+
+  private static String quoteIdentifier(String identifier) {
+    String normalized = Strings.requireNonBlank(identifier, "identifier");
+    return "\"" + normalized.replace("\"", "\"\"") + "\"";
+  }
+
+  private static String escapeSqlLiteral(String value) {
+    return value.replace("'", "''");
+  }
+
+
+  private final class ViewRuntimeImpl implements ViewRuntime {
+    private final Object lifecycleLock = new Object();
+    private final String datasetId;
+    private volatile ViewStatus status;
+    private volatile ScheduledFuture<?> periodicTask;
+
+    private ViewRuntimeImpl(String datasetId) {
+      this.datasetId = datasetId;
+      DefinitionDataset definition = resolveDatasetDefinition(DatasetId.parse(datasetId));
+      this.status = statusFromDefinition(definition, ViewRefreshState.STOPPED);
+    }
+
+    @Override
+    public ViewRuntime start() {
+      synchronized (lifecycleLock) {
+        DefinitionDataset definition = resolveDatasetDefinition(DatasetId.parse(datasetId));
+        ViewRefreshModel refresh = toRefreshModel(definition);
+        if (refresh.type() != ViewRefreshType.PERIODIC) {
+          return this;
+        }
+        if (periodicTask != null && !periodicTask.isCancelled() && !periodicTask.isDone()) {
+          return this;
+        }
+
+        long intervalMillis =
+            refresh.intervalMillis() == null || refresh.intervalMillis() <= 0L
+                ? 1000L
+                : refresh.intervalMillis();
+        if (refresh.runOnStart()) {
+          refreshGraph();
+        }
+        periodicTask =
+            scheduler.scheduleAtFixedRate(
+                () -> {
+                  try {
+                    refreshGraph();
+                  } catch (RuntimeException ex) {
+                    synchronized (lifecycleLock) {
+                      DefinitionDataset current = resolveDatasetDefinition(DatasetId.parse(datasetId));
+                      status = statusFromDefinition(current, ViewRefreshState.FAILED);
+                    }
+                  }
+                },
+                intervalMillis,
+                intervalMillis,
+                TimeUnit.MILLISECONDS);
+        status = statusFromDefinition(definition, ViewRefreshState.RUNNING);
+        return this;
+      }
+    }
+
+    @Override
+    public void stop() {
+      synchronized (lifecycleLock) {
+        ScheduledFuture<?> task = periodicTask;
+        periodicTask = null;
+        if (task != null) {
+          task.cancel(false);
+        }
+        DefinitionDataset definition = resolveDatasetDefinition(DatasetId.parse(datasetId));
+        status = statusFromDefinition(definition, ViewRefreshState.STOPPED);
+      }
+    }
+
+    @Override
+    public ViewRefreshResult refresh() {
+      synchronized (lifecycleLock) {
+        try {
+          ViewRefreshResult result = refreshCanonicalDatasetId(datasetId, false);
+          DefinitionDataset definition = resolveDatasetDefinition(DatasetId.parse(datasetId));
+          status =
+              statusFromDefinition(
+                  definition,
+                  periodicTask == null || periodicTask.isCancelled()
+                      ? ViewRefreshState.STOPPED
+                      : ViewRefreshState.RUNNING);
+          return new ViewRefreshResult(
+              result.viewName(),
+              result.outputDatasetId(),
+              result.success(),
+              result.rowCount(),
+              result.durationMillis(),
+              result.message(),
+              status);
+        } catch (RuntimeException ex) {
+          DefinitionDataset definition = resolveDatasetDefinition(DatasetId.parse(datasetId));
+          status = statusFromDefinition(definition, ViewRefreshState.FAILED);
+          throw ex;
+        }
+      }
+    }
+
+    @Override
+    public ViewRefreshResult refreshGraph() {
+      synchronized (lifecycleLock) {
+        try {
+          ViewRefreshResult result = refreshCanonicalDatasetId(datasetId, true);
+          DefinitionDataset definition = resolveDatasetDefinition(DatasetId.parse(datasetId));
+          status =
+              statusFromDefinition(
+                  definition,
+                  periodicTask == null || periodicTask.isCancelled()
+                      ? ViewRefreshState.STOPPED
+                      : ViewRefreshState.RUNNING);
+          return new ViewRefreshResult(
+              result.viewName(),
+              result.outputDatasetId(),
+              result.success(),
+              result.rowCount(),
+              result.durationMillis(),
+              result.message(),
+              status);
+        } catch (RuntimeException ex) {
+          DefinitionDataset definition = resolveDatasetDefinition(DatasetId.parse(datasetId));
+          status = statusFromDefinition(definition, ViewRefreshState.FAILED);
+          throw ex;
+        }
+      }
+    }
+
+    @Override
+    public ViewStatus status() {
+      synchronized (lifecycleLock) {
+        return status;
+      }
     }
 
     @Override
     public void close() {
-      ConfigManagerImplSubscription.closeSubscription(this);
+      stop();
     }
 
-    void addScheduled(String layer, ScheduledFuture<?> future) {
-      if (future == null) {
-        return;
-      }
-      String key = required(layer, "layerId");
-      if (closed.get()) {
-        future.cancel(false);
-        return;
-      }
-      scheduledByLayer.computeIfAbsent(key, ignored -> new CopyOnWriteArrayList<>()).add(future);
-    }
-
-    void cancelScheduled(String layer) {
-      if (layer == null) {
-        return;
-      }
-      CopyOnWriteArrayList<ScheduledFuture<?>> futures = scheduledByLayer.remove(layer);
-      if (futures == null) {
-        return;
-      }
-      for (ScheduledFuture<?> future : futures) {
-        if (future != null) {
-          future.cancel(false);
-        }
-      }
-    }
-
-    void pruneScheduled(String layer) {
-      if (layer == null) {
-        return;
-      }
-      CopyOnWriteArrayList<ScheduledFuture<?>> futures = scheduledByLayer.get(layer);
-      if (futures == null) {
-        return;
-      }
-      futures.removeIf(future -> future == null || future.isDone() || future.isCancelled());
-      if (futures.isEmpty()) {
-        scheduledByLayer.remove(layer, futures);
-      }
+    private ViewRefreshModel toRefreshModel(DefinitionDataset definition) {
+      DefinitionDataset.Refresh refresh =
+          definition.view() == null ? null : definition.view().refresh();
+      return ViewRefreshModel.builder()
+          .withType(parseRefreshType(refresh == null ? null : refresh.type()))
+          .withIntervalMillis(refresh == null ? null : refresh.intervalMillis())
+          .withRunOnStart(Boolean.TRUE.equals(refresh == null ? null : refresh.runOnStart()))
+          .build();
     }
   }
-
-  record ParsedLayerIdentity(String group, String configId, String layerId, String resourceId) {}
-
-  record LayerEntry(DefinitionConfigLayer definition, ParsedLayerIdentity identity) {}
-
-  record Resolution(String group, String configId, String layerId) {}
-
-  record UpdateSnapshot(ConfigUpdate update, ConfigLineage lineage, JsonNode changedPayload) {}
-
-  record AuditContext(
-      String requestId, String traceId, String callerAppSubject, String subject, String delegatedUser) {}
-
-  record TimedEffective(
-      Instant effectiveTime, Instant expiresAt, DefinitionConfigLayer.Effective entry) {}
 }
-
-
-
-
-
-
-
 
 
 
