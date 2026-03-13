@@ -1,1519 +1,1482 @@
-package org.pronzato.fabric.api.control.discovery.lifecycle;
+package org.pronzato.fabric.api.data.manager;
 
+import org.pronzato.fabric.api.util.CloseSupport;
+import com.crankuptheamps.client.Message;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.EnumMap;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
-import org.pronzato.fabric.api.control.discovery.definitions.Definition;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfig;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfigLayer;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.types.pojo.Schema;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConnection;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEntitlement;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngest;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngestSource;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionSchema;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionService;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStream;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStatusData;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
-import org.pronzato.fabric.api.control.discovery.definitions.common.Semantic;
-import org.pronzato.fabric.api.control.discovery.definitions.common.Semantic.RelationshipHint;
+import org.pronzato.fabric.api.control.status.data.DataStatusPublisher;
+import org.pronzato.fabric.api.Fabric;
+import org.pronzato.fabric.api.data.checkpoints.CheckpointStore;
+import org.pronzato.fabric.api.data.checkpoints.CheckpointStores;
+import org.pronzato.fabric.api.data.IngestAdmin;
+import org.pronzato.fabric.api.data.RowManager;
+import org.pronzato.fabric.api.data.RowResult;
+import org.pronzato.fabric.api.data.IngestManager;
+import org.pronzato.fabric.api.data.dataset.DatasetId;
+import org.pronzato.fabric.api.data.ingest.IngestPayload;
+import org.pronzato.fabric.api.data.ingest.IngestPayloadJson;
+import org.pronzato.fabric.api.data.ingest.IngestPayloadNvFix;
+import org.pronzato.fabric.api.data.ingest.IngestRuntimeStatus;
+import org.pronzato.fabric.api.data.ingest.SchemaSampleOptions;
+import org.pronzato.fabric.api.data.ingest.SchemaSampleRequest;
+import org.pronzato.fabric.api.data.ingest.agent.IngestAgent;
+import org.pronzato.fabric.api.data.ingest.source.IngestAmpsPump;
+import org.pronzato.fabric.api.data.ingest.model.IngestFormat;
+import org.pronzato.fabric.api.data.ingest.model.IngestModel;
+import org.pronzato.fabric.api.data.ingest.IngestRuntime;
+import org.pronzato.fabric.api.data.ingest.model.IngestSourceAmpsModel;
+import org.pronzato.fabric.api.data.ingest.model.IngestSourceModel;
+import org.pronzato.fabric.api.data.ingest.model.IngestTargetModel;
+import org.pronzato.fabric.api.data.ingest.model.IngestTargetParquetModel;
+import org.pronzato.fabric.api.data.ingest.model.IngestModelMapper;
+import org.pronzato.fabric.api.data.ParquetManager;
+import org.pronzato.fabric.api.data.duckdb.OdbcSessionSupport;
+import org.pronzato.fabric.api.data.duckdb.OdbcRuntimeGuard;
+import org.pronzato.fabric.api.data.parquet.ParquetManagerImpl;
+import org.pronzato.fabric.api.data.parquet.ParquetMaintenanceManagerUnsupported;
+import org.pronzato.fabric.api.control.plugins.FabricPlugins;
+import org.pronzato.fabric.api.control.plugins.IngestSourceProvider;
+import org.pronzato.fabric.api.control.plugins.IngestSourceRuntimeContext;
+import org.pronzato.fabric.api.schemas.SchemaCompatibility;
+import org.pronzato.fabric.api.schemas.SchemaManager;
+import org.pronzato.fabric.api.schemas.SchemaModel;
+import org.pronzato.fabric.api.schemas.SchemaModels;
+import org.pronzato.fabric.api.schemas.SchemaType;
+import org.pronzato.fabric.api.schemas.manager.SchemaManagerImpl;
+import org.pronzato.fabric.api.connectors.amps.AmpsConnection;
+import org.pronzato.fabric.api.control.discovery.lifecycle.DeleteOutcome;
+import org.pronzato.fabric.api.control.discovery.lifecycle.DeleteResult;
+import org.pronzato.fabric.api.control.discovery.DeleteManager;
+import org.pronzato.fabric.api.control.session.SessionImpl;
+import org.pronzato.fabric.api.control.session.SessionContext;
+import org.pronzato.fabric.api.util.Strings;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-public final class AssetLifecycleGraphBuilder {
-  private AssetLifecycleGraphBuilder() {}
+public final class IngestManagerImpl implements IngestManager, IngestAdmin, AutoCloseable {
+  static final Logger LOGGER = LoggerFactory.getLogger(IngestManagerImpl.class);
+  static final String INPUT_TYPE_API_IPC = "API_IPC";
+  private static final long MAX_SCHEMA_ALLOCATOR_BYTES = 8L * 1024L * 1024L;
+  private static final long MAX_ROLL_ALLOCATOR_BYTES = 64L * 1024L * 1024L;
+  static final long ROLL_SCAN_INTERVAL_MILLIS = 250L;
+  static final int DEFAULT_PARQUET_MAX_ROWS_PER_FILE = 10_000;
+  static final long DEFAULT_PARQUET_MAX_IDLE_MILLIS = 30_000L;
+  static final String FORMAT_JSON = "JSON";
+  static final String FORMAT_NVFIX = "NVFIX";
+  private static final String SOURCE_API = "API";
+  private static final String SOURCE_AMPS = "AMPS";
+  private static final String MODE_DIRECT = "DIRECT";
+  private static final String MODE_SERVICE = "SERVICE";
+  static final String DEFAULT_ACTOR = "fabric-lite";
+  static final String PLATFORM_GROUP = "platform";
+  static final String S3_MANAGED_ROOT = "fabric/data";
+  private static final String COUNT_SQL_PREFIX = "select count(*) as row_count from ";
+  static final String OPERATION_APPEND = "APPEND";
+  static final String OPERATION_INGEST = "INGEST";
 
-  public static AssetLifecycleGraph build(List<Definition> definitions) {
-    if (definitions == null || definitions.isEmpty()) {
-      return new AssetLifecycleGraph(Map.of(), List.of(), Map.of(), Map.of());
-    }
+  final RowManager rowManager;
+  final DiscoveryCache DiscoveryCache;
+  final String group;
+  final SchemaManager schemaManager;
+  final IngestModelMapper modelMapper;
+  final FabricPlugins plugins;
+  final Fabric.Session session;
+  final DeleteManager deleteManager;
+  final CheckpointStore checkpointStore;
+  final ParquetManager parquetManager;
+  final String runtimeMode;
+  final boolean serviceMode;
+  final ScheduledExecutorService rollScheduler;
+  final AtomicReference<ScheduledFuture<?>> rollScanTask = new AtomicReference<>();
+  final ConcurrentMap<String, IngestRuntimeImpl> runtimes = new ConcurrentHashMap<>();
+  final ConcurrentMap<String, ActiveTableDescriptor> activeTableDescriptors = new ConcurrentHashMap<>();
+  final ConcurrentMap<String, ParquetRollBuffer> parquetRollBuffers = new ConcurrentHashMap<>();
+  final ConcurrentMap<String, ParquetRollPolicy> parquetRollPolicies = new ConcurrentHashMap<>();
+  final ConcurrentMap<String, String> parquetFilenamePrefixes = new ConcurrentHashMap<>();
+  final ThreadLocal<String> parquetFilenamePrefixOverride = new ThreadLocal<>();
+  final RootAllocator schemaIpcAllocator = new RootAllocator(MAX_SCHEMA_ALLOCATOR_BYTES);
+  final RootAllocator rollIpcAllocator = new RootAllocator(MAX_ROLL_ALLOCATOR_BYTES);
 
-    Map<String, Semantic> configSemanticByKey = indexConfigSemantic(definitions);
-    Map<String, AssetLifecycleNode> nodes = new LinkedHashMap<>();
-    List<DefinitionContext> contexts = new ArrayList<>();
-    NodeIndex index = new NodeIndex();
-
-    for (Definition definition : definitions) {
-      if (definition == null) {
-        continue;
-      }
-      DefinitionContext context = toContext(definition);
-      if (context == null) {
-        continue;
-      }
-      if (nodes.putIfAbsent(context.assetId(), context.node()) == null) {
-        contexts.add(context);
-        index.register(context);
-      }
-    }
-
-    Map<String, Integer> datasetProducerCounts = countIngestDatasetProducers(contexts, index, nodes);
-    List<AssetLifecycleEdge> edges = new ArrayList<>();
-    Set<String> dedupe = new LinkedHashSet<>();
-
-    for (DefinitionContext context : contexts) {
-      Definition definition = context.definition();
-      if (definition instanceof DefinitionDataset dataset) {
-        inferDatasetEdges(context, dataset, index, nodes, edges, dedupe);
-      } else if (definition instanceof DefinitionService service) {
-        inferServiceEdges(context, service, index, nodes, edges, dedupe);
-      } else if (definition instanceof DefinitionStream stream) {
-        inferStreamEdges(context, stream, index, nodes, edges, dedupe);
-      } else if (definition instanceof DefinitionIngest ingest) {
-        inferIngestEdges(context, ingest, index, nodes, datasetProducerCounts, edges, dedupe);
-      } else if (definition instanceof DefinitionIngestSource ingestSource) {
-        inferIngestSourceEdges(context, ingestSource, index, nodes, edges, dedupe);
-      } else if (definition instanceof DefinitionSchema schema) {
-        inferSchemaEdges(context, schema, index, nodes, edges, dedupe);
-      } else if (definition instanceof DefinitionConfigLayer config) {
-        inferConfigEdges(context, config, index, nodes, edges, dedupe);
-      } else if (definition instanceof DefinitionEntitlement entitlement) {
-        inferEntitlementEdges(context, entitlement, index, nodes, edges, dedupe);
-      } else if (definition instanceof DefinitionConnection connection) {
-        inferConnectionEdges(context, connection, index, nodes, edges, dedupe);
-      }
-      inferSemanticHintEdges(
-          context, definition, configSemanticByKey, index, nodes, edges, dedupe);
-    }
-
-    edges.sort(
-        Comparator.comparing(AssetLifecycleEdge::fromAssetId)
-            .thenComparing(AssetLifecycleEdge::toAssetId)
-            .thenComparing(AssetLifecycleEdge::relationshipType));
-    Map<String, List<AssetLifecycleEdge>> outgoing = new LinkedHashMap<>();
-    Map<String, List<AssetLifecycleEdge>> incoming = new LinkedHashMap<>();
-    for (AssetLifecycleEdge edge : edges) {
-      outgoing.computeIfAbsent(edge.fromAssetId(), ignored -> new ArrayList<>()).add(edge);
-      incoming.computeIfAbsent(edge.toAssetId(), ignored -> new ArrayList<>()).add(edge);
-    }
-    return new AssetLifecycleGraph(nodes, edges, outgoing, incoming);
-  }
-
-  private static DefinitionContext toContext(Definition definition) {
-    DefinitionEnvelope envelope = definition.envelope();
-    if (envelope == null || !hasText(envelope.group()) || !hasText(envelope.name())) {
-      return null;
-    }
-    DefinitionType type = envelope.type() == null ? DefinitionType.UNKNOWN : envelope.type();
-    String group = envelope.group().trim();
-    String name = envelope.name().trim();
-    String namespace = "";
-    String assetId;
-
-    if (definition instanceof DefinitionConfigLayer) {
-      return null;
-    }
-    if (definition instanceof DefinitionDataset dataset) {
-      namespace = hasText(dataset.namespace()) ? dataset.namespace().trim() : "default";
-      assetId = "dataset:" + group + "/" + namespace + "/" + name;
-    } else if (definition instanceof DefinitionService service) {
-      assetId = hasText(service.resourceId()) ? service.resourceId().trim() : "service:" + group + "/" + name;
-    } else if (definition instanceof DefinitionStream stream) {
-      namespace = hasText(stream.namespace()) ? stream.namespace().trim() : "default";
-      assetId = hasText(stream.streamId()) ? stream.streamId().trim() : "stream:" + group + "/" + namespace + "/" + name;
-    } else if (definition instanceof DefinitionIngest ingest) {
-      String[] datasetParts = splitDatasetId(ingest.datasetId());
-      if (datasetParts != null) {
-        namespace = datasetParts[1];
-      }
-      assetId = "ingest:" + group + "/" + name;
-    } else if (definition instanceof DefinitionIngestSource ingestSource) {
-      namespace = hasText(ingestSource.namespace()) ? ingestSource.namespace().trim() : "default";
-      assetId = "ingest-source:" + group + "/" + name;
-    } else if (definition instanceof DefinitionSchema) {
-      assetId = "schema:" + group + "/" + name;
-    } else if (definition instanceof DefinitionConfigLayer config) {
-      if (!isBaseConfig(config)) {
-        return null;
-      }
-      assetId = hasText(config.configId()) ? config.configId().trim() : "config:" + group + "/" + name + "/base";
-      String[] configParts = splitConfigId(assetId);
-      if (configParts != null) {
-        namespace = configParts[1];
-      }
-    } else if (definition instanceof DefinitionEntitlement) {
-      assetId = "entitlement:" + group + "/" + name;
-    } else if (definition instanceof DefinitionConnection) {
-      assetId = "connection:" + group + "/" + name;
-    } else {
-      assetId = type.name().toLowerCase(Locale.ROOT) + ":" + group + "/" + name;
-    }
-
-    return new DefinitionContext(
-        definition,
-        assetId,
-        new AssetLifecycleNode(assetId, type, group, name, namespace, "definition"),
+  public IngestManagerImpl(RowManager rowManager, DiscoveryCache DiscoveryCache, String group) {
+    this(
+        rowManager,
+        DiscoveryCache,
         group,
-        namespace);
+        null,
+        null,
+        CheckpointStores.failFast(
+            "IngestManager checkpoint store is not configured. Configure session with withCheckpointPath(...)"));
   }
 
-  private static Semantic semantic(
-      Definition definition, Map<String, Semantic> configSemanticByKey) {
-    if (definition instanceof DefinitionDataset dataset) {
-      return dataset.semantic();
-    }
-    if (definition instanceof DefinitionService service) {
-      return service.semantic();
-    }
-    if (definition instanceof DefinitionStream stream) {
-      return stream.semantic();
-    }
-    if (definition instanceof DefinitionIngest ingest) {
-      return ingest.semantic();
-    }
-    if (definition instanceof DefinitionIngestSource ingestSource) {
-      return ingestSource.semantic();
-    }
-    if (definition instanceof DefinitionSchema schema) {
-      return schema.semantic();
-    }
-    if (definition instanceof DefinitionConfigLayer config) {
-      String group =
-          trimToNull(config == null || config.envelope() == null ? null : config.envelope().group());
-      String configSetId = normalizeConfigSetId(config == null ? null : config.configId());
-      if (group != null && configSetId != null && configSemanticByKey != null) {
-        Semantic fromMeta = configSemanticByKey.get(configSemanticKey(group, configSetId));
-        if (fromMeta != null) {
-          return fromMeta;
-        }
-      }
-      return null;
-    }
-    return null;
+  public IngestManagerImpl(
+      RowManager rowManager, DiscoveryCache DiscoveryCache, String group, Fabric.Session session) {
+    this(
+        rowManager,
+        DiscoveryCache,
+        group,
+        session,
+        null,
+        CheckpointStores.failFast(
+            "IngestManager checkpoint store is not configured. Configure session with withCheckpointPath(...)"));
   }
 
-  private static boolean isBaseConfig(DefinitionConfigLayer config) {
-    if (config == null) {
-      return true;
-    }
-    return !hasText(config.parentId());
-  }
-
-  private static String[] splitConfigId(String configId) {
-    if (!hasText(configId) || !configId.startsWith("config:")) {
-      return null;
-    }
-    String[] parts = configId.substring("config:".length()).split("/");
-    if (parts.length < 3) {
-      return null;
-    }
-    return new String[] {parts[0], parts[1], parts[2]};
-  }
-
-  private static String[] splitDatasetId(String datasetId) {
-    if (!hasText(datasetId) || !datasetId.startsWith("dataset:")) {
-      return null;
-    }
-    String[] parts = datasetId.substring("dataset:".length()).split("/");
-    if (parts.length < 3) {
-      return null;
-    }
-    return new String[] {parts[0], parts[1], parts[2]};
-  }
-
-  private static boolean hasText(String value) {
-    return value != null && !value.trim().isEmpty();
-  }
-
-  private static String normalizeToken(String value) {
-    if (value == null || value.trim().isEmpty()) {
-      return "unknown";
-    }
-    return value.trim().replace('\\', '/');
-  }
-
-  private static Map<String, Semantic> indexConfigSemantic(List<Definition> definitions) {
-    if (definitions == null || definitions.isEmpty()) {
-      return Map.of();
-    }
-    LinkedHashMap<String, Semantic> indexed = new LinkedHashMap<>();
-    for (Definition definition : definitions) {
-      if (!(definition instanceof DefinitionConfig configMeta)
-          || configMeta.semantic() == null) {
-        continue;
-      }
-      String group =
-          trimToNull(
-              configMeta.envelope() == null ? null : configMeta.envelope().group());
-      if (group == null) {
-        group = trimToNull(configMeta.group());
-      }
-      String configSetId = normalizeConfigSetId(configMeta.configId());
-      if (group == null || configSetId == null) {
-        continue;
-      }
-      indexed.put(configSemanticKey(group, configSetId), configMeta.semantic());
-    }
-    return indexed.isEmpty() ? Map.of() : Map.copyOf(indexed);
-  }
-
-  private static String configSemanticKey(String group, String configSetId) {
-    return group + "|" + configSetId;
-  }
-
-  private static String normalizeConfigSetId(String value) {
-    String normalized = trimToNull(value);
-    if (normalized == null) {
-      return null;
-    }
-    if (!normalized.startsWith("config:")) {
-      return normalized;
-    }
-    String payload = normalized.substring("config:".length());
-    String[] parts = payload.split("/");
-    if (parts.length < 2) {
-      return null;
-    }
-    return trimToNull(parts[1]);
-  }
-
-  private static String trimToNull(String value) {
-    if (value == null) {
-      return null;
-    }
-    String trimmed = value.trim();
-    return trimmed.isEmpty() ? null : trimmed;
-  }
-
-  private static String storageAssetId(String locator) {
-    return "storage:" + normalizeToken(locator);
-  }
-
-  private record DefinitionContext(
-      Definition definition,
-      String assetId,
-      AssetLifecycleNode node,
+  public IngestManagerImpl(
+      RowManager rowManager,
+      DiscoveryCache DiscoveryCache,
       String group,
-      String namespace) {}
+      Fabric.Session session,
+      ScheduledExecutorService rollScheduler) {
+    this(
+        rowManager,
+        DiscoveryCache,
+        group,
+        session,
+        rollScheduler,
+        CheckpointStores.failFast(
+            "IngestManager checkpoint store is not configured. Configure session with withCheckpointPath(...)"));
+  }
 
-  private static final class NodeIndex {
-    private final Map<DefinitionType, Map<String, String>> byTypeGroupName =
-        new EnumMap<>(DefinitionType.class);
-    private final Map<String, String> byDatasetKey = new LinkedHashMap<>();
-    private final Map<String, String> byStreamKey = new LinkedHashMap<>();
-    private final Map<String, String> byConfigId = new LinkedHashMap<>();
-    private final Map<String, String> byConfigFamily = new LinkedHashMap<>();
-    private final Map<String, String> bySchemaId = new LinkedHashMap<>();
-    private final Map<String, String> byIngestKey = new LinkedHashMap<>();
-    private final Map<String, String> byIngestSourceKey = new LinkedHashMap<>();
-    private final Map<String, String> byRawAssetId = new LinkedHashMap<>();
+  public IngestManagerImpl(
+      RowManager rowManager,
+      DiscoveryCache DiscoveryCache,
+      String group,
+      Fabric.Session session,
+      ScheduledExecutorService rollScheduler,
+      CheckpointStore checkpointStore) {
+    this.rowManager = Objects.requireNonNull(rowManager, "rowManager");
+    this.DiscoveryCache = Objects.requireNonNull(DiscoveryCache, "DiscoveryCache");
+    this.group = Strings.requireNonBlank(group, "session group");
+    this.serviceMode = rowManager instanceof RemoteRowManager;
+    this.runtimeMode = serviceMode ? MODE_SERVICE : MODE_DIRECT;
+    this.rollScheduler = rollScheduler;
+    this.schemaManager =
+        session == null
+            ? new SchemaManagerImpl(() -> this.DiscoveryCache, () -> this.group, () -> null)
+            : Objects.requireNonNull(session.schemas(), "session.schemas");
+    this.modelMapper = new IngestModelMapper();
+    this.plugins = FabricPlugins.system();
+    this.session = session;
+    DeleteManager sessionDeleteManager =
+        session instanceof SessionImpl sessionImpl ? sessionImpl.deletes() : null;
+    this.deleteManager =
+        sessionDeleteManager != null
+            ? sessionDeleteManager
+            : new DeleteManager(
+                () -> this.DiscoveryCache.allDefinitions(),
+                (type, definitionGroup, definitionName) ->
+                    this.DiscoveryCache.delete(type, definitionGroup, definitionName));
+    this.checkpointStore = Objects.requireNonNull(checkpointStore, "checkpointStore");
+    this.parquetManager =
+        rowManager instanceof RowManagerImpl
+            ? new ParquetManagerImpl(rowManager, DiscoveryCache, group, session, checkpointStore)
+            : new ParquetMaintenanceManagerUnsupported(
+                "Parquet maintenance requires DIRECT mode local data manager");
+  }
 
-    private void register(DefinitionContext context) {
-      byRawAssetId.put(context.assetId(), context.assetId());
-      byTypeGroupName
-          .computeIfAbsent(context.node().type(), ignored -> new LinkedHashMap<>())
-          .put(groupNameKey(context.group(), context.node().name()), context.assetId());
-      if (context.definition() instanceof DefinitionDataset dataset) {
-        String namespace = hasText(dataset.namespace()) ? dataset.namespace().trim() : "default";
-        byDatasetKey.put(groupNamespaceNameKey(context.group(), namespace, context.node().name()), context.assetId());
-      } else if (context.definition() instanceof DefinitionStream stream) {
-        String namespace = hasText(stream.namespace()) ? stream.namespace().trim() : "default";
-        byStreamKey.put(groupNamespaceNameKey(context.group(), namespace, context.node().name()), context.assetId());
-      } else if (context.definition() instanceof DefinitionConfigLayer config) {
-        if (hasText(config.configId())) {
-          String configId = config.configId().trim();
-          byConfigId.put(configId, context.assetId());
-          String[] parts = splitConfigId(configId);
-          if (parts != null) {
-            byConfigFamily.put(parts[0] + "|" + parts[1], context.assetId());
+  @Override
+  public ParquetManager parquet() {
+    return parquetManager;
+  }
+
+  public CheckpointStore checkpointStore() {
+    return checkpointStore;
+  }
+
+  @Override
+  public IngestAdmin admin() {
+    return this;
+  }
+
+  @Override
+  public IngestAgent agent(IngestAgent.Options options) {
+    if (session == null) {
+      throw new IllegalStateException("IngestAgent requires a session-backed ingest manager");
+    }
+    IngestAgent.Options resolved = options == null ? IngestAgent.Options.defaults() : options;
+    return IngestAgent.create(session, resolved);
+  }
+
+  @Override
+  public void setParquetRollPolicy(String ingestName, Integer maxRowsPerFile, Long maxIdleMillis) {
+    String normalizedName = Strings.requireNonBlank(ingestName, "ingestName");
+    flushPendingParquetBuffer(normalizedName, "runtime-roll-policy-update");
+    if (maxRowsPerFile == null && maxIdleMillis == null) {
+      parquetRollPolicies.remove(normalizedName);
+      return;
+    }
+    ParquetRollPolicy policy =
+        new ParquetRollPolicy(
+            resolveMaxRowsPerFile(maxRowsPerFile),
+            resolveMaxIdleMillis(maxIdleMillis));
+    parquetRollPolicies.put(normalizedName, policy);
+  }
+
+  @Override
+  public void setParquetFilenamePrefix(String ingestName, String parquetFilenamePrefix) {
+    String normalizedName = Strings.requireNonBlank(ingestName, "ingestName");
+    flushPendingParquetBuffer(normalizedName, "runtime-filename-prefix-update");
+    String normalizedPrefix = Strings.trimToNull(parquetFilenamePrefix);
+    if (normalizedPrefix == null) {
+      parquetFilenamePrefixes.remove(normalizedName);
+      return;
+    }
+    parquetFilenamePrefixes.put(normalizedName, normalizedPrefix);
+  }
+
+  @Override
+  public SchemaModel sampleSchema(SchemaSampleRequest request) {
+    SchemaSampleRequest resolvedRequest = Objects.requireNonNull(request, "request");
+    org.pronzato.fabric.api.data.ingest.SchemaSampleOptions options = resolvedRequest.options();
+    org.pronzato.fabric.api.data.schema.client.SchemaSampleOptions schemaOptions =
+        new org.pronzato.fabric.api.data.schema.client.SchemaSampleOptions(
+            options.maxSamples(),
+            options.maxBytes(),
+            org.pronzato.fabric.api.data.schema.client.SchemaSampleOptions.DEFAULT_MAX_MILLIS,
+            true,
+            resolvedRequest.format().name());
+    org.pronzato.fabric.api.data.schema.client.SchemaSampleResult sampled =
+        schemaManager instanceof SchemaManagerImpl manager
+            ? manager.samplePayloadsConfigured(
+                "payloads",
+                resolvedRequest.format(),
+                options.jsonMode(),
+                options.jsonRootField(),
+                options.nvFixPairDelimiter(),
+                options.nvFixKvDelimiter(),
+                options.nvFixTrimKeys(),
+                options.nvFixTrimValues(),
+                resolvedRequest.samples(),
+                schemaOptions)
+            : schemaManager.samplePayloads(resolvedRequest.format(), resolvedRequest.samples(), schemaOptions);
+    return SchemaModels.fromSample(
+        sampled.ingestName(),
+        SchemaType.TABULAR,
+        SchemaCompatibility.BACKWARDS,
+        sampled);
+  }
+
+  @Override
+  public SchemaModel sampleSchemaFromAmps(SchemaSampleOptions options) {
+    SchemaSampleOptions resolvedOptions =
+        options == null ? SchemaSampleOptions.defaults() : options;
+    if (session == null) {
+      throw new IllegalStateException("AMPS schema sampling requires a session-backed ingest manager");
+    }
+    String connectionName =
+        Strings.requireNonBlank(resolvedOptions.connectionName(), "options.connectionName");
+    String topic = Strings.requireNonBlank(resolvedOptions.topic(), "options.topic");
+    IngestFormat format =
+        resolvedOptions.format() == null ? IngestFormat.NVFIX : resolvedOptions.format();
+    List<String> samples =
+        collectAmpsPayloadSamples(
+            connectionName,
+            topic,
+            resolvedOptions.ampsOptions(),
+            resolvedOptions.ampsFilter(),
+            resolvedOptions.ampsSow(),
+            resolvedOptions.maxSamples(),
+            resolvedOptions.ampsWaitMillis());
+    if (samples.isEmpty()) {
+      throw new IllegalStateException(
+          "No payload samples received from AMPS connection="
+              + connectionName
+              + " topic="
+              + topic);
+    }
+    SchemaModel sampled =
+        sampleSchema(
+            new SchemaSampleRequest(
+                format,
+                samples,
+                resolvedOptions));
+    return toRegistrationSchema(sampled);
+  }
+
+  private List<String> collectAmpsPayloadSamples(
+      String connectionName,
+      String topic,
+      String options,
+      String filter,
+      boolean sow,
+      int maxSamples,
+      long waitMillis) {
+    List<String> samples = new ArrayList<>();
+    Object monitor = new Object();
+    AtomicBoolean done = new AtomicBoolean(false);
+    AmpsConnection.SubscriptionSpec spec =
+        new AmpsConnection.SubscriptionSpec(sow, topic, options, filter);
+    try (AmpsConnection amps = session.connections().amps(connectionName);
+        AmpsConnection.Subscription ignored =
+            amps.subscribe(
+                spec,
+                (AmpsConnection.SubscriptionListener)
+                    message -> {
+                  if (message == null || done.get()) {
+                    return;
+                  }
+                  Message raw = message.raw();
+                  if (raw != null && raw.getCommand() == Message.Command.GroupEnd && sow) {
+                    synchronized (monitor) {
+                      done.set(true);
+                      monitor.notifyAll();
+                    }
+                    return;
+                  }
+                  String payload = Strings.trimToNull(message.data());
+                  if (payload == null) {
+                    return;
+                  }
+                  synchronized (monitor) {
+                    if (done.get()) {
+                      return;
+                    }
+                    if (samples.size() >= maxSamples) {
+                      done.set(true);
+                      monitor.notifyAll();
+                      return;
+                    }
+                    samples.add(payload);
+                    if (samples.size() >= maxSamples) {
+                      done.set(true);
+                    }
+                    monitor.notifyAll();
+                  }
+                })) {
+      long deadline = System.currentTimeMillis() + Math.max(1_000L, waitMillis);
+      synchronized (monitor) {
+        while (!done.get() && samples.size() < maxSamples) {
+          long remaining = deadline - System.currentTimeMillis();
+          if (remaining <= 0L) {
+            break;
+          }
+          monitor.wait(Math.min(500L, remaining));
+        }
+      }
+    } catch (Exception ex) {
+      if (ex instanceof InterruptedException) {
+        Thread.currentThread().interrupt();
+      }
+      throw new IllegalStateException(
+          "Failed to sample AMPS payloads connection="
+              + connectionName
+              + " topic="
+              + topic,
+          ex);
+    }
+    LOGGER.info("[Ingest][SchemaSample][AMPS] connectionName={} topic={} requested={} received={} sow={} waitMillis={}", connectionName, topic, maxSamples, samples.size(), sow, waitMillis);
+    return List.copyOf(samples);
+  }
+
+  private SchemaModel toRegistrationSchema(SchemaModel schema) {
+    if (schema == null || schema.getFields() == null || schema.getFields().isEmpty()) {
+      return schema;
+    }
+    List<SchemaModel.Field> nullableFields = new ArrayList<>(schema.getFields().size());
+    for (SchemaModel.Field field : schema.getFields()) {
+      if (field == null) {
+        continue;
+      }
+      nullableFields.add(field.toBuilder().withNullable(true).build());
+    }
+    return schema.toBuilder().withFields(nullableFields).build();
+  }
+
+  @Override
+  public org.pronzato.fabric.api.data.schema.client.SchemaSampleResult sampleSchema(
+      String ingestName, org.pronzato.fabric.api.data.schema.client.SchemaSampleOptions options) {
+    String normalizedIngestName = Strings.requireNonBlank(ingestName, "ingestName");
+    org.pronzato.fabric.api.data.schema.client.SchemaSampleOptions resolvedOptions =
+        options == null
+            ? org.pronzato.fabric.api.data.schema.client.SchemaSampleOptions.defaults()
+            : options;
+    return schemaManager.sample(normalizedIngestName, resolvedOptions);
+  }
+
+  @Override
+  public SchemaModel sampleSchemaModel(
+      String ingestName,
+      org.pronzato.fabric.api.data.schema.client.SchemaSampleOptions options,
+      String schemaName,
+      SchemaCompatibility compatibility) {
+    String normalizedSchemaName = Strings.requireNonBlank(schemaName, "schemaName");
+    SchemaCompatibility resolvedCompatibility =
+        compatibility == null ? SchemaCompatibility.BACKWARDS : compatibility;
+    org.pronzato.fabric.api.data.schema.client.SchemaSampleResult sampled =
+        sampleSchema(ingestName, options);
+    SchemaModel inferred =
+        SchemaModels.fromSample(
+            normalizedSchemaName, SchemaType.TABULAR, resolvedCompatibility, sampled);
+    return schemaManager.register(normalizedSchemaName, SchemaType.TABULAR, inferred);
+  }
+
+  @Override
+  public IngestModel sampleAndUpdateSchema(
+      String ingestName,
+      org.pronzato.fabric.api.data.schema.client.SchemaSampleOptions options,
+      String schemaName,
+      SchemaCompatibility compatibility) {
+    String normalizedIngestName = Strings.requireNonBlank(ingestName, "ingestName");
+    IngestModel existing =
+        getModel(normalizedIngestName)
+            .orElseThrow(() -> new IllegalArgumentException("Unknown ingest: " + group + "/" + normalizedIngestName));
+    SchemaModel registeredSchema =
+        sampleSchemaModel(normalizedIngestName, options, schemaName, compatibility);
+    IngestModel updated = existing.toBuilder().withSchema(registeredSchema).build();
+    register(updated);
+    return getModel(normalizedIngestName).orElse(updated);
+  }
+
+  @Override
+  public void register(IngestModel model) {
+    IngestManagerImplDataset.register(this, model);
+  }
+
+  @Override
+  public void delete(String ingestName) {
+    delete(ingestName, IngestAdmin.DeleteOptions.ingestOnly());
+  }
+
+  @Override
+  public void delete(String ingestName, IngestAdmin.DeleteOptions options) {
+    String normalizedName = Strings.requireNonBlank(ingestName, "ingestName");
+    IngestAdmin.DeleteOptions resolvedOptions =
+        options == null ? IngestAdmin.DeleteOptions.ingestOnly() : options;
+    resolveIngestDefinition(normalizedName);
+
+    stop(normalizedName);
+    activeTableDescriptors.remove(normalizedName);
+    parquetRollPolicies.remove(normalizedName);
+    parquetFilenamePrefixes.remove(normalizedName);
+    parquetRollBuffers.remove(normalizedName);
+    runtimes.remove(normalizedName);
+
+    DeleteResult result =
+        deleteManager.delete(
+            "ingest:" + group + "/" + normalizedName,
+            toLifecycleDeleteOptions(resolvedOptions));
+    if (result.outcome() == DeleteOutcome.BLOCKED) {
+      throw new IllegalStateException(
+          "Delete blocked for ingest " + normalizedName + ": " + result.blockers());
+    }
+    if (result.outcome() == DeleteOutcome.PARTIAL) {
+      throw new IllegalStateException(
+          "Delete partially completed for ingest "
+              + normalizedName
+              + ": "
+              + result.warnings());
+    }
+  }
+
+  @Override
+  public void deleteDatasetDefinition(String datasetId) {
+    IngestManagerImplDataset.deleteDatasetDefinition(this, datasetId);
+  }
+
+  private org.pronzato.fabric.api.control.discovery.lifecycle.DeleteOptions toLifecycleDeleteOptions(
+      IngestAdmin.DeleteOptions options) {
+    List<DefinitionType> cascadeTypes = new ArrayList<>();
+    cascadeTypes.add(DefinitionType.INGEST_SOURCE);
+    if (options != null && options.deleteDatasetDefinition()) {
+      cascadeTypes.add(DefinitionType.DATASET);
+    }
+    return new org.pronzato.fabric.api.control.discovery.lifecycle.DeleteOptions(
+        true,
+        options != null && options.deleteSchemaDefinition(),
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        List.copyOf(cascadeTypes));
+  }
+
+  private String toClientVisibleS3Path(String parquetPath, String connectionName) {
+    return IngestManagerImplDataset.toClientVisibleS3Path(this, parquetPath, connectionName);
+  }
+
+  @Override
+  public Optional<IngestModel> getModel(String ingestName) {
+    String normalizedName = Strings.requireNonBlank(ingestName, "ingestName");
+    Optional<DefinitionIngest> ingest = DiscoveryCache.get(DefinitionIngest.class, group, normalizedName);
+    if (ingest.isEmpty()) {
+      return Optional.empty();
+    }
+    Optional<DefinitionIngestSource> source =
+        DiscoveryCache.get(DefinitionIngestSource.class, group, normalizedName);
+    SchemaModel schema = resolveSchemaModel(ingest.get());
+    IngestModel model = modelMapper.fromDefinitions(ingest.get(), source.orElse(null), schema);
+    DefinitionDataset dataset = resolveDatasetDefinition(ingest.get().datasetId());
+    if (dataset != null) {
+      IngestTargetModel target = modelMapper.fromDefinitionDataset(dataset);
+      if (target != null) {
+        if (target instanceof IngestTargetParquetModel parquetTarget) {
+          String clientPath =
+              toClientVisibleS3Path(parquetTarget.parquetPath(), parquetTarget.connectionName());
+          if (!Objects.equals(clientPath, parquetTarget.parquetPath())) {
+            target = parquetTarget.toBuilder().withParquetPath(clientPath).build();
           }
         }
-      } else if (context.definition() instanceof DefinitionSchema schema) {
-        bySchemaId.put("schema:" + context.group() + "/" + context.node().name(), context.assetId());
-        if (hasText(schema.hash())) {
-          bySchemaId.put("schema-hash:" + schema.hash().trim(), context.assetId());
-        }
-      } else if (context.definition() instanceof DefinitionIngest ingest) {
-        String namespace = context.namespace();
-        if (!hasText(namespace)) {
-          String[] datasetParts = splitDatasetId(ingest.datasetId());
-          namespace = datasetParts == null ? "default" : datasetParts[1];
-        }
-        byIngestKey.put(
-            groupNamespaceNameKey(context.group(), namespace, context.node().name()), context.assetId());
-      } else if (context.definition() instanceof DefinitionIngestSource ingestSource) {
-        String namespace = hasText(ingestSource.namespace()) ? ingestSource.namespace().trim() : "default";
-        byIngestSourceKey.put(
-            groupNamespaceNameKey(context.group(), namespace, context.node().name()), context.assetId());
+        model = model.toBuilder().withTarget(target).build();
       }
     }
+    return Optional.of(model);
+  }
 
-    private String resolveSchemaReference(
-        String schemaId,
-        String schemaGroup,
-        String schemaName,
-        String fallbackGroup,
-        Map<String, AssetLifecycleNode> nodes) {
-      if (hasText(schemaId)) {
-        return resolveReference(schemaId, DefinitionType.SCHEMA, fallbackGroup, null, nodes);
+  @Override
+  public List<IngestModel> listModels() {
+    List<DefinitionIngest> definitions = new ArrayList<>(DiscoveryCache.list(DefinitionIngest.class, group));
+    definitions.sort(
+        Comparator.comparing(
+            definition ->
+                Strings.requireNonBlank(
+                    definition.envelope() == null ? null : definition.envelope().name(),
+                    "ingest.envelope.name"),
+            String.CASE_INSENSITIVE_ORDER));
+    List<IngestModel> models = new ArrayList<>(definitions.size());
+    for (DefinitionIngest definition : definitions) {
+      String name =
+          Strings.requireNonBlank(
+              definition.envelope() == null ? null : definition.envelope().name(),
+              "ingest.envelope.name");
+      getModel(name).ifPresent(models::add);
+    }
+    return List.copyOf(models);
+  }
+
+  @Override
+  public IngestRuntime open(String ingestName) {
+    String normalizedName = Strings.requireNonBlank(ingestName, "ingestName");
+    DefinitionIngest ingestDefinition = resolveIngestDefinition(normalizedName);
+    DefinitionIngestSource sourceDefinition =
+        DiscoveryCache
+            .get(DefinitionIngestSource.class, group, normalizedName)
+            .orElseThrow(
+                () ->
+                    new IllegalStateException("IngestSource not found for ingest: " + group + "/" + normalizedName));
+    DatasetId datasetId =
+        DatasetId.parse(Strings.requireNonBlank(ingestDefinition.datasetId(), "ingest.datasetId"));
+    prepareActiveDataset(ingestDefinition, datasetId);
+    boolean apiSource = sourceDefinition.amps() == null && sourceDefinition.external() == null;
+    String source = resolveSourceKind(sourceDefinition, apiSource);
+    IngestRuntimeImpl runtime = new IngestRuntimeImpl(normalizedName, datasetId, apiSource, source);
+    IngestRuntimeImpl existing = runtimes.putIfAbsent(normalizedName, runtime);
+    if (existing != null && !existing.closed()) {
+      LOGGER.info("[IngestRuntime] open ingestName={} mode={} source={} bytes=0", normalizedName, runtimeMode, existing.sourceKind());
+      return existing;
+    }
+    if (existing != null) {
+      runtimes.put(normalizedName, runtime);
+    }
+    LOGGER.info("[IngestRuntime] open ingestName={} mode={} source={} bytes=0", normalizedName, runtimeMode, source);
+    return runtime;
+  }
+
+  @Override
+  public IngestRuntime start(String ingestName) {
+    IngestRuntime runtime = open(ingestName);
+    if (runtime instanceof IngestRuntimeImpl impl) {
+      LOGGER.info("[IngestRuntime] start ingestName={} mode={} source={} bytes=0", impl.ingestName, runtimeMode, impl.sourceKind());
+      impl.startManagedSource();
+    }
+    return runtime;
+  }
+
+  @Override
+  public IngestRuntime start(String ingestName, IngestManager.IngestRuntimeOptions options) {
+    String normalizedName = Strings.requireNonBlank(ingestName, "ingestName");
+    IngestManager.IngestRuntimeOptions resolved =
+        options == null ? IngestManager.IngestRuntimeOptions.builder().build() : options;
+    if (options != null) {
+      setParquetRollPolicy(
+          normalizedName, resolved.parquetMaxRowsPerFile(), resolved.parquetMaxIdleMillis());
+      setParquetFilenamePrefix(normalizedName, resolved.parquetFilenamePrefix());
+    }
+    return start(normalizedName);
+  }
+
+  @Override
+  public void stop(String ingestName) {
+    String normalizedName = Strings.requireNonBlank(ingestName, "ingestName");
+    IngestRuntimeImpl runtime = runtimes.get(normalizedName);
+    if (runtime != null) {
+      LOGGER.info("[IngestRuntime] stop ingestName={} mode={} source={} bytes=0", normalizedName, runtimeMode, runtime.sourceKind());
+      runtime.stop();
+      if (runtime.closed()) {
+        runtimes.remove(normalizedName, runtime);
       }
-      String group = hasText(schemaGroup) ? schemaGroup.trim() : fallbackGroup;
-      if (hasText(group) && hasText(schemaName)) {
-        String byName = resolveReference(schemaName, DefinitionType.SCHEMA, group, null, nodes);
-        if (hasText(byName)) {
-          return byName;
-        }
-        String explicit = "schema:" + group + "/" + schemaName.trim();
-        return bySchemaId.getOrDefault(explicit, explicit);
+    }
+    flushPendingParquetBuffer(normalizedName, "runtime-stop");
+  }
+
+  @Override
+  public void append(String ingestName, IngestPayload payload) {
+    IngestManagerImplAppend.append(this, ingestName, payload);
+  }
+
+  private void append(String ingestName, IngestPayload payload, DuckDbActiveMutation mutation) {
+    IngestManagerImplAppend.append(this, ingestName, payload, mutation);
+  }
+
+  private void append(
+      String ingestName,
+      IngestPayload payload,
+      DuckDbActiveMutation mutation,
+      boolean enforceWriteGate) {
+    IngestManagerImplAppend.append(this, ingestName, payload, mutation, enforceWriteGate);
+  }
+
+  @Override
+  public void appendIpc(String ingestName, byte[] arrowIpcStreamBytes) {
+    IngestManagerImplAppend.appendIpc(this, ingestName, arrowIpcStreamBytes);
+  }
+
+  private void appendIpc(String ingestName, byte[] arrowIpcStreamBytes, DuckDbActiveMutation mutation) {
+    IngestManagerImplAppend.appendIpc(this, ingestName, arrowIpcStreamBytes, mutation);
+  }
+
+  private void appendIpc(
+      String ingestName,
+      byte[] arrowIpcStreamBytes,
+      DuckDbActiveMutation mutation,
+      boolean enforceWriteGate) {
+    IngestManagerImplAppend.appendIpc(
+        this, ingestName, arrowIpcStreamBytes, mutation, enforceWriteGate);
+  }
+
+  private void flushPendingParquetBuffer(String ingestName, String reason) {
+    IngestManagerImplAppend.flushPendingParquetBuffer(this, ingestName, reason);
+  }
+
+  private void flushAllPendingParquetBuffers(String reason) {
+    IngestManagerImplAppend.flushAllPendingParquetBuffers(this, reason);
+  }
+
+  private void ensureRollScanTask() {
+    IngestManagerImplAppend.ensureRollScanTask(this);
+  }
+
+  private void cancelRollScanTask() {
+    IngestManagerImplAppend.cancelRollScanTask(this);
+  }
+
+  public void requireWrite(String datasetId, String operation) {
+    IngestManagerImplAppend.requireWrite(this, datasetId, operation);
+  }
+
+  public void appendFromAmps(
+      String ingestName,
+      String payloadText,
+      IngestAmpsPump.PayloadFormat payloadFormat,
+      int ampsCommand,
+      IngestAmpsPump.OofHandling oofHandling,
+      String parquetFilenamePrefix) {
+    String priorPrefix = parquetFilenamePrefixOverride.get();
+    String resolvedPrefix = Strings.trimToNull(parquetFilenamePrefix);
+    if (resolvedPrefix == null) {
+      parquetFilenamePrefixOverride.remove();
+    } else {
+      parquetFilenamePrefixOverride.set(resolvedPrefix);
+    }
+    try {
+      handleAmpsMessage(ingestName, payloadText, payloadFormat, ampsCommand, oofHandling, true);
+    } finally {
+      if (priorPrefix == null) {
+        parquetFilenamePrefixOverride.remove();
+      } else {
+        parquetFilenamePrefixOverride.set(priorPrefix);
       }
+    }
+  }
+
+  private void enforceWrite(String datasetId, String operation, List<String> columnsOrNull) {
+    IngestManagerImplAppend.enforceWrite(this, datasetId, operation, columnsOrNull);
+  }
+
+  private void handleAmpsMessage(
+      String ingestName,
+      String payloadText,
+      IngestAmpsPump.PayloadFormat payloadFormat,
+      int ampsCommand,
+      IngestAmpsPump.OofHandling oofHandling,
+      boolean enforceWriteGate) {
+    IngestPayload payload =
+        payloadFormat == IngestAmpsPump.PayloadFormat.JSON
+            ? new IngestPayloadJson(payloadText)
+            : new IngestPayloadNvFix(payloadText);
+    if (ampsCommand == com.crankuptheamps.client.Message.Command.OOF
+        || ampsCommand == com.crankuptheamps.client.Message.Command.SOWDelete) {
+      DuckDbActiveMutation mutation =
+          oofHandling == IngestAmpsPump.OofHandling.MARK_AS_DELETED
+              ? DuckDbActiveMutation.MARK_AS_DELETED
+              : DuckDbActiveMutation.DELETE;
+      append(ingestName, payload, mutation, enforceWriteGate);
+      markRuntimeMessageIngested(ingestName);
+      return;
+    }
+    append(ingestName, payload, DuckDbActiveMutation.UPSERT, enforceWriteGate);
+    markRuntimeMessageIngested(ingestName);
+  }
+
+  private void prepareActiveDataset(DefinitionIngest ingestDefinition, DatasetId datasetId) {
+    IngestManagerImplDataset.prepareActiveDataset(this, ingestDefinition, datasetId);
+  }
+
+  private DefinitionIngest resolveIngestDefinition(String ingestName) {
+    return IngestManagerImplDataset.resolveIngestDefinition(this, ingestName);
+  }
+
+  private SchemaModel resolveSchemaModel(DefinitionIngest ingest) {
+    return IngestManagerImplDataset.resolveSchemaModel(this, ingest);
+  }
+
+  private DefinitionDataset resolveDatasetDefinition(String datasetCanonicalId) {
+    return IngestManagerImplDataset.resolveDatasetDefinition(this, datasetCanonicalId);
+  }
+
+  private static String ensureSubscribeOption(String options, String optionToken) {
+    String normalizedToken = Strings.requireNonBlank(optionToken, "optionToken");
+    String normalizedOptions = Strings.trimToNull(options);
+    if (normalizedOptions == null) {
+      return normalizedToken;
+    }
+    for (String token : normalizedOptions.split(";")) {
+      String normalized = Strings.trimToNull(token);
+      if (normalized != null && normalizedToken.equalsIgnoreCase(normalized)) {
+        return normalizedOptions;
+      }
+    }
+    return normalizedOptions + ";" + normalizedToken;
+  }
+
+  private static String removeSubscribeOption(String options, String optionToken) {
+    String normalizedToken = Strings.requireNonBlank(optionToken, "optionToken");
+    String normalizedOptions = Strings.trimToNull(options);
+    if (normalizedOptions == null) {
       return null;
     }
+    List<String> retained = new ArrayList<>();
+    for (String token : normalizedOptions.split(";")) {
+      String normalized = Strings.trimToNull(token);
+      if (normalized == null) {
+        continue;
+      }
+      if (!normalizedToken.equalsIgnoreCase(normalized)) {
+        retained.add(normalized);
+      }
+    }
+    if (retained.isEmpty()) {
+      return null;
+    }
+    return String.join(";", retained);
+  }
 
-    private String resolveReference(
-        String raw,
-        DefinitionType expectedType,
-        String sourceGroup,
-        String sourceNamespace,
-        Map<String, AssetLifecycleNode> nodes) {
-      if (!hasText(raw)) {
-        return null;
+  private static String resolveAmpsSubscribeOptions(DefinitionIngestSource.AmpsSource amps) {
+    boolean sowEnabled = Boolean.TRUE.equals(amps.sow()) || Boolean.TRUE.equals(amps.sowOnly());
+    String options = removeSubscribeOption(amps.options(), "no_bookmark");
+    options = removeSubscribeOption(options, "nobookmark");
+    if (!sowEnabled) {
+      return removeSubscribeOption(options, "oof");
+    }
+    if (amps.oofHandling() == null) {
+      return options;
+    }
+    return ensureSubscribeOption(options, "oof");
+  }
+
+  private static boolean resolveAmpsBookmarkResume(DefinitionIngestSource.AmpsSource amps) {
+    return !hasSubscribeOption(amps.options(), "no_bookmark")
+        && !hasSubscribeOption(amps.options(), "nobookmark");
+  }
+
+  private static boolean hasSubscribeOption(String options, String optionToken) {
+    String normalizedToken = Strings.requireNonBlank(optionToken, "optionToken");
+    String normalizedOptions = Strings.trimToNull(options);
+    if (normalizedOptions == null) {
+      return false;
+    }
+    for (String token : normalizedOptions.split(";")) {
+      String normalized = Strings.trimToNull(token);
+      if (normalized != null && normalizedToken.equalsIgnoreCase(normalized)) {
+        return true;
       }
-      String normalized = raw.trim();
-      if (nodes.containsKey(normalized)) {
-        return normalized;
+    }
+    return false;
+  }
+
+  @Override
+  public void close() {
+    cancelRollScanTask();
+    flushAllPendingParquetBuffers("manager-close");
+    for (IngestRuntimeImpl runtime : runtimes.values()) {
+      runtime.stop();
+    }
+    runtimes.clear();
+    parquetRollBuffers.clear();
+    parquetRollPolicies.clear();
+    parquetFilenamePrefixes.clear();
+    parquetFilenamePrefixOverride.remove();
+    CloseSupport.closeQuietly(schemaIpcAllocator);
+    CloseSupport.closeQuietly(rollIpcAllocator);
+  }
+
+  private static int payloadBytes(IngestPayload payload) {
+    return IngestManagerImplAppend.payloadBytes(payload);
+  }
+
+  private static String resolveSourceKind(DefinitionIngestSource sourceDefinition, boolean apiSource) {
+    if (sourceDefinition != null && sourceDefinition.external() != null) {
+      return Strings.firstNonBlank(
+              Strings.trimToNull(sourceDefinition.external().sourceType()),
+              SOURCE_API)
+          .toUpperCase(Locale.ROOT);
+    }
+    return apiSource ? SOURCE_API : SOURCE_AMPS;
+  }
+
+  private DataStatusPublisher createDataStatusPublisher(
+      String statusName,
+      DefinitionStatusData.ProducerType producerType,
+      String producerId,
+      String datasetId,
+      Map<String, String> tags) {
+    if (!(session instanceof SessionImpl sessionImpl)) {
+      return null;
+    }
+    if (sessionImpl.controlPlaneConnection() == null) {
+      return null;
+    }
+    SessionContext context = sessionImpl.context();
+    if (context == null) {
+      return null;
+    }
+    String resolvedGroup = Strings.trimToNull(context.getGroup());
+    String resolvedName = Strings.trimToNull(statusName);
+    String resolvedInstance = Strings.trimToNull(context.getInstance());
+    if (resolvedGroup == null || resolvedName == null || resolvedInstance == null) {
+      return null;
+    }
+    return new DataStatusPublisher(
+        sessionImpl.controlPlaneConnection(),
+        resolvedGroup,
+        resolvedName,
+        resolvedInstance,
+        producerType,
+        producerId,
+        datasetId,
+        sessionImpl.runtimePlacementHost(),
+        Strings.trimToNull(context.getAppName()),
+        Strings.trimToNull(context.getInstance()),
+        Strings.trimToNull(context.getGroup()),
+        tags,
+        sessionImpl.dataStatusCadenceSeconds(),
+        sessionImpl.statusScheduler());
+  }
+
+  private void removeRuntime(String ingestName, IngestRuntimeImpl runtime) {
+    runtimes.remove(ingestName, runtime);
+  }
+
+  private void markRuntimeMessageIngested(String ingestName) {
+    String normalized = Strings.trimToNull(ingestName);
+    if (normalized == null) {
+      return;
+    }
+    IngestRuntimeImpl runtime = runtimes.get(normalized);
+    if (runtime != null) {
+      runtime.recordMessageIngested();
+    }
+  }
+
+  private final class IngestRuntimeImpl implements IngestRuntime {
+    private final String ingestName;
+    private final DatasetId datasetId;
+    private final boolean apiSource;
+    private final boolean managedSource;
+    private final String sourceKind;
+    private final DataStatusPublisher statusPublisher;
+    private final AtomicLong messagesIngested = new AtomicLong(0L);
+    private final AtomicReference<Throwable> failure = new AtomicReference<>();
+    private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean(false);
+    private volatile IngestAmpsPump pump;
+    private volatile AutoCloseable sourceHandle;
+
+    private IngestRuntimeImpl(
+        String ingestName, DatasetId datasetId, boolean apiSource, String sourceKind) {
+      this.ingestName = ingestName;
+      this.datasetId = datasetId;
+      this.apiSource = apiSource;
+      this.managedSource = !apiSource && !serviceMode;
+      this.sourceKind = Strings.requireNonBlank(sourceKind, "sourceKind");
+      this.statusPublisher =
+          createDataStatusPublisher(
+              "runtime/" + ingestName,
+              DefinitionStatusData.ProducerType.INGEST_RUNTIME,
+              "ingest-runtime:" + group + "/" + ingestName,
+              datasetId.toString(),
+              Map.of(
+                  "sourceKind", this.sourceKind,
+                  "runtimeMode", runtimeMode,
+                  "managedSource", Boolean.toString(this.managedSource)));
+      if (statusPublisher != null) {
+        statusPublisher.start();
+        statusPublisher.publishOnline(
+            managedSource ? "runtime opened (managed source)" : "runtime opened (api source)");
+        statusPublisher.putTag("messagesIngested", "0");
       }
-      if (isCanonical(normalized)) {
-        if (normalized.startsWith("config:")) {
-          String[] parts = splitConfigId(normalized);
-          if (parts != null) {
-            String family = byConfigFamily.get(parts[0] + "|" + parts[1]);
-            if (hasText(family)) {
-              return family;
-            }
+    }
+
+    @Override
+    public void append(IngestPayload payload) {
+      if (closed()) {
+        throw new IllegalStateException("IngestRuntime is closed: " + ingestName);
+      }
+      if (!apiSource) {
+        throw new IllegalStateException("append(payload) is supported for API source only: " + ingestName);
+      }
+      try {
+        LOGGER.info("[IngestRuntime] append ingestName={} mode={} source={} bytes={}", ingestName, runtimeMode, sourceKind, payloadBytes(payload));
+        IngestManagerImpl.this.append(ingestName, payload);
+        recordMessageIngested();
+      } catch (RuntimeException ex) {
+        failure.compareAndSet(null, ex);
+        if (statusPublisher != null) {
+          statusPublisher.publishError(
+              "append failed: "
+                  + Strings.firstNonBlank(
+                      Strings.trimToNull(ex.getMessage()), ex.getClass().getSimpleName()));
+        }
+        throw ex;
+      }
+    }
+
+    @Override
+    public Optional<Throwable> failure() {
+      return Optional.ofNullable(failure.get());
+    }
+
+    @Override
+    public long queryCount() {
+      RowResult result;
+      try {
+        result = rowManager.querySql(COUNT_SQL_PREFIX + sqlToken(datasetId), 1);
+      } catch (RuntimeException ex) {
+        if (isMissingActiveTable(ex)) {
+          return 0L;
+        }
+        throw ex;
+      }
+      if (result.rows().isEmpty() || result.rows().get(0).isEmpty()) {
+        return 0L;
+      }
+      Object count = result.rows().get(0).get(0);
+      if (count instanceof Number number) {
+        return number.longValue();
+      }
+      String text = Strings.trimToNull(String.valueOf(count));
+      return text == null ? 0L : Long.parseLong(text);
+    }
+
+    private static boolean isMissingActiveTable(Throwable error) {
+      Throwable current = error;
+      while (current != null) {
+        String message = Strings.trimToNull(current.getMessage());
+        if (message != null) {
+          String normalized = message.toLowerCase(Locale.ROOT);
+          if (normalized.contains("table with name")
+              && normalized.contains("does not exist")) {
+            return true;
           }
         }
-        return normalized;
+        current = current.getCause();
       }
-      if (expectedType == DefinitionType.DATASET) {
-        String namespace = hasText(sourceNamespace) ? sourceNamespace : "default";
-        String candidate = byDatasetKey.get(groupNamespaceNameKey(sourceGroup, namespace, normalized));
-        return hasText(candidate) ? candidate : "dataset:" + sourceGroup + "/" + namespace + "/" + normalized;
-      }
-      if (expectedType == DefinitionType.STREAM) {
-        String namespace = hasText(sourceNamespace) ? sourceNamespace : "default";
-        String candidate = byStreamKey.get(groupNamespaceNameKey(sourceGroup, namespace, normalized));
-        return hasText(candidate) ? candidate : "stream:" + sourceGroup + "/" + namespace + "/" + normalized;
-      }
-      if (expectedType == DefinitionType.CONFIG_LAYER) {
-        if (normalized.startsWith("config:")) {
-          String[] parts = splitConfigId(normalized);
-          if (parts != null) {
-            String family = byConfigFamily.get(parts[0] + "|" + parts[1]);
-            if (hasText(family)) {
-              return family;
-            }
-          }
-          return normalized;
-        }
-        String candidate = byConfigId.get("config:" + sourceGroup + "/" + normalized + "/base");
-        return hasText(candidate) ? candidate : "config:" + sourceGroup + "/" + normalized + "/base";
-      }
-      if (expectedType == DefinitionType.CONNECTION) {
-        String candidate = byTypeGroupName(DefinitionType.CONNECTION, sourceGroup, normalized);
-        return hasText(candidate) ? candidate : "connection:" + sourceGroup + "/" + normalized;
-      }
-      if (expectedType == DefinitionType.INGEST) {
-        String namespace = hasText(sourceNamespace) ? sourceNamespace : "default";
-        String candidate = byIngestKey.get(groupNamespaceNameKey(sourceGroup, namespace, normalized));
-        if (!hasText(candidate)) {
-          candidate = byTypeGroupName(DefinitionType.INGEST, sourceGroup, normalized);
-        }
-        return hasText(candidate) ? candidate : "ingest:" + sourceGroup + "/" + normalized;
-      }
-      if (expectedType == DefinitionType.INGEST_SOURCE) {
-        String namespace = hasText(sourceNamespace) ? sourceNamespace : "default";
-        String candidate = byIngestSourceKey.get(groupNamespaceNameKey(sourceGroup, namespace, normalized));
-        if (!hasText(candidate)) {
-          candidate = byTypeGroupName(DefinitionType.INGEST_SOURCE, sourceGroup, normalized);
-        }
-        return hasText(candidate) ? candidate : "ingest-source:" + sourceGroup + "/" + normalized;
-      }
-      if (expectedType == DefinitionType.SCHEMA) {
-        String byName = byTypeGroupName(DefinitionType.SCHEMA, sourceGroup, normalized);
-        if (hasText(byName)) {
-          return byName;
-        }
-        String explicit = "schema:" + sourceGroup + "/" + normalized;
-        return bySchemaId.getOrDefault(explicit, explicit);
-      }
-      if (expectedType != null) {
-        String byName = byTypeGroupName(expectedType, sourceGroup, normalized);
-        if (hasText(byName)) {
-          return byName;
-        }
-      }
-      String fallback = byRawAssetId.get(normalized);
-      return hasText(fallback) ? fallback : normalized;
+      return false;
     }
 
-    private String byTypeGroupName(DefinitionType type, String group, String name) {
-      Map<String, String> values = byTypeGroupName.get(type);
-      if (values == null || !hasText(group) || !hasText(name)) {
-        return null;
+    private static String sqlToken(DatasetId datasetId) {
+      return quoteIdentifier(datasetId.namespace()) + "." + quoteIdentifier(datasetId.name());
+    }
+
+    private static String quoteIdentifier(String identifier) {
+      return "\"" + identifier.replace("\"", "\"\"") + "\"";
+    }
+
+    @Override
+    public IngestRuntimeStatus status() {
+      Throwable currentFailure = failure.get();
+      String lastError =
+          currentFailure == null
+              ? null
+              : Strings.firstNonBlank(
+                  Strings.trimToNull(currentFailure.getMessage()),
+                  currentFailure.getClass().getSimpleName());
+      IngestAmpsPump active = pump;
+      return new IngestRuntimeStatus(
+          queryCount(),
+          lastError,
+          active == null ? null : active.lastCheckpoint(),
+          active == null ? null : active.lastCheckpointFlushUtc());
+    }
+
+    @Override
+    public void stop() {
+      if (!managedSource) {
+        if (!closed.compareAndSet(false, true)) {
+          return;
+        }
+        CloseSupport.closeQuietly(statusPublisher);
+        removeRuntime(ingestName, this);
+        return;
       }
-      return values.get(groupNameKey(group, name));
-    }
-
-    private static String groupNameKey(String group, String name) {
-      return normalize(group) + "|" + normalize(name);
-    }
-
-    private static String groupNamespaceNameKey(String group, String namespace, String name) {
-      return normalize(group) + "|" + normalize(namespace) + "|" + normalize(name);
-    }
-
-    private static String normalize(String value) {
-      return value == null ? "" : value.trim().toLowerCase(Locale.ROOT);
-    }
-
-    private static boolean isCanonical(String value) {
-      if (!hasText(value)) {
-        return false;
+      if (!closed.compareAndSet(false, true)) {
+        return;
       }
-      String trimmed = value.trim();
-      int separator = trimmed.indexOf(':');
-      if (separator <= 0 || separator >= trimmed.length() - 1 || trimmed.contains(" ")) {
-        return false;
+      IngestAmpsPump active = pump;
+      pump = null;
+      if (active != null) {
+        active.close();
       }
-      String prefix = trimmed.substring(0, separator).toLowerCase(Locale.ROOT);
-      return switch (prefix) {
-        case "dataset",
-            "stream",
-            "service",
-            "endpoint",
-            "materialized",
-            "feed",
-            "config",
-            "schema",
-            "connection",
-            "ingest",
-            "ingest-source",
-            "entitlement",
-            "namespace",
-            "app",
-            "user",
-            "group",
-            "role",
-            "doc",
-            "storage",
-            "external" -> true;
-        default -> false;
+      AutoCloseable managed = sourceHandle;
+      sourceHandle = null;
+      CloseSupport.closeQuietly(managed);
+      CloseSupport.closeQuietly(statusPublisher);
+      removeRuntime(ingestName, this);
+    }
+
+    private boolean closed() {
+      return closed.get();
+    }
+
+    private void recordMessageIngested() {
+      long ingested = messagesIngested.incrementAndGet();
+      if (statusPublisher != null) {
+        statusPublisher.putTag("messagesIngested", Long.toString(ingested));
+      }
+    }
+
+    private String sourceKind() {
+      return sourceKind;
+    }
+
+    private synchronized void startManagedSource() {
+      if (!managedSource) {
+        return;
+      }
+      if (closed()) {
+        throw new IllegalStateException("IngestRuntime is closed: " + ingestName);
+      }
+      if (pump != null || sourceHandle != null) {
+        return;
+      }
+      if (statusPublisher != null) {
+        statusPublisher.publishOnline("starting managed source");
+      }
+      DefinitionIngestSource source =
+          DiscoveryCache
+              .get(DefinitionIngestSource.class, group, ingestName)
+              .orElseThrow(
+                  () ->
+                      new IllegalStateException("IngestSource not found for ingest: " + group + "/" + ingestName));
+      if (source.amps() != null) {
+        startAmpsSource(source);
+        if (statusPublisher != null) {
+          statusPublisher.publishOnline("managed AMPS source running");
+        }
+        return;
+      }
+      if (source.odbc() != null) {
+        startOdbcSource(source.odbc());
+        if (statusPublisher != null) {
+          statusPublisher.publishOnline("managed ODBC source running");
+        }
+        return;
+      }
+      if (source.external() != null) {
+        startExternalSource(source);
+        if (statusPublisher != null) {
+          statusPublisher.publishOnline("managed external source running");
+        }
+        return;
+      }
+      throw new IllegalStateException(
+          "Unsupported managed ingest source for " + group + "/" + ingestName);
+    }
+
+    private void startAmpsSource(DefinitionIngestSource source) {
+      if (session == null) {
+        throw new IllegalStateException("AMPS runtime requires session-backed ingest manager");
+      }
+      DefinitionIngestSource.AmpsSource amps =
+          Objects.requireNonNull(source.amps(), "ingestSource.amps");
+      String format = Strings.requireNonBlank(source.format(), "ingestSource.format");
+      IngestAmpsPump.PayloadFormat payloadFormat = payloadFormat(format, ingestName);
+
+      IngestAmpsPump created =
+          IngestAmpsPump.builder(session)
+              .withIngestName(ingestName)
+              .withIngestSourceName(ingestName)
+              .withDatasetId(datasetId.toString())
+              .withConnectionName(Strings.requireNonBlank(amps.connectionName(), "amps.connectionName"))
+              .withTopic(Strings.requireNonBlank(amps.topic(), "amps.topic"))
+              .withSowSubscribe(amps.sow())
+              .withSow(amps.sowOnly())
+              .withOptions(resolveAmpsSubscribeOptions(amps))
+              .withBookmarkResume(resolveAmpsBookmarkResume(amps))
+              .withFilter(amps.filter())
+              .withMode(
+                  amps.mode() == DefinitionIngestSource.Mode.BATCH
+                      ? AmpsConnection.BatchMode.BATCH
+                      : AmpsConnection.BatchMode.STREAM)
+              .withBatchMaxMessages(
+                  sanitizePositiveInt(amps.batchMaxMessages(), AmpsConnection.DEFAULT_BATCH_MAX_MESSAGES))
+              .withBatchMaxBytes(
+                  sanitizePositiveInt(amps.batchMaxBytes(), AmpsConnection.DEFAULT_BATCH_MAX_BYTES))
+              .withBatchFlushMillis(
+                  sanitizePositiveLong(amps.batchFlushMillis(), AmpsConnection.DEFAULT_BATCH_FLUSH_MILLIS))
+              .withPayloadFormat(payloadFormat)
+              .withOofHandling(
+                  amps.oofHandling() == DefinitionIngestSource.OofHandling.MARK_AS_DELETED
+                      ? IngestAmpsPump.OofHandling.MARK_AS_DELETED
+                      : IngestAmpsPump.OofHandling.DELETE_EVENT)
+              .withWriteAuthorizer(
+                  (datasetIdArg, operation) ->
+                      IngestManagerImpl.this.enforceWrite(datasetIdArg, operation, null))
+              .withAmpsMessageHandler(
+                  (ingestNameArg,
+                      payloadText,
+                      payloadFormatArg,
+                      ampsCommand,
+                      oofHandling,
+                      parquetFilenamePrefix) ->
+                      IngestManagerImpl.this.handleAmpsMessage(
+                          ingestNameArg,
+                          payloadText,
+                          payloadFormatArg,
+                          ampsCommand,
+                          oofHandling,
+                          false))
+              .withErrorListener(
+                  error -> {
+                    failure.compareAndSet(null, error);
+                    if (statusPublisher != null && error != null) {
+                      statusPublisher.publishError(
+                          "pump error: "
+                              + Strings.firstNonBlank(
+                                  Strings.trimToNull(error.getMessage()),
+                                  error.getClass().getSimpleName()));
+                    }
+                  })
+              .withCheckpointStore(checkpointStore)
+              .build();
+      try {
+        created.start();
+        pump = created;
+      } catch (Exception ex) {
+        failure.compareAndSet(null, ex);
+        if (statusPublisher != null) {
+          statusPublisher.publishError(
+              "managed AMPS source failed: "
+                  + Strings.firstNonBlank(
+                      Strings.trimToNull(ex.getMessage()), ex.getClass().getSimpleName()));
+        }
+        throw new IllegalStateException("Failed to start ingest AMPS runtime: " + ingestName, ex);
+      }
+    }
+
+    private void startExternalSource(DefinitionIngestSource source) {
+      if (session == null) {
+        throw new IllegalStateException("External source runtime requires session-backed ingest manager");
+      }
+      DefinitionIngestSource.ExternalSource external =
+          Objects.requireNonNull(source.external(), "ingestSource.external");
+      String providerId =
+          Strings.requireNonBlank(external.sourceType(), "ingestSource.external.sourceType");
+      if (OdbcRuntimeGuard.isOdbcType(providerId)) {
+        startOdbcSource(toOdbcSource(external));
+        return;
+      }
+      IngestSourceProvider provider = plugins.findIngestSourceProvider(providerId);
+      if (provider == null) {
+        throw new IllegalStateException(
+            "No ingest source provider registered for external source type '" + providerId + "'");
+      }
+      if (!provider.supportsRuntime()) {
+        throw new IllegalStateException(
+            "Ingest source provider '" + provider.providerId() + "' does not support runtime execution");
+      }
+      try {
+        AutoCloseable handle =
+            provider.startRuntime(
+                new IngestSourceRuntimeContext(
+                    session,
+                    ingestName,
+                    source,
+                    external,
+                    new IngestSourceRuntimeContext.Sink() {
+                      @Override
+                      public void appendJson(String payload) {
+                        IngestManagerImpl.this.append(ingestName, new IngestPayloadJson(payload));
+                      }
+
+                      @Override
+                      public void appendNvfix(String payload) {
+                        IngestManagerImpl.this.append(ingestName, new IngestPayloadNvFix(payload));
+                      }
+
+                      @Override
+                      public void appendIpc(byte[] arrowIpcStreamBytes) {
+                        IngestManagerImpl.this.appendIpc(ingestName, arrowIpcStreamBytes);
+                      }
+                    }));
+        sourceHandle = handle == null ? () -> {} : handle;
+      } catch (RuntimeException ex) {
+        failure.compareAndSet(null, ex);
+        if (statusPublisher != null) {
+          statusPublisher.publishError(
+              "managed external source failed: "
+                  + Strings.firstNonBlank(
+                      Strings.trimToNull(ex.getMessage()), ex.getClass().getSimpleName()));
+        }
+        throw ex;
+      } catch (Exception ex) {
+        failure.compareAndSet(null, ex);
+        if (statusPublisher != null) {
+          statusPublisher.publishError(
+              "managed external source failed: "
+                  + Strings.firstNonBlank(
+                      Strings.trimToNull(ex.getMessage()), ex.getClass().getSimpleName()));
+        }
+        throw new IllegalStateException(
+            "Failed to start ingest external runtime: " + ingestName + " provider=" + provider.providerId(),
+            ex);
+      }
+    }
+
+    private void startOdbcSource(DefinitionIngestSource.OdbcSource odbcSource) {
+      if (!(rowManager instanceof RowManagerImpl localRowManager)) {
+        throw OdbcSessionSupport.ingestSourceFailed(
+            ingestName,
+            odbcSource == null ? null : odbcSource.connectionName(),
+            odbcSource == null ? null : odbcSource.databaseType(),
+            "direct_mode_required",
+            null);
+      }
+      DefinitionIngestSource.OdbcSource source =
+          Objects.requireNonNull(odbcSource, "ingestSource.odbc");
+      String requestedConnectionName =
+          Strings.requireNonBlank(source.connectionName(), "ingestSource.odbc.connectionName");
+      DefinitionConnection.Odbc.DatabaseType requestedDatabaseType = source.databaseType();
+      try {
+        byte[] arrowIpcStreamBytes =
+            localRowManager.withDuckdbSession(
+                session -> {
+                  OdbcSessionSupport.OdbcConnectionSpec connection =
+                      OdbcSessionSupport.resolveConnection(
+                          DiscoveryCache,
+                          group,
+                          requestedConnectionName,
+                          requestedDatabaseType,
+                          ingestName);
+                  String remoteSql =
+                      OdbcSessionSupport.ingestSourceSql(source, ingestName, connection.connectionName());
+                  try (OdbcSessionSupport.OdbcQueryResult queryResult =
+                      OdbcSessionSupport.openQueryResult(session, connection, remoteSql)) {
+                    return TabularManagerImpl.toArrowIpcBytes(
+                        queryResult.resultSet(), datasetId.toString(), schemaIpcAllocator);
+                  } catch (SQLException ex) {
+                    throw OdbcSessionSupport.ingestSourceFailed(
+                        ingestName,
+                        connection.connectionName(),
+                        connection.databaseType(),
+                        ex.getMessage(),
+                        ex);
+                  } catch (RuntimeException ex) {
+                    if (isDeterministicOdbcFailure(ex)) {
+                      throw ex;
+                    }
+                    throw OdbcSessionSupport.ingestSourceFailed(
+                        ingestName,
+                        connection.connectionName(),
+                        connection.databaseType(),
+                        ex.getMessage(),
+                        ex);
+                  }
+                });
+        if (arrowIpcStreamBytes != null && arrowIpcStreamBytes.length > 0) {
+          IngestManagerImpl.this.appendIpc(ingestName, arrowIpcStreamBytes);
+        }
+        sourceHandle = () -> {};
+      } catch (RuntimeException ex) {
+        failure.compareAndSet(null, ex);
+        if (statusPublisher != null) {
+          statusPublisher.publishError(
+              "managed ODBC source failed: "
+                  + Strings.firstNonBlank(
+                      Strings.trimToNull(ex.getMessage()), ex.getClass().getSimpleName()));
+        }
+        if (isDeterministicOdbcFailure(ex)) {
+          throw ex;
+        }
+        throw OdbcSessionSupport.ingestSourceFailed(
+            ingestName, requestedConnectionName, requestedDatabaseType, ex.getMessage(), ex);
+      }
+    }
+
+    private static boolean isDeterministicOdbcFailure(RuntimeException ex) {
+      String message = Strings.trimToNull(ex == null ? null : ex.getMessage());
+      return message != null && message.startsWith("ODBC_");
+    }
+
+    private static DefinitionIngestSource.OdbcSource toOdbcSource(
+        DefinitionIngestSource.ExternalSource external) {
+      Map<String, String> options = external.options();
+      String connectionName =
+          Strings.firstNonBlank(
+              Strings.trimToNull(external.reference()),
+              Strings.trimToNull(options == null ? null : options.get("connectionName")));
+      String tableName = Strings.trimToNull(options == null ? null : options.get("tableName"));
+      String querySql = Strings.trimToNull(options == null ? null : options.get("querySql"));
+      DefinitionConnection.Odbc.DatabaseType databaseType =
+          parseDatabaseType(options == null ? null : options.get("databaseType"));
+      return new DefinitionIngestSource.OdbcSource(
+          connectionName,
+          databaseType,
+          tableName,
+          querySql,
+          options == null ? Map.of() : Map.copyOf(options));
+    }
+
+    private static DefinitionConnection.Odbc.DatabaseType parseDatabaseType(String value) {
+      String normalized = Strings.trimToNull(value);
+      if (normalized == null) {
+        return DefinitionConnection.Odbc.DatabaseType.OTHER;
+      }
+      try {
+        return DefinitionConnection.Odbc.DatabaseType.valueOf(normalized.toUpperCase(Locale.ROOT));
+      } catch (IllegalArgumentException ex) {
+        return DefinitionConnection.Odbc.DatabaseType.OTHER;
+      }
+    }
+
+    private static IngestAmpsPump.PayloadFormat payloadFormat(String format, String ingestName) {
+      String normalized = Strings.requireNonBlank(format, "format").toUpperCase(Locale.ROOT);
+      return switch (normalized) {
+        case FORMAT_JSON -> IngestAmpsPump.PayloadFormat.JSON;
+        case FORMAT_NVFIX -> IngestAmpsPump.PayloadFormat.NVFIX;
+        default ->
+            throw new IllegalStateException(
+                "IngestSource format must be JSON or NVFIX: " + ingestName + " format=" + format);
       };
     }
   }
 
-  private static void inferDatasetEdges(
-      DefinitionContext context,
-      DefinitionDataset dataset,
-      NodeIndex index,
-      Map<String, AssetLifecycleNode> nodes,
-      List<AssetLifecycleEdge> edges,
-      Set<String> dedupe) {
-    DefinitionDataset.View view = dataset.view();
-    if (view != null && view.dependencies() != null) {
-      for (String dependency : view.dependencies()) {
-        String target = index.resolveReference(dependency, null, context.group(), context.namespace(), nodes);
-        addEdge(
-            context.assetId(),
-            target,
-            RelationshipType.DERIVED_FROM,
-            OwnershipType.SHARED,
-            PromotionBehavior.REQUIRED_WITH_PARENT,
-            DeleteBehavior.BLOCK,
-            RetentionBehavior.KEEP_HISTORY,
-            true,
-            true,
-            "dataset.view.dependencies",
-            "Dataset view dependency",
-            null,
-            edges,
-            dedupe);
-      }
+  private static int sanitizePositiveInt(Integer value, int defaultValue) {
+    if (value == null || value <= 0) {
+      return defaultValue;
     }
+    return value;
+  }
 
-    DefinitionDataset.Binding binding = dataset.binding();
-    if (binding == null) {
-      return;
+  private static long sanitizePositiveLong(Long value, long defaultValue) {
+    if (value == null || value <= 0L) {
+      return defaultValue;
     }
-    DefinitionDataset.ParquetBinding parquet = binding.parquet();
-    if (parquet != null) {
-      if (hasText(parquet.connectionName())) {
-        String connectionAsset =
-            index.resolveReference(
-                parquet.connectionName(), DefinitionType.CONNECTION, context.group(), null, nodes);
-        addEdge(
-            context.assetId(),
-            connectionAsset,
-            RelationshipType.USES_CONNECTION,
-            OwnershipType.SHARED,
-            PromotionBehavior.REBIND_IN_TARGET,
-            DeleteBehavior.DETACH,
-            RetentionBehavior.KEEP_HISTORY,
-            true,
-            true,
-            "dataset.binding.parquet.connectionName",
-            "Parquet dataset uses external connection",
-            null,
-            edges,
-            dedupe);
-      }
-      if (hasText(parquet.uri())) {
-        addEdge(
-            context.assetId(),
-            storageAssetId(parquet.uri()),
-            RelationshipType.STORES_IN,
-            OwnershipType.EXTERNAL,
-            PromotionBehavior.NEVER_PROMOTE,
-            DeleteBehavior.MANUAL,
-            RetentionBehavior.ARCHIVE_ONLY,
-            false,
-            true,
-            "dataset.binding.parquet.uri",
-            "Parquet dataset storage target",
-            parquet.uri(),
-            edges,
-            dedupe);
-      }
+    return value;
+  }
+
+  static int resolveMaxRowsPerFile(Integer value) {
+    if (value == null) {
+      return DEFAULT_PARQUET_MAX_ROWS_PER_FILE;
     }
-    DefinitionDataset.DuckdbBinding duckdb = binding.duckdb();
-    if (duckdb != null && hasText(duckdb.databasePath())) {
-      addEdge(
-          context.assetId(),
-          storageAssetId(duckdb.databasePath()),
-          RelationshipType.STORES_IN,
-          OwnershipType.EXTERNAL,
-          PromotionBehavior.NEVER_PROMOTE,
-          DeleteBehavior.MANUAL,
-          RetentionBehavior.ARCHIVE_ONLY,
-          false,
-          true,
-          "dataset.binding.duckdb.databasePath",
-          "DuckDB file path backing dataset",
-          duckdb.databasePath(),
-          edges,
-          dedupe);
+    if (value <= 0) {
+      throw new IllegalArgumentException("maxRowsPerFile must be > 0");
     }
-    DefinitionDataset.ExternalBinding external = binding.external();
-    if (external != null && hasText(external.reference())) {
-      addEdge(
-          context.assetId(),
-          "external:" + external.reference().trim(),
-          RelationshipType.CONSUMES,
-          OwnershipType.EXTERNAL,
-          PromotionBehavior.REBIND_IN_TARGET,
-          DeleteBehavior.DETACH,
-          RetentionBehavior.KEEP_HISTORY,
-          false,
-          true,
-          "dataset.binding.external.reference",
-          "External dataset reference",
-          external.reference(),
-          edges,
-          dedupe);
+    return value;
+  }
+
+  static long resolveMaxIdleMillis(Long value) {
+    if (value == null) {
+      return DEFAULT_PARQUET_MAX_IDLE_MILLIS;
     }
-    DefinitionDataset.OdbcBinding odbc = binding.odbc();
-    if (odbc != null && hasText(odbc.connectionName())) {
-      String ref =
-          index.resolveReference(
-              odbc.connectionName(), DefinitionType.CONNECTION, context.group(), null, nodes);
-      addEdge(
-          context.assetId(),
-          ref,
-          RelationshipType.USES_CONNECTION,
-          OwnershipType.SHARED,
-          PromotionBehavior.REBIND_IN_TARGET,
-          DeleteBehavior.DETACH,
-          RetentionBehavior.KEEP_HISTORY,
-          true,
-          true,
-          "dataset.binding.odbc.connectionName",
-          "ODBC dataset source connection",
-          null,
-          edges,
-          dedupe);
+    if (value <= 0L) {
+      throw new IllegalArgumentException("maxIdleMillis must be > 0");
+    }
+    return value;
+  }
+
+  static final class ParquetRollBuffer {
+    final Object monitor = new Object();
+    final List<byte[]> pendingIpcBatches = new ArrayList<>();
+    DatasetId datasetId;
+    ParquetRollPolicy policy;
+    String parquetFilenamePrefix;
+    long pendingRows;
+    long lastAppendMillis;
+    Schema schema;
+
+    ParquetRollBuffer(
+        DatasetId datasetId, ParquetRollPolicy policy, String parquetFilenamePrefix) {
+      this.datasetId = Objects.requireNonNull(datasetId, "datasetId");
+      this.policy = Objects.requireNonNull(policy, "policy");
+      this.parquetFilenamePrefix = Strings.trimToNull(parquetFilenamePrefix);
     }
   }
 
-  private static void inferServiceEdges(
-      DefinitionContext context,
-      DefinitionService service,
-      NodeIndex index,
-      Map<String, AssetLifecycleNode> nodes,
-      List<AssetLifecycleEdge> edges,
-      Set<String> dedupe) {
-    if (service.schemaRef() != null) {
-      String schemaId =
-          index.resolveSchemaReference(
-              service.schemaRef().schemaId(),
-              service.schemaRef().group(),
-              service.schemaRef().name(),
-              context.group(),
-              nodes);
-      addEdge(
-          context.assetId(),
-          schemaId,
-          RelationshipType.USES_SCHEMA,
-          OwnershipType.SHARED,
-          PromotionBehavior.REQUIRED_WITH_PARENT,
-          DeleteBehavior.BLOCK,
-          RetentionBehavior.KEEP_HISTORY,
-          true,
-          true,
-          "service.schemaRef",
-          "Service contract schema",
-          null,
-          edges,
-          dedupe);
+  record ParquetRollPolicy(int maxRowsPerFile, long maxIdleMillis) {
+    static ParquetRollPolicy disabled() {
+      return new ParquetRollPolicy(0, 0L);
     }
-    if (service.connectionRefs() != null) {
-      for (String connectionRef : service.connectionRefs()) {
-        String connectionId =
-            index.resolveReference(connectionRef, DefinitionType.CONNECTION, context.group(), null, nodes);
-        addEdge(
-            context.assetId(),
-            connectionId,
-            RelationshipType.USES_CONNECTION,
-            OwnershipType.SHARED,
-            PromotionBehavior.REBIND_IN_TARGET,
-            DeleteBehavior.DETACH,
-            RetentionBehavior.KEEP_HISTORY,
-            true,
-            true,
-            "service.connectionRefs",
-            "Service connection dependency",
-            null,
-            edges,
-            dedupe);
-      }
-    }
-    if (service.amps() != null && hasText(service.amps().connection())) {
-      String connectionId =
-          index.resolveReference(service.amps().connection(), DefinitionType.CONNECTION, context.group(), null, nodes);
-      addEdge(
-          context.assetId(),
-          connectionId,
-          RelationshipType.USES_CONNECTION,
-          OwnershipType.SHARED,
-          PromotionBehavior.REBIND_IN_TARGET,
-          DeleteBehavior.DETACH,
-          RetentionBehavior.KEEP_HISTORY,
-          true,
-          true,
-          "service.amps.connection",
-          "AMPS transport connection",
-          null,
-          edges,
-          dedupe);
+
+    boolean enabled() {
+      return maxRowsPerFile > 0 || maxIdleMillis > 0L;
     }
   }
 
-  private static void inferStreamEdges(
-      DefinitionContext context,
-      DefinitionStream stream,
-      NodeIndex index,
-      Map<String, AssetLifecycleNode> nodes,
-      List<AssetLifecycleEdge> edges,
-      Set<String> dedupe) {
-    if (hasText(stream.schemaId()) || hasText(stream.schemaKey())) {
-      String schemaId =
-          index.resolveSchemaReference(stream.schemaId(), context.group(), stream.schemaKey(), context.group(), nodes);
-      addEdge(
-          context.assetId(),
-          schemaId,
-          RelationshipType.USES_SCHEMA,
-          OwnershipType.SHARED,
-          PromotionBehavior.REQUIRED_WITH_PARENT,
-          DeleteBehavior.BLOCK,
-          RetentionBehavior.KEEP_HISTORY,
-          true,
-          true,
-          "stream.schema",
-          "Stream payload schema",
-          null,
-          edges,
-          dedupe);
-    }
-    if (stream.connectionRefs() != null) {
-      for (String connectionRef : stream.connectionRefs()) {
-        String connectionId =
-            index.resolveReference(connectionRef, DefinitionType.CONNECTION, context.group(), null, nodes);
-        addEdge(
-            context.assetId(),
-            connectionId,
-            RelationshipType.USES_CONNECTION,
-            OwnershipType.SHARED,
-            PromotionBehavior.REBIND_IN_TARGET,
-            DeleteBehavior.DETACH,
-            RetentionBehavior.KEEP_HISTORY,
-            true,
-            true,
-            "stream.connectionRefs",
-            "Stream transport connection",
-            null,
-            edges,
-            dedupe);
-      }
-    }
-    if (stream.dependencyRefs() != null) {
-      for (String ref : stream.dependencyRefs()) {
-        String dependency = index.resolveReference(ref, null, context.group(), context.namespace(), nodes);
-        addEdge(
-            context.assetId(),
-            dependency,
-            RelationshipType.DEPENDS_ON,
-            OwnershipType.SHARED,
-            PromotionBehavior.OPTIONAL_WITH_PARENT,
-            DeleteBehavior.BLOCK,
-            RetentionBehavior.KEEP_HISTORY,
-            false,
-            true,
-            "stream.dependencyRefs",
-            "Stream dependency reference",
-            null,
-            edges,
-            dedupe);
-      }
-    }
-  }
+  record ArrowIpcBatchMeta(long rowCount, Schema schema) {}
 
-  private static void inferIngestEdges(
-      DefinitionContext context,
-      DefinitionIngest ingest,
-      NodeIndex index,
-      Map<String, AssetLifecycleNode> nodes,
-      Map<String, Integer> datasetProducerCounts,
-      List<AssetLifecycleEdge> edges,
-      Set<String> dedupe) {
-    String ingestSourceId =
-        index.resolveReference(
-            context.node().name(), DefinitionType.INGEST_SOURCE, context.group(), context.namespace(), nodes);
-    addEdge(
-        context.assetId(),
-        ingestSourceId,
-        RelationshipType.OWNS,
-        OwnershipType.OWNED,
-        PromotionBehavior.REQUIRED_WITH_PARENT,
-        DeleteBehavior.CASCADE_SOFT,
-        RetentionBehavior.KEEP_HISTORY,
-        true,
-        false,
-        "ingest.name->ingestSource",
-        "Ingest source definition paired by ingest name",
-        null,
-        edges,
-        dedupe);
+  record ActiveTableDescriptor(
+      String ingestName,
+      String tableName,
+      List<String> primaryKey,
+      boolean memory,
+      String databasePath,
+      String parquetHistoryPath,
+      boolean persistOnStop,
+      boolean createIfMissing,
+      List<String> schemaFields) {}
 
-    if (hasText(ingest.datasetId())) {
-      String datasetId =
-          index.resolveReference(
-              ingest.datasetId(), DefinitionType.DATASET, context.group(), context.namespace(), nodes);
-      int producers = datasetProducerCounts.getOrDefault(datasetId, 0);
-      boolean ownedDataset = producers <= 1 && sameGroup(nodes, context.assetId(), datasetId);
-      addEdge(
-          context.assetId(),
-          datasetId,
-          RelationshipType.PRODUCES,
-          ownedDataset ? OwnershipType.OWNED : OwnershipType.SHARED,
-          ownedDataset ? PromotionBehavior.REQUIRED_WITH_PARENT : PromotionBehavior.REBIND_IN_TARGET,
-          ownedDataset ? DeleteBehavior.CASCADE_SOFT : DeleteBehavior.DETACH,
-          RetentionBehavior.KEEP_HISTORY,
-          true,
-          !ownedDataset,
-          "ingest.datasetId",
-          ownedDataset
-              ? "Dataset owned by single ingest pipeline"
-              : "Dataset is shared and should rebind in target lane",
-          null,
-          edges,
-          dedupe);
-    }
+  record S3PathRoot(String bucket, String basePrefix) {}
 
-    if (hasText(ingest.outputSchemaId())) {
-      String outputSchemaId =
-          index.resolveSchemaReference(
-              ingest.outputSchemaId(), context.group(), ingest.outputSchemaId(), context.group(), nodes);
-      boolean derivedSchema =
-          hasText(outputSchemaId)
-              && outputSchemaId.startsWith("schema:" + context.group() + "/ingest:");
-      addEdge(
-          context.assetId(),
-          outputSchemaId,
-          RelationshipType.USES_SCHEMA,
-          derivedSchema ? OwnershipType.DERIVED : OwnershipType.SHARED,
-          PromotionBehavior.REQUIRED_WITH_PARENT,
-          derivedSchema ? DeleteBehavior.CASCADE_SOFT : DeleteBehavior.BLOCK,
-          RetentionBehavior.KEEP_HISTORY,
-          true,
-          !derivedSchema,
-          "ingest.outputSchemaId",
-          "Ingest output schema contract",
-          null,
-          edges,
-          dedupe);
-    }
-  }
+  record ScopedConnectionRef(String group, String name) {}
 
-  private static void inferIngestSourceEdges(
-      DefinitionContext context,
-      DefinitionIngestSource ingestSource,
-      NodeIndex index,
-      Map<String, AssetLifecycleNode> nodes,
-      List<AssetLifecycleEdge> edges,
-      Set<String> dedupe) {
-    String ingestName = hasText(ingestSource.ingestName()) ? ingestSource.ingestName().trim() : context.node().name();
-    String ingestId =
-        index.resolveReference(ingestName, DefinitionType.INGEST, context.group(), context.namespace(), nodes);
-    addEdge(
-        context.assetId(),
-        ingestId,
-        RelationshipType.PRODUCES,
-        OwnershipType.OWNED,
-        PromotionBehavior.REQUIRED_WITH_PARENT,
-        DeleteBehavior.BLOCK,
-        RetentionBehavior.KEEP_HISTORY,
-        true,
-        false,
-        "ingestSource.ingestName",
-        "Ingest source feeds ingest definition",
-        null,
-        edges,
-        dedupe);
-
-    if (ingestSource.amps() != null) {
-      DefinitionIngestSource.AmpsSource amps = ingestSource.amps();
-      if (hasText(amps.connectionName())) {
-        String connectionId =
-            index.resolveReference(amps.connectionName(), DefinitionType.CONNECTION, context.group(), null, nodes);
-        addEdge(
-            context.assetId(),
-            connectionId,
-            RelationshipType.USES_CONNECTION,
-            OwnershipType.SHARED,
-            PromotionBehavior.REBIND_IN_TARGET,
-            DeleteBehavior.DETACH,
-            RetentionBehavior.KEEP_HISTORY,
-            true,
-            true,
-            "ingestSource.amps.connectionName",
-            "AMPS ingest source transport connection",
-            null,
-            edges,
-            dedupe);
-      }
-    }
-
-    if (ingestSource.external() != null && hasText(ingestSource.external().reference())) {
-      String reference = ingestSource.external().reference().trim();
-      addEdge(
-          context.assetId(),
-          "external:" + reference,
-          RelationshipType.CONSUMES,
-          OwnershipType.EXTERNAL,
-          PromotionBehavior.REBIND_IN_TARGET,
-          DeleteBehavior.MANUAL,
-          RetentionBehavior.KEEP_HISTORY,
-          false,
-          true,
-          "ingestSource.external.reference",
-          "External ingest source reference",
-          reference,
-          edges,
-          dedupe);
-    }
-  }
-
-  private static void inferSchemaEdges(
-      DefinitionContext context,
-      DefinitionSchema schema,
-      NodeIndex index,
-      Map<String, AssetLifecycleNode> nodes,
-      List<AssetLifecycleEdge> edges,
-      Set<String> dedupe) {
-    if (schema.refs() != null) {
-      for (DefinitionSchema.Ref ref : schema.refs()) {
-        if (ref == null || !hasText(ref.refId())) {
-          continue;
-        }
-        DefinitionType expectedType = definitionTypeFromToken(ref.refType());
-        String target =
-            index.resolveReference(ref.refId(), expectedType, context.group(), context.namespace(), nodes);
-        RelationshipType relationshipType =
-            relationshipTypeForSchemaRef(expectedType, target, nodes);
-        addEdge(
-            context.assetId(),
-            target,
-            relationshipType,
-            OwnershipType.SHARED,
-            PromotionBehavior.OPTIONAL_WITH_PARENT,
-            expectedType == DefinitionType.SCHEMA ? DeleteBehavior.BLOCK : DeleteBehavior.DETACH,
-            RetentionBehavior.KEEP_HISTORY,
-            expectedType == DefinitionType.SCHEMA,
-            true,
-            "schema.refs",
-            "Schema reference",
-            null,
-            edges,
-            dedupe);
-      }
-    }
-    if (hasText(schema.doc())) {
-      addEdge(
-          context.assetId(),
-          "doc:" + normalizeToken(schema.doc()),
-          RelationshipType.DOCUMENTED_BY,
-          OwnershipType.EXTERNAL,
-          PromotionBehavior.NEVER_PROMOTE,
-          DeleteBehavior.MANUAL,
-          RetentionBehavior.ARCHIVE_ONLY,
-          false,
-          true,
-          "schema.doc",
-          "Schema documentation reference",
-          schema.doc(),
-          edges,
-          dedupe);
-    }
-  }
-
-  private static void inferConfigEdges(
-      DefinitionContext context,
-      DefinitionConfigLayer config,
-      NodeIndex index,
-      Map<String, AssetLifecycleNode> nodes,
-      List<AssetLifecycleEdge> edges,
-      Set<String> dedupe) {
-    if (config == null) {
-      return;
-    }
-    DefinitionConfigLayer payload = config;
-    if (hasText(payload.schemaKey())) {
-      String schemaId =
-          index.resolveSchemaReference(
-              null, context.group(), payload.schemaKey().trim(), context.group(), nodes);
-      addEdge(
-          context.assetId(),
-          schemaId,
-          RelationshipType.USES_SCHEMA,
-          OwnershipType.SHARED,
-          PromotionBehavior.REQUIRED_WITH_PARENT,
-          DeleteBehavior.BLOCK,
-          RetentionBehavior.KEEP_HISTORY,
-          true,
-          true,
-          "config.configPayload.schemaKey",
-          "Config schema binding",
-          null,
-          edges,
-          dedupe);
-    }
-    if (hasText(payload.parentId())) {
-      String parentId =
-          index.resolveReference(payload.parentId(), DefinitionType.CONFIG_LAYER, context.group(), null, nodes);
-      addEdge(
-          context.assetId(),
-          parentId,
-          RelationshipType.DEPENDS_ON,
-          OwnershipType.OWNED,
-          PromotionBehavior.REQUIRED_WITH_PARENT,
-          DeleteBehavior.BLOCK,
-          RetentionBehavior.KEEP_HISTORY,
-          true,
-          false,
-          "config.configPayload.parentId",
-          "Config parent inheritance dependency",
-          null,
-          edges,
-          dedupe);
-    }
-  }
-
-  private static void inferEntitlementEdges(
-      DefinitionContext context,
-      DefinitionEntitlement entitlement,
-      NodeIndex index,
-      Map<String, AssetLifecycleNode> nodes,
-      List<AssetLifecycleEdge> edges,
-      Set<String> dedupe) {
-    addEntitlementGovernedAssetEdge(
-        context, index, nodes, entitlement.scopeId(), definitionTypeFromToken(entitlement.scopeType()), "entitlement.scopeId", edges, dedupe);
-
-    if (entitlement.policies() != null) {
-      for (DefinitionEntitlement.PolicyDocument policy : entitlement.policies()) {
-        if (policy == null) {
-          continue;
-        }
-        addEntitlementGovernedAssetEdge(
-            context,
-            index,
-            nodes,
-            policy.resourceId(),
-            definitionTypeFromToken(policy.scopeType() == null ? policy.type() : policy.scopeType()),
-            "entitlement.policy.resourceId",
-            edges,
-            dedupe);
-        if (policy.bindings() != null) {
-          for (DefinitionEntitlement.PolicyBinding binding : policy.bindings()) {
-            if (binding == null || !hasText(binding.subject())) {
-              continue;
-            }
-            addEdge(
-                context.assetId(),
-                binding.subject().trim(),
-                RelationshipType.REFERENCES,
-                OwnershipType.EXTERNAL,
-                PromotionBehavior.NEVER_PROMOTE,
-                DeleteBehavior.DETACH,
-                RetentionBehavior.KEEP_HISTORY,
-                false,
-                true,
-                "entitlement.policy.bindings.subject",
-                "Policy subject reference",
-                null,
-                edges,
-                dedupe);
-            if (binding.obligations() != null && binding.obligations().datasetScope() != null) {
-              for (String datasetScope : binding.obligations().datasetScope()) {
-                addEntitlementGovernedAssetEdge(
-                    context,
-                    index,
-                    nodes,
-                    datasetScope,
-                    DefinitionType.DATASET,
-                    "entitlement.policy.bindings.obligations.datasetScope",
-                    edges,
-                    dedupe);
-              }
-            }
-          }
-        }
-      }
-    }
-    if (entitlement.relationships() != null) {
-      for (DefinitionEntitlement.RelationshipTuple relationship : entitlement.relationships()) {
-        if (relationship == null) {
-          continue;
-        }
-        addEntitlementGovernedAssetEdge(
-            context,
-            index,
-            nodes,
-            relationship.resourceId(),
-            definitionTypeFromToken(relationship.resourceType()),
-            "entitlement.relationships.resourceId",
-            edges,
-            dedupe);
-        addEntitlementGovernedAssetEdge(
-            context,
-            index,
-            nodes,
-            relationship.resourceSubject(),
-            null,
-            "entitlement.relationships.resourceSubject",
-            edges,
-            dedupe);
-      }
-    }
-  }
-
-  private static void inferConnectionEdges(
-      DefinitionContext context,
-      DefinitionConnection connection,
-      NodeIndex index,
-      Map<String, AssetLifecycleNode> nodes,
-      List<AssetLifecycleEdge> edges,
-      Set<String> dedupe) {
-    if (connection.client() != null && hasText(connection.client().physicalRef())) {
-      String physicalRef = connection.client().physicalRef().trim();
-      String resolvedPhysical =
-          index.resolveReference(physicalRef, DefinitionType.CONNECTION, context.group(), null, nodes);
-      if (!hasText(resolvedPhysical) || !nodes.containsKey(resolvedPhysical)) {
-        String[] slashParts = physicalRef.split("/");
-        if (slashParts.length == 2) {
-          resolvedPhysical =
-              index.resolveReference(
-                  slashParts[1], DefinitionType.CONNECTION, slashParts[0], null, nodes);
-        }
-      }
-      addEdge(
-          context.assetId(),
-          resolvedPhysical,
-          RelationshipType.USES_CONNECTION,
-          OwnershipType.SHARED,
-          PromotionBehavior.REBIND_IN_TARGET,
-          DeleteBehavior.DETACH,
-          RetentionBehavior.KEEP_HISTORY,
-          true,
-          true,
-          "connection.client.physicalRef",
-          "Client connection depends on physical connection",
-          null,
-          edges,
-          dedupe);
-    }
-    if (connection.bitbucketRepo() != null && hasText(connection.bitbucketRepo().authConnectionName())) {
-      String authConnection =
-          index.resolveReference(
-              connection.bitbucketRepo().authConnectionName(),
-              DefinitionType.CONNECTION,
-              context.group(),
-              null,
-              nodes);
-      addEdge(
-          context.assetId(),
-          authConnection,
-          RelationshipType.USES_CONNECTION,
-          OwnershipType.SHARED,
-          PromotionBehavior.REBIND_IN_TARGET,
-          DeleteBehavior.DETACH,
-          RetentionBehavior.KEEP_HISTORY,
-          true,
-          true,
-          "connection.bitbucketRepo.authConnectionName",
-          "Bitbucket auth connection",
-          null,
-          edges,
-          dedupe);
-    }
-    if (connection.odbc() != null && hasText(connection.odbc().connectionName())) {
-      String ref =
-          index.resolveReference(connection.odbc().connectionName(), DefinitionType.CONNECTION, context.group(), null, nodes);
-      addEdge(
-          context.assetId(),
-          ref,
-          RelationshipType.USES_CONNECTION,
-          OwnershipType.SHARED,
-          PromotionBehavior.REBIND_IN_TARGET,
-          DeleteBehavior.DETACH,
-          RetentionBehavior.KEEP_HISTORY,
-          false,
-          true,
-          "connection.odbc.connectionName",
-          "ODBC connection chain reference",
-          null,
-          edges,
-          dedupe);
-    }
-    if (connection.s3() != null && hasText(connection.s3().bucket())) {
-      String uri =
-          "s3://"
-              + connection.s3().bucket().trim()
-              + (hasText(connection.s3().basePrefix()) ? "/" + connection.s3().basePrefix().trim() : "");
-      addEdge(
-          context.assetId(),
-          storageAssetId(uri),
-          RelationshipType.STORES_IN,
-          OwnershipType.EXTERNAL,
-          PromotionBehavior.NEVER_PROMOTE,
-          DeleteBehavior.MANUAL,
-          RetentionBehavior.ARCHIVE_ONLY,
-          false,
-          true,
-          "connection.s3.bucket",
-          "S3 storage locator",
-          uri,
-          edges,
-          dedupe);
-    }
-    if (connection.physical() != null && hasText(connection.physical().uriOrEndpoint())) {
-      addEdge(
-          context.assetId(),
-          "endpoint:" + normalizeToken(connection.physical().uriOrEndpoint()),
-          RelationshipType.DEPENDS_ON,
-          OwnershipType.EXTERNAL,
-          PromotionBehavior.NEVER_PROMOTE,
-          DeleteBehavior.MANUAL,
-          RetentionBehavior.ARCHIVE_ONLY,
-          false,
-          true,
-          "connection.physical.uriOrEndpoint",
-          "Physical endpoint locator",
-          connection.physical().uriOrEndpoint(),
-          edges,
-          dedupe);
-    }
-  }
-
-  private static void inferSemanticHintEdges(
-      DefinitionContext context,
-      Definition definition,
-      Map<String, Semantic> configSemanticByKey,
-      NodeIndex index,
-      Map<String, AssetLifecycleNode> nodes,
-      List<AssetLifecycleEdge> edges,
-      Set<String> dedupe) {
-    Semantic metadata = semantic(definition, configSemanticByKey);
-    if (metadata == null || metadata.relationshipHints() == null || metadata.relationshipHints().isEmpty()) {
-      return;
-    }
-    for (Semantic.RelationshipHint hint : metadata.relationshipHints()) {
-      if (hint == null || !hasText(hint.targetAssetId())) {
-        continue;
-      }
-      String targetToken = hint.targetAssetId().trim();
-      if (targetToken.toLowerCase(Locale.ROOT).startsWith("todo:")) {
-        continue;
-      }
-      String target = index.resolveReference(targetToken, null, context.group(), context.namespace(), nodes);
-      addEdge(
-          context.assetId(),
-          target,
-          mapHintType(hint.relationshipType()),
-          OwnershipType.SHARED,
-          PromotionBehavior.OPTIONAL_WITH_PARENT,
-          DeleteBehavior.DETACH,
-          RetentionBehavior.KEEP_HISTORY,
-          false,
-          true,
-          "semantic.relationshipHints",
-          hint.description(),
-          hint.joinExpression(),
-          edges,
-          dedupe);
-    }
-  }
-
-  private static Map<String, Integer> countIngestDatasetProducers(
-      List<DefinitionContext> contexts, NodeIndex index, Map<String, AssetLifecycleNode> nodes) {
-    Map<String, Integer> counts = new LinkedHashMap<>();
-    for (DefinitionContext context : contexts) {
-      if (!(context.definition() instanceof DefinitionIngest ingest) || !hasText(ingest.datasetId())) {
-        continue;
-      }
-      String datasetId =
-          index.resolveReference(ingest.datasetId(), DefinitionType.DATASET, context.group(), context.namespace(), nodes);
-      counts.put(datasetId, counts.getOrDefault(datasetId, 0) + 1);
-    }
-    return counts;
-  }
-
-  private static boolean sameGroup(
-      Map<String, AssetLifecycleNode> nodes, String leftAssetId, String rightAssetId) {
-    AssetLifecycleNode left = nodes.get(leftAssetId);
-    AssetLifecycleNode right = nodes.get(rightAssetId);
-    return left != null && right != null && left.group().equalsIgnoreCase(right.group());
-  }
-
-  private static RelationshipType mapHintType(Semantic.RelationshipType type) {
-    if (type == null) {
-      return RelationshipType.DEPENDS_ON;
-    }
-    return switch (type) {
-      case DEPENDS_ON -> RelationshipType.DEPENDS_ON;
-      case DERIVED_FROM -> RelationshipType.DERIVED_FROM;
-      case JOINS_TO -> RelationshipType.JOINS_TO;
-      case CONSUMES -> RelationshipType.CONSUMES;
-      case PRODUCES -> RelationshipType.PRODUCES;
-      case DOCUMENTED_BY -> RelationshipType.DOCUMENTED_BY;
-      case GOVERNED_BY -> RelationshipType.GOVERNED_BY;
-    };
-  }
-
-  private static DefinitionType definitionTypeFromToken(String token) {
-    if (!hasText(token)) {
-      return null;
-    }
-    String normalized = token.trim().toLowerCase(Locale.ROOT);
-    return switch (normalized) {
-      case "dataset", "metaset", "materialized" -> DefinitionType.DATASET;
-      case "service" -> DefinitionType.SERVICE;
-      case "stream", "feed" -> DefinitionType.STREAM;
-      case "schema" -> DefinitionType.SCHEMA;
-      case "config" -> DefinitionType.CONFIG_LAYER;
-      case "connection" -> DefinitionType.CONNECTION;
-      case "entitlement" -> DefinitionType.ENTITLEMENT;
-      case "ingest" -> DefinitionType.INGEST;
-      case "ingest_source", "ingest-source" -> DefinitionType.INGEST_SOURCE;
-      default -> null;
-    };
-  }
-
-  private static void addEntitlementGovernedAssetEdge(
-      DefinitionContext context,
-      NodeIndex index,
-      Map<String, AssetLifecycleNode> nodes,
-      String rawTarget,
-      DefinitionType expectedType,
-      String source,
-      List<AssetLifecycleEdge> edges,
-      Set<String> dedupe) {
-    if (!hasText(rawTarget)) {
-      return;
-    }
-    String target = index.resolveReference(rawTarget, expectedType, context.group(), context.namespace(), nodes);
-    if (!hasText(target)) {
-      return;
-    }
-    boolean governableTarget = isGovernableTarget(target, expectedType, nodes);
-    if (governableTarget) {
-      addEdge(
-          target,
-          context.assetId(),
-          RelationshipType.GOVERNED_BY,
-          OwnershipType.SHARED,
-          PromotionBehavior.OPTIONAL_WITH_PARENT,
-          DeleteBehavior.DETACH,
-          RetentionBehavior.KEEP_HISTORY,
-          false,
-          true,
-          source,
-          "Asset governed by entitlement policy",
-          null,
-          edges,
-          dedupe);
-      addEdge(
-          context.assetId(),
-          target,
-          RelationshipType.DEPENDS_ON,
-          OwnershipType.SHARED,
-          PromotionBehavior.OPTIONAL_WITH_PARENT,
-          DeleteBehavior.DETACH,
-          RetentionBehavior.KEEP_HISTORY,
-          false,
-          true,
-          source,
-          "Entitlement scope depends on governed asset",
-          null,
-          edges,
-          dedupe);
-      return;
-    }
-    addEdge(
-        context.assetId(),
-        target,
-        RelationshipType.REFERENCES,
-        OwnershipType.EXTERNAL,
-        PromotionBehavior.OPTIONAL_WITH_PARENT,
-        DeleteBehavior.DETACH,
-        RetentionBehavior.KEEP_HISTORY,
-        false,
-        true,
-        source,
-        "Entitlement references non-governable target",
-        null,
-        edges,
-        dedupe);
-  }
-
-  private static RelationshipType relationshipTypeForSchemaRef(
-      DefinitionType expectedType, String targetAssetId, Map<String, AssetLifecycleNode> nodes) {
-    if (expectedType == DefinitionType.SCHEMA) {
-      return RelationshipType.DEPENDS_ON;
-    }
-    if (expectedType == DefinitionType.DATASET) {
-      return RelationshipType.DERIVED_FROM;
-    }
-    if (expectedType == DefinitionType.SERVICE
-        || expectedType == DefinitionType.STREAM
-        || expectedType == DefinitionType.CONFIG_LAYER
-        || expectedType == DefinitionType.INGEST
-        || expectedType == DefinitionType.INGEST_SOURCE) {
-      return RelationshipType.DEPENDS_ON;
-    }
-    if (isInternalAssetId(targetAssetId, nodes)) {
-      return RelationshipType.DEPENDS_ON;
-    }
-    return RelationshipType.REFERENCES;
-  }
-
-  private static boolean isGovernableTarget(
-      String assetId, DefinitionType expectedType, Map<String, AssetLifecycleNode> nodes) {
-    if (expectedType == DefinitionType.DATASET
-        || expectedType == DefinitionType.SERVICE
-        || expectedType == DefinitionType.STREAM
-        || expectedType == DefinitionType.CONFIG_LAYER
-        || expectedType == DefinitionType.INGEST) {
-      return true;
-    }
-    if (!hasText(assetId)) {
-      return false;
-    }
-    AssetLifecycleNode node = nodes.get(assetId);
-    if (node != null) {
-      return node.type() == DefinitionType.DATASET
-          || node.type() == DefinitionType.SERVICE
-          || node.type() == DefinitionType.STREAM
-          || node.type() == DefinitionType.CONFIG_LAYER
-          || node.type() == DefinitionType.INGEST;
-    }
-    return assetId.startsWith("dataset:")
-        || assetId.startsWith("service:")
-        || assetId.startsWith("stream:")
-        || assetId.startsWith("config:")
-        || assetId.startsWith("ingest:");
-  }
-
-  private static boolean isInternalAssetId(
-      String assetId, Map<String, AssetLifecycleNode> nodes) {
-    if (!hasText(assetId)) {
-      return false;
-    }
-    if (nodes.containsKey(assetId)) {
-      return true;
-    }
-    return assetId.startsWith("dataset:")
-        || assetId.startsWith("service:")
-        || assetId.startsWith("stream:")
-        || assetId.startsWith("schema:")
-        || assetId.startsWith("config:")
-        || assetId.startsWith("connection:")
-        || assetId.startsWith("ingest:")
-        || assetId.startsWith("ingest-source:")
-        || assetId.startsWith("entitlement:")
-        || assetId.startsWith("app:")
-        || assetId.startsWith("platform:")
-        || assetId.startsWith("environment:");
-  }
-
-  private static void addEdge(
-      String fromAssetId,
-      String toAssetId,
-      RelationshipType relationshipType,
-      OwnershipType ownershipType,
-      PromotionBehavior promotionBehavior,
-      DeleteBehavior deleteBehavior,
-      RetentionBehavior retentionBehavior,
-      boolean required,
-      boolean shared,
-      String source,
-      String notes,
-      String targetLocator,
-      List<AssetLifecycleEdge> edges,
-      Set<String> dedupe) {
-    if (!hasText(fromAssetId) || !hasText(toAssetId)) {
-      return;
-    }
-    AssetLifecycleEdge edge =
-        new AssetLifecycleEdge(
-            fromAssetId.trim(),
-            toAssetId.trim(),
-            relationshipType,
-            ownershipType,
-            promotionBehavior,
-            deleteBehavior,
-            retentionBehavior,
-            required,
-            shared,
-            source,
-            notes,
-            targetLocator);
-    String key =
-        edge.fromAssetId()
-            + "|"
-            + edge.toAssetId()
-            + "|"
-            + edge.relationshipType()
-            + "|"
-            + edge.promotionBehavior()
-            + "|"
-            + edge.deleteBehavior();
-    if (dedupe.add(key)) {
-      edges.add(edge);
-    }
-  }
 }
+
+
+
+
+
+
+
 
