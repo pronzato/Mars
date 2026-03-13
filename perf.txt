@@ -1,413 +1,386 @@
-package org.pronzato.fabric.api.control.entitlements.simple.services;
+package org.pronzato.fabric.api.data.manager;
 
-import java.util.LinkedHashSet;
+import com.fasterxml.jackson.databind.JsonNode;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
-import java.util.Objects;
-import java.util.Set;
-import java.util.concurrent.atomic.AtomicReference;
-import org.pronzato.fabric.api.control.entitlements.core.EntitlementsScopeType;
-import org.pronzato.fabric.api.control.entitlements.provider.EntitlementSubjectCandidates;
-import org.pronzato.fabric.api.control.entitlements.provider.EntitlementProviderSelector;
-import org.pronzato.fabric.api.control.entitlements.provider.ResolveRequest;
-import org.pronzato.fabric.api.control.entitlements.provider.SubjectContext;
-import org.pronzato.fabric.api.control.entitlements.core.services.ServiceEntitlements;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.types.DateUnit;
+import org.apache.arrow.vector.types.FloatingPointPrecision;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.Schema;
+import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngest;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionSchema;
+import org.pronzato.fabric.api.util.Strings;
 
-public final class ServiceEntitlementsSimple implements ServiceEntitlements {
-  private static final Logger LOGGER = LoggerFactory.getLogger(ServiceEntitlementsSimple.class);
-  private static final String PLATFORM_GROUP = "platform";
+final class IngestManagerImplSchema {
+  private IngestManagerImplSchema() {}
 
-  private final AtomicReference<Map<String, Set<String>>> membershipIndexRef;
-  private final AtomicReference<Map<String, ServiceEntitlementsSimpleManager.Rules>> entitlementsIndexRef;
-  private final EntitlementProviderSelector providerSelector;
-  private final boolean logDecisions;
-
-  ServiceEntitlementsSimple(
-      AtomicReference<Map<String, Set<String>>> membershipIndexRef,
-      AtomicReference<Map<String, ServiceEntitlementsSimpleManager.Rules>> entitlementsIndexRef,
-      boolean logDecisions) {
-    this(membershipIndexRef, entitlementsIndexRef, null, logDecisions);
-  }
-
-  ServiceEntitlementsSimple(
-      AtomicReference<Map<String, Set<String>>> membershipIndexRef,
-      AtomicReference<Map<String, ServiceEntitlementsSimpleManager.Rules>> entitlementsIndexRef,
-      EntitlementProviderSelector providerSelector,
-      boolean logDecisions) {
-    this.membershipIndexRef = Objects.requireNonNull(membershipIndexRef, "membershipIndexRef");
-    this.entitlementsIndexRef = Objects.requireNonNull(entitlementsIndexRef, "entitlementsIndexRef");
-    this.providerSelector = providerSelector;
-    this.logDecisions = logDecisions;
-  }
-
-  @Override
-  public Decision authorize(Identity identity, Request request) {
-    Objects.requireNonNull(identity, "identity");
-    Objects.requireNonNull(request, "request");
-    Objects.requireNonNull(request.action(), "request.action is required");
-
-    String subject = requireIdentitySubject(identity);
-    String resourceId = ServiceEntitlements.requireAssetResourceId(request.serviceResourceId());
-
-    SubjectContext subjectContext;
+  static ParsedExpectedSchema parseExpectedSchema(
+      DefinitionSchema expectedSchemaDefinition, String ingestId, String outputSchemaId) {
+    String schemaText =
+        Strings.trimToNull(expectedSchemaDefinition == null ? null : expectedSchemaDefinition.schema());
+    if (schemaText == null) {
+      throw new IllegalStateException(
+          "Expected schema payload is empty for ingest="
+              + ingestId
+              + " expectedSchema="
+              + outputSchemaId);
+    }
     try {
-      subjectContext = resolveSubjectContext(identity, request, resourceId, subject);
-    } catch (RuntimeException ex) {
-      return new Decision(false, "DENY SUBJECT_PROVIDER_UNAVAILABLE: " + safeReason(ex), null);
-    }
-
-    String resolvedSubject = subjectContext.subjectId();
-    Set<String> subjectCandidates = directSubjectCandidates(resolvedSubject);
-    Set<String> membershipCandidates = membershipSubjectCandidates(resolvedSubject);
-    String operationName = trimToNull(request.operationName());
-    Set<String> subjectGroups = subjectContext.effectiveGroups();
-    boolean platformAdmin = isPlatformAdmin(subjectGroups);
-
-    ServiceEntitlementsSimpleManager.Rules rules = entitlementsIndexRef.get().get(resourceId);
-    if (rules == null) {
-      Decision decision =
-          platformAdmin
-              ? new Decision(true, "ALLOW platform admin default (no entitlements configured)", null)
-              : new Decision(false, "ABSTAIN no entitlements for resourceId", null);
-      logPlatformAdminDefault(resourceId, operationName, resolvedSubject, decision);
-      if (isAbstain(decision)) {
-        logAbstain(
-            resourceId,
-            operationName,
-            resolvedSubject,
-            membershipCandidates,
-            null,
-            null,
-            decision.reason());
+      JsonNode root = DiscoveryCodec.mapper().readTree(schemaText);
+      JsonNode fields = root.path("fields");
+      if (!fields.isArray()) {
+        fields = root.path("columns");
       }
-      return decision;
-    }
-
-    ServiceEntitlementsSimpleManager.ActionSlot slot = actionSlot(request.action());
-    ServiceEntitlementsSimpleManager.RuleSet ruleSet = rules.forAction(slot);
-    MatchResult denyMatch =
-        match(ruleSet == null ? List.of() : ruleSet.denyBindings(), subjectCandidates, subjectGroups, operationName);
-    MatchResult allowMatch =
-        match(ruleSet == null ? List.of() : ruleSet.allowBindings(), subjectCandidates, subjectGroups, operationName);
-
-    Decision decision;
-    if (denyMatch.matched()) {
-      decision = new Decision(false, "DENY matched rules", null);
-    } else if (allowMatch.matched()) {
-      decision = new Decision(true, "ALLOW matched rules", null);
-    } else if (platformAdmin) {
-      decision = new Decision(true, "ALLOW platform admin default", null);
-    } else if (allowMatch.subjectMatched()) {
-      decision = new Decision(false, "ABSTAIN no matching policy (operation mismatch)", null);
-    } else {
-      decision = new Decision(false, "ABSTAIN no matching policy", null);
-    }
-
-    logPlatformAdminDefault(resourceId, operationName, resolvedSubject, decision);
-    if (isAbstain(decision)) {
-      logAbstain(resourceId, operationName, resolvedSubject, membershipCandidates, rules, ruleSet, decision.reason());
-    }
-
-    if (logDecisions) {
-      LOGGER.info("[Entitlements][SIMPLE] action={} resourceId={} subject={} allowed={} matched={}", request.action().name(), resourceId, resolvedSubject, decision.allowed(), !isAbstain(decision));
-    }
-    return decision;
-  }
-
-  private SubjectContext resolveSubjectContext(
-      Identity identity, Request request, String resourceId, String subject) {
-    String effectiveSubject = effectiveSubject(identity, subject);
-    if (providerSelector == null) {
-      Set<String> membershipCandidates = membershipSubjectCandidates(effectiveSubject);
-      Set<String> groups = groupsForCandidates(membershipCandidates);
-      return new SubjectContext(effectiveSubject, groups, groups, Map.of(), false);
-    }
-
-    EntitlementProviderSelector.Selection selectedProvider =
-        providerSelector.select(EntitlementsScopeType.SERVICE, resourceId);
-
-    Map<String, String> requestAttributes = new java.util.LinkedHashMap<>();
-    requestAttributes.putAll(request.metadata());
-    requestAttributes.putAll(request.bindings());
-    String operation = trimToNull(request.operationName());
-    if (operation != null) {
-      requestAttributes.put("operationName", operation);
-    }
-    return selectedProvider.provider().resolve(
-        new ResolveRequest(
-            identity.subject(),
-            identity.delegatedSubject(),
-            EntitlementsScopeType.SERVICE.name(),
-            resourceId,
-            requestAttributes));
-  }
-
-  private void logPlatformAdminDefault(
-      String resourceId, String operationName, String subject, Decision decision) {
-    if (decision == null || !decision.allowed()) {
-      return;
-    }
-    String reason = trimToNull(decision.reason());
-    if (reason == null || !reason.toUpperCase().startsWith("ALLOW PLATFORM ADMIN DEFAULT")) {
-      return;
-    }
-    LOGGER.info("[Entitlements][SIMPLE][PLATFORM_DEFAULT_ALLOW] scopeType={} scopeId={} operation={} subject={} reason={}", ServiceEntitlements.scopeType(), resourceId, operationName, subject, reason);
-  }
-
-  private void logAbstain(
-      String resourceId,
-      String operationName,
-      String subject,
-      Set<String> subjectCandidates,
-      ServiceEntitlementsSimpleManager.Rules rules,
-      ServiceEntitlementsSimpleManager.RuleSet ruleSet,
-      String reason) {
-    int policyCount = rules == null ? 0 : rules.policyCount();
-    String bindingSummary = summarizeBindings(ruleSet == null ? List.of() : ruleSet.bindingSummaries());
-    LOGGER.warn("[Entitlements][SIMPLE][ABSTAIN] scopeType={} scopeId={} operation={} subject={} subjectCandidates={} policyCount={} bindings={} reason={}", ServiceEntitlements.scopeType(), resourceId, operationName, subject, subjectCandidates, policyCount, bindingSummary, reason);
-  }
-
-  private static boolean isAbstain(Decision decision) {
-    if (decision == null || decision.allowed()) {
-      return false;
-    }
-    String reason = trimToNull(decision.reason());
-    return reason != null && reason.toUpperCase().startsWith("ABSTAIN");
-  }
-
-  public boolean isMemberOfGroup(String subject, String groupId) {
-    String normalizedSubject = trimToNull(subject);
-    String normalizedGroup = normalizeGroup(groupId);
-    if (normalizedSubject == null || normalizedGroup == null) {
-      return false;
-    }
-    Set<String> groups = groupsForCandidates(membershipSubjectCandidates(normalizedSubject));
-    if (groups.isEmpty()) {
-      return false;
-    }
-    for (String candidate : groups) {
-      if (normalizedGroup.equals(normalizeGroup(candidate))) {
-        return true;
+      if (!fields.isArray() || fields.isEmpty()) {
+        throw new IllegalStateException(
+            "Expected schema has no fields for ingest="
+                + ingestId
+                + " expectedSchema="
+                + outputSchemaId);
       }
+      List<ExpectedField> orderedFields = new ArrayList<>();
+      Map<String, ExpectedField> byName = new LinkedHashMap<>();
+      int index = 0;
+      for (JsonNode field : fields) {
+        String name = Strings.trimToNull(field.path("name").asText(null));
+        if (name == null) {
+          throw new IllegalStateException(
+              "Expected schema field name is required at index "
+                  + index
+                  + " for ingest="
+                  + ingestId
+                  + " expectedSchema="
+                  + outputSchemaId);
+        }
+        String type = expectedTypeLabel(field);
+        boolean nullable = field.path("nullable").asBoolean(true);
+        if (byName.containsKey(name)) {
+          throw new IllegalStateException(
+              "Expected schema has duplicate field name '"
+                  + name
+                  + "' for ingest="
+                  + ingestId
+                  + " expectedSchema="
+                  + outputSchemaId);
+        }
+        ExpectedField expectedField = new ExpectedField(name, type, nullable);
+        orderedFields.add(expectedField);
+        byName.put(name, expectedField);
+        index++;
+      }
+      return new ParsedExpectedSchema(List.copyOf(orderedFields), Map.copyOf(byName));
+    } catch (IOException ex) {
+      throw new IllegalStateException(
+          "Expected schema payload is not valid JSON for ingest="
+              + ingestId
+              + " expectedSchema="
+              + outputSchemaId,
+          ex);
     }
-    return false;
   }
 
-  public boolean hasRules(String resourceId) {
-    try {
-      String canonical = ServiceEntitlements.requireAssetResourceId(resourceId);
-      return entitlementsIndexRef.get().containsKey(canonical);
-    } catch (RuntimeException ex) {
-      return false;
+  static Schema readArrowSchema(
+      byte[] arrowIpcStreamBytes, String ingestId, BufferAllocator schemaIpcAllocator) {
+    if (arrowIpcStreamBytes == null || arrowIpcStreamBytes.length == 0) {
+      throw new IllegalStateException("Arrow IPC stream bytes are required for ingest=" + ingestId);
+    }
+    try (ArrowStreamReader reader =
+        new ArrowStreamReader(new ByteArrayInputStream(arrowIpcStreamBytes), schemaIpcAllocator)) {
+      Schema schema = reader.getVectorSchemaRoot().getSchema();
+      if (schema == null || schema.getFields() == null || schema.getFields().isEmpty()) {
+        throw new IllegalStateException("Arrow IPC schema is empty for ingest=" + ingestId);
+      }
+      return schema;
+    } catch (IOException | RuntimeException ex) {
+      throw new IllegalStateException(
+          "Failed to decode Arrow IPC schema for ingest=" + ingestId + ": " + ex.getMessage(), ex);
     }
   }
 
-  public Set<String> groupsForSubject(String subject) {
-    String normalizedSubject = trimToNull(subject);
-    if (normalizedSubject == null) {
-      return Set.of();
+  static SchemaComparison compareSchemas(
+      ParsedExpectedSchema expected, Schema actualSchema, DefinitionIngest.SchemaMode schemaMode) {
+    List<ActualField> actualOrdered = new ArrayList<>();
+    Map<String, ActualField> actualByName = new LinkedHashMap<>();
+    for (Field field : actualSchema.getFields()) {
+      String name = Strings.trimToNull(field == null ? null : field.getName());
+      if (name == null) {
+        throw new IllegalStateException("Arrow IPC schema contains blank field name");
+      }
+      if (actualByName.containsKey(name)) {
+        throw new IllegalStateException("Arrow IPC schema contains duplicate field name '" + name + "'");
+      }
+      ActualField actualField = new ActualField(name, actualTypeLabel(field.getType()), field.isNullable());
+      actualOrdered.add(actualField);
+      actualByName.put(name, actualField);
     }
-    return Set.copyOf(groupsForCandidates(membershipSubjectCandidates(normalizedSubject)));
-  }
 
-  private static ServiceEntitlementsSimpleManager.ActionSlot actionSlot(Action action) {
-    if (action == Action.START) {
-      return ServiceEntitlementsSimpleManager.ActionSlot.START;
-    }
-    if (action == Action.READ) {
-      return ServiceEntitlementsSimpleManager.ActionSlot.READ;
-    }
-    return ServiceEntitlementsSimpleManager.ActionSlot.INVOKE;
-  }
+    List<String> missing = new ArrayList<>();
+    List<String> extra = new ArrayList<>();
+    List<String> typeMismatches = new ArrayList<>();
+    List<String> nullabilityMismatches = new ArrayList<>();
+    List<String> appendOnlyViolations = new ArrayList<>();
+    List<String> nonNullableExtraFields = new ArrayList<>();
 
-  private static MatchResult match(
-      List<ServiceEntitlementsSimpleManager.BindingRule> bindings,
-      Set<String> subjects,
-      Set<String> groups,
-      String operationName) {
-    if (bindings == null || bindings.isEmpty()) {
-      return MatchResult.NO_MATCH;
-    }
-    boolean subjectMatched = false;
-    for (ServiceEntitlementsSimpleManager.BindingRule binding : bindings) {
-      if (binding == null || !subjectMatches(binding, subjects, groups)) {
+    for (ExpectedField expectedField : expected.orderedFields()) {
+      ActualField actualField = actualByName.get(expectedField.name());
+      if (actualField == null) {
+        missing.add(expectedField.name());
         continue;
       }
-      subjectMatched = true;
-      if (operationMatches(binding.methodsAllow(), operationName)) {
-        return MatchResult.MATCHED;
+      if (!expectedField.type().equals(actualField.type())) {
+        typeMismatches.add(
+            expectedField.name()
+                + "(expected="
+                + expectedField.type()
+                + ", actual="
+                + actualField.type()
+                + ")");
+      }
+      if (expectedField.nullable() != actualField.nullable()) {
+        nullabilityMismatches.add(
+            expectedField.name()
+                + "(expected="
+                + nullableLabel(expectedField.nullable())
+                + ", actual="
+                + nullableLabel(actualField.nullable())
+                + ")");
       }
     }
-    return subjectMatched ? MatchResult.SUBJECT_ONLY : MatchResult.NO_MATCH;
-  }
 
-  private static boolean subjectMatches(
-      ServiceEntitlementsSimpleManager.BindingRule binding,
-      Set<String> subjects,
-      Set<String> groups) {
-    if (binding.group()) {
-      if (groups == null || groups.isEmpty()) {
-        return false;
+    for (ActualField actualField : actualOrdered) {
+      if (!expected.byName().containsKey(actualField.name())) {
+        extra.add(actualField.name());
       }
-      String normalizedPolicyGroup = normalizeGroup(binding.subject());
-      if (normalizedPolicyGroup == null) {
-        return false;
-      }
-      for (String group : groups) {
-        if (normalizedPolicyGroup.equals(normalizeGroup(group))) {
-          return true;
+    }
+    if (schemaMode != DefinitionIngest.SchemaMode.STRICT) {
+      int expectedCount = expected.orderedFields().size();
+      int compared = Math.min(expectedCount, actualOrdered.size());
+      for (int i = 0; i < compared; i++) {
+        String expectedName = expected.orderedFields().get(i).name();
+        String actualName = actualOrdered.get(i).name();
+        if (!expectedName.equals(actualName)) {
+          appendOnlyViolations.add(
+              "index=" + i + "(expected=" + expectedName + ", actual=" + actualName + ")");
         }
       }
-      return false;
-    }
-    return subjects != null && subjects.contains(binding.subject());
-  }
-
-  private static boolean operationMatches(Set<String> methodsAllow, String operationName) {
-    if (methodsAllow == null || methodsAllow.isEmpty()) {
-      return true;
-    }
-    return operationName != null && methodsAllow.contains(operationName);
-  }
-
-  private Set<String> groupsForCandidates(Set<String> subjectCandidates) {
-    if (subjectCandidates == null || subjectCandidates.isEmpty()) {
-      return Set.of();
-    }
-    Map<String, Set<String>> membershipIndex = membershipIndexRef.get();
-    if (membershipIndex == null || membershipIndex.isEmpty()) {
-      return Set.of();
-    }
-    LinkedHashSet<String> groups = new LinkedHashSet<>();
-    for (String candidate : subjectCandidates) {
-      Set<String> candidateGroups = membershipIndex.get(candidate);
-      if (candidateGroups != null && !candidateGroups.isEmpty()) {
-        groups.addAll(candidateGroups);
+      for (int i = expectedCount; i < actualOrdered.size(); i++) {
+        ActualField actualField = actualOrdered.get(i);
+        if (expected.byName().containsKey(actualField.name())) {
+          appendOnlyViolations.add(
+              "index=" + i + "(expectedExtraColumn, actualExpectedField=" + actualField.name() + ")");
+          continue;
+        }
+        if (!actualField.nullable()) {
+          nonNullableExtraFields.add(actualField.name());
+        }
       }
     }
-    return groups.isEmpty() ? Set.of() : Set.copyOf(groups);
+
+    return new SchemaComparison(
+        expected.orderedFields().size(),
+        actualOrdered.size(),
+        List.copyOf(missing),
+        List.copyOf(extra),
+        List.copyOf(typeMismatches),
+        List.copyOf(nullabilityMismatches),
+        List.copyOf(appendOnlyViolations),
+        List.copyOf(nonNullableExtraFields),
+        schemaMode);
   }
 
-  private static Set<String> directSubjectCandidates(String subject) {
-    String normalized = trimToNull(subject);
-    if (normalized == null) {
-      return Set.of();
+  static String formatSchemaMismatch(
+      String ingestId,
+      DefinitionIngest.SchemaMode schemaMode,
+      String expectedSchemaId,
+      Schema actualSchema,
+      List<String> missingFields,
+      List<String> extraFields,
+      List<String> typeMismatches,
+      List<String> nullabilityMismatches,
+      List<String> appendOnlyViolations,
+      List<String> nonNullableExtraFields,
+      int expectedFieldCount,
+      int actualFieldCount) {
+    StringBuilder message = new StringBuilder();
+    message
+        .append("Ingest schema mismatch ingest=")
+        .append(ingestId)
+        .append(" mode=")
+        .append(schemaMode)
+        .append(" expectedSchema=")
+        .append(expectedSchemaId)
+        .append(" actualSchema=")
+        .append(actualSchema)
+        .append(" diff: fieldCount(expected=")
+        .append(expectedFieldCount)
+        .append(", actual=")
+        .append(actualFieldCount)
+        .append(")");
+    if (!missingFields.isEmpty()) {
+      message.append(" missingFields=").append(missingFields);
     }
-    return Set.of(normalized);
+    if (!extraFields.isEmpty()) {
+      message.append(" extraFields=").append(extraFields);
+    }
+    if (!typeMismatches.isEmpty()) {
+      message.append(" typeMismatches=").append(typeMismatches);
+    }
+    if (!nullabilityMismatches.isEmpty()) {
+      message.append(" nullabilityMismatches=").append(nullabilityMismatches);
+    }
+    if (!appendOnlyViolations.isEmpty()) {
+      message.append(" appendOnlyViolations=").append(appendOnlyViolations);
+    }
+    if (!nonNullableExtraFields.isEmpty()) {
+      message.append(" nonNullableExtraFields=").append(nonNullableExtraFields);
+    }
+    return message.toString();
   }
 
-  private static Set<String> membershipSubjectCandidates(String subject) {
-    return EntitlementSubjectCandidates.membershipSubjectCandidates(subject);
-  }
-
-  private static String normalizeGroup(String value) {
-    String normalized = trimToNull(value);
-    if (normalized == null) {
-      return null;
+  private static String expectedTypeLabel(JsonNode field) {
+    String typeToken = Strings.trimToNull(field.path("type").asText(null));
+    if (typeToken == null) {
+      throw new IllegalStateException("Expected schema field type is required");
     }
-    if (normalized.startsWith("group:") && normalized.length() > "group:".length()) {
-      return normalized.substring("group:".length());
+    String normalized = typeToken.toUpperCase(Locale.ROOT).trim();
+    if (normalized.startsWith("DECIMAL(")) {
+      return normalized.replace(" ", "");
     }
-    return normalized;
-  }
-
-  private static boolean isPlatformAdmin(Set<String> groups) {
-    if (groups == null || groups.isEmpty()) {
-      return false;
-    }
-    for (String group : groups) {
-      String normalized = normalizeGroup(group);
-      if (normalized != null && PLATFORM_GROUP.equalsIgnoreCase(normalized)) {
-        return true;
+    if ("DECIMAL".equals(normalized) || "NUMERIC".equals(normalized)) {
+      Integer precision = field.hasNonNull("precision") ? field.get("precision").asInt() : null;
+      Integer scale = field.hasNonNull("scale") ? field.get("scale").asInt() : null;
+      if (precision != null || scale != null) {
+        return "DECIMAL(" + (precision == null ? 0 : precision) + "," + (scale == null ? 0 : scale) + ")";
       }
+      return "DECIMAL";
     }
-    return false;
+    return switch (normalized) {
+      case "BOOL", "BOOLEAN" -> "BOOL";
+      case "STRING", "VARCHAR", "CHAR", "TEXT" -> "STRING";
+      case "BINARY", "BYTES", "VARBINARY" -> "BINARY";
+      case "INT8", "TINYINT" -> "INT8";
+      case "INT16", "SMALLINT" -> "INT16";
+      case "INT", "INTEGER", "INT32" -> "INT32";
+      case "BIGINT", "LONG", "INT64" -> "INT64";
+      case "UINT8" -> "UINT8";
+      case "UINT16" -> "UINT16";
+      case "UINT32" -> "UINT32";
+      case "UINT64" -> "UINT64";
+      case "FLOAT16", "HALF" -> "FLOAT16";
+      case "FLOAT", "REAL", "FLOAT32" -> "FLOAT32";
+      case "DOUBLE", "FLOAT64" -> "FLOAT64";
+      case "DATE", "DATE32" -> "DATE32";
+      case "DATE64" -> "DATE64";
+      case "TIMESTAMP" -> "TIMESTAMP";
+      case "TIME", "TIME32" -> "TIME32";
+      case "TIME64" -> "TIME64";
+      default -> normalized;
+    };
   }
 
-  private static String summarizeBindings(List<ServiceEntitlementsSimpleManager.BindingSummary> bindings) {
-    if (bindings == null || bindings.isEmpty()) {
-      return "[]";
-    }
-    StringBuilder out = new StringBuilder("[");
-    for (int i = 0; i < bindings.size(); i++) {
-      ServiceEntitlementsSimpleManager.BindingSummary binding = bindings.get(i);
-      if (i > 0) {
-        out.append(", ");
+  private static String actualTypeLabel(ArrowType type) {
+    if (type instanceof ArrowType.Int intType) {
+      int width = intType.getBitWidth();
+      boolean signed = intType.getIsSigned();
+      if (signed) {
+        return switch (width) {
+          case 8 -> "INT8";
+          case 16 -> "INT16";
+          case 32 -> "INT32";
+          case 64 -> "INT64";
+          default -> "INT" + width;
+        };
       }
-      out.append("{policyId=")
-          .append(nullToDash(binding.policyId()))
-          .append(", name=")
-          .append(nullToDash(binding.policyName()))
-          .append(", ")
-          .append(binding.group() ? "group=" : "subject=")
-          .append(nullToDash(binding.subject()))
-          .append(", methodsAllow=")
-          .append(binding.methodsAllow().isEmpty() ? "[]" : binding.methodsAllow())
-          .append("}");
+      return switch (width) {
+        case 8 -> "UINT8";
+        case 16 -> "UINT16";
+        case 32 -> "UINT32";
+        case 64 -> "UINT64";
+        default -> "UINT" + width;
+      };
     }
-    out.append(']');
-    return out.toString();
+    if (type instanceof ArrowType.FloatingPoint floatingPoint) {
+      FloatingPointPrecision precision = floatingPoint.getPrecision();
+      return switch (precision) {
+        case HALF -> "FLOAT16";
+        case SINGLE -> "FLOAT32";
+        case DOUBLE -> "FLOAT64";
+      };
+    }
+    if (type instanceof ArrowType.Decimal decimal) {
+      return "DECIMAL(" + decimal.getPrecision() + "," + decimal.getScale() + ")";
+    }
+    if (type instanceof ArrowType.Bool) {
+      return "BOOL";
+    }
+    if (type instanceof ArrowType.Utf8
+        || type instanceof ArrowType.LargeUtf8
+        || type instanceof ArrowType.Utf8View) {
+      return "STRING";
+    }
+    if (type instanceof ArrowType.Binary
+        || type instanceof ArrowType.LargeBinary
+        || type instanceof ArrowType.BinaryView
+        || type instanceof ArrowType.FixedSizeBinary) {
+      return "BINARY";
+    }
+    if (type instanceof ArrowType.Date dateType) {
+      if (dateType.getUnit() == DateUnit.MILLISECOND) {
+        return "DATE64";
+      }
+      return "DATE32";
+    }
+    if (type instanceof ArrowType.Timestamp) {
+      return "TIMESTAMP";
+    }
+    if (type instanceof ArrowType.Time timeType) {
+      return timeType.getBitWidth() <= 32 ? "TIME32" : "TIME64";
+    }
+    return type == null ? "UNKNOWN" : type.toString().toUpperCase(Locale.ROOT);
   }
 
-  private static String nullToDash(String value) {
-    return value == null ? "-" : value;
+  private static String nullableLabel(boolean nullable) {
+    return nullable ? "NULLABLE" : "NOT_NULL";
   }
 
-  private static String trimToNull(String value) {
-    if (value == null) {
-      return null;
-    }
-    String normalized = value.trim();
-    return normalized.isEmpty() ? null : normalized;
-  }
+  record ParsedExpectedSchema(List<ExpectedField> orderedFields, Map<String, ExpectedField> byName) {}
 
-  private static String safeReason(RuntimeException error) {
-    if (error == null) {
-      return "unknown";
-    }
-    String message = trimToNull(error.getMessage());
-    return message == null ? error.getClass().getSimpleName() : message;
-  }
+  private record ExpectedField(String name, String type, boolean nullable) {}
 
-  private static String requireIdentitySubject(Identity identity) {
-    String subject = identity.subject();
-    if (subject == null || subject.isBlank()) {
-      throw new IllegalArgumentException("identity.subject is required");
-    }
-    return subject;
-  }
+  private record ActualField(String name, String type, boolean nullable) {}
 
-  private static String effectiveSubject(Identity identity, String subject) {
-    if (identity.delegatedSubject() == null) {
-      return subject;
-    }
-    if (identity.delegatedSubject().isBlank()) {
-      throw new IllegalArgumentException("identity.delegatedSubject is blank");
-    }
-    return identity.delegatedSubject();
-  }
-
-  private enum MatchResult {
-    MATCHED(true, true),
-    SUBJECT_ONLY(false, true),
-    NO_MATCH(false, false);
-
-    private final boolean matched;
-    private final boolean subjectMatched;
-
-    MatchResult(boolean matched, boolean subjectMatched) {
-      this.matched = matched;
-      this.subjectMatched = subjectMatched;
-    }
-
-    private boolean matched() {
-      return matched;
-    }
-
-    private boolean subjectMatched() {
-      return subjectMatched;
+  record SchemaComparison(
+      int expectedFieldCount,
+      int actualFieldCount,
+      List<String> missingFields,
+      List<String> extraFields,
+      List<String> typeMismatches,
+      List<String> nullabilityMismatches,
+      List<String> appendOnlyViolations,
+      List<String> nonNullableExtraFields,
+      DefinitionIngest.SchemaMode schemaMode) {
+    boolean matches() {
+      if (schemaMode == DefinitionIngest.SchemaMode.STRICT) {
+        return expectedFieldCount == actualFieldCount
+            && missingFields.isEmpty()
+            && extraFields.isEmpty()
+            && typeMismatches.isEmpty()
+            && nullabilityMismatches.isEmpty();
+      }
+      return missingFields.isEmpty()
+          && typeMismatches.isEmpty()
+          && nullabilityMismatches.isEmpty()
+          && appendOnlyViolations.isEmpty()
+          && nonNullableExtraFields.isEmpty();
     }
   }
 }
