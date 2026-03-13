@@ -1,629 +1,167 @@
-package org.pronzato.fabric.api.catalog.semantics;
+package org.pronzato.fabric.api.configs.manager;
 
-import org.pronzato.fabric.api.control.discovery.definitions.common.Semantic;
-
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.NullNode;
+import java.security.MessageDigest;
 import java.util.ArrayList;
-import java.util.EnumMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import org.pronzato.fabric.api.control.discovery.definitions.Definition;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfig;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfigLayer;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngest;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngestSource;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionSchema;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionService;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStream;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
+import org.pronzato.fabric.api.configs.audit.ConfigEvent;
+import org.pronzato.fabric.api.configs.audit.ConfigPublisher;
 import org.pronzato.fabric.api.util.Strings;
+import org.slf4j.Logger;
 
-public final class SemanticCompletenessAuditor {
-  private SemanticCompletenessAuditor() {}
+final class ConfigManagerImplAudit {
+  private ConfigManagerImplAudit() {}
 
-  public record AuditInput(String source, Definition definition) {}
-
-  public static SemanticAuditReport auditDefinitions(
-      Iterable<Definition> definitions, SemanticValidationPolicy policy) {
-    List<AuditInput> inputs = new ArrayList<>();
-    if (definitions != null) {
-      int index = 0;
-      for (Definition definition : definitions) {
-        inputs.add(new AuditInput("definition#" + index, definition));
-        index++;
-      }
-    }
-    return auditAssets(inputs, policy);
-  }
-
-  public static SemanticAuditReport auditAssets(
-      Iterable<AuditInput> inputs, SemanticValidationPolicy policy) {
-    SemanticValidationPolicy effectivePolicy =
-        policy == null ? SemanticValidationPolicy.fromTier("dev") : policy;
-    List<SemanticAssetAudit> assets = new ArrayList<>();
-    Map<String, Integer> countsByType = new LinkedHashMap<>();
-    Map<SemanticFindingSeverity, Integer> countsBySeverity =
-        new EnumMap<>(SemanticFindingSeverity.class);
-    countsBySeverity.put(SemanticFindingSeverity.ERROR, 0);
-    countsBySeverity.put(SemanticFindingSeverity.WARN, 0);
-    countsBySeverity.put(SemanticFindingSeverity.INFO, 0);
-
-    int placeholderFindings = 0;
-    int totalFindings = 0;
-    int totalScore = 0;
-    boolean enforcementFailed = false;
-
-    List<AuditInput> normalizedInputs = new ArrayList<>();
-    if (inputs != null) {
-      for (AuditInput input : inputs) {
-        if (input != null && input.definition() != null) {
-          normalizedInputs.add(input);
-        }
-      }
-    }
-    Map<String, Semantic> configSemanticByKey = indexConfigSemantic(normalizedInputs);
-
-    for (AuditInput input : normalizedInputs) {
-      if (input == null || input.definition() == null) {
-        continue;
-      }
-        Definition definition = input.definition();
-        String definitionType = targetedDefinitionType(definition);
-        if (definitionType == null) {
-          continue;
-        }
-        countsByType.merge(definitionType, 1, Integer::sum);
-        SemanticAssetAudit assetAudit =
-            auditAsset(
-                input.source(),
-                definitionType,
-                definition,
-                configSemanticByKey,
-                effectivePolicy);
-        assets.add(assetAudit);
-        totalScore += assetAudit.score();
-
-        for (SemanticAuditFinding finding : assetAudit.findings()) {
-          countsBySeverity.merge(finding.severity(), 1, Integer::sum);
-          totalFindings++;
-          if (finding.placeholder()) {
-            placeholderFindings++;
-          }
-        }
-        if (effectivePolicy.enforcePlaceholderRejection()
-            && assetAudit.findings().stream().anyMatch(finding -> finding.severity() == SemanticFindingSeverity.ERROR)) {
-          enforcementFailed = true;
-        }
-    }
-
-    double completenessPercentage = assets.isEmpty() ? 100.0 : (double) totalScore / assets.size();
-    SemanticAuditSummary summary =
-        new SemanticAuditSummary(
-            assets.size(),
-            Map.copyOf(countsByType),
-            Map.copyOf(countsBySeverity),
-            placeholderFindings,
-            totalFindings,
-            roundToTwoDecimals(completenessPercentage));
-    return new SemanticAuditReport(effectivePolicy, summary, enforcementFailed, List.copyOf(assets));
-  }
-
-  private static SemanticAssetAudit auditAsset(
-      String source,
-      String definitionType,
-      Definition definition,
-      Map<String, Semantic> configSemanticByKey,
-      SemanticValidationPolicy policy) {
-    Semantic semantic = semantic(definition, configSemanticByKey);
-    String assetId = assetId(definitionType, definition);
-    List<SemanticAuditFinding> findings = new ArrayList<>();
-
-    if (semantic == null) {
-      findings.add(
-          new SemanticAuditFinding(
-              "SEM_REQUIRED_METADATA",
-              SemanticFindingSeverity.ERROR,
-              "semantic",
-              "semantic metadata is missing",
-              false));
-      return finalizeAssetAudit(source, assetId, definitionType, findings);
-    }
-
-    validateGlobalRequired(findings, semantic);
-    validateGlobalPlaceholders(findings, semantic, policy);
-    validateTypeSpecific(findings, definitionType, semantic);
-
-    return finalizeAssetAudit(source, assetId, definitionType, findings);
-  }
-
-  private static SemanticAssetAudit finalizeAssetAudit(
-      String source, String assetId, String definitionType, List<SemanticAuditFinding> findings) {
-    int score = calculateScore(findings);
-    int placeholderCount = 0;
-    for (SemanticAuditFinding finding : findings) {
-      if (finding.placeholder()) {
-        placeholderCount++;
-      }
-    }
-    SemanticCompletenessClass classification = classify(score, placeholderCount);
-    return new SemanticAssetAudit(
-        Strings.firstNonBlank(Strings.trimToNull(source), assetId),
-        assetId,
-        definitionType,
-        score,
-        classification,
-        placeholderCount,
-        List.copyOf(findings));
-  }
-
-  private static void validateGlobalRequired(List<SemanticAuditFinding> findings, Semantic semantic) {
-    requireText(findings, "SEM_REQUIRED_TITLE", "semantic.title", semantic.title());
-    requireText(findings, "SEM_REQUIRED_DESCRIPTION", "semantic.description", semantic.description());
-    requireText(findings, "SEM_REQUIRED_BUSINESS_MEANING", "semantic.businessMeaning", semantic.businessMeaning());
-    requireText(findings, "SEM_REQUIRED_DOMAIN", "semantic.domain", semantic.domain());
-    requireNonEmptyList(findings, "SEM_REQUIRED_TAGS", "semantic.tags", semantic.tags());
-
-    if (semantic.ownership() == null) {
-      findings.add(
-          new SemanticAuditFinding(
-              "SEM_REQUIRED_OWNERSHIP",
-              SemanticFindingSeverity.ERROR,
-              "semantic.ownership",
-              "semantic.ownership is required",
-              false));
-    } else {
-      requireText(findings, "SEM_REQUIRED_OWNER_ID", "semantic.ownership.ownerId", semantic.ownership().ownerId());
-    }
-
-    if (semantic.dataShape() == null || semantic.dataShape().type() == null) {
-      findings.add(
-          new SemanticAuditFinding(
-              "SEM_REQUIRED_DATASHAPE_TYPE",
-              SemanticFindingSeverity.ERROR,
-              "semantic.dataShape.type",
-              "semantic.dataShape.type is required",
-              false));
-    }
-    if (semantic.trust() == null || semantic.trust().certification() == null) {
-      findings.add(
-          new SemanticAuditFinding(
-              "SEM_REQUIRED_TRUST_CERTIFICATION",
-              SemanticFindingSeverity.ERROR,
-              "semantic.trust.certification",
-              "semantic.trust.certification is required",
-              false));
-    }
-    if (semantic.trust() == null || semantic.trust().qualityStatus() == null) {
-      findings.add(
-          new SemanticAuditFinding(
-              "SEM_REQUIRED_TRUST_QUALITY",
-              SemanticFindingSeverity.ERROR,
-              "semantic.trust.qualityStatus",
-              "semantic.trust.qualityStatus is required",
-              false));
-    }
-    if (semantic.toolHints() == null || semantic.toolHints().actionClass() == null) {
-      findings.add(
-          new SemanticAuditFinding(
-              "SEM_REQUIRED_ACTION_CLASS",
-              SemanticFindingSeverity.ERROR,
-              "semantic.toolHints.actionClass",
-              "semantic.toolHints.actionClass is required",
-              false));
-    }
-  }
-
-  private static void validateGlobalPlaceholders(
-      List<SemanticAuditFinding> findings, Semantic semantic, SemanticValidationPolicy policy) {
-    addPlaceholderIf(
-        findings,
-        policy,
-        "SEM_PLACEHOLDER_TITLE",
-        "semantic.title",
-        SemanticMetadataValidator.isPlaceholderText(semantic.title()));
-    addPlaceholderIf(
-        findings,
-        policy,
-        "SEM_PLACEHOLDER_DESCRIPTION",
-        "semantic.description",
-        SemanticMetadataValidator.isPlaceholderText(semantic.description()));
-    addPlaceholderIf(
-        findings,
-        policy,
-        "SEM_PLACEHOLDER_BUSINESS_MEANING",
-        "semantic.businessMeaning",
-        SemanticMetadataValidator.isPlaceholderText(semantic.businessMeaning()));
-    addPlaceholderIf(
-        findings,
-        policy,
-        "SEM_PLACEHOLDER_DOMAIN_DEFAULT",
-        "semantic.domain",
-        SemanticMetadataValidator.isDefaultDomain(semantic.domain()));
-    addPlaceholderIf(
-        findings,
-        policy,
-        "SEM_PLACEHOLDER_TAGS_DEFAULT",
-        "semantic.tags",
-        SemanticMetadataValidator.containsDefaultTag(semantic.tags()));
-    addPlaceholderIf(
-        findings,
-        policy,
-        "SEM_PLACEHOLDER_OWNER_DEFAULT",
-        "semantic.ownership.ownerId",
-        semantic.ownership() != null && SemanticMetadataValidator.isDefaultOwnerId(semantic.ownership().ownerId()));
-    addPlaceholderIf(
-        findings,
-        policy,
-        "SEM_PLACEHOLDER_TRUST_CERT_NONE",
-        "semantic.trust.certification",
-        semantic.trust() != null && semantic.trust().certification() == Semantic.Certification.NONE);
-    addPlaceholderIf(
-        findings,
-        policy,
-        "SEM_PLACEHOLDER_TRUST_QUALITY_UNKNOWN",
-        "semantic.trust.qualityStatus",
-        semantic.trust() != null && semantic.trust().qualityStatus() == Semantic.QualityStatus.UNKNOWN);
-    addPlaceholderIf(
-        findings,
-        policy,
-        "SEM_PLACEHOLDER_GRAIN",
-        "semantic.dataShape.grain",
-        semantic.dataShape() != null && SemanticMetadataValidator.isPlaceholderText(semantic.dataShape().grain()));
-    addPlaceholderIf(
-        findings,
-        policy,
-        "SEM_PLACEHOLDER_USAGE",
-        "semantic.usage",
-        hasPlaceholderUsage(semantic));
-  }
-
-  private static void validateTypeSpecific(
-      List<SemanticAuditFinding> findings, String definitionType, Semantic semantic) {
-    if ("DATASET".equals(definitionType) || "STREAM".equals(definitionType) || "SCHEMA".equals(definitionType)) {
-      if (semantic.dataShape() == null || isBlank(semantic.dataShape().grain())) {
-        findings.add(
-            new SemanticAuditFinding(
-                "SEM_WEAK_GRAIN",
-                SemanticFindingSeverity.WARN,
-                "semantic.dataShape.grain",
-                "grain should be explicitly defined",
-                false));
-      }
-      if (semantic.dataShape() == null || semantic.dataShape().keyFields().isEmpty()) {
-        findings.add(
-            new SemanticAuditFinding(
-                "SEM_WEAK_KEYS",
-                SemanticFindingSeverity.WARN,
-                "semantic.dataShape.keyFields",
-                "keyFields should include business keys",
-                false));
-      }
-      if (!hasSemanticFieldRichness(semantic)) {
-        findings.add(
-            new SemanticAuditFinding(
-                "SEM_WEAK_FIELD_RICHNESS",
-                SemanticFindingSeverity.WARN,
-                "semantic.dataShape",
-                "add dimension/measure/time fields or fieldRoles for better semantic coverage",
-                false));
-      }
-      if (!hasUsefulUsage(semantic)) {
-        findings.add(
-            new SemanticAuditFinding(
-                "SEM_WEAK_USAGE",
-                SemanticFindingSeverity.WARN,
-                "semantic.usage",
-                "add at least one useful example question or usage hint",
-                false));
-      }
-      return;
-    }
-
-    if ("CONFIG".equals(definitionType)) {
-      if (!hasUsefulUsage(semantic)) {
-        findings.add(
-            new SemanticAuditFinding(
-                "SEM_WEAK_CONFIG_USAGE",
-                SemanticFindingSeverity.WARN,
-                "semantic.usage",
-                "add at least one useful example question or usage hint for config semantics",
-                false));
-      }
-      return;
-    }
-
-    if ("SERVICE".equals(definitionType)) {
-      if (semantic.toolHints() == null || semantic.toolHints().readOnly() == null) {
-        findings.add(
-            new SemanticAuditFinding(
-                "SEM_REQUIRED_SERVICE_READ_ONLY",
-                SemanticFindingSeverity.ERROR,
-                "semantic.toolHints.readOnly",
-                "service semantic toolHints.readOnly is required",
-                false));
-      }
-      if (semantic.toolHints() == null || semantic.toolHints().idempotent() == null) {
-        findings.add(
-            new SemanticAuditFinding(
-                "SEM_REQUIRED_SERVICE_IDEMPOTENT",
-                SemanticFindingSeverity.ERROR,
-                "semantic.toolHints.idempotent",
-                "service semantic toolHints.idempotent is required",
-                false));
-      }
-      if (!hasUsefulUsage(semantic)) {
-        findings.add(
-            new SemanticAuditFinding(
-                "SEM_WEAK_SERVICE_USAGE",
-                SemanticFindingSeverity.WARN,
-                "semantic.usage",
-                "add at least one useful service example question or usage hint",
-                false));
-      }
-      return;
-    }
-
-    if ("INGEST".equals(definitionType) || "INGEST_SOURCE".equals(definitionType)) {
-      if (!hasUsefulUsage(semantic)) {
-        findings.add(
-            new SemanticAuditFinding(
-                "SEM_WEAK_INGEST_USAGE",
-                SemanticFindingSeverity.WARN,
-                "semantic.usage",
-                "add at least one useful usage hint for ingest operations",
-                false));
-      }
-    }
-  }
-
-  private static boolean hasSemanticFieldRichness(Semantic semantic) {
-    if (semantic == null || semantic.dataShape() == null) {
-      return false;
-    }
-    return !semantic.dataShape().dimensionFields().isEmpty()
-        || !semantic.dataShape().measureFields().isEmpty()
-        || !semantic.dataShape().timeFields().isEmpty()
-        || !semantic.dataShape().fieldRoles().isEmpty();
-  }
-
-  private static boolean hasUsefulUsage(Semantic semantic) {
-    if (semantic == null || semantic.usage() == null) {
-      return false;
-    }
-    return hasNonPlaceholderText(semantic.usage().exampleQuestions())
-        || hasNonPlaceholderText(semantic.usage().usageHints());
-  }
-
-  private static boolean hasNonPlaceholderText(List<String> values) {
-    if (values == null || values.isEmpty()) {
-      return false;
-    }
-    for (String value : values) {
-      String normalized = Strings.trimToNull(value);
-      if (normalized != null && !SemanticMetadataValidator.isPlaceholderText(normalized)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private static boolean hasPlaceholderUsage(Semantic semantic) {
-    if (semantic == null || semantic.usage() == null) {
-      return false;
-    }
-    return listHasPlaceholder(semantic.usage().exampleQuestions())
-        || listHasPlaceholder(semantic.usage().exampleQueries())
-        || listHasPlaceholder(semantic.usage().usageHints())
-        || listHasPlaceholder(semantic.usage().knownPitfalls());
-  }
-
-  private static boolean listHasPlaceholder(List<String> values) {
-    if (values == null || values.isEmpty()) {
-      return false;
-    }
-    for (String value : values) {
-      if (SemanticMetadataValidator.isPlaceholderText(value)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private static void addPlaceholderIf(
-      List<SemanticAuditFinding> findings,
-      SemanticValidationPolicy policy,
-      String code,
-      String field,
-      boolean condition) {
-    if (!condition) {
-      return;
-    }
-    findings.add(
-        new SemanticAuditFinding(
-            code,
-            policy.placeholderSeverity(),
-            field,
-            "placeholder/default semantic value detected: " + field,
-            true));
-  }
-
-  private static void requireText(
-      List<SemanticAuditFinding> findings, String code, String field, String value) {
-    if (isBlank(value)) {
-      findings.add(
-          new SemanticAuditFinding(
-              code,
-              SemanticFindingSeverity.ERROR,
-              field,
-              field + " is required",
-              false));
-    }
-  }
-
-  private static void requireNonEmptyList(
-      List<SemanticAuditFinding> findings, String code, String field, List<String> values) {
-    if (values == null || values.isEmpty()) {
-      findings.add(
-          new SemanticAuditFinding(
-              code,
-              SemanticFindingSeverity.ERROR,
-              field,
-              field + " must be non-empty",
-              false));
-    }
-  }
-
-  private static int calculateScore(List<SemanticAuditFinding> findings) {
-    int deductions = 0;
-    for (SemanticAuditFinding finding : findings) {
-      if (finding.severity() == SemanticFindingSeverity.ERROR) {
-        deductions += 20;
-      } else if (finding.severity() == SemanticFindingSeverity.WARN) {
-        deductions += 8;
-      } else if (finding.severity() == SemanticFindingSeverity.INFO) {
-        deductions += 2;
-      }
-    }
-    return Math.max(0, 100 - deductions);
-  }
-
-  private static SemanticCompletenessClass classify(int score, int placeholderCount) {
-    if (placeholderCount > 0) {
-      return SemanticCompletenessClass.PLACEHOLDER;
-    }
-    if (score >= 90) {
-      return SemanticCompletenessClass.STRONG;
-    }
-    if (score >= 75) {
-      return SemanticCompletenessClass.COMPLETE;
-    }
-    return SemanticCompletenessClass.WEAK;
-  }
-
-  private static String targetedDefinitionType(Definition definition) {
-    if (definition instanceof DefinitionDataset) {
-      return "DATASET";
-    }
-    if (definition instanceof DefinitionService) {
-      return "SERVICE";
-    }
-    if (definition instanceof DefinitionStream) {
-      return "STREAM";
-    }
-    if (definition instanceof DefinitionIngest) {
-      return "INGEST";
-    }
-    if (definition instanceof DefinitionIngestSource) {
-      return "INGEST_SOURCE";
-    }
-    if (definition instanceof DefinitionSchema) {
-      return "SCHEMA";
-    }
-    if (definition instanceof DefinitionConfigLayer) {
-      return "CONFIG";
-    }
-    return null;
-  }
-
-  private static Semantic semantic(
-      Definition definition, Map<String, Semantic> configSemanticByKey) {
-    if (definition instanceof DefinitionDataset dataset) {
-      return dataset.semantic();
-    }
-    if (definition instanceof DefinitionService service) {
-      return service.semantic();
-    }
-    if (definition instanceof DefinitionStream stream) {
-      return stream.semantic();
-    }
-    if (definition instanceof DefinitionIngest ingest) {
-      return ingest.semantic();
-    }
-    if (definition instanceof DefinitionIngestSource ingestSource) {
-      return ingestSource.semantic();
-    }
-    if (definition instanceof DefinitionSchema schema) {
-      return schema.semantic();
-    }
-    if (definition instanceof DefinitionConfigLayer config) {
-      String group =
-          Strings.trimToNull(
-              config == null || config.envelope() == null ? null : config.envelope().group());
-      String configSetId = normalizeConfigSetId(config == null ? null : config.configId());
-      if (group != null && configSetId != null && configSemanticByKey != null) {
-        Semantic fromMeta = configSemanticByKey.get(configSemanticKey(group, configSetId));
-        if (fromMeta != null) {
-          return fromMeta;
-        }
-      }
-      return null;
-    }
-    return null;
-  }
-
-  private static Map<String, Semantic> indexConfigSemantic(List<AuditInput> inputs) {
-    if (inputs == null || inputs.isEmpty()) {
-      return Map.of();
-    }
-    LinkedHashMap<String, Semantic> indexed = new LinkedHashMap<>();
-    for (AuditInput input : inputs) {
-      Definition definition = input == null ? null : input.definition();
-      if (!(definition instanceof DefinitionConfig configMeta)
-          || configMeta.semantic() == null) {
-        continue;
-      }
-      String group =
-          Strings.firstNonBlank(
-              Strings.trimToNull(configMeta.envelope() == null ? null : configMeta.envelope().group()),
-              Strings.trimToNull(configMeta.group()));
-      String configSetId = normalizeConfigSetId(configMeta.configId());
-      if (group == null || configSetId == null) {
-        continue;
-      }
-      indexed.put(configSemanticKey(group, configSetId), configMeta.semantic());
-    }
-    return indexed.isEmpty() ? Map.of() : Map.copyOf(indexed);
-  }
-
-  private static String configSemanticKey(String group, String configSetId) {
-    return group + "|" + configSetId;
-  }
-
-  private static String normalizeConfigSetId(String value) {
-    String normalized = Strings.trimToNull(value);
-    if (normalized == null) {
-      return null;
-    }
-    if (!normalized.startsWith("config:")) {
+  static String resolveAuditSessionId(String sessionId, String callerAppName, String callerAppInstance) {
+    String normalized = Strings.trimToNull(sessionId);
+    if (normalized != null) {
       return normalized;
     }
-    String payload = normalized.substring("config:".length());
-    String[] parts = payload.split("/");
-    if (parts.length < 2) {
+    String app = Strings.firstNonBlank(Strings.trimToNull(callerAppName), "unknown-app");
+    String instance = Strings.firstNonBlank(Strings.trimToNull(callerAppInstance), "default");
+    return "app:" + app + "|" + instance + "|" + UUID.randomUUID();
+  }
+
+  static String resolveDelegatedUser(Map<String, Object> attributes) {
+    if (attributes == null || attributes.isEmpty()) {
       return null;
     }
-    return Strings.trimToNull(parts[1]);
+    return Strings.firstNonBlank(
+        asString(attributes.get("delegatedUser")),
+        asString(attributes.get("delegatedUserSubject")));
   }
 
-  private static String assetId(String definitionType, Definition definition) {
-    String group =
-        Strings.firstNonBlank(
-            definition == null || definition.envelope() == null ? null : definition.envelope().group(),
-            "unknown");
-    String name =
-        Strings.firstNonBlank(
-            definition == null || definition.envelope() == null ? null : definition.envelope().name(),
-            "unknown");
-    return definitionType.toLowerCase(Locale.ROOT) + ":" + group + "/" + name;
+  static String nextAuditRequestId(AtomicLong auditRequestSequence, String sessionId) {
+    long value = auditRequestSequence.incrementAndGet();
+    String prefix = Strings.firstNonBlank(sessionId, "config-audit");
+    return prefix + ":" + value;
   }
 
-  private static boolean isBlank(String value) {
-    return Strings.trimToNull(value) == null;
+  static void publishAudit(ConfigPublisher auditPublisher, Logger logger, ConfigEvent event) {
+    try {
+      auditPublisher.publish(event);
+    } catch (Exception ex) {
+      logger.debug(
+          "[ConfigUsageAudit] publish ignored eventType={} message={}",
+          event == null || event.envelope() == null ? null : event.envelope().eventType(),
+          ex.toString());
+    }
   }
 
-  private static double roundToTwoDecimals(double value) {
-    return Math.round(value * 100.0d) / 100.0d;
+  static String hashJson(ObjectMapper hashMapper, JsonNode node) {
+    try {
+      JsonNode canonical = canonicalize(hashMapper, node);
+      byte[] payload = hashMapper.writeValueAsBytes(canonical);
+      MessageDigest digest = MessageDigest.getInstance("SHA-256");
+      return hex(digest.digest(payload));
+    } catch (Exception ex) {
+      throw new IllegalStateException("failed to hash config payload", ex);
+    }
+  }
+
+  static JsonNode redactSensitiveAuditPayload(ObjectMapper mapper, JsonNode payload) {
+    if (payload == null || payload.isNull() || payload.isMissingNode()) {
+      return payload;
+    }
+    if (payload.isObject()) {
+      com.fasterxml.jackson.databind.node.ObjectNode object = mapper.createObjectNode();
+      payload
+          .fields()
+          .forEachRemaining(
+              entry -> {
+                String key = entry == null ? null : entry.getKey();
+                JsonNode value = entry == null ? null : entry.getValue();
+                if (isSensitiveAuditField(key)) {
+                  object.put(Strings.firstNonBlank(Strings.trimToNull(key), "field"), "<redacted>");
+                } else {
+                  object.set(
+                      Strings.firstNonBlank(Strings.trimToNull(key), "field"),
+                      redactSensitiveAuditPayload(mapper, value));
+                }
+              });
+      return object;
+    }
+    if (payload.isArray()) {
+      com.fasterxml.jackson.databind.node.ArrayNode array = mapper.createArrayNode();
+      for (JsonNode child : payload) {
+        array.add(redactSensitiveAuditPayload(mapper, child));
+      }
+      return array;
+    }
+    return payload.deepCopy();
+  }
+
+  static JsonNode resolvedPayloadAsJsonNode(ObjectMapper mapper, Object payload) {
+    if (payload == null) {
+      return NullNode.getInstance();
+    }
+    if (payload instanceof JsonNode node) {
+      return node;
+    }
+    return mapper.valueToTree(payload);
+  }
+
+  private static JsonNode canonicalize(ObjectMapper hashMapper, JsonNode node) {
+    if (node == null || node.isMissingNode()) {
+      return hashMapper.nullNode();
+    }
+    if (node.isObject()) {
+      com.fasterxml.jackson.databind.node.ObjectNode sorted = hashMapper.createObjectNode();
+      List<String> keys = new ArrayList<>();
+      node.fieldNames().forEachRemaining(keys::add);
+      keys.sort(String::compareTo);
+      for (String key : keys) {
+        sorted.set(key, canonicalize(hashMapper, node.get(key)));
+      }
+      return sorted;
+    }
+    if (node.isArray()) {
+      com.fasterxml.jackson.databind.node.ArrayNode array = hashMapper.createArrayNode();
+      for (JsonNode child : node) {
+        array.add(canonicalize(hashMapper, child));
+      }
+      return array;
+    }
+    return node.deepCopy();
+  }
+
+  private static String hex(byte[] bytes) {
+    if (bytes == null || bytes.length == 0) {
+      return "";
+    }
+    StringBuilder out = new StringBuilder(bytes.length * 2);
+    for (byte value : bytes) {
+      out.append(String.format("%02x", value & 0xff));
+    }
+    return out.toString();
+  }
+
+  private static boolean isSensitiveAuditField(String key) {
+    String normalized = Strings.trimToNull(key);
+    if (normalized == null) {
+      return false;
+    }
+    normalized = normalized.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]", "");
+    return normalized.contains("apikey")
+        || normalized.contains("accesskey")
+        || normalized.contains("secret")
+        || normalized.contains("token")
+        || normalized.contains("password")
+        || normalized.contains("credential")
+        || normalized.contains("privatekey")
+        || normalized.contains("passwd");
+  }
+
+  private static String asString(Object value) {
+    if (value == null) {
+      return null;
+    }
+    return Strings.trimToNull(String.valueOf(value));
   }
 }
-
