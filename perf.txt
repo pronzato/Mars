@@ -1,522 +1,502 @@
-package org.pronzato.fabric.api.services.flight.streaming;
+package org.pronzato.fabric.api.data.manager;
 
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
+import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
-import java.nio.ByteBuffer;
+import java.util.Locale;
 import java.util.Objects;
-import java.util.OptionalLong;
-import java.util.UUID;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.TimeUnit;
+import java.util.Optional;
+import java.util.Set;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConnection;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngest;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngestSource;
 import org.pronzato.fabric.api.data.dataset.DatasetId;
-import org.pronzato.fabric.api.data.manager.DuckdbActiveChangeLog;
-import org.pronzato.fabric.api.data.manager.RowManagerImpl;
-import org.pronzato.fabric.api.data.duckdb.DuckdbNotifier;
+import org.pronzato.fabric.api.data.dataset.DatasetResolver;
+import org.pronzato.fabric.api.data.entitlements.NamespaceEntitlementDefaults;
+import org.pronzato.fabric.api.data.ingest.model.IngestModel;
+import org.pronzato.fabric.api.data.ingest.model.IngestTargetDuckDbActiveModel;
+import org.pronzato.fabric.api.data.ingest.model.IngestTargetModel;
+import org.pronzato.fabric.api.data.ingest.model.IngestTargetParquetModel;
+import org.pronzato.fabric.api.schemas.SchemaCompatibility;
+import org.pronzato.fabric.api.schemas.SchemaModel;
+import org.pronzato.fabric.api.schemas.SchemaType;
 import org.pronzato.fabric.api.util.Strings;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
-public final class DatasetStreamHub {
-  private static final Logger LOGGER = LoggerFactory.getLogger(DatasetStreamHub.class);
-  private static final int SUBSCRIBER_QUEUE_CAPACITY = 32;
-  private static final int CHANGE_READ_LIMIT = 1024;
-  private static final long IDLE_STOP_MILLIS = 2_000L;
-  private static final long AWAIT_MAX_MILLIS = 1_000L;
+final class IngestManagerImplDataset {
+  private IngestManagerImplDataset() {}
 
-  private final DatasetId datasetId;
-  private final String accessMode;
-  private final List<String> primaryKeyColumns;
-  private final RowManagerImpl rowManager;
-  private final DuckdbNotifier changeNotifier;
-  private final ArrowBatchPublisher batchPublisher;
-  private final DatasetStreamHubRegistry registry;
-  private final Object lock = new Object();
-  private final LinkedHashMap<String, SubscriberState> subscribers = new LinkedHashMap<>();
-
-  private volatile Thread producerThread;
-  private volatile boolean closed;
-  private volatile boolean stopRequested;
-  private volatile RuntimeException fatalFailure;
-  private volatile long lastActivityMillis = System.currentTimeMillis();
-
-  private long knownSeq;
-  private String publicFilterSql;
-  private int publicBatchMaxRows;
-  private int publicFlushMillis;
-  private long publicCursorSeq;
-  private long publicPendingMaxSeq;
-  private long publicDeadlineMillis;
-  private final LinkedHashSet<String> publicPendingKeys = new LinkedHashSet<>();
-
-  public DatasetStreamHub(
-      DatasetId datasetId,
-      String accessMode,
-      List<String> primaryKeyColumns,
-      RowManagerImpl rowManager,
-      DuckdbNotifier changeNotifier,
-      ArrowBatchPublisher batchPublisher,
-      DatasetStreamHubRegistry registry) {
-    this.datasetId = Objects.requireNonNull(datasetId, "datasetId");
-    this.accessMode = normalizeAccessMode(accessMode);
-    this.primaryKeyColumns = List.copyOf(Objects.requireNonNull(primaryKeyColumns, "primaryKeyColumns"));
-    this.rowManager = Objects.requireNonNull(rowManager, "rowManager");
-    this.changeNotifier = Objects.requireNonNull(changeNotifier, "changeNotifier");
-    this.batchPublisher = Objects.requireNonNull(batchPublisher, "batchPublisher");
-    this.registry = Objects.requireNonNull(registry, "registry");
-    this.knownSeq = Math.max(0L, rowManager.duckDbActiveChangeMaxSeq(datasetId));
+  static void register(IngestManagerImpl manager, IngestModel model) {
+    IngestModel normalized = Objects.requireNonNull(model, "model");
+    if (normalized.target() == null) {
+      throw new IllegalArgumentException("ingest target is required");
+    }
+    String ingestName = Strings.requireNonBlank(normalized.name(), "model.name");
+    IngestManagerImplAppend.flushPendingParquetBuffer(manager, ingestName, "register-update");
+    applyRuntimeParquetRollPolicyFromModel(manager, ingestName, normalized.target());
+    String namespace = Strings.requireNonBlank(normalized.namespace(), "model.namespace");
+    SchemaModel schema = Objects.requireNonNull(normalized.schema(), "model.schema");
+    validateTargetSchemaReferences(ingestName, normalized.target(), schema);
+    IngestManagerImpl.ActiveTableDescriptor activeDescriptor = null;
+    if (normalized.target() instanceof IngestTargetDuckDbActiveModel duckDbActiveTarget) {
+      activeDescriptor = buildActiveTableDescriptor(manager, ingestName, schema, duckDbActiveTarget);
+    }
+    String schemaName = manager.modelMapper.deterministicSchemaName(manager.group, namespace, ingestName);
+    SchemaModel schemaToRegister =
+        schema.toBuilder()
+            .withName(schemaName)
+            .withType(SchemaType.TABULAR)
+            .withCompatibility(
+                schema.getCompatibility() == null
+                    ? SchemaCompatibility.BACKWARDS
+                    : schema.getCompatibility())
+            .build();
+    manager.schemaManager.register(schemaName, SchemaType.TABULAR, schemaToRegister);
+    DefinitionIngest ingestDefinition =
+        manager.modelMapper.toDefinition(normalized, manager.group, IngestManagerImpl.DEFAULT_ACTOR, schemaName);
+    DefinitionIngestSource sourceDefinition =
+        manager.modelMapper.toDefinition(
+            Objects.requireNonNull(normalized.source(), "model.source"),
+            manager.group,
+            IngestManagerImpl.DEFAULT_ACTOR);
+    String parquetUriOverride = inferParquetUri(manager, normalized, normalized.target());
+    DefinitionDataset datasetDefinition =
+        manager.modelMapper.toDefinitionDataset(
+            normalized, manager.group, IngestManagerImpl.DEFAULT_ACTOR, parquetUriOverride);
+    try (org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache.ConfigCacheTx tx =
+        manager.DiscoveryCache.beginTx("ingest:" + manager.group + "/" + ingestName)) {
+      if (datasetDefinition != null) {
+        manager.DiscoveryCache.upsertTx(tx, datasetDefinition);
+        NamespaceEntitlementDefaults.ensureDefaultNamespaceAccess(
+            manager.DiscoveryCache, tx, datasetDefinition, IngestManagerImpl.DEFAULT_ACTOR);
+      }
+      manager.DiscoveryCache.upsertTx(tx, ingestDefinition);
+      manager.DiscoveryCache.upsertTx(tx, sourceDefinition);
+      manager.DiscoveryCache.commitTx(tx);
+    }
+    if (activeDescriptor != null) {
+      manager.activeTableDescriptors.put(ingestName, activeDescriptor);
+    } else {
+      manager.activeTableDescriptors.remove(ingestName);
+    }
   }
 
-  public SubscriberHandle addSubscriber(StreamSubscriptionContext context) {
-    Objects.requireNonNull(context, "context");
-    if (!datasetId.equals(context.datasetId())) {
-      throw new IllegalArgumentException("Hub dataset mismatch: " + context.datasetId());
+  static void deleteDatasetDefinition(IngestManagerImpl manager, String datasetId) {
+    DatasetId parsed = DatasetId.parse(Strings.requireNonBlank(datasetId, "datasetId"));
+    org.pronzato.fabric.api.control.discovery.lifecycle.DeleteResult result =
+        manager.deleteManager.delete(
+            parsed.toString(),
+            new org.pronzato.fabric.api.control.discovery.lifecycle.DeleteOptions(
+                false, false, false, false, false, false, true, false, List.of()));
+    if (result.outcome() == org.pronzato.fabric.api.control.discovery.lifecycle.DeleteOutcome.BLOCKED) {
+      throw new IllegalStateException(
+          "Delete blocked for dataset definition " + parsed + ": " + result.blockers());
     }
-    if (!accessMode.equals(context.accessMode())) {
+    if (result.outcome() == org.pronzato.fabric.api.control.discovery.lifecycle.DeleteOutcome.PARTIAL) {
+      throw new IllegalStateException(
+          "Delete partially completed for dataset definition " + parsed + ": " + result.warnings());
+    }
+  }
+
+  static void applyRuntimeParquetRollPolicyFromModel(
+      IngestManagerImpl manager, String ingestName, IngestTargetModel target) {
+    if (!(target instanceof IngestTargetParquetModel parquetTarget)) {
+      manager.parquetRollPolicies.remove(ingestName);
+      return;
+    }
+    Integer maxRowsPerFile = parquetTarget.maxRowsPerFile();
+    Long maxIdleMillis = parquetTarget.maxIdleMillis();
+    if (maxRowsPerFile == null && maxIdleMillis == null) {
+      return;
+    }
+    IngestManagerImpl.ParquetRollPolicy policy =
+        new IngestManagerImpl.ParquetRollPolicy(
+            IngestManagerImpl.resolveMaxRowsPerFile(maxRowsPerFile),
+            IngestManagerImpl.resolveMaxIdleMillis(maxIdleMillis));
+    manager.parquetRollPolicies.put(ingestName, policy);
+  }
+
+  static String inferParquetUri(IngestManagerImpl manager, IngestModel model, IngestTargetModel target) {
+    if (!(target instanceof IngestTargetParquetModel parquet)) {
+      return null;
+    }
+    String parquetPath = Strings.trimToNull(parquet.parquetPath());
+    String connectionName = Strings.trimToNull(parquet.connectionName());
+    if (connectionName == null) {
+      return Strings.requireNonBlank(parquetPath, "target.parquet.parquetPath");
+    }
+    if (parquetPath != null) {
       throw new IllegalArgumentException(
-          "STREAM_ACCESS_MODE_MISMATCH dataset="
-              + datasetId
-              + " expected="
-              + accessMode
-              + " requested="
-              + context.accessMode());
+          "target.parquet.parquetPath is not supported when target.parquet.connectionName is set; "
+              + "managed S3 path is derived as /fabric/data/{group}/{datasetName}");
     }
-    synchronized (lock) {
-      if (closed) {
-        throw new IllegalStateException("Dataset stream hub is closed for " + datasetId);
-      }
-      if (fatalFailure != null) {
-        throw fatalFailure;
-      }
-      String token = "sub-" + UUID.randomUUID();
-      long startingSeq = resolveStartingSeqLocked(context);
-      SubscriberState state =
-          new SubscriberState(
-              token,
-              context,
-              new ArrayBlockingQueue<>(SUBSCRIBER_QUEUE_CAPACITY),
-              Math.max(0L, startingSeq));
-      if (context.isPublic()) {
-        configurePublicContractLocked(context);
-      }
-      subscribers.put(token, state);
-      stopRequested = false;
-      lastActivityMillis = System.currentTimeMillis();
-      startProducerLocked();
-      return new SubscriberHandle(this, token, state.queue, state.lastSeq);
-    }
-  }
-
-  public void removeSubscriber(String token) {
-    if (Strings.trimToNull(token) == null) {
-      return;
-    }
-    synchronized (lock) {
-      SubscriberState removed = subscribers.remove(token);
-      if (removed == null) {
-        return;
-      }
-      removed.closed = true;
-      removed.queue.offer(Delivery.terminal(removed.lastSeq));
-      if (subscribers.isEmpty()) {
-        stopRequested = true;
-        lastActivityMillis = System.currentTimeMillis();
-      }
-    }
-  }
-
-  public boolean isIdle() {
-    synchronized (lock) {
-      return subscribers.isEmpty() && (producerThread == null || !producerThread.isAlive());
-    }
-  }
-
-  public void close() {
-    Thread thread;
-    synchronized (lock) {
-      closed = true;
-      stopRequested = true;
-      thread = producerThread;
-      for (SubscriberState state : subscribers.values()) {
-        state.closed = true;
-        state.queue.offer(Delivery.terminal(state.lastSeq));
-      }
-      subscribers.clear();
-    }
-    if (thread != null) {
-      thread.interrupt();
-    }
-  }
-
-  private long resolveStartingSeqLocked(StreamSubscriptionContext context) {
-    if (context.isPublic() && !subscribers.isEmpty()) {
-      return publicCursorSeq;
-    }
-    return context.startingSeq();
-  }
-
-  private void configurePublicContractLocked(StreamSubscriptionContext context) {
-    if (subscribers.isEmpty()) {
-      publicFilterSql = context.filterSql();
-      publicBatchMaxRows = context.batchMaxRows();
-      publicFlushMillis = context.flushMillis();
-      publicCursorSeq = context.startingSeq();
-      publicPendingMaxSeq = publicCursorSeq;
-      publicDeadlineMillis = 0L;
-      publicPendingKeys.clear();
-      return;
-    }
-    if (!Objects.equals(publicFilterSql, context.filterSql())
-        || publicBatchMaxRows != context.batchMaxRows()
-        || publicFlushMillis != context.flushMillis()) {
+    DatasetId datasetId =
+        manager.modelMapper.resolveDatasetId(
+            manager.group,
+            Strings.requireNonBlank(model == null ? null : model.namespace(), "model.namespace"),
+            Objects.requireNonNull(model, "model"));
+    parquetPath = datasetId.name();
+    IngestManagerImpl.S3PathRoot root = resolveS3PathRoot(manager, connectionName);
+    String normalizedClientPath = normalizeS3ClientPath(parquetPath);
+    String resolvedClientPath = stripManagedS3Prefix(manager, normalizedClientPath);
+    if (Strings.trimToNull(resolvedClientPath) == null) {
       throw new IllegalArgumentException(
-          "PUBLIC_STREAM_OPTIONS_MISMATCH dataset="
-              + datasetId
-              + " expected(batchMaxRows="
-              + publicBatchMaxRows
-              + ", flushMillis="
-              + publicFlushMillis
-              + ", filterSql="
-              + Strings.firstNonBlank(publicFilterSql, "<none>")
-              + ")");
+          "target.parquet.parquetPath must include a dataset path after managed prefix "
+              + managedS3Prefix(manager));
     }
+    String prefix = joinPath(managedS3Prefix(manager), resolvedClientPath);
+    return "s3://" + root.bucket() + (prefix == null ? "" : "/" + prefix);
   }
 
-  private void startProducerLocked() {
-    if (producerThread != null && producerThread.isAlive()) {
-      return;
+  static IngestManagerImpl.S3PathRoot resolveS3PathRoot(IngestManagerImpl manager, String connectionName) {
+    String normalizedName = Strings.requireNonBlank(connectionName, "target.parquet.connectionName");
+    DefinitionConnection connection = resolveConnection(manager, normalizedName);
+    if (connection.connectionType() != DefinitionConnection.ConnectionType.S3) {
+      throw new IllegalArgumentException(
+          "Connection '" + normalizedName + "' is not S3 (type=" + connection.connectionType() + ")");
     }
-    Thread thread =
-        Thread.ofPlatform()
-            .daemon()
-            .name("flight-stream-hub-" + datasetId.toString().replace(':', '_').replace('/', '_'))
-            .start(this::runProducerLoop);
-    producerThread = thread;
+    DefinitionConnection.S3 s3 = connection.s3();
+    String bucket = Strings.trimToNull(s3 == null ? null : s3.bucket());
+    String basePrefix = Strings.trimToNull(s3 == null ? null : s3.basePrefix());
+    if (bucket != null) {
+      return new IngestManagerImpl.S3PathRoot(bucket, basePrefix);
+    }
+    String physicalRef =
+        connection.client() == null ? null : Strings.trimToNull(connection.client().physicalRef());
+    if (physicalRef != null) {
+      IngestManagerImpl.ScopedConnectionRef ref = parseScopedConnectionRef(physicalRef);
+      DefinitionConnection physicalConnection = resolveConnection(manager, ref.group(), ref.name());
+      if (physicalConnection.connectionType() != DefinitionConnection.ConnectionType.S3
+          || physicalConnection.s3() == null) {
+        throw new IllegalArgumentException(
+            "Connection '" + normalizedName + "' physicalRef is not an S3 connection: " + physicalRef);
+      }
+      String fallbackBucket = Strings.trimToNull(physicalConnection.s3().bucket());
+      String fallbackPrefix = Strings.trimToNull(physicalConnection.s3().basePrefix());
+      return new IngestManagerImpl.S3PathRoot(
+          Strings.requireNonBlank(fallbackBucket, "s3.bucket"),
+          Strings.firstNonBlank(basePrefix, fallbackPrefix));
+    }
+    throw new IllegalArgumentException(
+        "Connection '" + normalizedName + "' is missing S3 bucket information");
   }
 
-  private void runProducerLoop() {
+  static DefinitionConnection resolveConnection(IngestManagerImpl manager, String connectionName) {
+    Optional<DefinitionConnection> inGroup =
+        manager.DiscoveryCache.get(DefinitionConnection.class, manager.group, connectionName);
+    if (inGroup.isPresent()) {
+      return inGroup.get();
+    }
+    return manager.DiscoveryCache
+        .get(DefinitionConnection.class, IngestManagerImpl.PLATFORM_GROUP, connectionName)
+        .orElseThrow(
+            () ->
+                new IllegalArgumentException(
+                    "Connection '"
+                        + manager.group
+                        + "/"
+                        + connectionName
+                        + "' or '"
+                        + IngestManagerImpl.PLATFORM_GROUP
+                        + "/"
+                        + connectionName
+                        + "' was not found"));
+  }
+
+  static DefinitionConnection resolveConnection(
+      IngestManagerImpl manager, String groupName, String connectionName) {
+    return manager.DiscoveryCache
+        .get(DefinitionConnection.class, groupName, connectionName)
+        .orElseThrow(
+            () ->
+                new IllegalArgumentException(
+                    "Connection '" + groupName + "/" + connectionName + "' was not found"));
+  }
+
+  static IngestManagerImpl.ScopedConnectionRef parseScopedConnectionRef(String scopedRef) {
+    String normalized = Strings.requireNonBlank(scopedRef, "connection client.physicalRef");
+    int slash = normalized.indexOf('/');
+    if (slash < 0) {
+      return new IngestManagerImpl.ScopedConnectionRef(IngestManagerImpl.PLATFORM_GROUP, normalized);
+    }
+    if (slash == 0 || slash == normalized.length() - 1) {
+      throw new IllegalArgumentException("Invalid connection reference: " + normalized);
+    }
+    return new IngestManagerImpl.ScopedConnectionRef(
+        normalized.substring(0, slash), normalized.substring(slash + 1));
+  }
+
+  static String normalizeS3ClientPath(String parquetPath) {
+    String normalized = Strings.requireNonBlank(parquetPath, "target.parquet.parquetPath");
+    if (normalized.regionMatches(true, 0, "s3://", 0, 5)) {
+      throw new IllegalArgumentException("target.parquet.parquetPath must be relative, not an s3:// URI");
+    }
+    String candidate = normalized.replace('\\', '/');
+    while (candidate.startsWith("/")) {
+      candidate = candidate.substring(1);
+    }
+    String[] segments = candidate.split("/");
+    List<String> sanitized = new ArrayList<>(segments.length);
+    for (String segment : segments) {
+      String trimmed = Strings.trimToNull(segment);
+      if (trimmed == null) {
+        continue;
+      }
+      if (".".equals(trimmed) || "..".equals(trimmed)) {
+        throw new IllegalArgumentException(
+            "target.parquet.parquetPath contains unsupported segment: " + trimmed);
+      }
+      if (trimmed.indexOf(':') >= 0) {
+        throw new IllegalArgumentException("target.parquet.parquetPath must not contain ':' segments");
+      }
+      sanitized.add(trimmed);
+    }
+    if (sanitized.isEmpty()) {
+      throw new IllegalArgumentException(
+          "target.parquet.parquetPath must include at least one path segment");
+    }
+    return String.join("/", sanitized);
+  }
+
+  static String stripManagedS3Prefix(IngestManagerImpl manager, String parquetPath) {
+    String normalized = normalizePathToken(parquetPath);
+    if (normalized == null) {
+      return null;
+    }
+    String managed = managedS3Prefix(manager);
+    if (startsWithPathPrefixIgnoreCase(normalized, managed)) {
+      return trimLeadingPathSeparator(normalized.substring(managed.length()));
+    }
+    String groupOnly = normalizedGroupToken(manager);
+    if (startsWithPathPrefixIgnoreCase(normalized, groupOnly)) {
+      return trimLeadingPathSeparator(normalized.substring(groupOnly.length()));
+    }
+    return normalized;
+  }
+
+  static String toClientVisibleS3Path(
+      IngestManagerImpl manager, String parquetPath, String connectionName) {
+    String connection = Strings.trimToNull(connectionName);
+    String value = Strings.trimToNull(parquetPath);
+    if (connection == null || value == null) {
+      return parquetPath;
+    }
+    String normalized = value;
+    if (normalized.regionMatches(true, 0, "s3://", 0, 5)) {
+      String withoutScheme = normalized.substring(5);
+      int slash = withoutScheme.indexOf('/');
+      if (slash >= 0 && slash + 1 < withoutScheme.length()) {
+        normalized = withoutScheme.substring(slash + 1);
+      } else {
+        return parquetPath;
+      }
+    } else if (normalized.contains("://")) {
+      return parquetPath;
+    }
+    String trimmed = stripManagedS3Prefix(manager, normalized);
+    return Strings.trimToNull(trimmed) == null ? parquetPath : trimmed;
+  }
+
+  static String managedS3Prefix(IngestManagerImpl manager) {
+    return joinPath(IngestManagerImpl.S3_MANAGED_ROOT, normalizedGroupToken(manager));
+  }
+
+  static String normalizedGroupToken(IngestManagerImpl manager) {
+    return Strings.requireNonBlank(manager.group, "session group").toLowerCase(Locale.ROOT);
+  }
+
+  static boolean startsWithPathPrefixIgnoreCase(String path, String prefix) {
+    String normalizedPath = normalizePathToken(path);
+    String normalizedPrefix = normalizePathToken(prefix);
+    if (normalizedPath == null || normalizedPrefix == null) {
+      return false;
+    }
+    if (normalizedPath.equalsIgnoreCase(normalizedPrefix)) {
+      return true;
+    }
+    return normalizedPath.length() > normalizedPrefix.length()
+        && normalizedPath.regionMatches(true, 0, normalizedPrefix, 0, normalizedPrefix.length())
+        && normalizedPath.charAt(normalizedPrefix.length()) == '/';
+  }
+
+  static String normalizePathToken(String value) {
+    String normalized = Strings.trimToNull(value);
+    if (normalized == null) {
+      return null;
+    }
+    String candidate = normalized.replace('\\', '/');
+    while (candidate.startsWith("/")) {
+      candidate = candidate.substring(1);
+    }
+    while (candidate.endsWith("/")) {
+      candidate = candidate.substring(0, candidate.length() - 1);
+    }
+    return Strings.trimToNull(candidate);
+  }
+
+  static String trimLeadingPathSeparator(String value) {
+    String normalized = Strings.trimToNull(value);
+    if (normalized == null) {
+      return null;
+    }
+    String out = normalized;
+    while (out.startsWith("/")) {
+      out = out.substring(1);
+    }
+    return Strings.trimToNull(out);
+  }
+
+  static String joinPath(String... parts) {
+    List<String> normalized = new ArrayList<>();
+    for (String part : parts) {
+      String trimmed = Strings.trimToNull(part);
+      if (trimmed == null) {
+        continue;
+      }
+      String candidate = trimmed.replace('\\', '/');
+      while (candidate.startsWith("/")) {
+        candidate = candidate.substring(1);
+      }
+      while (candidate.endsWith("/")) {
+        candidate = candidate.substring(0, candidate.length() - 1);
+      }
+      String normalizedPart = Strings.trimToNull(candidate);
+      if (normalizedPart != null) {
+        normalized.add(normalizedPart);
+      }
+    }
+    return normalized.isEmpty() ? null : String.join("/", normalized);
+  }
+
+  static DefinitionIngest resolveIngestDefinition(IngestManagerImpl manager, String ingestName) {
+    Optional<DefinitionIngest> definition =
+        manager.DiscoveryCache.get(DefinitionIngest.class, manager.group, ingestName);
+    if (definition.isEmpty()) {
+      throw new IllegalArgumentException("Unknown ingest: " + manager.group + "/" + ingestName);
+    }
+    return definition.get();
+  }
+
+  static SchemaModel resolveSchemaModel(IngestManagerImpl manager, DefinitionIngest ingest) {
+    Objects.requireNonNull(ingest, "ingest");
+    String schemaName = Strings.requireNonBlank(ingest.outputSchemaId(), "ingest.outputSchemaId");
+    String ingestName =
+        Strings.requireNonBlank(
+            ingest.envelope() == null ? null : ingest.envelope().name(), "ingest.envelope.name");
+    return manager.schemaManager
+        .get(manager.group, schemaName)
+        .orElseThrow(
+            () ->
+                new IllegalStateException(
+                    "Schema not found for ingest="
+                        + manager.group
+                        + "/"
+                        + ingestName
+                        + " schema="
+                        + schemaName));
+  }
+
+  static DefinitionDataset resolveDatasetDefinition(
+      IngestManagerImpl manager, String datasetCanonicalId) {
+    String datasetIdText = Strings.trimToNull(datasetCanonicalId);
+    if (datasetIdText == null) {
+      return null;
+    }
+    DatasetId datasetId;
     try {
-      while (!Thread.currentThread().isInterrupted()) {
-        if (closed) {
-          return;
-        }
-        List<SubscriberState> snapshot = snapshotSubscribers();
-        if (snapshot.isEmpty()) {
-          if (stopRequested) {
-            return;
-          }
-          if (System.currentTimeMillis() - lastActivityMillis >= IDLE_STOP_MILLIS) {
-            return;
-          }
-          awaitWithoutChanges();
+      datasetId = DatasetId.parse(datasetIdText);
+    } catch (RuntimeException ex) {
+      return null;
+    }
+    try {
+      return new DatasetResolver(manager.DiscoveryCache).resolveDefinition(datasetId);
+    } catch (RuntimeException ex) {
+      return null;
+    }
+  }
+
+  static void prepareActiveDataset(
+      IngestManagerImpl manager, DefinitionIngest ingestDefinition, DatasetId datasetId) {
+    if (!(manager.rowManager instanceof RowManagerImpl localDataManager)) {
+      return;
+    }
+    DefinitionDataset dataset = resolveDatasetDefinition(manager, ingestDefinition.datasetId());
+    if (dataset == null || dataset.binding() == null || dataset.binding().duckdb() == null) {
+      return;
+    }
+    String targetType = Strings.trimToNull(dataset.binding().duckdb().targetType());
+    if (!"DUCKDB_ACTIVE".equalsIgnoreCase(Strings.firstNonBlank(targetType, ""))) {
+      return;
+    }
+    localDataManager.prepareDuckDbActive(datasetId);
+  }
+
+  static IngestManagerImpl.ActiveTableDescriptor buildActiveTableDescriptor(
+      IngestManagerImpl manager,
+      String ingestName,
+      SchemaModel schema,
+      IngestTargetDuckDbActiveModel target) {
+    String tableName = Strings.requireNonBlank(target.tableName(), "target.duckdbActive.tableName");
+    List<String> primaryKey = target.primaryKey();
+    if (primaryKey == null || primaryKey.isEmpty()) {
+      throw new IllegalArgumentException("target.duckdbActive.primaryKey is required");
+    }
+    List<String> schemaFields =
+        schema.getFields() == null
+            ? List.of()
+            : schema.getFields().stream()
+                .map(SchemaModel.Field::getName)
+                .filter(Objects::nonNull)
+                .toList();
+    for (String key : primaryKey) {
+      if (!schemaFields.contains(key)) {
+        throw new IllegalArgumentException(
+            "target.duckdbActive.primaryKey contains unknown field '"
+                + key
+                + "' for ingest "
+                + ingestName);
+      }
+    }
+    return new IngestManagerImpl.ActiveTableDescriptor(
+        ingestName,
+        tableName,
+        List.copyOf(primaryKey),
+        target.memory(),
+        target.databasePath(),
+        target.parquetHistoryPath(),
+        target.persistOnStop(),
+        target.createIfMissing(),
+        schemaFields);
+  }
+
+  static void validateTargetSchemaReferences(
+      String ingestName, IngestTargetModel target, SchemaModel schema) {
+    if (!(target instanceof IngestTargetParquetModel parquetTarget)) {
+      return;
+    }
+    String partitionValueField = Strings.trimToNull(parquetTarget.partitionValueField());
+    if (partitionValueField == null) {
+      return;
+    }
+    Set<String> schemaFields = new HashSet<>();
+    if (schema.getFields() != null) {
+      for (SchemaModel.Field field : schema.getFields()) {
+        if (field == null) {
           continue;
         }
-        if ("PUBLIC".equals(accessMode)) {
-          producePublic(snapshot);
-        } else {
-          producePrivate(snapshot);
+        String fieldName = Strings.trimToNull(field.getName());
+        if (fieldName == null) {
+          continue;
         }
-      }
-    } catch (RuntimeException ex) {
-      fatalFailure = ex;
-      LOGGER.warn("[FlightStreamHub][fatal] dataset={} mode={} message={}", datasetId, accessMode, ex.getMessage(), ex);
-      failAllSubscribers(ex);
-    } finally {
-      synchronized (lock) {
-        producerThread = null;
-      }
-      registry.evict(datasetId, this);
-    }
-  }
-
-  private void producePublic(List<SubscriberState> snapshot) {
-    long now = System.currentTimeMillis();
-    long timeout = publicAwaitTimeout(now);
-    awaitForNextKnownSeq(publicCursorSeq, timeout);
-    if (publicCursorSeq < knownSeq) {
-      List<DuckdbActiveChangeLog.ChangeEvent> changes = readChangesAfter(publicCursorSeq);
-      if (!changes.isEmpty()) {
-        for (DuckdbActiveChangeLog.ChangeEvent change : changes) {
-          if (change.seq() <= publicCursorSeq) {
-            continue;
-          }
-          if (publicPendingKeys.add(change.pk()) && publicPendingKeys.size() == 1) {
-            publicDeadlineMillis = now + Math.max(1L, publicFlushMillis);
-          }
-          publicPendingMaxSeq = Math.max(publicPendingMaxSeq, change.seq());
-          if (publicPendingKeys.size() >= publicBatchMaxRows) {
-            flushPublic(snapshot);
-          }
-        }
+        schemaFields.add(fieldName.toLowerCase(Locale.ROOT));
       }
     }
-    if (!publicPendingKeys.isEmpty() && System.currentTimeMillis() >= publicDeadlineMillis) {
-      flushPublic(snapshot);
-    }
-  }
-
-  private void producePrivate(List<SubscriberState> snapshot) {
-    long minSeq = minSubscriberSeq(snapshot);
-    long now = System.currentTimeMillis();
-    long timeout = privateAwaitTimeout(snapshot, now);
-    awaitForNextKnownSeq(minSeq, timeout);
-    if (minSeq < knownSeq) {
-      List<DuckdbActiveChangeLog.ChangeEvent> changes = readChangesAfter(minSeq);
-      if (!changes.isEmpty()) {
-        for (DuckdbActiveChangeLog.ChangeEvent change : changes) {
-          for (SubscriberState state : snapshot) {
-            if (state.closed || change.seq() <= state.lastSeq) {
-              continue;
-            }
-            if (state.pendingKeys.add(change.pk()) && state.pendingKeys.size() == 1) {
-              state.deadlineMillis = System.currentTimeMillis() + Math.max(1L, state.context.flushMillis());
-            }
-            state.pendingMaxSeq = Math.max(state.pendingMaxSeq, change.seq());
-            if (state.pendingKeys.size() >= state.context.batchMaxRows()) {
-              flushPrivate(state);
-            }
-          }
-        }
-      }
-    }
-    now = System.currentTimeMillis();
-    for (SubscriberState state : snapshot) {
-      if (!state.pendingKeys.isEmpty() && now >= state.deadlineMillis) {
-        flushPrivate(state);
-      }
-    }
-  }
-
-  private long publicAwaitTimeout(long now) {
-    if (publicPendingKeys.isEmpty()) {
-      return AWAIT_MAX_MILLIS;
-    }
-    return Math.max(1L, Math.min(AWAIT_MAX_MILLIS, publicDeadlineMillis - now));
-  }
-
-  private long privateAwaitTimeout(List<SubscriberState> states, long now) {
-    long deadline = Long.MAX_VALUE;
-    for (SubscriberState state : states) {
-      if (state.pendingKeys.isEmpty()) {
-        continue;
-      }
-      deadline = Math.min(deadline, state.deadlineMillis);
-    }
-    if (deadline == Long.MAX_VALUE) {
-      return AWAIT_MAX_MILLIS;
-    }
-    return Math.max(1L, Math.min(AWAIT_MAX_MILLIS, deadline - now));
-  }
-
-  private long minSubscriberSeq(List<SubscriberState> states) {
-    long min = Long.MAX_VALUE;
-    for (SubscriberState state : states) {
-      min = Math.min(min, state.lastSeq);
-    }
-    return min == Long.MAX_VALUE ? 0L : min;
-  }
-
-  private void awaitWithoutChanges() {
-    awaitForNextKnownSeq(knownSeq, Math.min(250L, AWAIT_MAX_MILLIS));
-  }
-
-  private void awaitForNextKnownSeq(long afterSeq, long timeoutMillis) {
-    OptionalLong nextSeq =
-        changeNotifier.awaitNextSeq(
-            datasetId.toString(),
-            Math.max(0L, afterSeq),
-            Math.max(1L, timeoutMillis),
-            () -> Thread.currentThread().isInterrupted() || closed || stopRequested);
-    if (nextSeq.isPresent()) {
-      knownSeq = Math.max(knownSeq, nextSeq.getAsLong());
-    }
-  }
-
-  private List<DuckdbActiveChangeLog.ChangeEvent> readChangesAfter(long afterSeq) {
-    List<DuckdbActiveChangeLog.ChangeEvent> changes =
-        rowManager.readDuckDbActiveChanges(datasetId, Math.max(0L, afterSeq), CHANGE_READ_LIMIT);
-    if (!changes.isEmpty()) {
-      knownSeq = Math.max(knownSeq, changes.get(changes.size() - 1).seq());
-      return changes;
-    }
-    knownSeq = Math.max(knownSeq, rowManager.duckDbActiveChangeMaxSeq(datasetId));
-    return List.of();
-  }
-
-  private void flushPublic(List<SubscriberState> snapshot) {
-    if (publicPendingKeys.isEmpty()) {
-      return;
-    }
-    List<String> keys = List.copyOf(publicPendingKeys);
-    long seq = publicPendingMaxSeq;
-    ByteBuffer ipc =
-        batchPublisher.buildBatchIpc(
-            new StreamSubscriptionContext(
-                datasetId,
-                "PUBLIC",
-                null,
-                snapshot.isEmpty() ? null : snapshot.get(0).context.callerAppSubject(),
-                snapshot.isEmpty() ? null : snapshot.get(0).context.requestMetadata(),
-                snapshot.isEmpty() ? "default" : snapshot.get(0).context.subscriptionId(),
-                snapshot.isEmpty() ? null : snapshot.get(0).context.startMode(),
-                publicCursorSeq,
-                publicBatchMaxRows,
-                publicFlushMillis,
-                publicFilterSql,
-                null),
-            primaryKeyColumns,
-            keys);
-    Delivery delivery = Delivery.data(seq, ipc);
-    for (SubscriberState state : snapshot) {
-      if (state.closed) {
-        continue;
-      }
-      enqueuePublic(state, delivery);
-      state.lastSeq = Math.max(state.lastSeq, seq);
-    }
-    publicCursorSeq = Math.max(publicCursorSeq, seq);
-    publicPendingKeys.clear();
-    publicPendingMaxSeq = publicCursorSeq;
-    publicDeadlineMillis = 0L;
-  }
-
-  private void flushPrivate(SubscriberState state) {
-    if (state.closed || state.pendingKeys.isEmpty()) {
-      return;
-    }
-    List<String> keys = List.copyOf(state.pendingKeys);
-    long seq = state.pendingMaxSeq;
-    ByteBuffer ipc = batchPublisher.buildBatchIpc(state.context, primaryKeyColumns, keys);
-    enqueuePrivate(state, Delivery.data(seq, ipc));
-    state.lastSeq = Math.max(state.lastSeq, seq);
-    state.pendingKeys.clear();
-    state.pendingMaxSeq = state.lastSeq;
-    state.deadlineMillis = 0L;
-  }
-
-  private void enqueuePublic(SubscriberState state, Delivery delivery) {
-    if (state.queue.offer(delivery)) {
-      return;
-    }
-    state.queue.poll();
-    state.queue.offer(delivery);
-  }
-
-  private void enqueuePrivate(SubscriberState state, Delivery delivery) {
-    try {
-      while (!state.closed && !closed && !Thread.currentThread().isInterrupted()) {
-        if (stopRequested) {
-          return;
-        }
-        if (state.queue.offer(delivery, 100L, TimeUnit.MILLISECONDS)) {
-          return;
-        }
-      }
-    } catch (InterruptedException ex) {
-      Thread.currentThread().interrupt();
-      return;
-    }
-  }
-
-  private void failAllSubscribers(RuntimeException failure) {
-    synchronized (lock) {
-      for (SubscriberState state : subscribers.values()) {
-        state.closed = true;
-        state.queue.offer(Delivery.failure(state.lastSeq, failure));
-      }
-      subscribers.clear();
-      lastActivityMillis = System.currentTimeMillis();
-    }
-  }
-
-  private List<SubscriberState> snapshotSubscribers() {
-    synchronized (lock) {
-      if (subscribers.isEmpty()) {
-        return List.of();
-      }
-      return new ArrayList<>(subscribers.values());
-    }
-  }
-
-  private static String normalizeAccessMode(String value) {
-    String normalized = Strings.trimToNull(value);
-    if (normalized == null || "PRIVATE".equalsIgnoreCase(normalized)) {
-      return "PRIVATE";
-    }
-    if ("PUBLIC".equalsIgnoreCase(normalized)) {
-      return "PUBLIC";
-    }
-    throw new IllegalArgumentException("accessMode must be PUBLIC or PRIVATE");
-  }
-
-  public static final class SubscriberHandle implements AutoCloseable {
-    private final DatasetStreamHub hub;
-    private final String token;
-    private final BlockingQueue<Delivery> queue;
-    private final long startSeq;
-    private volatile boolean closed;
-
-    private SubscriberHandle(
-        DatasetStreamHub hub, String token, BlockingQueue<Delivery> queue, long startSeq) {
-      this.hub = hub;
-      this.token = token;
-      this.queue = queue;
-      this.startSeq = startSeq;
-    }
-
-    public Delivery poll(long timeoutMillis) throws InterruptedException {
-      return queue.poll(Math.max(1L, timeoutMillis), TimeUnit.MILLISECONDS);
-    }
-
-    public long startSeq() {
-      return startSeq;
-    }
-
-    @Override
-    public void close() {
-      if (closed) {
-        return;
-      }
-      closed = true;
-      hub.removeSubscriber(token);
-    }
-  }
-
-  public record Delivery(long lastSeq, ByteBuffer ipc, RuntimeException failure, boolean terminal) {
-    static Delivery data(long lastSeq, ByteBuffer ipc) {
-      return new Delivery(lastSeq, ipc, null, false);
-    }
-
-    static Delivery failure(long lastSeq, RuntimeException failure) {
-      return new Delivery(lastSeq, null, failure, true);
-    }
-
-    static Delivery terminal(long lastSeq) {
-      return new Delivery(lastSeq, null, null, true);
-    }
-  }
-
-  private static final class SubscriberState {
-    private final String token;
-    private final StreamSubscriptionContext context;
-    private final BlockingQueue<Delivery> queue;
-    private long lastSeq;
-    private long pendingMaxSeq;
-    private long deadlineMillis;
-    private boolean closed;
-    private final LinkedHashSet<String> pendingKeys = new LinkedHashSet<>();
-
-    private SubscriberState(
-        String token, StreamSubscriptionContext context, BlockingQueue<Delivery> queue, long startSeq) {
-      this.token = token;
-      this.context = context;
-      this.queue = queue;
-      this.lastSeq = Math.max(0L, startSeq);
-      this.pendingMaxSeq = this.lastSeq;
+    if (!schemaFields.contains(partitionValueField.toLowerCase(Locale.ROOT))) {
+      throw new IllegalArgumentException(
+          "target.parquet.partitionValueField contains unknown field '"
+              + partitionValueField
+              + "' for ingest "
+              + ingestName);
     }
   }
 }
-
