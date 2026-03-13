@@ -1,794 +1,763 @@
-package org.pronzato.fabric.api.schemas.manager;
+package org.pronzato.fabric.api.services.manager;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.SerializationFeature;
-import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
-import java.nio.charset.StandardCharsets;
-import java.time.Instant;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.Iterator;
+import io.grpc.BindableService;
+import io.grpc.ManagedChannel;
+import io.opentelemetry.api.common.Attributes;
+import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Locale;
-import java.util.regex.Pattern;
+import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.Set;
-import java.util.TreeSet;
-import java.util.function.Supplier;
-import org.pronzato.fabric.api.connections.ConnectionManager;
-import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
-import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
-import org.pronzato.fabric.api.control.discovery.DeleteManager;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngest;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngestSource;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionSchema;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
-import org.pronzato.fabric.api.control.discovery.lifecycle.DeleteOutcome;
-import org.pronzato.fabric.api.control.discovery.lifecycle.DeleteResult;
-import org.pronzato.fabric.api.data.ingest.model.IngestFormat;
-import org.pronzato.fabric.api.data.schema.FormatSampler;
-import org.pronzato.fabric.api.data.schema.FormatSamplerJson;
-import org.pronzato.fabric.api.data.schema.FormatSamplerNvFix;
-import org.pronzato.fabric.api.data.schema.FormatSamplerOptions;
-import org.pronzato.fabric.api.data.schema.PayloadSample;
-import org.pronzato.fabric.api.data.schema.SampleSource;
-import org.pronzato.fabric.api.data.schema.SchemaInference;
-import org.pronzato.fabric.api.data.schema.client.InferredField;
-import org.pronzato.fabric.api.data.schema.client.SchemaSampleDiagnostics;
-import org.pronzato.fabric.api.data.schema.client.SchemaSampleOptions;
-import org.pronzato.fabric.api.data.schema.client.SchemaSampleResult;
-import org.pronzato.fabric.api.data.schema.FormatSampler.FormatSamplerResult;
-import org.pronzato.fabric.api.data.schema.sources.amps.SampleSourceAmps;
-import org.pronzato.fabric.api.schemas.SchemaManager;
-import org.pronzato.fabric.api.schemas.SchemaModel;
-import org.pronzato.fabric.api.schemas.SchemaType;
-import org.pronzato.fabric.api.schemas.manager.SchemaCompatibilityRules;
-import org.pronzato.fabric.api.schemas.manager.SchemaModelMapper;
-import org.pronzato.fabric.api.schemas.manager.SchemaViews;
-import org.pronzato.fabric.api.util.IdentityParsingSupport;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.apache.arrow.flight.FlightProducer;
+import org.pronzato.fabric.api.control.ControlConnection;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionService;
+import org.pronzato.fabric.api.control.status.service.ServiceHbCache;
+import org.pronzato.fabric.api.control.status.service.ServiceStatusPublisher;
+import org.pronzato.fabric.api.data.TabularManager;
+import org.pronzato.fabric.api.data.catalog.DuckdbCatalogImpl;
+import org.pronzato.fabric.api.data.dataset.DatasetId;
+import org.pronzato.fabric.api.data.manager.TabularManagerImpl;
+import org.pronzato.fabric.api.control.entitlements.core.services.ServiceEntitlements;
+import org.pronzato.fabric.api.control.security.kerberos.KerberosSpn;
+import org.pronzato.fabric.api.services.ServiceRunOptions;
+import org.pronzato.fabric.api.services.common.ServiceInstanceResolver;
+import org.pronzato.fabric.api.services.common.routing.ServiceRoutingMode;
+import org.pronzato.fabric.api.services.flight.FlightSqlRequestHeadersMiddleware;
+import org.pronzato.fabric.api.services.flight.FlightSqlServiceProducer;
+import org.pronzato.fabric.api.services.flight.FlightSqlServiceRuntime;
+import org.pronzato.fabric.api.services.flight.ingest.FlightIngestProducer;
+import org.pronzato.fabric.api.services.flight.ingest.FlightIngestServiceRuntime;
+import org.pronzato.fabric.api.services.grpc.GrpcClientRuntime;
+import org.pronzato.fabric.api.services.grpc.GrpcServiceRuntime;
+import org.pronzato.fabric.api.telemetry.OtelManager;
+import org.pronzato.fabric.api.telemetry.manager.FabricArrowFlightOtel;
+import org.pronzato.fabric.api.telemetry.manager.FabricOtelAttributes;
+import org.pronzato.fabric.api.telemetry.manager.FabricOtelEnablement;
+import org.pronzato.fabric.api.telemetry.manager.FabricOtelSupport;
+import org.pronzato.fabric.api.telemetry.manager.OtelManagerNoop;
 import org.pronzato.fabric.api.util.Strings;
 
-public final class SchemaManagerImpl implements SchemaManager {
-  private static final String FORMAT_JSON = "JSON";
-  private static final String FORMAT_NVFIX = "NVFIX";
-  private static final String PAYLOADS_INGEST_NAME = "payloads";
-  private static final String SYSTEM_USER = "fabric-lite";
-  private static final String VERSION_SEPARATOR = "__v";
-  private static final Pattern VERSION_SUFFIX_PATTERN = Pattern.compile(".*__v\\d{4}$");
-  private static final ObjectMapper CANONICAL_MAPPER =
-      DiscoveryCodec.mapper().copy().configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
-  private static final Comparator<SchemaModel> SCHEMA_ORDER =
-      Comparator
-          .comparing(SchemaManagerImpl::schemaName, String.CASE_INSENSITIVE_ORDER)
-          .thenComparing(SchemaManagerImpl::schemaName)
-          .thenComparing(SchemaManagerImpl::schemaTypeName);
+final class ServiceManagerImplBootstrap {
 
-  private final Supplier<DiscoveryCache> configCacheSupplier;
-  private final Supplier<String> sessionGroupSupplier;
-  private final Supplier<ConnectionManager> connectionManagerSupplier;
-  private final Supplier<DeleteManager> deleteManagerSupplier;
-  private final SampleSourceFactory sampleSourceFactory;
-  private final FormatSamplerFactory formatSamplerFactory;
+  private ServiceManagerImplBootstrap() {}
 
-  public SchemaManagerImpl(
-      Supplier<DiscoveryCache> configCacheSupplier,
-      Supplier<String> sessionGroupSupplier,
-      Supplier<ConnectionManager> connectionManagerSupplier) {
-    this(
-        configCacheSupplier,
-        sessionGroupSupplier,
-        connectionManagerSupplier,
-        null,
-        null,
-        null);
-  }
+  static ServiceManagerImpl.RunningGrpcServer startGrpcServer(
+      ServiceManagerImpl manager,
+      DefinitionService def,
+      BindableService svc,
+      ServiceRunOptions options)
+      throws Exception {
+    Objects.requireNonNull(def, "def");
+    Objects.requireNonNull(svc, "svc");
+    String serviceName = ServiceManagerImpl.resolveServiceName(def);
+    String serviceId = ServiceManagerImpl.serviceId(def);
+    DefinitionService.Grpc grpc = manager.requireGrpc(def, serviceName);
+    manager.requireGrpcRoutingMode(def, "server");
+    options = options == null ? ServiceRunOptions.defaults() : options;
 
-  public SchemaManagerImpl(
-      Supplier<DiscoveryCache> configCacheSupplier,
-      Supplier<String> sessionGroupSupplier,
-      Supplier<ConnectionManager> connectionManagerSupplier,
-      Supplier<DeleteManager> deleteManagerSupplier) {
-    this(
-        configCacheSupplier,
-        sessionGroupSupplier,
-        connectionManagerSupplier,
-        deleteManagerSupplier,
-        null,
-        null);
-  }
+    int bindPort = manager.resolveBindPort(grpc, options);
+    String bindHost = manager.resolveBindHost(grpc, options);
+    String advertiseHost = manager.resolveAdvertiseHost(grpc, options);
+    int advertisePort = manager.resolveAdvertisePort(grpc, options, bindPort);
+    boolean tlsEnabled = ServiceManagerImpl.tlsEnabled(grpc);
+    boolean kerberosEnabled = ServiceManagerImpl.kerberosEnabled(grpc);
+    String instanceId = resolveInstanceId(options, advertiseHost, advertisePort);
 
-  SchemaManagerImpl(
-      Supplier<DiscoveryCache> configCacheSupplier,
-      Supplier<String> sessionGroupSupplier,
-      Supplier<ConnectionManager> connectionManagerSupplier,
-      SampleSourceFactory sampleSourceFactory,
-      FormatSamplerFactory formatSamplerFactory) {
-    this(
-        configCacheSupplier,
-        sessionGroupSupplier,
-        connectionManagerSupplier,
-        null,
-        sampleSourceFactory,
-        formatSamplerFactory);
-  }
+    GrpcServiceRuntime.Config cfg = new GrpcServiceRuntime.Config();
+    cfg.bindHost = bindHost;
+    cfg.bindPort = bindPort;
+    cfg.advertiseHost = advertiseHost;
+    cfg.advertisePort = advertisePort;
+    cfg.portFailback = Boolean.TRUE.equals(grpc.portFailback());
+    cfg.tlsEnabled = tlsEnabled;
+    cfg.certChainPem =
+        ServiceManagerImpl.toFile(
+            ServiceManagerImpl.firstNonNull(
+                options.tlsCertChain(), manager.session().serviceTlsCertChain()));
+    cfg.privateKeyPem =
+        ServiceManagerImpl.toFile(
+            ServiceManagerImpl.firstNonNull(
+                options.tlsPrivateKey(), manager.session().serviceTlsPrivateKey()));
+    cfg.kerberosEnabled = kerberosEnabled;
+    cfg.kerberosSpn = grpc.kerberos() == null ? null : grpc.kerberos().spn();
+    cfg.kerberosPrincipal = manager.sessionKerberosPrincipal();
+    cfg.kerberosKeytab = manager.sessionKerberosKeytab();
+    cfg.kerberosRealm = KerberosSpn.extractRealm(cfg.kerberosPrincipal);
 
-  SchemaManagerImpl(
-      Supplier<DiscoveryCache> configCacheSupplier,
-      Supplier<String> sessionGroupSupplier,
-      Supplier<ConnectionManager> connectionManagerSupplier,
-      Supplier<DeleteManager> deleteManagerSupplier,
-      SampleSourceFactory sampleSourceFactory,
-      FormatSamplerFactory formatSamplerFactory) {
-    this.configCacheSupplier = Objects.requireNonNull(configCacheSupplier, "configCacheSupplier");
-    this.sessionGroupSupplier = Objects.requireNonNull(sessionGroupSupplier, "sessionGroupSupplier");
-    this.connectionManagerSupplier =
-        Objects.requireNonNull(connectionManagerSupplier, "connectionManagerSupplier");
-    this.deleteManagerSupplier = deleteManagerSupplier == null ? () -> null : deleteManagerSupplier;
-    this.sampleSourceFactory =
-        sampleSourceFactory == null ? this::createDefaultSampleSource : sampleSourceFactory;
-    this.formatSamplerFactory =
-        formatSamplerFactory == null ? this::createDefaultFormatSampler : formatSamplerFactory;
-  }
-
-  @Override
-  public SchemaSampleResult sample(String ingestName, SchemaSampleOptions options) {
-    String normalizedIngestName = Strings.requireNonBlank(ingestName, "ingestName");
-    SchemaSampleOptions resolvedOptions = options == null ? SchemaSampleOptions.defaults() : options;
-    DiscoveryCache DiscoveryCache = requireConfigCache();
-    String group = requireSessionGroup();
-    DiscoveryCache
-        .get(DefinitionIngest.class, group, normalizedIngestName)
-        .orElseThrow(
-            () ->
-                new IllegalArgumentException(
-                    "Unknown ingest: " + group + "/" + normalizedIngestName));
-    DefinitionIngestSource source =
-        DiscoveryCache
-            .get(DefinitionIngestSource.class, group, normalizedIngestName)
-            .orElseThrow(
-                () ->
-                    new IllegalStateException(
-                        "IngestSource not found for ingest: " + group + "/" + normalizedIngestName));
-    String resolvedFormat = resolveFormat(source, resolvedOptions);
-    String ingestId = group + "/" + normalizedIngestName;
-
-    List<PayloadSample> samples;
-    try (SampleSource sampleSource =
-        sampleSourceFactory.create(ingestId, source, resolvedOptions)) {
-      samples = collect(sampleSource, resolvedOptions.maxMessages(), resolvedOptions.maxBytes());
-    } catch (RuntimeException ex) {
-      throw ex;
-    } catch (Exception ex) {
-      throw new IllegalStateException("Failed to close sample source ingest=" + ingestId, ex);
-    }
-    if (samples.isEmpty()) {
-      throw new IllegalStateException("No payload samples were collected ingest=" + ingestId);
-    }
-
-    return inferFromSamples(
-        normalizedIngestName, ingestId, resolvedFormat, source, samples, resolvedOptions.allowNulls());
-  }
-
-  @Override
-  public SchemaSampleResult samplePayloads(
-      IngestFormat format, Iterable<String> payloads, SchemaSampleOptions options) {
-    IngestFormat resolvedFormat = Objects.requireNonNull(format, "format");
-    Objects.requireNonNull(payloads, "payloads");
-    SchemaSampleOptions resolvedOptions = options == null ? SchemaSampleOptions.defaults() : options;
-    String formatToken = normalizeFormat(resolvedFormat.name());
-    return samplePayloads(
-        PAYLOADS_INGEST_NAME,
-        new DefinitionIngestSource(null, null, PAYLOADS_INGEST_NAME, formatToken, null, null, null),
-        payloads,
-        resolvedOptions);
-  }
-
-  public SchemaSampleResult samplePayloadsConfigured(
-      String ingestName,
-      IngestFormat format,
-      String jsonMode,
-      String jsonRootField,
-      String nvFixPairDelimiter,
-      String nvFixKvDelimiter,
-      Boolean nvFixTrimKeys,
-      Boolean nvFixTrimValues,
-      Iterable<String> payloads,
-      SchemaSampleOptions options) {
-    String normalizedIngestName = Strings.requireNonBlank(ingestName, "ingestName");
-    IngestFormat resolvedFormat = Objects.requireNonNull(format, "format");
-    String formatToken = normalizeFormat(resolvedFormat.name());
-    DefinitionIngestSource.JsonConfig json =
-        resolvedFormat == IngestFormat.JSON
-            ? new DefinitionIngestSource.JsonConfig(jsonMode, jsonRootField)
-            : null;
-    DefinitionIngestSource.NvFixConfig nvfix =
-        resolvedFormat == IngestFormat.NVFIX
-            ? new DefinitionIngestSource.NvFixConfig(
-                nvFixPairDelimiter,
-                nvFixKvDelimiter,
-                nvFixTrimKeys,
-                nvFixTrimValues)
-            : null;
-    return samplePayloads(
-        normalizedIngestName,
-        new DefinitionIngestSource(
-            null,
-            null,
-            normalizedIngestName,
-            formatToken,
-            json,
-            nvfix,
-            null),
-        payloads,
-        options);
-  }
-
-  SchemaSampleResult samplePayloads(
-      String ingestName,
-      DefinitionIngestSource source,
-      Iterable<String> payloads,
-      SchemaSampleOptions options) {
-    String resolvedIngestName = Strings.requireNonBlank(ingestName, "ingestName");
-    Objects.requireNonNull(payloads, "payloads");
-    SchemaSampleOptions resolvedOptions = options == null ? SchemaSampleOptions.defaults() : options;
-    String formatToken = resolveFormat(source, resolvedOptions);
-    List<PayloadSample> samples = collect(payloads, resolvedOptions.maxMessages(), resolvedOptions.maxBytes());
-    if (samples.isEmpty()) {
-      throw new IllegalStateException("No payload samples were provided");
-    }
-    String ingestId = "inline/" + resolvedIngestName;
-    return inferFromSamples(
-        resolvedIngestName,
-        ingestId,
-        formatToken,
-        source,
-        samples,
-        resolvedOptions.allowNulls());
-  }
-
-  @Override
-  public SchemaModel registerTabular(String schemaName, SchemaModel schema) {
-    return register(schemaName, SchemaType.TABULAR, schema);
-  }
-
-  @Override
-  public SchemaModel register(String schemaName, SchemaType schemaType, SchemaModel schema) {
-    String group = requireSessionGroup();
-    return register(group, schemaName, schemaType, schema);
-  }
-
-  @Override
-  public Optional<SchemaModel> get(String schemaName) {
-    String group = requireSessionGroup();
-    return get(group, schemaName);
-  }
-
-  @Override
-  public Optional<SchemaModel> get(String group, String schemaName) {
-    String normalizedGroup = Strings.requireNonBlank(group, "group");
-    String normalizedName = Strings.requireNonBlank(schemaName, "schemaName");
-    DiscoveryCache cache = requireConfigCache();
-    return cache
-        .get(DefinitionSchema.class, normalizedGroup, normalizedName)
-        .map(SchemaModelMapper::fromDefinition);
-  }
-
-  @Override
-  public List<SchemaModel> listVersions(String schemaName) {
-    String group = requireSessionGroup();
-    return listVersions(group, schemaName);
-  }
-
-  @Override
-  public Optional<SchemaModel> getVersion(String schemaName, int versionNum) {
-    if (versionNum <= 0) {
-      throw new IllegalArgumentException("versionNum must be > 0");
-    }
-    for (SchemaModel version : listVersions(schemaName)) {
-      Integer candidate = version.getVersionNum();
-      if (candidate != null && candidate == versionNum) {
-        return Optional.of(version);
-      }
-    }
-    return Optional.empty();
-  }
-
-  @Override
-  public Optional<SchemaModel> getVersion(String schemaName, String versionToken) {
-    String normalizedToken = Strings.trimToNull(versionToken);
-    if (normalizedToken == null) {
-      return Optional.empty();
-    }
-    Integer parsedVersionNum = parseVersionToken(normalizedToken);
-    if (parsedVersionNum != null) {
-      return getVersion(schemaName, parsedVersionNum);
-    }
-    for (SchemaModel version : listVersions(schemaName)) {
-      String name = Strings.trimToNull(version.getName());
-      if (normalizedToken.equals(name)) {
-        return Optional.of(version);
-      }
-      String versionName = Strings.trimToNull(version.getVersionName());
-      if (versionName != null && normalizedToken.equalsIgnoreCase(versionName)) {
-        return Optional.of(version);
-      }
-    }
-    return Optional.empty();
-  }
-
-  @Override
-  public List<SchemaModel> list() {
-    DiscoveryCache cache = requireConfigCache();
-    String group = requireSessionGroup();
-    return sortSchemas(filterCanonicalSchemas(mapSchemas(cache.listSchemas(group))));
-  }
-
-  @Override
-  public List<SchemaModel> list(SchemaType type) {
-    DiscoveryCache cache = requireConfigCache();
-    String group = requireSessionGroup();
-    SchemaType normalizedType = Objects.requireNonNull(type, "schemaType");
-    return sortSchemas(
-        filterCanonicalSchemas(
-            mapSchemas(cache.listSchemas(group, SchemaModelMapper.toDefinitionType(normalizedType)))));
-  }
-
-  @Override
-  public boolean exists(String schemaName) {
-    return get(schemaName).isPresent();
-  }
-
-  @Override
-  public void delete(String schemaName) {
-    delete(requireSessionGroup(), schemaName);
-  }
-
-  @Override
-  public void delete(String group, String schemaName) {
-    String normalizedGroup = Strings.requireNonBlank(group, "group");
-    String normalizedName = Strings.requireNonBlank(schemaName, "schemaName");
-    DiscoveryCache cache = requireConfigCache();
-    DeleteManager deleteManager = deleteManagerSupplier.get();
-    if (deleteManager == null) {
-      deleteManager =
-          new DeleteManager(
-              () -> new ArrayList<>(cache.allDefinitions()),
-              (type, definitionGroup, definitionName) ->
-                  cache.delete(type, definitionGroup, definitionName));
-    }
-    DeleteResult result =
-        deleteManager.delete(
-            "schema:" + normalizedGroup + "/" + normalizedName,
-            new org.pronzato.fabric.api.control.discovery.lifecycle.DeleteOptions(
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                true,
-                false,
-                List.of()));
-    if (result.outcome() == DeleteOutcome.BLOCKED) {
-      throw new IllegalStateException(
-          "Delete blocked for schema "
-              + normalizedGroup
-              + "/"
-              + normalizedName
-              + ": "
-              + result.blockers());
-    }
-    if (result.outcome() == DeleteOutcome.PARTIAL) {
-      throw new IllegalStateException(
-          "Delete partially completed for schema "
-              + normalizedGroup
-              + "/"
-              + normalizedName
-              + ": "
-              + result.warnings());
-    }
-  }
-
-  private SchemaModel register(
-      String group,
-      String schemaName,
-      SchemaType schemaType,
-      SchemaModel schema) {
-    String normalizedGroup = Strings.requireNonBlank(group, "group");
-    String normalizedName = Strings.requireNonBlank(schemaName, "schemaName");
-    SchemaType normalizedType = Objects.requireNonNull(schemaType, "schemaType");
-    Objects.requireNonNull(schema, "schema");
-    DiscoveryCache cache = requireConfigCache();
-    SchemaModel normalizedModel =
-        schema.toBuilder()
-            .withGroup(normalizedGroup)
-            .withName(normalizedName)
-            .withType(normalizedType)
-            .build();
-    Optional<DefinitionSchema> existing =
-        cache.get(DefinitionSchema.class, normalizedGroup, normalizedName);
-    SchemaModel existingModel = null;
-    DefinitionSchema existingDefinition = null;
-    if (existing.isPresent()) {
-      existingDefinition = existing.get();
-      existingModel = SchemaModelMapper.fromDefinition(existingDefinition);
-      enforceCompatibleUpdate(normalizedGroup, normalizedName, existingModel, normalizedModel);
-    }
-    SchemaModel modelToPersist = normalizedModel;
-    if (existingModel != null) {
-      int previousVersion = normalizedVersionNum(existingModel.getVersionNum());
-      int nextVersion = previousVersion + 1;
-      modelToPersist =
-          normalizedModel.toBuilder()
-              .withVersionNum(nextVersion)
-              .withVersionName(versionName(nextVersion))
-              .build();
-    }
-    String now = Instant.now().toString();
-    DefinitionSchema canonicalDefinition = SchemaModelMapper.toDefinition(modelToPersist, now, SYSTEM_USER);
-    if (existingDefinition != null
-        && Objects.equals(
-            Strings.trimToNull(existingDefinition.hash()),
-            Strings.trimToNull(canonicalDefinition.hash()))) {
-      return existingModel == null ? SchemaModelMapper.fromDefinition(existingDefinition) : existingModel;
-    }
-
-    DefinitionSchema versionedDefinition = null;
-    if (existingDefinition != null) {
-      String versionedName = nextVersionedSchemaName(cache, normalizedGroup, normalizedName);
-      versionedDefinition = SchemaModelMapper.toVersionedDefinition(existingDefinition, versionedName);
-    }
-    try (DiscoveryCache.ConfigCacheTx tx =
-        cache.beginTx("schema:" + normalizedGroup + "/" + normalizedName)) {
-      if (versionedDefinition != null) {
-        cache.upsertTx(tx, versionedDefinition);
-      }
-      cache.upsertTx(tx, canonicalDefinition);
-      cache.commitTx(tx);
-    }
-    return SchemaModelMapper.fromDefinition(canonicalDefinition);
-  }
-
-  private List<SchemaModel> listVersions(String group, String schemaName) {
-    String normalizedGroup = Strings.requireNonBlank(group, "group");
-    String normalizedSchemaName = Strings.requireNonBlank(schemaName, "schemaName");
-    DiscoveryCache cache = requireConfigCache();
-    List<SchemaModel> versions = new ArrayList<>();
-    for (SchemaModel model : mapSchemas(cache.listSchemas(normalizedGroup))) {
-      String candidateName = Strings.trimToNull(model == null ? null : model.getName());
-      if (!matchesVersionFamily(normalizedSchemaName, candidateName)) {
-        continue;
-      }
-      versions.add(model);
-    }
-    versions.sort(
-        Comparator.comparingInt((SchemaModel model) -> normalizedVersionNum(model.getVersionNum()))
-            .thenComparing(SchemaManagerImpl::schemaName, String.CASE_INSENSITIVE_ORDER)
-            .thenComparing(SchemaManagerImpl::schemaName));
-    return List.copyOf(versions);
-  }
-
-  private static void enforceCompatibleUpdate(
-      String group, String schemaName, SchemaModel existing, SchemaModel updated) {
-    if (existing == null || updated == null) {
-      return;
-    }
-    SchemaType existingType = existing.getType();
-    SchemaType updatedType = updated.getType();
-    if (existingType != null && updatedType != null && existingType != updatedType) {
-      throw schemaUpdateRejected(
-          group,
-          schemaName,
-          "SCHEMA_TYPE_CHANGE",
-          "_schema",
-          existingType.name(),
-          updatedType.name());
-    }
-    SchemaCompatibilityRules.requireCompatible(
-        "schemaName=" + schemaName + " schemaType=" + updatedType + " group=" + group,
-        updated.getCompatibility(),
-        SchemaViews.fromSchemaModel(existing),
-        SchemaViews.fromSchemaModel(updated));
-  }
-
-  private static IllegalArgumentException schemaUpdateRejected(
-      String group,
-      String schemaName,
-      String reason,
-      String field,
-      String from,
-      String to) {
-    return new IllegalArgumentException(
-        "Schema update rejected group="
-            + group
-            + " name="
-            + schemaName
-            + " reason="
-            + reason
-            + " field="
-            + field
-            + " from="
-            + from
-            + " to="
-            + to);
-  }
-
-  private List<PayloadSample> collect(SampleSource source, int maxMessages, int maxBytes) {
-    Objects.requireNonNull(source, "source");
-    Iterator<PayloadSample> iterator = source.iterator();
-    List<PayloadSample> result = new ArrayList<>();
-    int totalBytes = 0;
-    while (iterator != null && iterator.hasNext()) {
-      PayloadSample sample = iterator.next();
-      if (sample == null || sample.payload() == null) {
-        continue;
-      }
-      if (result.size() >= maxMessages) {
-        break;
-      }
-      int payloadBytes = sample.payload().getBytes(StandardCharsets.UTF_8).length;
-      if (totalBytes + payloadBytes > maxBytes) {
-        break;
-      }
-      totalBytes += payloadBytes;
-      result.add(sample);
-    }
-    return List.copyOf(result);
-  }
-
-  private List<PayloadSample> collect(Iterable<String> payloads, int maxMessages, int maxBytes) {
-    Objects.requireNonNull(payloads, "payloads");
-    List<PayloadSample> result = new ArrayList<>();
-    int totalBytes = 0;
-    long now = Instant.now().toEpochMilli();
-    int sampleIndex = 0;
-    for (String payload : payloads) {
-      if (result.size() >= maxMessages) {
-        break;
-      }
-      PayloadSample sample =
-          new PayloadSample(
-              PAYLOADS_INGEST_NAME,
-              payload,
-              now + sampleIndex);
-      int payloadBytes = sample.payload().getBytes(StandardCharsets.UTF_8).length;
-      if (totalBytes + payloadBytes > maxBytes) {
-        break;
-      }
-      totalBytes += payloadBytes;
-      result.add(sample);
-      sampleIndex++;
-    }
-    return List.copyOf(result);
-  }
-
-  private SchemaSampleResult inferFromSamples(
-      String ingestName,
-      String ingestId,
-      String format,
-      DefinitionIngestSource source,
-      List<PayloadSample> samples,
-      boolean allowNulls) {
-    FormatSampler sampler = formatSamplerFactory.create(format, source);
-    FormatSamplerResult parsed = sampler.parseSamples(samples, new FormatSamplerOptions(ingestId, allowNulls));
-    if (parsed.rows().isEmpty()) {
-      throw new IllegalStateException(
-          "Unable to parse sampled payloads ingest="
-              + ingestId
-              + " format="
-              + format
-              + " parseErrors="
-              + parsed.parseErrorCount());
-    }
-
-    SchemaInference.InferredSchema inferred = SchemaInference.infer(parsed.rows(), allowNulls);
-    SchemaSampleDiagnostics diagnostics = mergeDiagnostics(inferred, parsed);
-    String recommendedSchemaJson = recommendedSchemaJson(inferred.fields());
-
-    return new SchemaSampleResult(
-        ingestName,
-        format,
-        inferred.fields(),
-        recommendedSchemaJson,
-        diagnostics,
-        samples.size(),
-        sampledBytes(samples));
-  }
-
-  private SampleSource createDefaultSampleSource(
-      String ingestId, DefinitionIngestSource source, SchemaSampleOptions options) {
-    DefinitionIngestSource.AmpsSource amps = source == null ? null : source.amps();
-    if (amps == null) {
-      throw new IllegalArgumentException(
-          "Unsupported sample source transport ingest=" + ingestId + " transport=NONE");
-    }
-    ConnectionManager connectionManager = connectionManagerSupplier.get();
-    if (connectionManager == null) {
-      throw new IllegalStateException("Session ConnectionManager is not available");
-    }
-    return new SampleSourceAmps(connectionManager, ingestId, amps, options);
-  }
-
-  private FormatSampler createDefaultFormatSampler(String format, DefinitionIngestSource source) {
-    if (FORMAT_JSON.equals(format)) {
-      return new FormatSamplerJson(source == null ? null : source.json());
-    }
-    if (FORMAT_NVFIX.equals(format)) {
-      return new FormatSamplerNvFix(source == null ? null : source.nvfix());
-    }
-    throw new IllegalArgumentException("Unsupported ingest source format: " + format);
-  }
-
-  private static int sampledBytes(List<PayloadSample> samples) {
-    int total = 0;
-    if (samples == null) {
-      return 0;
-    }
-    for (PayloadSample sample : samples) {
-      if (sample == null || sample.payload() == null) {
-        continue;
-      }
-      total += sample.payload().getBytes(StandardCharsets.UTF_8).length;
-    }
-    return total;
-  }
-
-  private static String resolveFormat(
-      DefinitionIngestSource source, SchemaSampleOptions options) {
-    String requested = Strings.trimToNull(options == null ? null : options.overrideFormat());
-    String configured = Strings.trimToNull(source == null ? null : source.format());
-    String format = requested == null ? configured : requested;
-    if (format == null) {
-      throw new IllegalArgumentException("ingestSource.format is required");
-    }
-    return normalizeFormat(format);
-  }
-
-  private static String normalizeFormat(String format) {
-    String normalized = Strings.requireNonBlank(format, "format").toUpperCase(Locale.ROOT);
-    if (!FORMAT_JSON.equals(normalized) && !FORMAT_NVFIX.equals(normalized)) {
-      throw new IllegalArgumentException("Unsupported format: " + format);
-    }
-    return normalized;
-  }
-
-  private static SchemaSampleDiagnostics mergeDiagnostics(
-      SchemaInference.InferredSchema inferred, FormatSamplerResult parsed) {
-    Set<String> parseFailures = new TreeSet<>();
-    if (parsed != null) {
-      parseFailures.addAll(parsed.parseFailures());
-    }
-    if (inferred != null) {
-      parseFailures.addAll(inferred.parseFailures());
-    }
-    int parseErrorCount = parseFailures.size();
-    if (parsed != null && parsed.parseErrorCount() > parseErrorCount) {
-      parseErrorCount = parsed.parseErrorCount();
-    }
-    if (inferred != null && inferred.parseErrorCount() > parseErrorCount) {
-      parseErrorCount = inferred.parseErrorCount();
-    }
-    if (inferred == null) {
-      return new SchemaSampleDiagnostics(
-          List.of(), List.of(), List.of(), List.copyOf(parseFailures), parseErrorCount);
-    }
-    return new SchemaSampleDiagnostics(
-        sortedDistinct(inferred.missingKeysSeen()),
-        sortedDistinct(inferred.typeConflicts()),
-        sortedDistinct(inferred.widenedFields()),
-        List.copyOf(parseFailures),
-        parseErrorCount);
-  }
-
-  private static String recommendedSchemaJson(List<InferredField> fields) {
-    ObjectNode root = CANONICAL_MAPPER.createObjectNode();
-    ArrayNode fieldNodes = root.putArray("fields");
-    List<InferredField> ordered = fields == null ? List.of() : fields;
-    for (InferredField field : ordered) {
-      if (field == null) {
-        continue;
-      }
-      ObjectNode node = fieldNodes.addObject();
-      node.put("name", field.name());
-      node.put("type", field.arrowTypeToken());
-      node.put("nullable", field.nullable());
-    }
+    authorizeStart(
+        manager,
+        serviceId,
+        resolveServerStartSubject(manager, grpc),
+        ServiceEntitlements.Transport.GRPC);
+    GrpcServiceRuntime runtime =
+        GrpcServiceRuntime.start(cfg, svc, manager.buildServerInterceptors(def, serviceId, grpc, options));
+    ServiceStatusPublisher publisher =
+        createGrpcStatusPublisher(
+            manager,
+            serviceName,
+            instanceId,
+            advertiseHost,
+            advertisePort,
+            bindHost,
+            bindPort,
+            grpc,
+            tlsEnabled,
+            options);
     try {
-      return CANONICAL_MAPPER.writeValueAsString(root);
+      publisher.start();
     } catch (Exception ex) {
-      throw new IllegalStateException("Failed to render inferred schema JSON", ex);
+      runtime.close();
+      throw ex;
+    }
+    manager
+        .logger()
+        .info(
+            "[ServiceManager][gRPC][server-start] serviceId={} bind={}:{} advertise={}:{} instanceId={} tlsEnabled={} kerberosEnabled={} identityMode={}",
+            serviceId,
+            bindHost,
+            runtime.port(),
+            advertiseHost,
+            advertisePort,
+            instanceId,
+            tlsEnabled,
+            kerberosEnabled,
+            ServiceManagerImpl.resolveGrpcIdentityMode(grpc));
+    return new ServiceManagerImpl.RunningGrpcServer(serviceId, instanceId, runtime, publisher);
+  }
+
+  static ServiceManagerImpl.RunningArrowFlightSqlServer startArrowFlightSqlServerInternal(
+      ServiceManagerImpl manager,
+      DefinitionService def,
+      ServiceRunOptions options,
+      Object implementation)
+      throws Exception {
+    Objects.requireNonNull(def, "def");
+    String serviceName = ServiceManagerImpl.resolveServiceName(def);
+    String serviceId = ServiceManagerImpl.serviceId(def);
+    DefinitionService.Arrow arrow = manager.requireArrowFlightSql(def, serviceName);
+    manager.requireArrowRoutingMode(def, "server");
+    options = options == null ? ServiceRunOptions.defaults() : options;
+
+    int bindPort = manager.resolveBindPort(arrow, options);
+    String bindHost = manager.resolveBindHost(arrow, options);
+    String advertiseHost = manager.resolveAdvertiseHost(arrow, options);
+    int advertisePort = manager.resolveAdvertisePort(arrow, options, bindPort);
+    boolean tlsEnabled = ServiceManagerImpl.tlsEnabled(arrow);
+    boolean kerberosEnabled = ServiceManagerImpl.kerberosEnabled(arrow);
+    String instanceId = resolveInstanceId(options, advertiseHost, advertisePort);
+
+    AtomicInteger portRef = new AtomicInteger(advertisePort);
+    FlightSqlServiceProducer producer =
+        toFlightSqlProducer(
+            manager, implementation, serviceId, advertiseHost, portRef::get, tlsEnabled, options);
+    FlightProducer runtimeProducer =
+        maybeInstrumentArrowServerProducer(
+            manager,
+            def,
+            producer,
+            "arrow-flight-sql",
+            FabricOtelEnablement.isArrowFlightSqlServerTracingEnabled(def));
+    FlightSqlServiceRuntime.Config cfg = new FlightSqlServiceRuntime.Config();
+    cfg.bindHost = bindHost;
+    cfg.bindPort = bindPort;
+    cfg.advertiseHost = advertiseHost;
+    cfg.advertisePort = advertisePort;
+    cfg.portFailback = Boolean.TRUE.equals(arrow.portFailback());
+    cfg.tlsEnabled = tlsEnabled;
+    cfg.certChainPem =
+        ServiceManagerImpl.toFile(
+            ServiceManagerImpl.firstNonNull(
+                options.tlsCertChain(), manager.session().serviceTlsCertChain()));
+    cfg.privateKeyPem =
+        ServiceManagerImpl.toFile(
+            ServiceManagerImpl.firstNonNull(
+                options.tlsPrivateKey(), manager.session().serviceTlsPrivateKey()));
+    cfg.kerberosEnabled = kerberosEnabled;
+    cfg.kerberosSpn = arrow.kerberos() == null ? null : arrow.kerberos().spn();
+    cfg.kerberosPrincipal = manager.sessionKerberosPrincipal();
+    cfg.kerberosKeytab = manager.sessionKerberosKeytab();
+    cfg.kerberosRealm = KerberosSpn.extractRealm(cfg.kerberosPrincipal);
+    cfg.middlewares =
+        ServiceManagerImpl.mergeFlightMiddlewares(
+            options,
+            Map.of(
+                FlightSqlRequestHeadersMiddleware.KEY, FlightSqlRequestHeadersMiddleware.factory()));
+
+    authorizeStart(
+        manager,
+        serviceId,
+        resolveServerStartSubject(manager, arrow),
+        ServiceEntitlements.Transport.ARROW_FLIGHT_SQL);
+
+    FlightSqlServiceRuntime runtime = FlightSqlServiceRuntime.start(cfg, runtimeProducer);
+    int boundPort = runtime.port();
+    portRef.set(boundPort);
+    ServiceStatusPublisher publisher =
+        createArrowStatusPublisher(
+            manager,
+            serviceName,
+            instanceId,
+            advertiseHost,
+            advertisePort,
+            bindHost,
+            boundPort,
+            arrow,
+            tlsEnabled,
+            options);
+    try {
+      publisher.start();
+    } catch (Exception ex) {
+      runtime.close();
+      throw ex;
+    }
+    manager
+        .logger()
+        .info(
+            "[ServiceManager][FlightSQL][server-start] serviceId={} bind={}:{} advertise={}:{} instanceId={} tlsEnabled={} kerberosEnabled={}",
+            serviceId,
+            bindHost,
+            runtime.port(),
+            advertiseHost,
+            advertisePort,
+            instanceId,
+            tlsEnabled,
+            kerberosEnabled);
+    return new ServiceManagerImpl.RunningArrowFlightSqlServer(serviceId, instanceId, runtime, publisher);
+  }
+
+  static ServiceManagerImpl.RunningArrowFlightIngestServer startArrowFlightIngestServerInternal(
+      ServiceManagerImpl manager,
+      DefinitionService def,
+      ServiceRunOptions options,
+      Object implementation)
+      throws Exception {
+    Objects.requireNonNull(def, "def");
+    String serviceName = ServiceManagerImpl.resolveServiceName(def);
+    String serviceId = ServiceManagerImpl.serviceId(def);
+    DefinitionService.Arrow arrow = manager.requireArrowFlightIngest(def, serviceName);
+    manager.requireArrowRoutingMode(def, "server");
+    options = options == null ? ServiceRunOptions.defaults() : options;
+
+    int bindPort = manager.resolveBindPort(arrow, options);
+    String bindHost = manager.resolveBindHost(arrow, options);
+    String advertiseHost = manager.resolveAdvertiseHost(arrow, options);
+    int advertisePort = manager.resolveAdvertisePort(arrow, options, bindPort);
+    boolean tlsEnabled = ServiceManagerImpl.tlsEnabled(arrow);
+    boolean kerberosEnabled = ServiceManagerImpl.kerberosEnabled(arrow);
+    String instanceId = resolveInstanceId(options, advertiseHost, advertisePort);
+
+    FlightIngestProducer producer = toFlightIngestProducer(manager, implementation, serviceId);
+    FlightProducer runtimeProducer =
+        maybeInstrumentArrowServerProducer(
+            manager,
+            def,
+            producer,
+            "arrow-flight",
+            FabricOtelEnablement.isArrowFlightServerTracingEnabled(def));
+    FlightIngestServiceRuntime.Config cfg = new FlightIngestServiceRuntime.Config();
+    cfg.bindHost = bindHost;
+    cfg.bindPort = bindPort;
+    cfg.advertiseHost = advertiseHost;
+    cfg.advertisePort = advertisePort;
+    cfg.portFailback = Boolean.TRUE.equals(arrow.portFailback());
+    cfg.tlsEnabled = tlsEnabled;
+    cfg.certChainPem =
+        ServiceManagerImpl.toFile(
+            ServiceManagerImpl.firstNonNull(
+                options.tlsCertChain(), manager.session().serviceTlsCertChain()));
+    cfg.privateKeyPem =
+        ServiceManagerImpl.toFile(
+            ServiceManagerImpl.firstNonNull(
+                options.tlsPrivateKey(), manager.session().serviceTlsPrivateKey()));
+    cfg.kerberosEnabled = kerberosEnabled;
+    cfg.kerberosSpn = arrow.kerberos() == null ? null : arrow.kerberos().spn();
+    cfg.kerberosPrincipal = manager.sessionKerberosPrincipal();
+    cfg.kerberosKeytab = manager.sessionKerberosKeytab();
+    cfg.kerberosRealm = KerberosSpn.extractRealm(cfg.kerberosPrincipal);
+    cfg.middlewares =
+        ServiceManagerImpl.mergeFlightMiddlewares(
+            options,
+            Map.of(
+                FlightSqlRequestHeadersMiddleware.KEY, FlightSqlRequestHeadersMiddleware.factory()));
+
+    authorizeStart(
+        manager,
+        serviceId,
+        resolveServerStartSubject(manager, arrow),
+        ServiceEntitlements.Transport.ARROW_FLIGHT_INGEST);
+
+    FlightIngestServiceRuntime runtime = FlightIngestServiceRuntime.start(cfg, runtimeProducer);
+    int boundPort = runtime.port();
+    ServiceStatusPublisher publisher =
+        createArrowStatusPublisher(
+            manager,
+            serviceName,
+            instanceId,
+            advertiseHost,
+            advertisePort,
+            bindHost,
+            boundPort,
+            arrow,
+            tlsEnabled,
+            options);
+    try {
+      publisher.start();
+    } catch (Exception ex) {
+      runtime.close();
+      throw ex;
+    }
+    manager
+        .logger()
+        .info(
+            "[ServiceManager][FlightIngest][server-start] serviceId={} bind={}:{} advertise={}:{} instanceId={} tlsEnabled={} kerberosEnabled={}",
+            serviceId,
+            bindHost,
+            runtime.port(),
+            advertiseHost,
+            advertisePort,
+            instanceId,
+            tlsEnabled,
+            kerberosEnabled);
+    return new ServiceManagerImpl.RunningArrowFlightIngestServer(serviceId, instanceId, runtime, publisher);
+  }
+
+  static ManagedChannel createGrpcChannel(
+      ServiceManagerImpl manager, DefinitionService def, ServiceRunOptions options) throws Exception {
+    Objects.requireNonNull(def, "def");
+    String serviceName = ServiceManagerImpl.resolveServiceName(def);
+    String serviceId = ServiceManagerImpl.serviceId(def);
+    String group = manager.resolveGroup(def);
+    DefinitionService.Grpc grpc = manager.requireGrpc(def, serviceName);
+    ServiceRoutingMode routingMode = manager.requireGrpcRoutingMode(def, "client");
+    options = options == null ? ServiceRunOptions.defaults() : options;
+
+    ServiceInstanceResolver instanceResolver = manager.session().serviceInstanceResolverIfInitialized();
+    GrpcClientRuntime.RoutingConfig cfg = new GrpcClientRuntime.RoutingConfig();
+    cfg.serviceId = serviceId;
+    if (instanceResolver != null) {
+      cfg.instanceResolver = instanceResolver;
+      cfg.serviceGroup = ServiceManagerImpl.requireValue(group, "group");
+      cfg.serviceName = ServiceManagerImpl.requireValue(serviceName, "serviceName");
+      cfg.closeInstanceResolverOnCleanup = false;
+    } else {
+      cfg.statusCache = createRoutingStatusCache(manager, group, serviceName, serviceId);
+    }
+    cfg.tlsEnabled = ServiceManagerImpl.tlsEnabled(grpc);
+    cfg.trustCertPem =
+        ServiceManagerImpl.toFile(
+            ServiceManagerImpl.firstNonNull(
+                options.tlsTrustCert(), options.clientTrustCert(), manager.session().trustCert()));
+    cfg.kerberosEnabled = ServiceManagerImpl.kerberosEnabled(grpc);
+    cfg.kerberosSpn = grpc.kerberos() == null ? null : grpc.kerberos().spn();
+    cfg.kerberosPrincipal = manager.sessionKerberosPrincipal();
+    cfg.kerberosKeytab = manager.sessionKerberosKeytab();
+    cfg.kerberosRealm = KerberosSpn.extractRealm(cfg.kerberosPrincipal);
+    cfg.kerberosRequireTls = true;
+    cfg.logRoutingSelections = manager.session().grpcRoutingLogSelections();
+    cfg.routingMode = routingMode;
+    cfg.defaultEffectiveSubject = manager.sessionKerberosPrincipal();
+    cfg.callerAppSubject = manager.sessionAppSubject();
+    cfg.routingKey = options.routingKey();
+
+    ManagedChannel channel =
+        GrpcClientRuntime.createRoutingChannel(
+            cfg, manager.buildClientInterceptors(def, serviceId, options));
+    manager
+        .logger()
+        .info(
+            "[ServiceManager][gRPC][client-routing] serviceId={} group={} service={} mode={} tlsEnabled={} kerberosEnabled={} routingKeyConfigured={}",
+            serviceId,
+            group,
+            serviceName,
+            routingMode,
+            cfg.tlsEnabled,
+            cfg.kerberosEnabled,
+            Strings.isNotBlank(cfg.routingKey));
+    return channel;
+  }
+
+  static ServiceHbCache createRoutingStatusCache(
+      ServiceManagerImpl manager, String group, String serviceName, String serviceId) throws Exception {
+    ControlConnection control = manager.session().controlPlaneConnection();
+    if (control == null) {
+      throw new IllegalStateException(
+          "Session control-plane client is not initialized for service: " + serviceId);
+    }
+    ServiceHbCache cache =
+        new ServiceHbCache(
+            control,
+            ServiceManagerImpl.requireValue(group, "group"),
+            ServiceManagerImpl.requireValue(serviceName, "serviceName"),
+            new ServiceHbCache.Config(),
+            manager.session().statusScheduler());
+    boolean success = false;
+    try {
+      cache.start();
+      success = true;
+      return cache;
+    } finally {
+      if (!success) {
+        cache.close();
+      }
     }
   }
 
-  private static List<String> sortedDistinct(List<String> values) {
-    if (values == null || values.isEmpty()) {
+  static FlightSqlServiceProducer toFlightSqlProducer(
+      ServiceManagerImpl manager,
+      Object implementation,
+      String serviceResourceId,
+      String advertiseHost,
+      java.util.function.IntSupplier portSupplier,
+      boolean tlsEnabled,
+      ServiceRunOptions options) {
+    List<String> datasetAllowlist =
+        normalizeDatasetAllowlist(options == null ? null : options.datasetIds());
+    Set<DatasetId> allowedDatasets = parseDatasetAllowlist(datasetAllowlist);
+    if (implementation == null) {
+      TabularManager tabularManager =
+          resolveFlightSqlTabularManager(manager, serviceResourceId, datasetAllowlist);
+      return new FlightSqlServiceProducer(
+          tabularManager,
+          manager.entitlements(),
+          serviceResourceId,
+          manager.session().discoveryCache(),
+          resolveRuntimeEnvironment(manager),
+          advertiseHost,
+          portSupplier,
+          tlsEnabled,
+          manager.checkpointStore(),
+          allowedDatasets);
+    }
+    if (implementation instanceof FlightSqlServiceProducer producer) {
+      return producer;
+    }
+    throw new IllegalArgumentException(
+        "Service implementation must be "
+            + FlightSqlServiceProducer.class.getName()
+            + " for Arrow Flight SQL services: "
+            + implementation.getClass().getName());
+  }
+
+  static TabularManager resolveFlightSqlTabularManager(
+      ServiceManagerImpl manager, String serviceResourceId, List<String> datasetAllowlist) {
+    TabularManager directTabular = manager.session().data().direct().tabular();
+    if (datasetAllowlist == null || datasetAllowlist.isEmpty()) {
+      return directTabular;
+    }
+    if (!(directTabular instanceof TabularManagerImpl localTabularManager)) {
+      manager
+          .logger()
+          .warn(
+              "[ServiceManager][FlightSQL][dataset-scope-ignored] serviceId={} reason=direct-tabular-not-local datasetIds={}",
+              serviceResourceId,
+              datasetAllowlist);
+      return directTabular;
+    }
+    String group = manager.resolveGroupName();
+    if (group == null) {
+      throw new IllegalStateException(
+          "Session group is required when ServiceRunOptions.datasetIds is configured");
+    }
+    DuckdbCatalogImpl scopedCatalog =
+        new DuckdbCatalogImpl(manager.session().discoveryCache(), localTabularManager.rowManager(), group);
+    TabularManagerImpl scopedTabularManager =
+        new TabularManagerImpl(localTabularManager.rowManager(), scopedCatalog);
+    scopedTabularManager.installDatasets(datasetAllowlist);
+    manager
+        .logger()
+        .info(
+            "[ServiceManager][FlightSQL][dataset-scope] serviceId={} datasetCount={} datasetIds={}",
+            serviceResourceId,
+            datasetAllowlist.size(),
+            datasetAllowlist);
+    return scopedTabularManager;
+  }
+
+  static List<String> normalizeDatasetAllowlist(List<String> datasetIds) {
+    if (datasetIds == null || datasetIds.isEmpty()) {
       return List.of();
     }
-    TreeSet<String> deduped = new TreeSet<>();
-    for (String value : values) {
-      String normalized = Strings.trimToNull(value);
-      if (normalized != null) {
-        deduped.add(normalized);
+    LinkedHashSet<String> normalized = new LinkedHashSet<>();
+    for (String value : datasetIds) {
+      String trimmed = Strings.trimToNull(value);
+      if (trimmed != null) {
+        normalized.add(trimmed);
       }
     }
-    return List.copyOf(deduped);
+    return normalized.isEmpty() ? List.of() : List.copyOf(normalized);
   }
 
-  @FunctionalInterface
-  interface SampleSourceFactory {
-    SampleSource create(String ingestId, DefinitionIngestSource source, SchemaSampleOptions options);
+  static Set<DatasetId> parseDatasetAllowlist(List<String> datasetIds) {
+    if (datasetIds == null || datasetIds.isEmpty()) {
+      return Set.of();
+    }
+    LinkedHashSet<DatasetId> parsed = new LinkedHashSet<>();
+    for (String value : datasetIds) {
+      parsed.add(DatasetId.parse(Strings.requireNonBlank(value, "datasetIds entry")));
+    }
+    return parsed.isEmpty() ? Set.of() : Set.copyOf(parsed);
   }
 
-  @FunctionalInterface
-  interface FormatSamplerFactory {
-    FormatSampler create(String format, DefinitionIngestSource source);
+  static FlightIngestProducer toFlightIngestProducer(
+      ServiceManagerImpl manager, Object implementation, String serviceResourceId) {
+    if (implementation == null) {
+      return new FlightIngestProducer(
+          manager.session().data().direct().ingest(),
+          manager.entitlements(),
+          serviceResourceId,
+          manager.session().discoveryCache(),
+          resolveRuntimeEnvironment(manager));
+    }
+    if (implementation instanceof FlightIngestProducer producer) {
+      return producer;
+    }
+    throw new IllegalArgumentException(
+        "Service implementation must be "
+            + FlightIngestProducer.class.getName()
+            + " for Arrow Flight ingest services: "
+            + implementation.getClass().getName());
   }
 
-  private DiscoveryCache requireConfigCache() {
-    return IdentityParsingSupport.requireNonNullRuntime(
-        configCacheSupplier.get(), "Session DiscoveryCache is not available");
+  static void authorizeStart(ServiceManagerImpl manager, String serviceId, String subject) {
+    authorizeStart(manager, serviceId, subject, ServiceEntitlements.Transport.GRPC);
   }
 
-  private String requireSessionGroup() {
-    return IdentityParsingSupport.requireGroup(sessionGroupSupplier.get(), "session group");
+  static void authorizeStart(
+      ServiceManagerImpl manager,
+      String serviceId,
+      String subject,
+      ServiceEntitlements.Transport transport) {
+    ServiceEntitlements.Decision decision =
+        manager
+            .entitlements()
+            .authorize(
+                new ServiceEntitlements.Identity(subject, null),
+                new ServiceEntitlements.Request(
+                    transport,
+                    ServiceEntitlements.Action.START,
+                    serviceId,
+                    ServiceManagerImpl.startOperationName(transport),
+                    null,
+                    null,
+                    Map.of(),
+                    Map.of()));
+    if (decision == null || !decision.allowed()) {
+      throw new IllegalArgumentException(ServiceManagerImpl.decisionReason(decision));
+    }
   }
 
-  private static List<SchemaModel> mapSchemas(List<DefinitionSchema> definitions) {
-    return SchemaManagerImplDefinition.mapSchemas(definitions);
+  static String resolveServerStartSubject(ServiceManagerImpl manager, DefinitionService.Grpc grpc) {
+    String appSubject = manager.sessionAppSubject();
+    if (appSubject != null) {
+      return appSubject;
+    }
+    String kerberosPrincipal = manager.sessionKerberosPrincipal();
+    String serviceSpn = grpc == null || grpc.kerberos() == null ? null : grpc.kerberos().spn();
+    return ServiceManagerImpl.firstNonBlank(kerberosPrincipal, serviceSpn);
   }
 
-  private static List<SchemaModel> sortSchemas(List<SchemaModel> schemas) {
-    return SchemaManagerImplDefinition.sortSchemas(schemas, SCHEMA_ORDER);
+  static String resolveServerStartSubject(ServiceManagerImpl manager, DefinitionService.Arrow arrow) {
+    String appSubject = manager.sessionAppSubject();
+    if (appSubject != null) {
+      return appSubject;
+    }
+    String kerberosPrincipal = manager.sessionKerberosPrincipal();
+    String serviceSpn = arrow == null || arrow.kerberos() == null ? null : arrow.kerberos().spn();
+    return ServiceManagerImpl.firstNonBlank(kerberosPrincipal, serviceSpn);
   }
 
-  private static String schemaName(SchemaModel schema) {
-    return SchemaManagerImplDefinition.schemaName(schema);
+  static FlightProducer maybeInstrumentArrowServerProducer(
+      ServiceManagerImpl manager,
+      DefinitionService service,
+      FlightProducer producer,
+      String transport,
+      boolean transportEnabled) {
+    if (!transportEnabled) {
+      return producer;
+    }
+    OtelManager otelManager = sessionOtelManager(manager);
+    if (!otelManager.enabled()) {
+      return producer;
+    }
+    return FabricArrowFlightOtel.instrumentServer(
+        otelManager,
+        producer,
+        manager.resolveGroup(service),
+        manager.currentAppName(),
+        ServiceManagerImpl.resolveServiceName(service),
+        transport);
   }
 
-  private static String schemaTypeName(SchemaModel schema) {
-    return SchemaManagerImplDefinition.schemaTypeName(schema);
+  static OtelManager sessionOtelManager(ServiceManagerImpl manager) {
+    OtelManager otelManager = manager.session().telemetry();
+    return otelManager == null ? OtelManagerNoop.instance() : otelManager;
   }
 
-  private static List<SchemaModel> filterCanonicalSchemas(List<SchemaModel> schemas) {
-    return SchemaManagerImplDefinition.filterCanonicalSchemas(schemas, VERSION_SUFFIX_PATTERN);
+  static String resolveRuntimeEnvironment(ServiceManagerImpl manager) {
+    return manager.session().context() == null
+        ? null
+        : Strings.trimToNull(manager.session().context().getEnv());
   }
 
-  private static String nextVersionedSchemaName(
-      DiscoveryCache cache, String group, String canonicalName) {
-    return SchemaManagerImplDefinition.nextVersionedSchemaName(
-        cache, group, canonicalName, VERSION_SEPARATOR);
+  static ServiceStatusPublisher createGrpcStatusPublisher(
+      ServiceManagerImpl manager,
+      String serviceName,
+      String instanceId,
+      String advertiseHost,
+      int advertisePort,
+      String bindHost,
+      int bindPort,
+      DefinitionService.Grpc grpc,
+      boolean tlsEnabled,
+      ServiceRunOptions options) {
+    ControlConnection control = manager.session().controlPlaneConnection();
+    if (control == null) {
+      throw new IllegalStateException("Session control-plane client is not initialized");
+    }
+    String group = ServiceManagerImpl.requireValue(manager.resolveGroupName(), "group");
+    String region =
+        manager.session().context() == null
+            ? null
+            : Strings.trimToNull(manager.session().context().getRegion());
+    Map<String, String> attrs = new java.util.HashMap<>();
+    attrs.put("bindHost", bindHost);
+    attrs.put("bindPort", Integer.toString(bindPort));
+    attrs.put("tlsEnabled", Boolean.toString(tlsEnabled));
+    attrs.put("kerberosEnabled", Boolean.toString(ServiceManagerImpl.kerberosEnabled(grpc)));
+    addDataResources(attrs, options);
+    if (grpc.tls() != null) {
+      String tlsTermination = Strings.trimToNull(grpc.tls().termination());
+      if (tlsTermination != null) {
+        attrs.put("tlsTermination", tlsTermination);
+      }
+    }
+    if (grpc.kerberos() != null) {
+      String kerberosSpn = Strings.trimToNull(grpc.kerberos().spn());
+      if (kerberosSpn != null) {
+        attrs.put("kerberosSpn", kerberosSpn);
+      }
+    }
+    return new ServiceStatusPublisher(
+        control,
+        group,
+        ServiceManagerImpl.requireValue(serviceName, "serviceName"),
+        ServiceManagerImpl.requireValue(instanceId, "instanceId"),
+        advertiseHost,
+        advertisePort,
+        region,
+        manager.resolvedServiceHeartbeatSeconds(),
+        manager.resolvedServiceStatusSeconds(),
+        manager.resolvedServiceHeartbeatTtlSeconds(),
+        tlsEnabled,
+        null,
+        null,
+        null,
+        manager.session().context() == null
+            ? null
+            : manager.session().context().getAppName(),
+        manager.session().context() == null
+            ? null
+            : manager.session().context().getInstance(),
+        group,
+        attrs,
+        manager.session().statusScheduler());
   }
 
-  private static boolean matchesVersionFamily(String canonicalName, String candidateName) {
-    return SchemaManagerImplDefinition.matchesVersionFamily(
-        canonicalName, candidateName, VERSION_SEPARATOR);
+  static ServiceStatusPublisher createArrowStatusPublisher(
+      ServiceManagerImpl manager,
+      String serviceName,
+      String instanceId,
+      String advertiseHost,
+      int advertisePort,
+      String bindHost,
+      int bindPort,
+      DefinitionService.Arrow arrow,
+      boolean tlsEnabled,
+      ServiceRunOptions options) {
+    ControlConnection control = manager.session().controlPlaneConnection();
+    if (control == null) {
+      throw new IllegalStateException("Session control-plane client is not initialized");
+    }
+    String group = ServiceManagerImpl.requireValue(manager.resolveGroupName(), "group");
+    String region =
+        manager.session().context() == null
+            ? null
+            : Strings.trimToNull(manager.session().context().getRegion());
+    Map<String, String> attrs = new java.util.HashMap<>();
+    attrs.put("bindHost", bindHost);
+    attrs.put("bindPort", Integer.toString(bindPort));
+    attrs.put("tlsEnabled", Boolean.toString(tlsEnabled));
+    attrs.put("kerberosEnabled", Boolean.toString(ServiceManagerImpl.kerberosEnabled(arrow)));
+    addDataResources(attrs, options);
+    if (arrow.tls() != null) {
+      String tlsTermination = Strings.trimToNull(arrow.tls().termination());
+      if (tlsTermination != null) {
+        attrs.put("tlsTermination", tlsTermination);
+      }
+    }
+    if (arrow.kerberos() != null) {
+      String kerberosSpn = Strings.trimToNull(arrow.kerberos().spn());
+      if (kerberosSpn != null) {
+        attrs.put("kerberosSpn", kerberosSpn);
+      }
+    }
+    return new ServiceStatusPublisher(
+        control,
+        group,
+        ServiceManagerImpl.requireValue(serviceName, "serviceName"),
+        ServiceManagerImpl.requireValue(instanceId, "instanceId"),
+        advertiseHost,
+        advertisePort,
+        region,
+        manager.resolvedServiceHeartbeatSeconds(),
+        manager.resolvedServiceStatusSeconds(),
+        manager.resolvedServiceHeartbeatTtlSeconds(),
+        tlsEnabled,
+        null,
+        null,
+        null,
+        manager.session().context() == null
+            ? null
+            : manager.session().context().getAppName(),
+        manager.session().context() == null
+            ? null
+            : manager.session().context().getInstance(),
+        group,
+        attrs,
+        manager.session().statusScheduler());
   }
 
-  private static int normalizedVersionNum(Integer versionNum) {
-    return SchemaManagerImplDefinition.normalizedVersionNum(versionNum);
+  static String resolveInstanceId(
+      ServiceRunOptions options, String advertiseHost, int advertisePort) {
+    String optionInstance = options == null ? null : Strings.trimToNull(options.instanceName());
+    if (optionInstance != null) {
+      return optionInstance;
+    }
+    String host = Strings.trimToNull(advertiseHost);
+    if (host == null) {
+      host = "host";
+    }
+    return "svc-" + host.replace('.', '-') + "-" + advertisePort;
   }
 
-  private static String versionName(int versionNum) {
-    return SchemaManagerImplDefinition.versionName(versionNum);
+  private static void addDataResources(Map<String, String> attrs, ServiceRunOptions options) {
+    if (attrs == null || options == null || Strings.isEmpty(options.datasetIds())) {
+      return;
+    }
+    LinkedHashSet<String> normalized = new LinkedHashSet<>();
+    for (String value : options.datasetIds()) {
+      String datasetId = Strings.trimToNull(value);
+      if (datasetId != null) {
+        normalized.add(datasetId);
+      }
+    }
+    if (normalized.isEmpty()) {
+      return;
+    }
+    attrs.put("datasetIds", String.join(",", normalized));
+    attrs.put("datasetCount", Integer.toString(normalized.size()));
   }
-
-  private static Integer parseVersionToken(String token) {
-    return SchemaManagerImplDefinition.parseVersionToken(token, VERSION_SEPARATOR);
-  }
-
-  private static Integer parseVersionSuffix(String value, String canonicalName) {
-    return SchemaManagerImplDefinition.parseVersionSuffix(value, canonicalName, VERSION_SEPARATOR);
-  }
-
-  private static boolean isVersionedSchemaName(String name) {
-    return SchemaManagerImplDefinition.isVersionedSchemaName(name, VERSION_SUFFIX_PATTERN);
-  }
-
 }
-
-
-
-
 
