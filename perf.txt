@@ -1,482 +1,474 @@
-package org.pronzato.fabric.api.connectors.s3;
+package org.pronzato.fabric.api.control.status.service;
 
-import java.io.InputStream;
-import java.net.URI;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Locale;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import java.io.Closeable;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
-import java.util.stream.Collectors;
-import org.pronzato.fabric.api.data.duckdb.DuckdbSession;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import org.pronzato.fabric.api.control.ControlConnection;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryTopics;
+import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionHbService;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStatusService;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
+import org.pronzato.fabric.api.services.common.ServiceAdvertise;
 import org.pronzato.fabric.api.util.Strings;
-import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
-import software.amazon.awssdk.auth.credentials.AwsCredentials;
-import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
-import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
-import software.amazon.awssdk.core.ResponseBytes;
-import software.amazon.awssdk.core.sync.RequestBody;
-import software.amazon.awssdk.core.sync.ResponseTransformer;
-import software.amazon.awssdk.regions.Region;
-import software.amazon.awssdk.services.s3.S3Client;
-import software.amazon.awssdk.services.s3.S3ClientBuilder;
-import software.amazon.awssdk.services.s3.model.Delete;
-import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
-import software.amazon.awssdk.services.s3.model.DeleteObjectsRequest;
-import software.amazon.awssdk.services.s3.model.DeleteObjectsResponse;
-import software.amazon.awssdk.services.s3.model.GetObjectRequest;
-import software.amazon.awssdk.services.s3.model.GetObjectResponse;
-import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
-import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
-import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
-import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
-import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
-import software.amazon.awssdk.services.s3.model.PutObjectRequest;
-import software.amazon.awssdk.services.s3.model.S3Exception;
-import software.amazon.awssdk.services.s3.model.S3Object;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-/** Administrative/low-level S3 operations exposed behind {@link S3Connection#admin()}. */
-public final class S3Admin implements AutoCloseable {
-  private static final int DELETE_BATCH_LIMIT = 1000;
+public final class ServiceStatusPublisher implements Closeable {
+  private static final Logger LOGGER = LoggerFactory.getLogger(ServiceStatusPublisher.class);
+  private static final boolean STATUS_DEBUG = false;
+  private static final long DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 10L;
+  private static final long DEFAULT_STATUS_INTERVAL_SECONDS = 30L;
+  private static final int DEFAULT_TTL_SECONDS = 30;
+  private static final String STATUS_ONLINE = "ONLINE";
+  private static final String STATUS_OFFLINE = "OFFLINE";
 
-  private final String name;
+  private final ObjectMapper om =
+      DiscoveryCodec.mapper().copy().configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
+  private final ControlConnection control;
+  private final ScheduledExecutorService ses;
+  private final boolean ownsScheduler;
+  private final long heartbeatIntervalSec;
+  private final long statusIntervalSec;
+  private final int ttlSeconds;
+  private final String group;
   private final String region;
-  private final String bucket;
-  private final String endpoint;
-  private final URI endpointUri;
-  private final boolean useSslForEndpoint;
-  private final boolean pathStyleAccess;
-  private final String basePrefix;
-  private final Map<String, String> attributes;
-  private final String accessKeyId;
-  private final String secretAccessKey;
-  private final String sessionToken;
-  private final S3Client client;
-  private volatile boolean httpfsConfigured;
+  private final String serviceName;
+  private final String serviceInstanceId;
+  private final String serviceHost;
+  private final int servicePort;
+  private final boolean tlsRequired;
+  private final String routeHost;
+  private final Integer routePort;
+  private final String routeAuthority;
+  private final long serviceStartEpochMs;
+  private final String serviceAppName;
+  private final String serviceAppInstanceId;
+  private final String serviceAppGroup;
+  private final Map<String, String> attrs;
+  private volatile String sessionId;
+  private volatile String sessionKey;
+  private volatile boolean open = true;
+  private volatile ScheduledFuture<?> heartbeatTask;
+  private volatile ScheduledFuture<?> statusTask;
 
-  S3Admin(
-      String name,
+  public ServiceStatusPublisher(
+      ControlConnection control,
+      String group,
+      String service,
+      String instanceId,
+      String host,
+      int port,
       String region,
-      String bucket,
-      String endpoint,
-      boolean pathStyleAccess,
-      String basePrefix,
-      Map<String, String> attributes,
-      String accessKeyId,
-      String secretAccessKey,
-      String sessionToken) {
-    this.name = Objects.requireNonNull(name, "name");
-    this.region = Strings.requireNonBlank(region, "s3.region");
-    this.bucket = Strings.requireNonBlank(bucket, "s3.bucket");
-    this.endpointUri = toEndpointUri(endpoint);
-    this.endpoint = endpointUri == null ? null : endpointUri.toString();
-    this.useSslForEndpoint =
-        endpointUri == null
-            || endpointUri.getScheme() == null
-            || !"http".equalsIgnoreCase(endpointUri.getScheme());
-    this.pathStyleAccess = pathStyleAccess;
-    this.basePrefix = normalizePrefix(basePrefix);
-    this.attributes = attributes == null ? Map.of() : Map.copyOf(attributes);
-    this.accessKeyId = Strings.requireNonBlank(accessKeyId, "s3.accessKeyId");
-    this.secretAccessKey = Strings.requireNonBlank(secretAccessKey, "s3.secretAccessKey");
-    this.sessionToken = Strings.trimToNull(sessionToken);
-    this.client = buildClient();
-  }
-
-  public S3ListResult listObjects(S3ListRequest request) {
-    Objects.requireNonNull(request, "request");
-    try {
-      ListObjectsV2Request.Builder builder =
-          ListObjectsV2Request.builder().bucket(bucket).maxKeys(Math.max(1, request.maxKeys()));
-      String prefix =
-          request.prefix() == null
-              ? basePrefix
-              : applyBasePrefix(parseKeyOrUri(request.prefix(), true));
-      if (hasText(prefix)) {
-        builder.prefix(prefix);
-      }
-      if (hasText(request.continuationToken())) {
-        builder.continuationToken(request.continuationToken());
-      }
-      if (request.delimiter() != null) {
-        builder.delimiter(request.delimiter());
-      }
-      ListObjectsV2Response response = client.listObjectsV2(builder.build());
-      List<String> commonPrefixes =
-          Optional.ofNullable(response.commonPrefixes()).orElse(List.of()).stream()
-              .map(prefixResult -> prefixResult.prefix())
-              .filter(Objects::nonNull)
-              .collect(Collectors.toList());
-      List<S3ObjectSummary> objects =
-          Optional.ofNullable(response.contents()).orElse(List.of()).stream()
-              .map(S3Admin::toSummary)
-              .collect(Collectors.toList());
-      return new S3ListResult(
-          List.copyOf(commonPrefixes),
-          List.copyOf(objects),
-          response.isTruncated(),
-          response.continuationToken(),
-          response.nextContinuationToken());
-    } catch (S3Exception ex) {
-      throw toOperationException("ListObjectsV2", ex, null);
-    } catch (Exception ex) {
-      throw new IllegalStateException("Failed to list S3 objects: " + ex.getMessage(), ex);
+      long heartbeatSeconds,
+      long statusSeconds,
+      int ttlSeconds,
+      boolean tlsRequired,
+      String routeHost,
+      Integer routePort,
+      String routeAuthority,
+      String appName,
+      String appInstance,
+      String appGroup,
+      Map<String, String> attrs,
+      ScheduledExecutorService scheduler) {
+    this.control = Objects.requireNonNull(control, "control");
+    this.group = Objects.requireNonNull(group, "group");
+    this.serviceName = Objects.requireNonNull(service, "service");
+    this.serviceInstanceId = Objects.requireNonNull(instanceId, "instanceId");
+    this.serviceHost = host;
+    this.servicePort = port;
+    this.heartbeatIntervalSec =
+        heartbeatSeconds <= 0 ? DEFAULT_HEARTBEAT_INTERVAL_SECONDS : heartbeatSeconds;
+    this.statusIntervalSec = statusSeconds <= 0 ? DEFAULT_STATUS_INTERVAL_SECONDS : statusSeconds;
+    this.ttlSeconds = ttlSeconds <= 0 ? DEFAULT_TTL_SECONDS : ttlSeconds;
+    this.tlsRequired = tlsRequired;
+    this.routeHost = routeHost;
+    this.routePort = routePort;
+    this.routeAuthority = routeAuthority;
+    this.serviceStartEpochMs = System.currentTimeMillis();
+    Map<String, String> attrCopy = Strings.isEmpty(attrs) ? Map.of() : Map.copyOf(attrs);
+    this.attrs = new ConcurrentHashMap<>(attrCopy);
+    String resolvedRegion = region;
+    if (Strings.isBlank(resolvedRegion)) {
+      resolvedRegion = attrCopy.get("region");
+    }
+    this.region = Strings.isBlank(resolvedRegion) ? "AMRS" : resolvedRegion;
+    this.serviceAppName = Strings.firstNonBlank(appName, serviceName);
+    this.serviceAppInstanceId = Strings.firstNonBlank(appInstance, serviceInstanceId);
+    this.serviceAppGroup = Strings.firstNonBlank(appGroup, group);
+    if (scheduler == null) {
+      this.ses = Executors.newSingleThreadScheduledExecutor();
+      this.ownsScheduler = true;
+    } else {
+      this.ses = scheduler;
+      this.ownsScheduler = false;
     }
   }
 
-  public S3ObjectMetadata headObject(String key) {
-    String resolved = resolveRequiredKey(key);
-    try {
-      HeadObjectResponse response =
-          client.headObject(HeadObjectRequest.builder().bucket(bucket).key(resolved).build());
-      return fromHead(resolved, response);
-    } catch (S3Exception ex) {
-      throw toOperationException("HeadObject", ex, resolved);
-    } catch (Exception ex) {
-      throw new IllegalStateException(
-          "Failed to read metadata for object '" + resolved + "': " + ex.getMessage(), ex);
-    }
+  public void start() {
+    publishServiceStartOrThrow();
+    heartbeatTask =
+        ses.scheduleAtFixedRate(
+            this::publishHeartbeatSafe, heartbeatIntervalSec, heartbeatIntervalSec, TimeUnit.SECONDS);
+    statusTask =
+        ses.scheduleAtFixedRate(
+            this::publishStatusSafe, statusIntervalSec, statusIntervalSec, TimeUnit.SECONDS);
   }
 
-  public S3ObjectContent readObject(S3ReadObjectRequest request) {
-    Objects.requireNonNull(request, "request");
-    String resolved = resolveRequiredKey(request.key());
-    try {
-      GetObjectRequest.Builder builder = GetObjectRequest.builder().bucket(bucket).key(resolved);
-      String range = toRangeHeader(request.rangeStart(), request.rangeEnd());
-      if (range != null) {
-        builder.range(range);
-      }
-      ResponseBytes<GetObjectResponse> response =
-          client.getObject(builder.build(), ResponseTransformer.toBytes());
-      GetObjectResponse metadata = response.response();
-      return new S3ObjectContent(
-          response.asByteArray(), fromGet(resolved, metadata), metadata.contentType());
-    } catch (S3Exception ex) {
-      throw toOperationException("GetObject", ex, resolved);
-    } catch (Exception ex) {
-      throw new IllegalStateException(
-          "Failed to read S3 object '" + resolved + "': " + ex.getMessage(), ex);
-    }
-  }
-
-  public S3ObjectContent readObject(String key) {
-    return readObject(S3ReadObjectRequest.builder().withKey(key).build());
-  }
-
-  public void uploadObject(S3UploadRequest request) {
-    Objects.requireNonNull(request, "request");
-    String resolved = resolveRequiredKey(request.key());
-    try {
-      PutObjectRequest.Builder builder = PutObjectRequest.builder().bucket(bucket).key(resolved);
-      if (hasText(request.contentType())) {
-        builder.contentType(request.contentType());
-      }
-      if (!request.metadata().isEmpty()) {
-        builder.metadata(request.metadata());
-      }
-      PutObjectRequest putRequest = builder.build();
-      if (request.bytes() != null) {
-        client.putObject(putRequest, RequestBody.fromBytes(request.bytes()));
-      } else {
-        InputStream stream = Objects.requireNonNull(request.stream(), "stream");
-        long length = request.contentLength();
-        if (length < 0) {
-          throw new IllegalArgumentException("contentLength must be >= 0 for stream uploads");
-        }
-        try {
-          client.putObject(putRequest, RequestBody.fromInputStream(stream, length));
-        } finally {
-          if (request.closeStream()) {
-            try {
-              stream.close();
-            } catch (Exception ignore) {
-            }
-          }
-        }
-      }
-    } catch (S3Exception ex) {
-      throw toOperationException("PutObject", ex, resolved);
-    } catch (Exception ex) {
-      throw new IllegalStateException(
-          "Failed to upload S3 object '" + resolved + "': " + ex.getMessage(), ex);
-    }
-  }
-
-  public void deleteObject(String key) {
-    String resolved = resolveRequiredKey(key);
-    try {
-      client.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(resolved).build());
-    } catch (S3Exception ex) {
-      throw toOperationException("DeleteObject", ex, resolved);
-    } catch (Exception ex) {
-      throw new IllegalStateException(
-          "Failed to delete S3 object '" + resolved + "': " + ex.getMessage(), ex);
-    }
-  }
-
-  public S3DeleteResult deleteObjects(List<String> keys) {
-    if (Strings.isEmpty(keys)) {
-      return new S3DeleteResult(0, List.of());
-    }
-    List<ObjectIdentifier> identifiers =
-        keys.stream()
-            .filter(Objects::nonNull)
-            .map(this::resolveRequiredKey)
-            .map(key -> ObjectIdentifier.builder().key(key).build())
-            .collect(Collectors.toList());
-    if (identifiers.isEmpty()) {
-      return new S3DeleteResult(0, List.of());
-    }
-    List<String> failed = new ArrayList<>();
-    int deleted = 0;
-    try {
-      for (int offset = 0; offset < identifiers.size(); offset += DELETE_BATCH_LIMIT) {
-        int to = Math.min(offset + DELETE_BATCH_LIMIT, identifiers.size());
-        List<ObjectIdentifier> batch = identifiers.subList(offset, to);
-        DeleteObjectsResponse response =
-            client.deleteObjects(
-                DeleteObjectsRequest.builder()
-                    .bucket(bucket)
-                    .delete(Delete.builder().objects(batch).build())
-                    .build());
-        deleted += response.deleted() == null ? 0 : response.deleted().size();
-        if (response.errors() != null) {
-          response.errors().stream()
-              .map(error -> error.key())
-              .filter(Objects::nonNull)
-              .forEach(failed::add);
-        }
-      }
-      return new S3DeleteResult(deleted, List.copyOf(failed));
-    } catch (S3Exception ex) {
-      throw toOperationException("DeleteObjects", ex, null);
-    } catch (Exception ex) {
-      throw new IllegalStateException("Failed to delete S3 objects: " + ex.getMessage(), ex);
-    }
-  }
-
-  public String resolveKey(String key) {
-    String parsed = parseKeyOrUri(key, false);
-    if (parsed.isEmpty()) {
-      return basePrefix == null ? parsed : basePrefix;
-    }
-    return applyBasePrefix(parsed);
-  }
-
-  public synchronized void configureDuckdbSession(DuckdbSession session) {
-    Objects.requireNonNull(session, "session");
-    if (!httpfsConfigured) {
-      session.exec("INSTALL httpfs");
-      session.exec("LOAD httpfs");
-      httpfsConfigured = true;
-    }
-    session.exec("SET s3_region='" + escapeSql(region) + "'");
-    session.execSensitive("SET s3_access_key_id='" + escapeSql(accessKeyId) + "'");
-    session.execSensitive("SET s3_secret_access_key='" + escapeSql(secretAccessKey) + "'");
-    if (sessionToken != null) {
-      session.execSensitive("SET s3_session_token='" + escapeSql(sessionToken) + "'");
-    }
-    String configuredEndpoint =
-        endpoint == null ? "s3." + region.trim() + ".amazonaws.com" : endpoint;
-    session.exec("SET s3_endpoint='" + escapeSql(configuredEndpoint) + "'");
-    boolean usePathStyle = pathStyleAccess || endpoint == null;
-    session.exec("SET s3_url_style='" + (usePathStyle ? "path" : "virtual_host") + "'");
-    session.exec("SET s3_use_ssl=" + (useSslForEndpoint ? "true" : "false"));
-    execOptionalDuckdbSetting(
-        session, "SET s3_allow_unverified_ssl=" + (useSslForEndpoint ? "false" : "true"));
-  }
-
-  private static void execOptionalDuckdbSetting(DuckdbSession session, String sql) {
-    try {
-      session.exec(sql);
-    } catch (IllegalStateException ex) {
-      String message = Strings.trimToNull(ex.getMessage());
-      String normalized = message == null ? "" : message.toLowerCase(Locale.ROOT);
-      if (normalized.contains("unrecognized configuration parameter")) {
-        return;
-      }
-      throw ex;
-    }
-  }
-
-  private S3Client buildClient() {
-    AwsCredentials credentials =
-        sessionToken == null
-            ? AwsBasicCredentials.create(accessKeyId, secretAccessKey)
-            : AwsSessionCredentials.create(accessKeyId, secretAccessKey, sessionToken);
-    S3ClientBuilder builder =
-        S3Client.builder()
-            .region(Region.of(region))
-            .credentialsProvider(StaticCredentialsProvider.create(credentials))
-            .forcePathStyle(pathStyleAccess);
-    if (endpointUri != null) {
-      builder.endpointOverride(endpointUri);
-    }
-    return builder.build();
-  }
-
-  private static String normalizePrefix(String value) {
-    String trimmed = Strings.trimToNull(value);
-    if (trimmed == null) {
-      return null;
-    }
-    String normalized = trimmed.replace('\\', '/');
-    while (normalized.startsWith("/")) {
-      normalized = normalized.substring(1);
-    }
-    while (normalized.endsWith("/")) {
-      normalized = normalized.substring(0, normalized.length() - 1);
-    }
-    return Strings.trimToNull(normalized);
-  }
-
-  private String resolveRequiredKey(String value) {
-    String resolved = resolveKey(value);
-    if (Strings.isBlank(resolved)) {
-      throw new IllegalArgumentException("object key is required");
-    }
-    return resolved;
-  }
-
-  private String parseKeyOrUri(String value, boolean allowEmpty) {
-    String trimmed = Strings.trimToNull(value);
-    if (trimmed == null) {
-      if (allowEmpty) {
-        return "";
-      }
-      throw new IllegalArgumentException("object key is required");
-    }
-    if (isS3Uri(trimmed)) {
-      URI uri;
-      try {
-        uri = URI.create(trimmed);
-      } catch (Exception ex) {
-        throw new IllegalArgumentException("Invalid S3 URI: " + value, ex);
-      }
-      String uriBucket = Strings.trimToNull(uri.getHost());
-      if (uriBucket == null) {
-        throw new IllegalArgumentException("S3 URI must include a bucket name: " + value);
-      }
-      if (!bucket.equals(uriBucket)) {
-        throw new IllegalArgumentException(
-            "S3 URI bucket mismatch: expected '" + bucket + "' but was '" + uriBucket + "'");
-      }
-      String path = Strings.trimToNull(uri.getPath());
-      if (path == null || "/".equals(path)) {
-        return "";
-      }
-      return path.startsWith("/") ? path.substring(1) : path;
-    }
-    String normalized = trimmed.replace('\\', '/');
-    while (normalized.startsWith("/")) {
-      normalized = normalized.substring(1);
-    }
-    return normalized;
-  }
-
-  private String applyBasePrefix(String key) {
-    if (!hasText(basePrefix) || !hasText(key)) {
-      return key;
-    }
-    if (key.equals(basePrefix) || key.startsWith(basePrefix + "/")) {
-      return key;
-    }
-    return basePrefix + "/" + key;
-  }
-
-  private static S3ObjectSummary toSummary(S3Object object) {
-    return new S3ObjectSummary(
-        object.key(),
-        object.size(),
-        object.lastModified(),
-        object.eTag(),
-        object.storageClassAsString());
-  }
-
-  private static S3ObjectMetadata fromHead(String key, HeadObjectResponse response) {
-    return new S3ObjectMetadata(
-        key,
-        response.contentLength(),
-        response.lastModified(),
-        response.eTag(),
-        response.contentType(),
-        response.contentEncoding(),
-        response.contentLanguage(),
-        response.metadata() == null ? Map.of() : Map.copyOf(response.metadata()));
-  }
-
-  private static S3ObjectMetadata fromGet(String key, GetObjectResponse response) {
-    return new S3ObjectMetadata(
-        key,
-        response.contentLength(),
-        response.lastModified(),
-        response.eTag(),
-        response.contentType(),
-        response.contentEncoding(),
-        response.contentLanguage(),
-        response.metadata() == null ? Map.of() : Map.copyOf(response.metadata()));
-  }
-
-  private static String toRangeHeader(Long start, Long end) {
-    if (start == null && end == null) {
-      return null;
-    }
-    long resolvedStart = Optional.ofNullable(start).orElse(0L);
-    if (resolvedStart < 0) {
-      throw new IllegalArgumentException("range start must be >= 0");
-    }
-    if (end != null && end < resolvedStart) {
-      throw new IllegalArgumentException("range end must be >= range start");
-    }
-    StringBuilder builder = new StringBuilder("bytes=").append(resolvedStart).append('-');
-    if (end != null) {
-      builder.append(end);
-    }
-    return builder.toString();
-  }
-
-  private static S3OperationException toOperationException(
-      String operation, S3Exception ex, String key) {
-    String errorCode = ex.awsErrorDetails() == null ? null : ex.awsErrorDetails().errorCode();
-    String message =
-        ex.awsErrorDetails() == null ? ex.getMessage() : ex.awsErrorDetails().errorMessage();
-    return new S3OperationException(operation, key, ex.statusCode(), errorCode, message, ex);
-  }
-
-  private static URI toEndpointUri(String value) {
-    String trimmed = Strings.trimToNull(value);
-    if (trimmed == null) {
-      return null;
-    }
-    String normalized = trimmed.contains("://") ? trimmed : "https://" + trimmed;
-    try {
-      return URI.create(normalized);
-    } catch (Exception ex) {
-      throw new IllegalArgumentException("Invalid s3.endpoint value: " + value, ex);
-    }
-  }
-
-  private static boolean isS3Uri(String value) {
-    return value != null
-        && (value.regionMatches(true, 0, "s3://", 0, "s3://".length())
-            || value.regionMatches(true, 0, "s3a://", 0, "s3a://".length()));
-  }
-
-  private static boolean hasText(String value) {
-    return !Strings.isBlank(value);
+  public ServiceStatusPublisher withSessionLineage(String sessionId, String sessionKey) {
+    this.sessionId = Strings.trimToNull(sessionId);
+    this.sessionKey = Strings.trimToNull(sessionKey);
+    return this;
   }
 
   @Override
   public void close() {
-    try {
-      client.close();
-    } catch (Exception ignore) {
+    if (!open) {
+      return;
+    }
+    open = false;
+    publishStatusSafe(STATUS_OFFLINE);
+    publishHeartbeatSafe();
+    ScheduledFuture<?> task = heartbeatTask;
+    heartbeatTask = null;
+    if (task != null) {
+      task.cancel(true);
+    }
+    ScheduledFuture<?> status = statusTask;
+    statusTask = null;
+    if (status != null) {
+      status.cancel(true);
+    }
+    if (ownsScheduler) {
+      ses.shutdownNow();
     }
   }
 
-  private static String escapeSql(String value) {
-    return value.replace("'", "''");
+  private void publishHeartbeatSafe() {
+    try {
+      publishServiceHeartbeat(STATUS_ONLINE);
+    } catch (Exception e) {
+      LOGGER.error("[Status] service heartbeat publish failed", e);
+    }
+  }
+
+  private void publishStatusSafe() {
+    publishStatusSafe(STATUS_ONLINE);
+  }
+
+  private void publishStatusSafe(String status) {
+    try {
+      publishServiceStatus(status);
+    } catch (Exception e) {
+      LOGGER.error("[Status] service status publish failed for status={}", status, e);
+    }
+  }
+
+  private void publishServiceStartOrThrow() {
+    validateServiceHeartbeatContract();
+    try {
+      publishServiceStatus(STATUS_ONLINE);
+      publishServiceHeartbeat(STATUS_ONLINE);
+    } catch (Exception ex) {
+      throw new IllegalStateException(
+          "Failed to publish initial service heartbeat/status: serviceId="
+              + valueOrUnknown(group)
+              + "/"
+              + valueOrUnknown(serviceName)
+              + ", instanceId="
+              + valueOrUnknown(serviceInstanceId),
+          ex);
+    }
+  }
+
+  private void validateServiceHeartbeatContract() {
+    ServiceAdvertise.requireRoutableHost(serviceHost, "advertiseHost");
+    if (servicePort <= 0) {
+      throw new IllegalStateException(
+          "Failed to publish service heartbeat: serviceId="
+              + valueOrUnknown(group)
+              + "/"
+              + valueOrUnknown(serviceName)
+              + ", instanceId="
+              + valueOrUnknown(serviceInstanceId)
+              + ", advertisePort is missing/invalid. Configure bind.port or advertise.port.");
+    }
+    if (tlsRequired) {
+      String tlsTermination = Strings.trimToNull(attrs.get("tlsTermination"));
+      if (tlsTermination == null) {
+        throw new IllegalStateException(
+            "Failed to publish service heartbeat: serviceId="
+                + valueOrUnknown(group)
+                + "/"
+                + valueOrUnknown(serviceName)
+                + ", instanceId="
+                + valueOrUnknown(serviceInstanceId)
+                + ", tlsEnabled=true but tlsTermination is missing.");
+      }
+    }
+  }
+
+  private void publishServiceStatus(String status) throws Exception {
+    DefinitionStatusService definition = buildServiceStatus(status);
+    if (definition == null) {
+      return;
+    }
+    publishStatusDefinition(definition);
+  }
+
+  private void publishServiceHeartbeat(String status) throws Exception {
+    DefinitionHbService heartbeat = buildServiceHeartbeat();
+    if (heartbeat == null) {
+      return;
+    }
+    String payload = om.writeValueAsString(heartbeat);
+    if (STATUS_DEBUG) {
+      LOGGER.debug("[Status] publish topic={} status={} payload={}", DiscoveryTopics.HEARTBEAT, status, payload);
+    }
+    int ttl = ttlSeconds > 0 ? ttlSeconds : 0;
+    control.amps().publish(DiscoveryTopics.HEARTBEAT, payload, ttl);
+  }
+
+  private void publishStatusDefinition(
+      org.pronzato.fabric.api.control.discovery.definitions.Definition definition) throws Exception {
+    if (definition == null) {
+      return;
+    }
+    String payload = om.writeValueAsString(definition);
+    if (STATUS_DEBUG) {
+      LOGGER.debug("[Status] publish topic={} payload={}", DiscoveryTopics.STATUS, payload);
+    }
+    control.amps().publish(DiscoveryTopics.STATUS, payload);
+  }
+
+  private DefinitionStatusService buildServiceStatus(String status) {
+    String normalizedGroup = Strings.trimToNull(group);
+    String normalizedName = Strings.trimToNull(serviceName);
+    String normalizedInstance = Strings.trimToNull(serviceInstanceId);
+    if (normalizedGroup == null || normalizedName == null || normalizedInstance == null) {
+      return null;
+    }
+    DefinitionEnvelope envelope = statusEnvelope(DefinitionType.STATUS_SERVICE, normalizedName);
+    if (envelope == null) {
+      return null;
+    }
+    long nowMs = System.currentTimeMillis();
+    Integer port = servicePort > 0 ? servicePort : null;
+    String transport = resolveTransport();
+    String uri = resolveUri(port);
+    Map<String, String> tagsSnapshot = attrs.isEmpty() ? Map.of() : Map.copyOf(attrs);
+    String advertiseHost = Strings.trimToNull(serviceHost);
+    Integer advertisePort = port;
+    String bindHost = Strings.trimToNull(attrs.get("bindHost"));
+    Integer bindPort = parseInteger(attrs.get("bindPort"));
+    Boolean tlsEnabled = tlsRequired;
+    String tlsTermination =
+        firstNonBlank(Strings.trimToNull(attrs.get("tlsTermination")), tlsRequired ? "PASSTHROUGH" : null);
+    Boolean kerberosEnabled = parseBoolean(attrs.get("kerberosEnabled"));
+    if (kerberosEnabled == null) {
+      kerberosEnabled = false;
+    }
+    String kerberosSpn = Strings.trimToNull(attrs.get("kerberosSpn"));
+    String derivedSpn = Strings.trimToNull(attrs.get("derivedSpn"));
+    Long startEpochMs = serviceStartEpochMs > 0L ? serviceStartEpochMs : null;
+    DefinitionStatusService.State state = null;
+    if (status != null) {
+      try {
+        state = DefinitionStatusService.State.valueOf(status);
+      } catch (IllegalArgumentException ignore) {
+        state = DefinitionStatusService.State.UNKNOWN;
+      }
+    }
+    if (state == null) {
+      state = DefinitionStatusService.State.UNKNOWN;
+    }
+    return new DefinitionStatusService(
+        envelope,
+        normalizedGroup,
+        DefinitionType.STATUS_SERVICE,
+        normalizedName,
+        normalizedInstance,
+        state,
+        nowMs,
+        startEpochMs,
+        null,
+        transport,
+        uri,
+        advertiseHost,
+        advertisePort,
+        bindHost,
+        bindPort,
+        tlsEnabled,
+        tlsTermination,
+        kerberosEnabled,
+        kerberosSpn,
+        derivedSpn,
+        Strings.trimToNull(serviceHost),
+        port,
+        tlsRequired,
+        Strings.trimToNull(routeHost),
+        routePort,
+        Strings.trimToNull(routeAuthority),
+        Strings.trimToNull(region),
+        Strings.trimToNull(serviceAppName),
+        Strings.trimToNull(serviceAppInstanceId),
+        Strings.trimToNull(serviceAppGroup),
+        tagsSnapshot,
+        sessionId,
+        sessionKey);
+  }
+
+  private DefinitionHbService buildServiceHeartbeat() {
+    String normalizedGroup = Strings.trimToNull(group);
+    String normalizedName = Strings.trimToNull(serviceName);
+    String normalizedInstance = Strings.trimToNull(serviceInstanceId);
+    if (normalizedGroup == null || normalizedName == null || normalizedInstance == null) {
+      return null;
+    }
+    DefinitionEnvelope envelope = statusEnvelope(DefinitionType.HEARTBEAT_SERVICE, normalizedName);
+    if (envelope == null) {
+      return null;
+    }
+    Integer port = servicePort > 0 ? servicePort : null;
+    String transport = resolveTransport();
+    String uri = resolveUri(port);
+    Map<String, String> tagsSnapshot = attrs.isEmpty() ? Map.of() : Map.copyOf(attrs);
+    String advertiseHost = Strings.trimToNull(serviceHost);
+    Integer advertisePort = port;
+    String bindHost = Strings.trimToNull(attrs.get("bindHost"));
+    Integer bindPort = parseInteger(attrs.get("bindPort"));
+    Boolean tlsEnabled = tlsRequired;
+    String tlsTermination =
+        firstNonBlank(Strings.trimToNull(attrs.get("tlsTermination")), tlsRequired ? "PASSTHROUGH" : null);
+    Boolean kerberosEnabled = parseBoolean(attrs.get("kerberosEnabled"));
+    if (kerberosEnabled == null) {
+      kerberosEnabled = false;
+    }
+    String kerberosSpn = Strings.trimToNull(attrs.get("kerberosSpn"));
+    String derivedSpn = Strings.trimToNull(attrs.get("derivedSpn"));
+    long nowMs = System.currentTimeMillis();
+    return new DefinitionHbService(
+        envelope,
+        normalizedGroup,
+        DefinitionType.HEARTBEAT_SERVICE,
+        normalizedName,
+        normalizedInstance,
+        transport,
+        uri,
+        advertiseHost,
+        advertisePort,
+        bindHost,
+        bindPort,
+        tlsEnabled,
+        tlsTermination,
+        kerberosEnabled,
+        kerberosSpn,
+        derivedSpn,
+        Strings.trimToNull(serviceHost),
+        port,
+        tlsRequired,
+        Strings.trimToNull(routeHost),
+        routePort,
+        Strings.trimToNull(routeAuthority),
+        Strings.trimToNull(region),
+        nowMs,
+        tagsSnapshot);
+  }
+
+  private DefinitionEnvelope statusEnvelope(DefinitionType type, String name) {
+    String normalizedGroup = Strings.trimToNull(group);
+    String normalizedName = Strings.trimToNull(name);
+    if (normalizedGroup == null || normalizedName == null || type == null) {
+      return null;
+    }
+    return new DefinitionEnvelope(
+        normalizedGroup,
+        type,
+        normalizedName,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null);
+  }
+
+  private String resolveTransport() {
+    if (Strings.isEmpty(attrs)) {
+      return null;
+    }
+    return firstNonBlank(attrs.get("transport"), attrs.get("protocol"), attrs.get("serviceType"));
+  }
+
+  private String resolveUri(Integer port) {
+    String authority = firstNonBlank(routeAuthority, routeHost, serviceHost);
+    if (authority == null) {
+      return null;
+    }
+    if (authority.contains(":")) {
+      return authority;
+    }
+    int resolvedPort = port == null ? 0 : port;
+    if (resolvedPort <= 0 && routePort != null) {
+      resolvedPort = routePort;
+    }
+    return resolvedPort > 0 ? authority + ":" + resolvedPort : authority;
+  }
+
+  private static String firstNonBlank(String... values) {
+    if (values == null) {
+      return null;
+    }
+    for (String value : values) {
+      if (Strings.isNotBlank(value)) {
+        return value.trim();
+      }
+    }
+    return null;
+  }
+
+  private static Integer parseInteger(String value) {
+    if (Strings.isBlank(value)) {
+      return null;
+    }
+    try {
+      return Integer.parseInt(value.trim());
+    } catch (NumberFormatException ignore) {
+      return null;
+    }
+  }
+
+  private static Boolean parseBoolean(String value) {
+    if (Strings.isBlank(value)) {
+      return null;
+    }
+    String normalized = value.trim();
+    if ("true".equalsIgnoreCase(normalized) || "yes".equalsIgnoreCase(normalized)) {
+      return true;
+    }
+    if ("false".equalsIgnoreCase(normalized) || "no".equalsIgnoreCase(normalized)) {
+      return false;
+    }
+    return null;
+  }
+
+  private static String valueOrUnknown(String value) {
+    return Strings.isBlank(value) ? "<unknown>" : value;
   }
 }
+
+
+
+
+
+
