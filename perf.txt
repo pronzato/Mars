@@ -1,485 +1,473 @@
-package org.pronzato.fabric.api.connectors.amps.factory;
+package org.pronzato.fabric.api.control.entitlements.simple.data;
 
-import java.time.Duration;
-import java.util.Arrays;
-import java.util.Base64;
+import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Objects;
-import java.util.function.Consumer;
-import org.pronzato.fabric.api.control.security.kerberos.KerberosClient;
-import org.pronzato.fabric.api.util.Strings;
+import java.util.Set;
+import java.util.Locale;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
+import org.pronzato.fabric.api.control.discovery.CanonicalIds;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEntitlement;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
+import org.pronzato.fabric.api.control.entitlements.core.EntitlementsAction;
+import org.pronzato.fabric.api.control.entitlements.core.EntitlementObligations;
+import org.pronzato.fabric.api.control.entitlements.core.EntitlementsScopeType;
+import org.pronzato.fabric.api.control.entitlements.core.data.DataEntitlements;
+import org.pronzato.fabric.api.control.entitlements.provider.DefaultEntitlementProviderRegistry;
+import org.pronzato.fabric.api.control.entitlements.provider.EntitlementProviderRegistry;
+import org.pronzato.fabric.api.control.entitlements.provider.EntitlementSubjectCandidates;
+import org.pronzato.fabric.api.control.entitlements.provider.EntitlementProviderSelector;
+import org.pronzato.fabric.api.control.entitlements.provider.EntitlementSubjectProvider;
+import org.pronzato.fabric.api.control.entitlements.provider.ResolveRequest;
+import org.pronzato.fabric.api.control.entitlements.provider.SubjectContext;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-public final class AmpsFactoryOptions {
-  private final Kerberos kerberos = new Kerberos();
-  private final Connection connection = new Connection();
+public final class DataEntitlementsSimple implements DataEntitlements {
+  private static final Logger LOGGER = LoggerFactory.getLogger(DataEntitlementsSimple.class);
 
-  public Kerberos kerberos() {
-    return kerberos;
+  // Canonical, deterministic action strings derived from the shared enum.
+  // (Works for any enum-based EntitlementsAction.)
+  private static final String READ_ACTION =
+      EntitlementsAction.READ.name().toLowerCase(Locale.ROOT);
+  private static final String WRITE_ACTION =
+      EntitlementsAction.WRITE.name().toLowerCase(Locale.ROOT);
+
+  private final DiscoveryCache DiscoveryCache;
+  private final String sessionGroup;
+  private final EntitlementProviderSelector providerSelector;
+
+  public DataEntitlementsSimple(DiscoveryCache DiscoveryCache, String sessionGroup) {
+    this(
+        DiscoveryCache,
+        sessionGroup,
+        new DefaultEntitlementProviderRegistry(DiscoveryCache));
   }
 
-  public Connection connection() {
-    return connection;
+  public DataEntitlementsSimple(
+      DiscoveryCache DiscoveryCache, String sessionGroup, EntitlementSubjectProvider provider) {
+    this(DiscoveryCache, sessionGroup, new DefaultEntitlementProviderRegistry(provider));
   }
 
-  public AmpsFactoryOptions withKerberos(Consumer<Kerberos> customizer) {
-    Objects.requireNonNull(customizer, "customizer");
-    customizer.accept(kerberos);
-    return this;
+  public DataEntitlementsSimple(
+      DiscoveryCache DiscoveryCache, String sessionGroup, EntitlementProviderRegistry providerRegistry) {
+    this(
+        DiscoveryCache,
+        sessionGroup,
+        providerRegistry,
+        new EntitlementProviderSelector(DiscoveryCache, providerRegistry));
   }
 
-  public AmpsFactoryOptions withConnection(Consumer<Connection> customizer) {
-    Objects.requireNonNull(customizer, "customizer");
-    customizer.accept(connection);
-    return this;
+  public DataEntitlementsSimple(
+      DiscoveryCache DiscoveryCache,
+      String sessionGroup,
+      EntitlementProviderRegistry providerRegistry,
+      EntitlementProviderSelector providerSelector) {
+    this.DiscoveryCache = Objects.requireNonNull(DiscoveryCache, "DiscoveryCache");
+    this.sessionGroup = sessionGroup;
+    Objects.requireNonNull(providerRegistry, "providerRegistry");
+    this.providerSelector = Objects.requireNonNull(providerSelector, "providerSelector");
   }
 
-  public AmpsFactoryOptions copy() {
-    AmpsFactoryOptions copy = new AmpsFactoryOptions();
-    copy.kerberos.copyFrom(this.kerberos);
-    copy.connection.copyFrom(this.connection);
-    return copy;
+  @Override
+  public Decision authorizeRead(Identity identity, String datasetCanonicalId) {
+    return authorize(identity, datasetCanonicalId, READ_ACTION);
   }
 
-  static AmpsFactoryOptions merge(AmpsFactoryOptions options) {
-    return options == null ? new AmpsFactoryOptions() : options;
+  @Override
+  public Decision authorizeWrite(Identity identity, String datasetCanonicalId) {
+    return authorize(identity, datasetCanonicalId, WRITE_ACTION);
   }
 
-  public static AmpsFactoryOptions fromSystemProperties() {
-    AmpsFactoryOptions options = new AmpsFactoryOptions();
-    Kerberos kerb = options.kerberos();
-    kerb.enabled = Boolean.parseBoolean(System.getProperty("amps.kerberos.enabled", "false"));
-    kerb.principal = System.getProperty("amps.kerberos.principal", kerb.principal);
-    kerb.keytab = System.getProperty("amps.kerberos.keytab", kerb.keytab);
-    kerb.realm = System.getProperty("amps.kerberos.realm", kerb.realm);
-    kerb.kdc = System.getProperty("amps.kerberos.kdc", kerb.kdc);
-    kerb.mechanism = System.getProperty("amps.kerberos.mechanism", kerb.mechanism);
-    kerb.service = System.getProperty("amps.kerberos.service", kerb.service);
-    kerb.saslHost = System.getProperty("amps.kerberos.saslHost", kerb.saslHost);
-    kerb.authorizationId =
-        System.getProperty("amps.kerberos.authorizationId", kerb.authorizationId);
-    kerb.qop = System.getProperty("amps.kerberos.qop", kerb.qop);
-    kerb.logonOptions = System.getProperty("amps.kerberos.logonOptions", kerb.logonOptions);
-    kerb.debug = Boolean.parseBoolean(System.getProperty("amps.kerberos.debug", "false"));
-    String autoRefreshProp = System.getProperty("amps.kerberos.autoRefresh");
-    if (autoRefreshProp != null) {
-      kerb.autoRefresh = Boolean.parseBoolean(autoRefreshProp);
-    }
-    String refreshPeriodProp = System.getProperty("amps.kerberos.refreshPeriod");
-    if (Strings.isNotBlank(refreshPeriodProp)) {
-      kerb.refreshPeriod = parseDuration(refreshPeriodProp, kerb.refreshPeriod);
-    }
-    String krb5ConfPathProp = System.getProperty("amps.kerberos.krb5ConfPath");
-    if (Strings.isNotBlank(krb5ConfPathProp)) {
-      kerb.krb5ConfPath = krb5ConfPathProp;
-    }
-    String krb5ConfBase64Prop = System.getProperty("amps.kerberos.krb5ConfDataBase64");
-    if (Strings.isNotBlank(krb5ConfBase64Prop)) {
-      try {
-        kerb.krb5ConfData = Base64.getDecoder().decode(krb5ConfBase64Prop.trim());
-        kerb.krb5ConfPath = null;
-      } catch (IllegalArgumentException ex) {
-        throw new IllegalStateException("Invalid base64 for amps.kerberos.krb5ConfDataBase64", ex);
-      }
-    }
-    return options;
-  }
+  private Decision authorize(Identity identity, String datasetCanonicalId, String requestedAction) {
+    String datasetId = DataEntitlements.requireDatasetResourceId(datasetCanonicalId);
+    String datasetGroup = CanonicalIds.parse(datasetId).group();
+    String namespaceId = namespaceResourceId(datasetId);
 
-  public static final class Connection {
-    private Duration connectTimeout = Duration.ofSeconds(5);
-    private Duration initialDelay = Duration.ofMillis(200);
-    private Duration maximumDelay = Duration.ofSeconds(2);
-    private Duration maximumRetryTime = Duration.ofSeconds(15);
-    private double backoffExponent = 2.0d;
-    private double jitter = 0.25d;
+    String subject = DataEntitlements.subject(identity);
 
-    public Duration connectTimeout() {
-      return connectTimeout;
-    }
+    // Direct subject match only (exact). No normalization here.
+    Set<String> subjectCandidates = directSubjectCandidates(subject);
 
-    public Connection connectTimeout(Duration value) {
-      if (value != null && !value.isNegative() && !value.isZero()) {
-        connectTimeout = value;
-      }
-      return this;
-    }
-
-    public Duration initialDelay() {
-      return initialDelay;
-    }
-
-    public Connection initialDelay(Duration value) {
-      if (value != null && !value.isNegative()) {
-        initialDelay = value;
-      }
-      return this;
-    }
-
-    public Duration maximumDelay() {
-      return maximumDelay;
-    }
-
-    public Connection maximumDelay(Duration value) {
-      if (value != null && !value.isNegative() && !value.isZero()) {
-        maximumDelay = value;
-      }
-      return this;
-    }
-
-    public Duration maximumRetryTime() {
-      return maximumRetryTime;
-    }
-
-    public Connection maximumRetryTime(Duration value) {
-      if (value != null && !value.isNegative() && !value.isZero()) {
-        maximumRetryTime = value;
-      }
-      return this;
-    }
-
-    public double backoffExponent() {
-      return backoffExponent;
-    }
-
-    public Connection backoffExponent(double value) {
-      if (value > 1.0d) {
-        backoffExponent = value;
-      }
-      return this;
-    }
-
-    public double jitter() {
-      return jitter;
-    }
-
-    public Connection jitter(double value) {
-      if (value >= 0.0d && value <= 1.0d) {
-        jitter = value;
-      }
-      return this;
-    }
-
-    void copyFrom(Connection source) {
-      if (source == null) {
-        return;
-      }
-      this.connectTimeout = source.connectTimeout;
-      this.initialDelay = source.initialDelay;
-      this.maximumDelay = source.maximumDelay;
-      this.maximumRetryTime = source.maximumRetryTime;
-      this.backoffExponent = source.backoffExponent;
-      this.jitter = source.jitter;
-    }
-  }
-
-  public static final class Kerberos {
-    private boolean enabled;
-    private String principal;
-    private String keytab;
-    private byte[] keytabBytes;
-    private String realm;
-    private String kdc;
-    private String mechanism = "GSSAPI";
-    private String service = "AMPS";
-    private String saslHost;
-    private String authorizationId;
-    private String qop;
-    private String logonOptions;
-    private boolean debug;
-    private boolean autoRefresh = true;
-    private Duration refreshPeriod = Duration.ofHours(6);
-    private String krb5ConfPath;
-    private byte[] krb5ConfData;
-    private String cacheKeyPrefix;
-    private KerberosClient runtimeContext;
-
-    public Kerberos enabled(boolean value) {
-      enabled = value;
-      return this;
-    }
-
-    public Kerberos principal(String value) {
-      principal = value;
-      return this;
-    }
-
-    public Kerberos keytab(String value) {
-      keytab = value;
-      return this;
-    }
-
-    public Kerberos keytabBytes(byte[] data) {
-      keytabBytes = data == null ? null : data.clone();
-      keytab = null;
-      return this;
-    }
-
-    public Kerberos realm(String value) {
-      realm = value;
-      return this;
-    }
-
-    public Kerberos kdc(String value) {
-      kdc = value;
-      return this;
-    }
-
-    public Kerberos mechanism(String value) {
-      if (Strings.isNotBlank(value)) {
-        mechanism = value;
-      }
-      return this;
-    }
-
-    public Kerberos service(String value) {
-      if (Strings.isNotBlank(value)) {
-        service = value;
-      }
-      return this;
-    }
-
-    public Kerberos saslHost(String value) {
-      saslHost = Strings.isBlank(value) ? null : value;
-      return this;
-    }
-
-    public Kerberos authorizationId(String value) {
-      authorizationId = value;
-      return this;
-    }
-
-    public Kerberos qop(String value) {
-      qop = value;
-      return this;
-    }
-
-    public Kerberos logonOptions(String value) {
-      logonOptions = value;
-      return this;
-    }
-
-    public Kerberos debug(boolean value) {
-      debug = value;
-      return this;
-    }
-
-    public Kerberos autoRefresh(boolean value) {
-      autoRefresh = value;
-      return this;
-    }
-
-    public Kerberos refreshPeriod(Duration value) {
-      if (value != null && !value.isNegative() && !value.isZero()) {
-        refreshPeriod = value;
-      }
-      return this;
-    }
-
-    public Kerberos krb5ConfPath(String value) {
-      krb5ConfPath = value;
-      return this;
-    }
-
-    public Kerberos krb5ConfData(byte[] value) {
-      krb5ConfData = value == null ? null : value.clone();
-      return this;
-    }
-
-    public Kerberos cacheKeyPrefix(String value) {
-      cacheKeyPrefix = value;
-      return this;
-    }
-
-    public Kerberos runtimeContext(KerberosClient value) {
-      runtimeContext = value;
-      return this;
-    }
-
-    public boolean isEnabled() {
-      return enabled;
-    }
-
-    public String getPrincipal() {
-      return principal;
-    }
-
-    public String getKeytab() {
-      return keytab;
-    }
-
-    public byte[] getKeytabBytes() {
-      return keytabBytes == null ? null : keytabBytes.clone();
-    }
-
-    public String realm() {
-      return realm;
-    }
-
-    public String kdc() {
-      return kdc;
-    }
-
-    public String getKrb5ConfPath() {
-      return krb5ConfPath;
-    }
-
-    public byte[] getKrb5ConfData() {
-      return krb5ConfData == null ? null : krb5ConfData.clone();
-    }
-
-    public boolean debugEnabled() {
-      return debug;
-    }
-
-    public boolean hasKrb5Config() {
-      return Strings.isNotBlank(krb5ConfPath) || (krb5ConfData != null && krb5ConfData.length > 0);
-    }
-
-    public KerberosClient runtimeContext() {
-      return runtimeContext;
-    }
-
-    boolean enabled() {
-      return enabled;
-    }
-
-    String mechanism() {
-      return mechanism;
-    }
-
-    String service() {
-      return service;
-    }
-
-    String saslHost() {
-      return saslHost;
-    }
-
-    String authorizationId() {
-      return authorizationId;
-    }
-
-    String qop() {
-      return qop;
-    }
-
-    String logonOptions() {
-      return Strings.isBlank(logonOptions) ? null : logonOptions;
-    }
-
-    boolean debug() {
-      return debug;
-    }
-
-    boolean autoRefreshEnabled() {
-      return autoRefresh;
-    }
-
-    Duration refreshPeriod() {
-      return refreshPeriod;
-    }
-
-    String loginCacheKey() {
-      String base =
-          String.join(
-              "|",
-              valueOrEmpty(principal),
-              valueOrEmpty(keytab),
-              hashBytes(keytabBytes),
-              valueOrEmpty(realm),
-              valueOrEmpty(kdc),
-              valueOrEmpty(krb5ConfPath),
-              hashBytes(krb5ConfData));
-      String prefix = valueOrEmpty(cacheKeyPrefix);
-      if (prefix.isEmpty()) {
-        return base;
-      }
-      return prefix + "|" + base;
-    }
-
-    void validate() {
-      if (!enabled) {
-        return;
-      }
-      if (runtimeContext != null) {
-        return;
-      }
-      if (Strings.isBlank(principal)) {
-        throw new IllegalStateException(
-            "Kerberos principal must be provided when Kerberos is enabled.");
-      }
-      boolean hasPath = Strings.isNotBlank(keytab);
-      boolean hasBytes = keytabBytes != null && keytabBytes.length > 0;
-      if (hasPath == hasBytes) {
-        throw new IllegalStateException(
-            "Kerberos keytab is required when Kerberos is enabled. Configure exactly one of keytab(...) or keytabBytes(...).");
-      }
-    }
-
-    void copyFrom(Kerberos source) {
-      if (source == null) {
-        return;
-      }
-      this.enabled = source.enabled;
-      this.principal = source.principal;
-      this.keytab = source.keytab;
-      this.keytabBytes = source.keytabBytes == null ? null : source.keytabBytes.clone();
-      this.realm = source.realm;
-      this.kdc = source.kdc;
-      this.mechanism = source.mechanism;
-      this.service = source.service;
-      this.saslHost = source.saslHost;
-      this.authorizationId = source.authorizationId;
-      this.qop = source.qop;
-      this.logonOptions = source.logonOptions;
-      this.debug = source.debug;
-      this.autoRefresh = source.autoRefresh;
-      this.refreshPeriod = source.refreshPeriod;
-      this.krb5ConfPath = source.krb5ConfPath;
-      this.krb5ConfData = source.krb5ConfData == null ? null : source.krb5ConfData.clone();
-      this.cacheKeyPrefix = source.cacheKeyPrefix;
-      this.runtimeContext = source.runtimeContext;
-    }
-
-    private static String hashBytes(byte[] value) {
-      if (value == null || value.length == 0) {
-        return "";
-      }
-      return Integer.toString(Arrays.hashCode(value));
-    }
-  }
-
-  private static Duration parseDuration(String value, Duration fallback) {
-    if (value == null) {
-      return fallback;
-    }
-    String trimmed = value.trim();
-    if (trimmed.isEmpty()) {
-      return fallback;
-    }
+    SubjectContext subjectContext;
     try {
-      if (trimmed.startsWith("P")) {
-        return Duration.parse(trimmed);
+      EntitlementProviderSelector.Selection selectedProvider =
+          providerSelector.select(EntitlementsScopeType.DATASET, datasetId);
+      subjectContext =
+          selectedProvider.provider().resolve(
+              new ResolveRequest(
+                  identity.subject(),
+                  identity.delegatedSubject(),
+                  EntitlementsScopeType.DATASET.name(),
+                  datasetId,
+                  Map.of()));
+    } catch (RuntimeException ex) {
+      return new Decision(false, "DENIED SUBJECT_PROVIDER_UNAVAILABLE: " + safeReason(ex), null);
+    }
+    Set<String> membershipCandidates =
+        EntitlementSubjectCandidates.membershipSubjectCandidates(subjectContext.subjectId());
+    Set<String> groups = subjectContext.effectiveGroups();
+
+    List<DefinitionEntitlement> entitlements = DiscoveryCache.list(DefinitionEntitlement.class);
+
+    // 1) Dataset scope is authoritative if present.
+    ScopeEvaluation datasetScope =
+        evaluateScope(
+            entitlements, datasetId, subjectCandidates, groups, requestedAction, true, datasetGroup);
+    if (datasetScope.exists()) {
+      if (datasetScope.deny()) {
+        boolean namespacePolicyExists = scopeExists(entitlements, namespaceId, false, datasetGroup);
+        logDeny(
+            subject,
+            membershipCandidates.size(),
+            datasetId,
+            true,
+            namespacePolicyExists,
+            "explicit_deny");
+        return new Decision(false, "DENY matched rules", null);
       }
-      char last = trimmed.charAt(trimmed.length() - 1);
-      if (Character.isLetter(last)) {
-        long amount = Long.parseLong(trimmed.substring(0, trimmed.length() - 1));
-        switch (Character.toUpperCase(last)) {
-          case 'H':
-            return Duration.ofHours(amount);
-          case 'M':
-            return Duration.ofMinutes(amount);
-          case 'S':
-            return Duration.ofSeconds(amount);
-          default:
-            return fallback;
+      if (datasetScope.allow()) {
+        return new Decision(true, "ALLOW matched rules", null, datasetScope.obligations());
+      }
+      boolean namespacePolicyExists = scopeExists(entitlements, namespaceId, false, datasetGroup);
+      logDeny(
+          subject,
+          membershipCandidates.size(),
+          datasetId,
+          true,
+          namespacePolicyExists,
+          "no_matching_binding");
+      return new Decision(false, "DENIED no matching policy", null);
+    }
+
+    // 2) Namespace scope fallback only if dataset scope does not exist.
+    ScopeEvaluation namespaceScope =
+        evaluateScope(
+            entitlements, namespaceId, subjectCandidates, groups, requestedAction, false, datasetGroup);
+    if (namespaceScope.exists()) {
+      if (namespaceScope.deny()) {
+        logDeny(subject, membershipCandidates.size(), datasetId, false, true, "explicit_deny");
+        return new Decision(false, "DENY matched rules", null);
+      }
+      if (namespaceScope.allow()) {
+        return new Decision(true, "ALLOW matched rules", null, namespaceScope.obligations());
+      }
+      logDeny(subject, membershipCandidates.size(), datasetId, false, true, "no_matching_binding");
+      return new Decision(false, "DENIED no matching policy", null);
+    }
+
+    // 3) No policy -> deny.
+    logDeny(subject, membershipCandidates.size(), datasetId, false, false, "no_policy");
+    return new Decision(false, "DENIED no matching policy", null);
+  }
+
+  private ScopeEvaluation evaluateScope(
+      List<DefinitionEntitlement> entitlements,
+      String scopeId,
+      Set<String> subjectCandidates,
+      Set<String> groups,
+      String requestedAction,
+      boolean datasetScope,
+      String datasetGroup) {
+    boolean exists = false;
+    boolean deny = false;
+    boolean allow = false;
+    EntitlementObligations allowObligations = EntitlementObligations.empty();
+    boolean allowObligationsChosen = false;
+
+    for (DefinitionEntitlement entitlement : entitlements) {
+      if (!enabled(entitlement == null || entitlement.envelope() == null
+          ? null
+          : entitlement.envelope().enabled())) {
+        continue;
+      }
+      if (!isInScope(entitlement == null ? null : entitlement.envelope(), datasetGroup)) {
+        continue;
+      }
+
+      String canonicalScopeId =
+          datasetScope
+              ? canonicalDatasetScopeId(entitlement == null ? null : entitlement.scopeId())
+              : canonicalNamespaceScopeId(entitlement == null ? null : entitlement.scopeId());
+
+      if (!scopeId.equals(canonicalScopeId)) {
+        continue;
+      }
+
+      exists = true;
+
+      RuleMatch match =
+          matchRules(entitlement.policies(), subjectCandidates, groups, requestedAction);
+
+      deny = deny || match.deny();
+      allow = allow || match.allow();
+      if (!allowObligationsChosen && match.allow()) {
+        allowObligations = match.allowObligations();
+        allowObligationsChosen = true;
+      }
+    }
+
+    return new ScopeEvaluation(exists, allow, deny, allowObligations);
+  }
+
+  private boolean scopeExists(
+      List<DefinitionEntitlement> entitlements,
+      String scopeId,
+      boolean datasetScope,
+      String datasetGroup) {
+    for (DefinitionEntitlement entitlement : entitlements) {
+      if (!enabled(entitlement == null || entitlement.envelope() == null
+          ? null
+          : entitlement.envelope().enabled())) {
+        continue;
+      }
+      if (!isInScope(entitlement == null ? null : entitlement.envelope(), datasetGroup)) {
+        continue;
+      }
+      String canonicalScopeId =
+          datasetScope
+              ? canonicalDatasetScopeId(entitlement == null ? null : entitlement.scopeId())
+              : canonicalNamespaceScopeId(entitlement == null ? null : entitlement.scopeId());
+      if (scopeId.equals(canonicalScopeId)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private RuleMatch matchRules(
+      List<DefinitionEntitlement.PolicyDocument> policies,
+      Set<String> subjectCandidates,
+      Set<String> groups,
+      String requestedAction) {
+    if (policies == null || policies.isEmpty()) {
+      return RuleMatch.NONE;
+    }
+
+    boolean deny = false;
+    boolean allow = false;
+    EntitlementObligations allowObligations = EntitlementObligations.empty();
+    boolean allowObligationsChosen = false;
+
+    for (DefinitionEntitlement.PolicyDocument policy : policies) {
+      if (policy == null || !enabled(policy.enabled()) || policy.bindings() == null) {
+        continue;
+      }
+      for (DefinitionEntitlement.PolicyBinding binding : policy.bindings()) {
+        if (binding == null || !enabled(binding.enabled())) {
+          continue;
+        }
+
+        String bindingAction = requireSupportedAction(binding.action(), policy.policyId());
+
+        // Action-specific evaluation (read evaluates read only, write evaluates write only)
+        if (!Objects.equals(requestedAction, bindingAction)) {
+          continue;
+        }
+
+        if (!matchesSubject(binding.subject(), subjectCandidates, groups)) {
+          continue;
+        }
+
+        if ("DENY".equalsIgnoreCase(binding.effect())) {
+          deny = true;
+        } else if ("ALLOW".equalsIgnoreCase(binding.effect())) {
+          allow = true;
+          if (!allowObligationsChosen) {
+            allowObligations = parseObligations(binding.obligations());
+            allowObligationsChosen = true;
+          }
         }
       }
-      return Duration.ofSeconds(Long.parseLong(trimmed));
-    } catch (Exception ex) {
-      return fallback;
+    }
+
+    return new RuleMatch(allow, deny, allowObligations);
+  }
+
+  private static EntitlementObligations parseObligations(DefinitionEntitlement.ObligationSet obligationSet) {
+    if (obligationSet == null) {
+      return EntitlementObligations.empty();
+    }
+
+    List<String> rowFilters =
+        copyRowFilterExpressions(obligationSet.rowFilters());
+    List<String> columnsAllow = copyStrings(obligationSet.columnsAllow());
+    Map<String, String> columnsMask = copyColumnMasks(obligationSet.columnsMask());
+
+    return new EntitlementObligations(rowFilters, columnsAllow, columnsMask);
+  }
+
+  private static List<String> copyRowFilterExpressions(List<DefinitionEntitlement.RowFilter> rowFilters) {
+    if (rowFilters == null || rowFilters.isEmpty()) {
+      return List.of();
+    }
+    List<String> copied = new java.util.ArrayList<>(rowFilters.size());
+    for (DefinitionEntitlement.RowFilter rowFilter : rowFilters) {
+      copied.add(rowFilter == null ? null : rowFilter.expression());
+    }
+    return copied;
+  }
+
+  private static List<String> copyStrings(List<String> values) {
+    if (values == null || values.isEmpty()) {
+      return List.of();
+    }
+    return new java.util.ArrayList<>(values);
+  }
+
+  private static Map<String, String> copyColumnMasks(List<DefinitionEntitlement.ColumnMask> columnMasks) {
+    if (columnMasks == null || columnMasks.isEmpty()) {
+      return Map.of();
+    }
+    LinkedHashMap<String, String> copied = new LinkedHashMap<>();
+    for (DefinitionEntitlement.ColumnMask columnMask : columnMasks) {
+      if (columnMask == null) {
+        copied.put(null, null);
+        continue;
+      }
+      String value = columnMask.replacement();
+      if (value == null) {
+        value = columnMask.strategy();
+      }
+      copied.put(columnMask.column(), value);
+    }
+    return copied;
+  }
+
+  private boolean isInScope(DefinitionEnvelope envelope, String datasetGroup) {
+    return envelope != null && trimToNull(envelope.group()) != null;
+  }
+
+  private static String namespaceResourceId(String datasetResourceId) {
+    CanonicalIds.ParsedId parsed = CanonicalIds.parse(datasetResourceId);
+    // canonical namespace id
+    return EntitlementsScopeType.NAMESPACE.name().toLowerCase(Locale.ROOT)
+        + ":"
+        + parsed.group()
+        + "/"
+        + parsed.namespace();
+  }
+
+  private static String canonicalDatasetScopeId(String scopeId) {
+    if (scopeId == null) {
+      return null;
+    }
+    try {
+      return DataEntitlements.requireDatasetResourceId(scopeId);
+    } catch (RuntimeException ex) {
+      return null;
     }
   }
 
-  private static String valueOrEmpty(String value) {
-    return value == null ? "" : value;
+  private static String canonicalNamespaceScopeId(String scopeId) {
+    if (scopeId == null) {
+      return null;
+    }
+    try {
+      CanonicalIds.ParsedId parsed = CanonicalIds.parse(scopeId);
+      if (!parsed.isNamespace()) {
+        return null;
+      }
+      return parsed.canonical();
+    } catch (RuntimeException ex) {
+      return null;
+    }
+  }
+
+  private static void logDeny(
+      String subject,
+      int membershipCandidatesCount,
+      String datasetId,
+      boolean datasetPolicyExists,
+      boolean namespacePolicyExists,
+      String reason) {
+    LOGGER.info("[DataEntitlements][DENY] subject={} membershipCandidates={} datasetId={} datasetPolicyExists={} namespacePolicyExists={} reason={}", subject, membershipCandidatesCount, datasetId, datasetPolicyExists, namespacePolicyExists, reason);
+  }
+
+  private static Set<String> directSubjectCandidates(String subject) {
+    String normalized = trimToNull(subject);
+    if (normalized == null) {
+      return Set.of();
+    }
+    return Set.of(normalized);
+  }
+
+  private static String requireSupportedAction(String action, String policyId) {
+    // Allow only READ/WRITE actions from the canonical EntitlementsAction enum.
+    if (Objects.equals(action, READ_ACTION) || Objects.equals(action, WRITE_ACTION)) {
+      return action;
+    }
+    String renderedAction = action == null ? "<null>" : action;
+    String renderedPolicyId = policyId == null ? "<null>" : policyId;
+    throw new IllegalStateException(
+        "Unsupported dataset entitlement action '"
+            + renderedAction
+            + "' in policy "
+            + renderedPolicyId
+            + "; allowed actions are 'read' and 'write'");
+  }
+
+  private static boolean matchesSubject(String bindingSubject, Set<String> subjectCandidates, Set<String> groups) {
+    String normalized = trimToNull(bindingSubject);
+    if (normalized == null) {
+      return false;
+    }
+
+    if (normalized.startsWith("group:")) {
+      String normalizedGroup = normalizeGroup(normalized);
+      for (String group : groups) {
+        if (Objects.equals(normalizedGroup, normalizeGroup(group))) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    return subjectCandidates.contains(normalized);
+  }
+
+  private static String normalizeGroup(String value) {
+    String normalized = trimToNull(value);
+    if (normalized == null) {
+      return null;
+    }
+    if (normalized.startsWith("group:") && normalized.length() > "group:".length()) {
+      return normalized.substring("group:".length());
+    }
+    return normalized;
+  }
+
+  private static boolean enabled(Boolean value) {
+    return value == null || value.booleanValue();
+  }
+
+  private static String trimToNull(String value) {
+    if (value == null) {
+      return null;
+    }
+    String normalized = value.trim();
+    return normalized.isEmpty() ? null : normalized;
+  }
+
+  private static String safeReason(RuntimeException error) {
+    if (error == null) {
+      return "unknown";
+    }
+    String message = trimToNull(error.getMessage());
+    return message == null ? error.getClass().getSimpleName() : message;
+  }
+
+  private record ScopeEvaluation(
+      boolean exists, boolean allow, boolean deny, EntitlementObligations obligations) {}
+
+  private record RuleMatch(boolean allow, boolean deny, EntitlementObligations allowObligations) {
+    private static final RuleMatch NONE =
+        new RuleMatch(false, false, EntitlementObligations.empty());
   }
 }
+
+
+
+
+
