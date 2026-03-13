@@ -1,520 +1,482 @@
-package org.pronzato.fabric.api.control.status.service;
+package org.pronzato.fabric.api.configs.manager;
 
-import com.crankuptheamps.client.Message;
-import java.io.Closeable;
-import java.time.Duration;
-import java.util.ArrayDeque;
-import java.util.Comparator;
-import java.util.Deque;
+import com.fasterxml.jackson.databind.JsonNode;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
-import java.util.function.Consumer;
-import java.util.regex.Pattern;
-import org.pronzato.fabric.api.control.ControlConnection;
-import org.pronzato.fabric.api.control.discovery.cache.DiscoveryTopics;
-import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionHbService;
+import org.pronzato.fabric.api.control.discovery.definitions.Definition;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfig;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfigLayer;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
+import org.pronzato.fabric.api.configs.ConfigManager.ConfigCodegen;
+import org.pronzato.fabric.api.configs.ConfigDecoder;
+import org.pronzato.fabric.api.configs.ConfigManager.ConfigInfo;
+import org.pronzato.fabric.api.configs.ConfigManager;
+import org.pronzato.fabric.api.configs.ConfigManager.ConfigUpdate;
+import org.pronzato.fabric.api.configs.audit.ConfigEventGenerated;
+import org.pronzato.fabric.api.configs.audit.ConfigEventResolved;
+import org.pronzato.fabric.api.configs.audit.ConfigEventType;
+import org.pronzato.fabric.api.configs.model.ConfigLayerLink;
+import org.pronzato.fabric.api.configs.ConfigManager.ConfigLineage;
+import org.pronzato.fabric.api.configs.model.ConfigResolved;
+import org.pronzato.fabric.api.configs.model.ConfigSummary;
+import org.pronzato.fabric.api.configs.workflow.ConfigHistoryEntry;
+import org.pronzato.fabric.api.configs.workflow.ConfigHistoryUtil;
+import org.pronzato.fabric.api.configs.workflow.ConfigRollbackRequest;
+import org.pronzato.fabric.api.configs.workflow.ConfigSnapshot;
 import org.pronzato.fabric.api.util.Strings;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
-public final class ServiceHbCache implements Closeable {
-  private static final Logger LOGGER = LoggerFactory.getLogger(ServiceHbCache.class);
-  private static final String FABRIC_HB_TOPIC = DiscoveryTopics.HEARTBEAT;
+final class ConfigManagerImplCrud {
+  private ConfigManagerImplCrud() {}
 
-  public static final class Target {
-    public final String instanceId;
-    public final String host;
-    public final int port;
-    public final boolean tls;
-    public final String authorityOverride;
-
-    public Target(String instanceId, String host, int port, boolean tls, String authorityOverride) {
-      this.instanceId = Strings.emptyToNull(instanceId);
-      this.host = host;
-      this.port = port;
-      this.tls = tls;
-      this.authorityOverride = Strings.emptyToNull(authorityOverride);
-    }
-
-    @Override
-    public String toString() {
-      String id = instanceId == null ? "" : instanceId + " ";
-      String base = id + host + ":" + port + (tls ? " (TLS)" : "");
-      return authorityOverride == null ? base : base + " auth=" + authorityOverride;
-    }
+  static List<ConfigSummary> list(ConfigManagerImpl manager, String group) {
+    manager.ensureOpen();
+    return manager.resolver().list(group);
   }
 
-  public enum AlertType {
-    FIRST_SEEN,
-    GONE,
-    FLAP_SUSPECT,
-    DEADMAN_TIMEOUT
+  static List<ConfigLayerLink> listLayerLinks(ConfigManagerImpl manager, String group, String configId) {
+    manager.ensureOpen();
+    return manager.resolver().listLayers(group, configId);
   }
 
-  public static final class Config {
-    private Duration flapWindow = Duration.ofSeconds(30);
-    private int flapThreshold = 4;
-    private Duration deadmanTimeout = Duration.ofSeconds(20);
-    private String regionFilter = null;
-    private boolean notifyOnTimestampOnly = false;
-
-    public Config withFlapWindow(Duration w) {
-      this.flapWindow = w;
-      return this;
-    }
-
-    public Config withFlapThreshold(int t) {
-      this.flapThreshold = t;
-      return this;
-    }
-
-    public Config withDeadmanTimeout(Duration t) {
-      this.deadmanTimeout = t;
-      return this;
-    }
-
-    public Config withRegionFilter(String regionOrNull) {
-      this.regionFilter = Strings.isBlank(regionOrNull) ? null : regionOrNull;
-      return this;
-    }
-
-    public Config withNotifyOnTimestampOnly(boolean v) {
-      this.notifyOnTimestampOnly = v;
-      return this;
-    }
-
-    Duration flapWindow() {
-      return flapWindow;
-    }
-
-    int flapThreshold() {
-      return flapThreshold;
-    }
-
-    Duration deadmanTimeout() {
-      return deadmanTimeout;
-    }
-
-    String regionFilter() {
-      return regionFilter;
-    }
-
-    boolean notifyOnTimestampOnly() {
-      return notifyOnTimestampOnly;
-    }
+  static ConfigResolved resolve(
+      ConfigManagerImpl manager, String group, String configId, String layerIdOrNull) {
+    manager.ensureOpen();
+    return manager.resolver().resolve(group, configId, layerIdOrNull);
   }
 
-  private final String group;
-  private final String service;
-  private final Config cfg;
-  private final Pattern servicePattern;
-  private final ControlConnection control;
-  private final com.fasterxml.jackson.databind.ObjectMapper om = DiscoveryCodec.mapper();
-  private final ConcurrentMap<String, ServiceStatusInstance> byInstance = new ConcurrentHashMap<>();
-  private final ConcurrentMap<String, Long> lastSeen = new ConcurrentHashMap<>();
-  private final ConcurrentMap<String, String> lastStatus = new ConcurrentHashMap<>();
-  private final ConcurrentMap<String, Deque<Long>> flipTimes = new ConcurrentHashMap<>();
-  private final List<Consumer<List<ServiceStatusInstance>>> snapshotListeners = new CopyOnWriteArrayList<>();
-  private final List<Consumer<ServiceStatusAlert>> alertListeners = new CopyOnWriteArrayList<>();
-  private final RoundRobin rr = new RoundRobin();
-  private final ScheduledExecutorService ses;
-  private final boolean ownsScheduler;
-  private volatile boolean running = false;
-  private volatile ScheduledFuture<?> deadmanTask;
-  private volatile ControlConnection.Subscription subscription;
-
-  public ServiceHbCache(
-      ControlConnection control,
+  static ConfigResolved resolve(
+      ConfigManagerImpl manager,
       String group,
-      String service,
-      Config cfg,
-      ScheduledExecutorService scheduler) {
-    this.control = Objects.requireNonNull(control, "control");
-    this.group = Objects.requireNonNull(group, "group");
-    this.service = Strings.isBlank(service) ? ".*" : service;
-    this.cfg = cfg == null ? new Config() : cfg;
-    this.servicePattern = compileServicePattern(this.service);
-    if (scheduler == null) {
-      this.ses = Executors.newScheduledThreadPool(1);
-      this.ownsScheduler = true;
-    } else {
-      this.ses = scheduler;
-      this.ownsScheduler = false;
-    }
+      String configId,
+      String layerIdOrNull,
+      Instant asOfOrNull) {
+    manager.ensureOpen();
+    return manager.resolver().resolve(group, configId, layerIdOrNull, asOfOrNull);
   }
 
-  public void start() throws Exception {
-    if (running) {
-      return;
-    }
-    running = true;
-    subscribe();
-    deadmanTask = ses.scheduleAtFixedRate(this::deadmanScanSafe, 5, 5, TimeUnit.SECONDS);
-  }
-
-  private void subscribe() throws Exception {
-    String filter = filterExpression();
-    subscription =
-        control
-            .sowAndSubscribe(
-                FABRIC_HB_TOPIC,
-                "oof",
-                filter.isBlank() ? null : filter,
-                msg -> {
-                  try {
-                    int command = msg.raw().getCommand();
-                    switch (command) {
-                      case Message.Command.SOW:
-                      case Message.Command.Publish:
-                        onUpsert(msg.data());
-                        break;
-                      case Message.Command.SOWDelete:
-                        onDelete(msg.data());
-                        break;
-                      case Message.Command.OOF:
-                        notifySnapshot();
-                        break;
-                      default:
-                        break;
-                    }
-                  } catch (Exception e) {
-                    LOGGER.error("[ServiceHbCache] Unexpected failure processing status update", e);
-                  }
-                });
-  }
-
-  @Override
-  public void close() {
-    running = false;
-    ControlConnection.Subscription currentSubscription = subscription;
-    subscription = null;
-    if (currentSubscription != null) {
-      try {
-        currentSubscription.close();
-      } catch (Exception ignore) {
+  static List<ConfigInfo> listConfigs(ConfigManagerImpl manager) {
+    manager.ensureOpen();
+    String requiredGroup = manager.requiredSessionGroup();
+    Map<String, List<ConfigManagerImpl.LayerEntry>> byConfig = manager.groupByConfig(requiredGroup);
+    List<String> configIds = new ArrayList<>(byConfig.keySet());
+    configIds.sort(String::compareTo);
+    List<ConfigInfo> results = new ArrayList<>(configIds.size());
+    for (String configId : configIds) {
+      List<ConfigManagerImpl.LayerEntry> layers = manager.sortLayers(byConfig.get(configId));
+      ConfigManagerImpl.LayerEntry representative = manager.representativeLayer(layers);
+      String displayName = null;
+      String schemaKey = null;
+      Definition metadata = manager.configView.get(DefinitionType.CONFIG, requiredGroup, configId);
+      if (metadata instanceof DefinitionConfig config) {
+        displayName = Strings.trimToNull(config.id());
+        schemaKey = Strings.trimToNull(config.schemaRef());
+      } else if (representative != null) {
+        DefinitionConfigLayer payload = representative.definition();
+        schemaKey = Strings.trimToNull(payload == null ? null : payload.schemaKey());
       }
+      results.add(new ConfigInfo(configId, displayName, schemaKey));
     }
-    ScheduledFuture<?> task = deadmanTask;
-    deadmanTask = null;
-    if (task != null) {
-      task.cancel(true);
-    }
-    if (ownsScheduler) {
-      ses.shutdownNow();
-    }
+    return List.copyOf(results);
   }
 
-  public AutoCloseable onSnapshot(Consumer<List<ServiceStatusInstance>> listener) {
-    Consumer<List<ServiceStatusInstance>> callback = Objects.requireNonNull(listener, "listener");
-    snapshotListeners.add(callback);
-    return () -> snapshotListeners.remove(callback);
-  }
-
-  public void onAlert(Consumer<ServiceStatusAlert> listener) {
-    alertListeners.add(Objects.requireNonNull(listener, "listener"));
-  }
-
-  public List<ServiceStatusInstance> listUp() {
-    pruneStaleInstances(System.currentTimeMillis(), false);
-    String rf = cfg.regionFilter();
-    return byInstance.values().stream()
-        .filter(i -> "ONLINE".equalsIgnoreCase(i.status))
-        .filter(i -> rf == null || rf.equalsIgnoreCase(i.region))
-        .sorted(Comparator.comparing(i -> i.instanceId))
-        .toList();
-  }
-
-  public Optional<ServiceStatusInstance> roundRobin() {
-    List<ServiceStatusInstance> list = listUp();
-    return list.isEmpty() ? Optional.empty() : Optional.of(list.get(rr.next(list.size())));
-  }
-
-  public Optional<Target> chooseTargetRoundRobin() {
-    return roundRobin().map(ServiceStatusInstance::asTarget);
-  }
-
-  private void onUpsert(String json) throws Exception {
-    DefinitionHbService heartbeat = om.readValue(json, DefinitionHbService.class);
-    if (!matchesScope(heartbeat)) {
-      return;
+  static List<String> listLayers(ConfigManagerImpl manager, String configId) {
+    manager.ensureOpen();
+    String requiredGroup = manager.requiredSessionGroup();
+    String requiredconfigId = manager.required(configId, "configId");
+    List<ConfigManagerImpl.LayerEntry> layers =
+        manager.sortLayers(manager.findConfigLayers(requiredGroup, requiredconfigId));
+    List<String> layerIds = new ArrayList<>(layers.size());
+    for (ConfigManagerImpl.LayerEntry layer : layers) {
+      layerIds.add(layer.identity().layerId());
     }
-    String instanceId = Strings.trimToNull(heartbeat.instance());
-    if (instanceId == null) {
-      return;
-    }
-    String host = Strings.trimToNull(heartbeat.advertiseHost());
-    int port = heartbeat.advertisePort() == null ? 0 : heartbeat.advertisePort();
-    String region = Strings.trimToNull(heartbeat.region());
-    String status = "ONLINE";
-    long ts =
-        heartbeat.heartbeatEpochMs() == null
-            ? System.currentTimeMillis()
-            : heartbeat.heartbeatEpochMs();
-    boolean tlsRequired = Boolean.TRUE.equals(heartbeat.tlsEnabled());
-    String routeHost = Strings.trimToNull(heartbeat.routeHost());
-    Integer routePort = heartbeat.routePort();
-    String routeAuthority = Strings.trimToNull(heartbeat.routeAuthority());
-    Map<String, String> attrs =
-        heartbeat.tags() == null || heartbeat.tags().isEmpty() ? Map.of() : Map.copyOf(heartbeat.tags());
-    ServiceStatusInstance newInstance =
-        new ServiceStatusInstance(
-            instanceId,
-            host,
-            port,
-            region == null ? "" : region,
-            ts,
-            status,
-            tlsRequired,
-            routeHost,
-            routePort,
-            routeAuthority,
-            attrs);
-    ServiceStatusInstance old = byInstance.put(instanceId, newInstance);
-    if (old == null) {
-      emitAlert(new ServiceStatusAlert(AlertType.FIRST_SEEN, instanceId, host + ":" + port + " " + status));
-    }
-    lastSeen.put(instanceId, ts);
-    handleFlip(instanceId, old == null ? null : old.status, status, ts);
-    boolean diff;
-    if (old == null) {
-      diff = true;
-    } else if (cfg.notifyOnTimestampOnly()) {
-      diff = !old.equals(newInstance);
+    return List.copyOf(layerIds);
+  }
+
+  static JsonNode resolveDeclared(
+      ConfigManagerImpl manager, String group, String configId, String layerId) {
+    manager.ensureOpen();
+    ConfigManagerImpl.LayerEntry layer = manager.requireLayer(group, configId, layerId);
+    return manager.deepCopy(manager.resolveDeclaredAt(layer.definition(), Instant.now()));
+  }
+
+  static JsonNode resolveDeclaredAt(
+      ConfigManagerImpl manager, String group, String configId, String layerId, Instant at) {
+    manager.ensureOpen();
+    Objects.requireNonNull(at, "at");
+    ConfigManagerImpl.LayerEntry layer = manager.requireLayer(group, configId, layerId);
+    return manager.deepCopy(manager.resolveDeclaredAt(layer.definition(), at));
+  }
+
+  static JsonNode resolve(ConfigManagerImpl manager, String configId, String layerId) {
+    return resolve(manager, configId, layerId, ConfigDecoder.asJsonNode());
+  }
+
+  static JsonNode resolveAt(
+      ConfigManagerImpl manager, String configId, String layerId, Instant at) {
+    return resolveAt(manager, configId, layerId, at, ConfigDecoder.asJsonNode());
+  }
+
+  static ConfigLineage lineage(ConfigManagerImpl manager, String configId, String layerId) {
+    ConfigResolved resolved = resolveWithMetadata(manager, configId, layerId);
+    return resolved == null ? null : resolved.lineage();
+  }
+
+  static ConfigLineage lineageAt(
+      ConfigManagerImpl manager, String configId, String layerId, Instant at) {
+    ConfigResolved resolved = resolveWithMetadataAt(manager, configId, layerId, at);
+    return resolved == null ? null : resolved.lineage();
+  }
+
+  static <T> T resolve(
+      ConfigManagerImpl manager, String configId, String layerId, ConfigDecoder<T> decoder) {
+    ConfigDecoder<T> requiredDecoder = Objects.requireNonNull(decoder, "decoder");
+    ConfigManagerImpl.Resolution resolvedId = manager.resolveId(configId, layerId);
+    ConfigManagerImpl.LayerEntry layer =
+        manager.requireLayer(resolvedId.group(), resolvedId.configId(), resolvedId.layerId());
+    ConfigManagerImpl.AuditContext auditContext = manager.captureAuditContext();
+    Instant resolvedAt = Instant.now();
+    JsonNode resolved;
+    ConfigResolved resolvedAudit;
+    if (manager.resolver != null) {
+      ConfigResolved resolvedConfig =
+          manager.resolver.resolve(
+              resolvedId.group(), resolvedId.configId(), resolvedId.layerId(), resolvedAt);
+      resolved = manager.deepCopy(manager.resolvedPayloadAsJsonNode(resolvedConfig.payload()));
+      resolvedAudit = resolvedConfig;
     } else {
-      ServiceStatusInstance newNoTs =
-          new ServiceStatusInstance(
-              newInstance.instanceId,
-              newInstance.host,
-              newInstance.port,
-              newInstance.region,
-              old.tsEpochMs,
-              newInstance.status,
-              newInstance.tlsRequired,
-              newInstance.routeHost,
-              newInstance.routePort,
-              newInstance.routeAuthority,
-              newInstance.attrs);
-      diff = !old.equals(newNoTs);
+      resolved = manager.deepCopy(manager.resolveDeclaredAt(layer.definition(), resolvedAt));
+      resolvedAudit = manager.fallbackResolved(resolvedId, layer, resolved, resolvedAt);
     }
-    if (diff) {
-      notifySnapshot();
-    }
+    T decoded = manager.decode(resolvedId, layer, resolved, resolvedAt, null, requiredDecoder);
+    manager.publishAudit(
+        new ConfigEventResolved(
+            manager.envelope(
+                ConfigEventType.CONFIG_RESOLVED,
+                resolvedId.group(),
+                resolvedId.configId(),
+                resolvedId.layerId(),
+                manager.schemaKey(layer.definition()),
+                auditContext,
+                resolvedAt),
+            "resolve",
+            resolvedAt.toString(),
+            null,
+            resolvedAudit == null ? null : resolvedAudit.updatedTimeUtc(),
+            resolvedAudit == null ? null : resolvedAudit.lineage(),
+            manager.redactSensitiveAuditPayload(manager.deepCopy(resolved))));
+    return decoded;
   }
 
-  private void onDelete(String json) throws Exception {
-    DefinitionHbService heartbeat = om.readValue(json, DefinitionHbService.class);
-    String instanceId = Strings.trimToNull(heartbeat.instance());
-    if (instanceId == null) {
-      return;
+  static <T> T resolveAt(
+      ConfigManagerImpl manager,
+      String configId,
+      String layerId,
+      Instant at,
+      ConfigDecoder<T> decoder) {
+    Objects.requireNonNull(at, "at");
+    ConfigDecoder<T> requiredDecoder = Objects.requireNonNull(decoder, "decoder");
+    ConfigManagerImpl.Resolution resolvedId = manager.resolveId(configId, layerId);
+    ConfigManagerImpl.LayerEntry layer =
+        manager.requireLayer(resolvedId.group(), resolvedId.configId(), resolvedId.layerId());
+    ConfigManagerImpl.AuditContext auditContext = manager.captureAuditContext();
+    JsonNode resolved;
+    ConfigResolved resolvedAudit;
+    if (manager.resolver != null) {
+      ConfigResolved resolvedConfig =
+          manager.resolver.resolve(resolvedId.group(), resolvedId.configId(), resolvedId.layerId(), at);
+      resolved = manager.deepCopy(manager.resolvedPayloadAsJsonNode(resolvedConfig.payload()));
+      resolvedAudit = resolvedConfig;
+    } else {
+      resolved = manager.deepCopy(manager.resolveDeclaredAt(layer.definition(), at));
+      resolvedAudit = manager.fallbackResolved(resolvedId, layer, resolved, at);
     }
-    if (!matchesScope(heartbeat) && !byInstance.containsKey(instanceId)) {
-      return;
-    }
-    ServiceStatusInstance removed = byInstance.remove(instanceId);
-    lastSeen.remove(instanceId);
-    lastStatus.remove(instanceId);
-    flipTimes.remove(instanceId);
-    if (removed != null) {
-      emitAlert(new ServiceStatusAlert(AlertType.GONE, instanceId, "removed"));
-      notifySnapshot();
-    }
+    T decoded = manager.decode(resolvedId, layer, resolved, at, at, requiredDecoder);
+    manager.publishAudit(
+        new ConfigEventResolved(
+            manager.envelope(
+                ConfigEventType.CONFIG_RESOLVED,
+                resolvedId.group(),
+                resolvedId.configId(),
+                resolvedId.layerId(),
+                manager.schemaKey(layer.definition()),
+                auditContext,
+                Instant.now()),
+            "resolveAt",
+            at.toString(),
+            at.toString(),
+            resolvedAudit == null ? null : resolvedAudit.updatedTimeUtc(),
+            resolvedAudit == null ? null : resolvedAudit.lineage(),
+            manager.redactSensitiveAuditPayload(manager.deepCopy(resolved))));
+    return decoded;
   }
 
-  private void handleFlip(String instanceId, String prev, String cur, long whenMs) {
-    if (prev == null || Objects.equals(prev, cur)) {
-      lastStatus.put(instanceId, cur);
-      return;
+  static ConfigResolved resolveWithMetadata(
+      ConfigManagerImpl manager, String configId, String layerId) {
+    ConfigManagerImpl.Resolution resolvedId = manager.resolveId(configId, layerId);
+    ConfigManagerImpl.AuditContext auditContext = manager.captureAuditContext();
+    Instant now = Instant.now();
+    ConfigManagerImpl.LayerEntry layer =
+        manager.requireLayer(resolvedId.group(), resolvedId.configId(), resolvedId.layerId());
+    ConfigResolved resolved;
+    if (manager.resolver != null) {
+      resolved =
+          manager.resolver.resolve(resolvedId.group(), resolvedId.configId(), resolvedId.layerId(), now);
+    } else {
+      JsonNode declared = manager.deepCopy(manager.resolveDeclaredAt(layer.definition(), now));
+      resolved = manager.fallbackResolved(resolvedId, layer, declared, now);
     }
-    lastStatus.put(instanceId, cur);
-    Deque<Long> q = flipTimes.computeIfAbsent(instanceId, ignored -> new ArrayDeque<>());
-    q.addLast(whenMs);
-    long cutoff = whenMs - cfg.flapWindow().toMillis();
-    while (!q.isEmpty() && q.peekFirst() < cutoff) {
-      q.removeFirst();
-    }
-    if (q.size() >= cfg.flapThreshold()) {
-      emitAlert(
-          new ServiceStatusAlert(
-              AlertType.FLAP_SUSPECT,
-              instanceId,
-              "flips=" + q.size() + " window=" + cfg.flapWindow().toSeconds() + "s"));
-    }
+    manager.publishAudit(
+        new ConfigEventResolved(
+            manager.envelope(
+                ConfigEventType.CONFIG_RESOLVED,
+                resolvedId.group(),
+                resolvedId.configId(),
+                resolvedId.layerId(),
+                manager.schemaKey(layer.definition()),
+                auditContext,
+                now),
+            "resolveWithMetadata",
+            now.toString(),
+            null,
+            resolved == null ? null : resolved.updatedTimeUtc(),
+            resolved == null ? null : resolved.lineage(),
+            resolved == null
+                ? null
+                : manager.redactSensitiveAuditPayload(
+                    manager.deepCopy(manager.resolvedPayloadAsJsonNode(resolved.payload())))));
+    return resolved;
   }
 
-  private void deadmanScanSafe() {
-    try {
-      deadmanScan();
-    } catch (Throwable t) {
-      LOGGER.error("[ServiceHbCache] Deadman scan failed", t);
+  static ConfigResolved resolveWithMetadataAt(
+      ConfigManagerImpl manager, String configId, String layerId, Instant at) {
+    Objects.requireNonNull(at, "at");
+    ConfigManagerImpl.Resolution resolvedId = manager.resolveId(configId, layerId);
+    ConfigManagerImpl.AuditContext auditContext = manager.captureAuditContext();
+    ConfigManagerImpl.LayerEntry layer =
+        manager.requireLayer(resolvedId.group(), resolvedId.configId(), resolvedId.layerId());
+    ConfigResolved resolved;
+    if (manager.resolver != null) {
+      resolved = manager.resolver.resolve(resolvedId.group(), resolvedId.configId(), resolvedId.layerId(), at);
+    } else {
+      JsonNode declared = manager.deepCopy(manager.resolveDeclaredAt(layer.definition(), at));
+      resolved = manager.fallbackResolved(resolvedId, layer, declared, at);
     }
+    manager.publishAudit(
+        new ConfigEventResolved(
+            manager.envelope(
+                ConfigEventType.CONFIG_RESOLVED,
+                resolvedId.group(),
+                resolvedId.configId(),
+                resolvedId.layerId(),
+                manager.schemaKey(layer.definition()),
+                auditContext,
+                Instant.now()),
+            "resolveWithMetadataAt",
+            at.toString(),
+            at.toString(),
+            resolved == null ? null : resolved.updatedTimeUtc(),
+            resolved == null ? null : resolved.lineage(),
+            resolved == null
+                ? null
+                : manager.redactSensitiveAuditPayload(
+                    manager.deepCopy(manager.resolvedPayloadAsJsonNode(resolved.payload())))));
+    return resolved;
   }
 
-  private void deadmanScan() {
-    pruneStaleInstances(System.currentTimeMillis(), true);
+  static ConfigCodegen generate(
+      ConfigManagerImpl manager,
+      String configId,
+      ConfigManager.Language language,
+      String basePackageOrModule) {
+    String group = manager.requiredSessionGroup();
+    String requiredconfigId = manager.required(configId, "configId");
+    List<ConfigManagerImpl.LayerEntry> layers = manager.sortLayers(manager.findConfigLayers(group, requiredconfigId));
+    ConfigManagerImpl.LayerEntry representative = manager.representativeLayer(layers);
+    if (representative == null || representative.identity() == null) {
+      throw new IllegalArgumentException("config not found: " + requiredconfigId);
+    }
+    ConfigManagerImpl.Resolution resolvedId =
+        new ConfigManagerImpl.Resolution(group, requiredconfigId, representative.identity().layerId());
+    return manager.generateForLayer(resolvedId, representative, language, basePackageOrModule);
   }
 
-  private void pruneStaleInstances(long nowEpochMs, boolean emitTimeoutAlerts) {
-    long limitMs = cfg.deadmanTimeout().toMillis();
-    if (limitMs <= 0L) {
-      return;
+  static ConfigCodegen generate(
+      ConfigManagerImpl manager,
+      String configId,
+      String layerId,
+      ConfigManager.Language language,
+      String basePackageOrModule) {
+    ConfigManagerImpl.Resolution resolvedId = manager.resolveId(configId, layerId);
+    ConfigManagerImpl.LayerEntry layer =
+        manager.requireLayer(resolvedId.group(), resolvedId.configId(), resolvedId.layerId());
+    return manager.generateForLayer(resolvedId, layer, language, basePackageOrModule);
+  }
+
+  static List<ConfigHistoryEntry> listHistory(
+      ConfigManagerImpl manager, String group, String configId, String layerId, int limit) {
+    manager.ensureOpen();
+    String requiredGroup = manager.required(group, "group");
+    String requiredconfigId = manager.required(configId, "configId");
+    String requiredLayerId = manager.required(layerId, "layerId");
+    int boundedLimit =
+        limit <= 0
+            ? ConfigHistoryUtil.DEFAULT_HISTORY_LIMIT
+            : Math.min(limit, ConfigHistoryUtil.DEFAULT_HISTORY_LIMIT);
+    ConfigManagerImpl.LayerEntry layer = manager.requireLayer(requiredGroup, requiredconfigId, requiredLayerId);
+    DefinitionConfigLayer payload = layer.definition();
+    List<DefinitionConfigLayer.History> history = payload == null ? null : payload.history();
+    if (history == null || history.isEmpty()) {
+      return List.of();
     }
-    boolean changed = false;
-    for (var entry : lastSeen.entrySet()) {
-      String instanceId = entry.getKey();
-      long lastSeenEpochMs = entry.getValue() == null ? 0L : entry.getValue();
-      long ageMs = nowEpochMs - lastSeenEpochMs;
-      if (ageMs <= limitMs) {
+    List<ConfigHistoryEntry> results = new ArrayList<>();
+    for (DefinitionConfigLayer.History snapshot : history) {
+      if (snapshot == null) {
         continue;
       }
-      if (emitTimeoutAlerts) {
-        emitAlert(
-            new ServiceStatusAlert(
-                AlertType.DEADMAN_TIMEOUT, instanceId, "ageMs=" + ageMs + " > " + limitMs));
-      }
-      ServiceStatusInstance removed = byInstance.remove(instanceId);
-      lastSeen.remove(instanceId);
-      lastStatus.remove(instanceId);
-      flipTimes.remove(instanceId);
-      if (removed != null) {
-        if (emitTimeoutAlerts && LOGGER.isDebugEnabled()) {
-          LOGGER.debug(
-              "[ServiceHbCache][stale-evict] instance={} endpoint={}:{} ageMs={} limitMs={}",
-              instanceId,
-              removed.host,
-              removed.port,
-              ageMs,
-              limitMs);
-        }
-        changed = true;
+      List<String> keys = manager.topLevelKeys(snapshot.declared());
+      results.add(
+          new ConfigHistoryEntry(
+              requiredGroup,
+              requiredconfigId,
+              requiredLayerId,
+              Strings.trimToNull(snapshot.configId()),
+              Strings.trimToNull(snapshot.updatedTimeUtc()),
+              Strings.trimToNull(snapshot.updatedBy()),
+              Strings.trimToNull(snapshot.mode()),
+              Strings.trimToNull(snapshot.effectiveAtUtc()),
+              keys.size(),
+              keys));
+      if (results.size() >= boundedLimit) {
+        break;
       }
     }
-    if (changed) {
-      notifySnapshot();
-    }
+    return List.copyOf(results);
   }
 
-  private boolean matchesScope(DefinitionHbService heartbeat) {
-    if (heartbeat == null) {
-      return false;
+  static ConfigSnapshot getSnapshot(
+      ConfigManagerImpl manager,
+      String group,
+      String configId,
+      String layerId,
+      String snapshotConfigId) {
+    manager.ensureOpen();
+    String requiredGroup = manager.required(group, "group");
+    String requiredconfigId = manager.required(configId, "configId");
+    String requiredLayerId = manager.required(layerId, "layerId");
+    String requiredConfigId = manager.required(snapshotConfigId, "snapshotConfigId");
+    ConfigManagerImpl.LayerEntry layer = manager.requireLayer(requiredGroup, requiredconfigId, requiredLayerId);
+    DefinitionConfigLayer current = layer.definition();
+    if (requiredConfigId.equals(Strings.trimToNull(current == null ? null : current.configId()))) {
+      DefinitionEnvelope envelope = current == null ? null : current.envelope();
+      DefinitionConfigLayer payload = current;
+      return new ConfigSnapshot(
+          requiredGroup,
+          requiredconfigId,
+          requiredLayerId,
+          requiredConfigId,
+          Strings.trimToNull(envelope == null ? null : envelope.updatedTimeUtc()),
+          Strings.trimToNull(envelope == null ? null : envelope.updatedBy()),
+          manager.deepCopy(payload == null ? null : payload.declared()),
+          manager.copyEffective(payload == null ? null : payload.effective()));
     }
-    if (heartbeat.type() != DefinitionType.HEARTBEAT_SERVICE) {
-      return false;
+    DefinitionConfigLayer payload = current;
+    List<DefinitionConfigLayer.History> history = payload == null ? null : payload.history();
+    DefinitionConfigLayer.History snapshot = manager.findHistorySnapshot(history, requiredConfigId);
+    if (snapshot == null) {
+      throw new IllegalArgumentException(
+          "history snapshot not found for config "
+              + requiredconfigId
+              + "/"
+              + requiredLayerId
+              + " configId="
+              + requiredConfigId);
     }
-    String messageGroup = Strings.trimToNull(heartbeat.group());
-    if (messageGroup == null || !messageGroup.equals(group)) {
-      return false;
-    }
-    String svc = Strings.trimToNull(heartbeat.name());
-    if (Strings.isBlank(svc)) {
-      return matchAllServices();
-    }
-    return matchesService(svc);
+    return new ConfigSnapshot(
+        requiredGroup,
+        requiredconfigId,
+        requiredLayerId,
+        Strings.trimToNull(snapshot.configId()),
+        Strings.trimToNull(snapshot.updatedTimeUtc()),
+        Strings.trimToNull(snapshot.updatedBy()),
+        manager.deepCopy(snapshot.declared()),
+        ConfigHistoryUtil.copyEffective(snapshot.effective()));
   }
 
-  private String filterExpression() {
-    return "/group = '"
-        + escapeFilterValue(group)
-        + "' and /type = '"
-        + DefinitionType.HEARTBEAT_SERVICE.name()
-        + "'";
-  }
-
-  private static String escapeFilterValue(String value) {
-    return value == null ? "" : value.replace("'", "''");
-  }
-
-  private boolean matchesService(String value) {
-    String candidate = value == null ? "" : value;
-    return servicePattern.matcher(candidate).matches();
-  }
-
-  private boolean matchAllServices() {
-    return ".*".equals(servicePattern.pattern());
-  }
-
-  private static Pattern compileServicePattern(String raw) {
-    if (Strings.isBlank(raw) || raw.equals("*") || raw.equals(".*")) {
-      return Pattern.compile(".*");
+  static ConfigUpdate rollback(ConfigManagerImpl manager, ConfigRollbackRequest request) {
+    manager.ensureOpen();
+    if (request == null) {
+      throw new IllegalArgumentException("request is required");
     }
-    if (raw.contains("*") || raw.contains("?")) {
-      return Pattern.compile(globToRegex(raw));
+    String group = manager.required(request.group(), "group");
+    String configId = manager.required(request.configId(), "configId");
+    String layerId = manager.required(request.layerId(), "layerId");
+    String targetConfigId = manager.required(request.targetConfigId(), "targetConfigId");
+    ConfigRollbackRequest.Mode mode = Objects.requireNonNull(request.mode(), "mode");
+    Instant effectiveAt = request.effectiveAt();
+    if (mode == ConfigRollbackRequest.Mode.IMMEDIATE && effectiveAt != null) {
+      throw new IllegalArgumentException("effectiveAt must be null when mode is IMMEDIATE");
     }
-    return Pattern.compile(Pattern.quote(raw));
-  }
-
-  private static String globToRegex(String glob) {
-    StringBuilder regex = new StringBuilder();
-    for (int i = 0; i < glob.length(); i++) {
-      char c = glob.charAt(i);
-      switch (c) {
-        case '*':
-          regex.append(".*");
-          break;
-        case '?':
-          regex.append('.');
-          break;
-        case '.':
-          regex.append("\\.");
-          break;
-        case '\\':
-          regex.append("\\\\");
-          break;
-        default:
-          if ("+()[]{}^$|".indexOf(c) >= 0) {
-            regex.append('\\');
-          }
-          regex.append(c);
-      }
+    if (mode == ConfigRollbackRequest.Mode.SCHEDULED && effectiveAt == null) {
+      throw new IllegalArgumentException("effectiveAt is required when mode is SCHEDULED");
     }
-    return regex.toString();
-  }
-
-  private void notifySnapshot() {
-    if (snapshotListeners.isEmpty()) {
-      return;
+    ConfigManagerImpl.LayerEntry layer = manager.requireLayer(group, configId, layerId);
+    DefinitionConfigLayer existing = layer.definition();
+    DefinitionConfigLayer payload = existing;
+    if (payload == null) {
+      throw new IllegalStateException("config payload is required");
     }
-    List<ServiceStatusInstance> snapshot = List.copyOf(listUp());
-    for (Consumer<List<ServiceStatusInstance>> listener : snapshotListeners) {
-      safe(() -> listener.accept(snapshot));
+    DefinitionConfigLayer.History target =
+        manager.findHistorySnapshot(payload.history(), targetConfigId);
+    if (target == null) {
+      throw new IllegalArgumentException(
+          "rollback target configId not found in history: "
+              + configId
+              + "/"
+              + layerId
+              + " targetConfigId="
+              + targetConfigId);
     }
-  }
-
-  private void emitAlert(ServiceStatusAlert alert) {
-    for (Consumer<ServiceStatusAlert> listener : alertListeners) {
-      safe(() -> listener.accept(alert));
+    JsonNode targetDeclared = target.declared();
+    if (targetDeclared == null || !targetDeclared.isObject()) {
+      throw new IllegalStateException(
+          "rollback target declared payload must be a JSON object for configId=" + targetConfigId);
     }
-  }
-
-  private static void safe(Runnable runnable) {
-    try {
-      runnable.run();
-    } catch (Throwable ignore) {
+    DefinitionConfigLayer.History currentSnapshot =
+        ConfigHistoryUtil.snapshotFromCurrent(existing, mode.name(), effectiveAt, "config-client");
+    List<DefinitionConfigLayer.History> rewrittenHistory =
+        ConfigHistoryUtil.appendSnapshot(
+            payload.history(), currentSnapshot, ConfigHistoryUtil.DEFAULT_HISTORY_LIMIT);
+    JsonNode rewrittenDeclared;
+    List<DefinitionConfigLayer.Effective> rewrittenEffective;
+    if (mode == ConfigRollbackRequest.Mode.SCHEDULED) {
+      rewrittenDeclared = manager.deepCopy(payload.declared());
+      rewrittenEffective = manager.upsertScheduledEffective(payload.effective(), effectiveAt, null, targetDeclared);
+    } else {
+      rewrittenDeclared = manager.deepCopy(targetDeclared);
+      rewrittenEffective = ConfigHistoryUtil.copyEffective(target.effective());
     }
-  }
-
-  private static final class RoundRobin {
-    private int index = -1;
-
-    synchronized int next(int size) {
-      index = (index + 1) % size;
-      return index;
-    }
+    DefinitionConfigLayer rewrittenPayload =
+        new DefinitionConfigLayer(
+            existing.envelope(),
+            payload.resourceId(),
+            payload.parentId(),
+            payload.shortName(),
+            payload.configType(),
+            payload.schemaKey(),
+            payload.displayName(),
+            rewrittenDeclared,
+            rewrittenEffective,
+            rewrittenHistory,
+            existing.configId(),
+            existing.effectiveConfigId());
+    DefinitionConfigLayer updated =
+        rewrittenPayload;
+    manager.configView.upsert(updated);
+    return manager.toUpdateAt(updated, layer.identity(), Instant.now());
   }
 }
-
-
-
-
-
 
