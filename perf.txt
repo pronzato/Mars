@@ -1,472 +1,465 @@
-package org.pronzato.fabric.api.control.status.service;
+package org.pronzato.fabric.api.data.manager;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.SerializationFeature;
-import java.io.Closeable;
-import java.util.Map;
+import org.pronzato.fabric.api.util.CloseSupport;
+import io.grpc.ManagedChannel;
+import java.util.List;
 import java.util.Objects;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
+import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
-import org.pronzato.fabric.api.control.ControlConnection;
-import org.pronzato.fabric.api.control.discovery.cache.DiscoveryTopics;
-import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionHbService;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStatusService;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
+import org.apache.arrow.flight.CallOption;
+import org.apache.arrow.flight.FlightCallHeaders;
+import org.apache.arrow.flight.FlightClient;
+import org.apache.arrow.flight.FlightGrpcUtils;
+import org.apache.arrow.flight.FlightRuntimeException;
+import org.apache.arrow.flight.FlightStatusCode;
+import org.apache.arrow.flight.HeaderCallOption;
+import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.RootAllocator;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionService;
+import org.pronzato.fabric.api.control.status.service.ServiceHbCache;
+import org.pronzato.fabric.api.control.security.UserContext;
+import org.pronzato.fabric.api.control.security.UserPrincipal;
+import org.pronzato.fabric.api.control.security.headers.FabricRequestHeaders;
+import org.pronzato.fabric.api.control.security.identity.CallerAppIdentity;
+import org.pronzato.fabric.api.control.security.kerberos.KerberosConfig;
+import org.pronzato.fabric.api.control.security.kerberos.KerberosSpn;
+import org.pronzato.fabric.api.services.ServiceRunOptions;
 import org.pronzato.fabric.api.services.common.ServiceAdvertise;
+import org.pronzato.fabric.api.services.common.ServiceInstanceResolver;
+import org.pronzato.fabric.api.services.common.routing.ServiceRoutingContext;
+import org.pronzato.fabric.api.services.common.routing.ServiceRoutingMode;
+import org.pronzato.fabric.api.services.common.routing.ServiceRoutingState;
+import org.pronzato.fabric.api.services.flight.FlightClientChannelSupport;
+import org.pronzato.fabric.api.services.flight.FlightSqlRequestHeadersMiddleware;
 import org.pronzato.fabric.api.util.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public final class ServiceStatusPublisher implements Closeable {
-  private static final Logger LOGGER = LoggerFactory.getLogger(ServiceStatusPublisher.class);
-  private static final boolean STATUS_DEBUG = false;
-  private static final long DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 10L;
-  private static final long DEFAULT_STATUS_INTERVAL_SECONDS = 30L;
-  private static final int DEFAULT_TTL_SECONDS = 30;
-  private static final String STATUS_ONLINE = "ONLINE";
-  private static final String STATUS_OFFLINE = "OFFLINE";
+final class RemoteFlightClientSupport {
+  private static final Logger LOGGER = LoggerFactory.getLogger(RemoteFlightClientSupport.class);
+  private static final long MAX_ALLOCATOR_BYTES = 64L * 1024L * 1024L;
+  private static final String KERBEROS_AUTH_FAILURE = "Kerberos authentication failed";
+  private static final String UNAUTHENTICATED = "UNAUTHENTICATED";
 
-  private final ObjectMapper om =
-      DiscoveryCodec.mapper().copy().configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
-  private final ControlConnection control;
-  private final ScheduledExecutorService ses;
-  private final boolean ownsScheduler;
-  private final long heartbeatIntervalSec;
-  private final long statusIntervalSec;
-  private final int ttlSeconds;
-  private final String group;
-  private final String region;
-  private final String serviceName;
-  private final String serviceInstanceId;
-  private final String serviceHost;
-  private final int servicePort;
-  private final boolean tlsRequired;
-  private final String routeHost;
-  private final Integer routePort;
-  private final String routeAuthority;
-  private final long serviceStartEpochMs;
-  private final String serviceAppName;
-  private final String serviceAppInstanceId;
-  private final String serviceAppGroup;
-  private final Map<String, String> attrs;
-  private volatile String sessionId;
-  private volatile String sessionKey;
-  private volatile boolean open = true;
-  private volatile ScheduledFuture<?> heartbeatTask;
-  private volatile ScheduledFuture<?> statusTask;
+  private RemoteFlightClientSupport() {}
 
-  public ServiceStatusPublisher(
-      ControlConnection control,
+  static String endpointSecurityContext(ServiceEndpoint endpoint) {
+    Objects.requireNonNull(endpoint, "endpoint");
+    return "serviceId="
+        + endpoint.serviceResourceId()
+        + ", endpoint="
+        + endpoint.connectHost()
+        + ":"
+        + endpoint.port()
+        + ", tlsEnabled="
+        + endpoint.tlsEnabled()
+        + ", kerberosEnabled="
+        + endpoint.kerberosEnabled();
+  }
+
+  static ServiceEndpoint resolveArrowService(
+      DiscoveryCache DiscoveryCache,
       String group,
-      String service,
-      String instanceId,
-      String host,
-      int port,
-      String region,
-      long heartbeatSeconds,
-      long statusSeconds,
-      int ttlSeconds,
-      boolean tlsRequired,
-      String routeHost,
-      Integer routePort,
-      String routeAuthority,
-      String appName,
-      String appInstance,
-      String appGroup,
-      Map<String, String> attrs,
-      ScheduledExecutorService scheduler) {
-    this.control = Objects.requireNonNull(control, "control");
-    this.group = Objects.requireNonNull(group, "group");
-    this.serviceName = Objects.requireNonNull(service, "service");
-    this.serviceInstanceId = Objects.requireNonNull(instanceId, "instanceId");
-    this.serviceHost = host;
-    this.servicePort = port;
-    this.heartbeatIntervalSec =
-        heartbeatSeconds <= 0 ? DEFAULT_HEARTBEAT_INTERVAL_SECONDS : heartbeatSeconds;
-    this.statusIntervalSec = statusSeconds <= 0 ? DEFAULT_STATUS_INTERVAL_SECONDS : statusSeconds;
-    this.ttlSeconds = ttlSeconds <= 0 ? DEFAULT_TTL_SECONDS : ttlSeconds;
-    this.tlsRequired = tlsRequired;
-    this.routeHost = routeHost;
-    this.routePort = routePort;
-    this.routeAuthority = routeAuthority;
-    this.serviceStartEpochMs = System.currentTimeMillis();
-    Map<String, String> attrCopy = Strings.isEmpty(attrs) ? Map.of() : Map.copyOf(attrs);
-    this.attrs = new ConcurrentHashMap<>(attrCopy);
-    String resolvedRegion = region;
-    if (Strings.isBlank(resolvedRegion)) {
-      resolvedRegion = attrCopy.get("region");
-    }
-    this.region = Strings.isBlank(resolvedRegion) ? "AMRS" : resolvedRegion;
-    this.serviceAppName = Strings.firstNonBlank(appName, serviceName);
-    this.serviceAppInstanceId = Strings.firstNonBlank(appInstance, serviceInstanceId);
-    this.serviceAppGroup = Strings.firstNonBlank(appGroup, group);
-    if (scheduler == null) {
-      this.ses = Executors.newSingleThreadScheduledExecutor();
-      this.ownsScheduler = true;
-    } else {
-      this.ses = scheduler;
-      this.ownsScheduler = false;
-    }
+      String serviceName,
+      DefinitionService.ServiceType expectedType,
+      ServiceInstanceResolver endpointResolver) {
+    return resolveArrowService(
+        DiscoveryCache, group, serviceName, expectedType, endpointResolver, null, null);
   }
 
-  public void start() {
-    publishServiceStartOrThrow();
-    heartbeatTask =
-        ses.scheduleAtFixedRate(
-            this::publishHeartbeatSafe, heartbeatIntervalSec, heartbeatIntervalSec, TimeUnit.SECONDS);
-    statusTask =
-        ses.scheduleAtFixedRate(
-            this::publishStatusSafe, statusIntervalSec, statusIntervalSec, TimeUnit.SECONDS);
-  }
+  static ServiceEndpoint resolveArrowService(
+      DiscoveryCache DiscoveryCache,
+      String group,
+      String serviceName,
+      DefinitionService.ServiceType expectedType,
+      ServiceInstanceResolver endpointResolver,
+      ServiceRoutingContext routingContext,
+      ServiceRoutingState routingState) {
+    Objects.requireNonNull(DiscoveryCache, "DiscoveryCache");
+    String resolvedGroup = Strings.requireNonBlank(group, "service group");
+    String resolvedServiceName = Strings.requireNonBlank(serviceName, "service name");
 
-  public ServiceStatusPublisher withSessionLineage(String sessionId, String sessionKey) {
-    this.sessionId = Strings.trimToNull(sessionId);
-    this.sessionKey = Strings.trimToNull(sessionKey);
-    return this;
-  }
+    Optional<DefinitionService> definition =
+        DiscoveryCache.get(DefinitionService.class, resolvedGroup, resolvedServiceName);
+    if (definition.isEmpty()) {
+      throw new IllegalArgumentException("Unknown service: " + resolvedServiceName);
+    }
 
-  @Override
-  public void close() {
-    if (!open) {
-      return;
+    DefinitionService service = definition.get();
+    DefinitionService.ServiceType actualType = service.serviceType();
+    if (actualType != null && actualType != expectedType) {
+      throw new IllegalArgumentException(
+          "Service is not "
+              + expectedType
+              + ": "
+              + resolvedServiceName
+              + " type="
+              + actualType);
     }
-    open = false;
-    publishStatusSafe(STATUS_OFFLINE);
-    publishHeartbeatSafe();
-    ScheduledFuture<?> task = heartbeatTask;
-    heartbeatTask = null;
-    if (task != null) {
-      task.cancel(true);
+    DefinitionService.Arrow arrow = service.arrow();
+    if (arrow == null) {
+      throw new IllegalArgumentException(
+          "Arrow service config is required for service: " + resolvedServiceName);
     }
-    ScheduledFuture<?> status = statusTask;
-    statusTask = null;
-    if (status != null) {
-      status.cancel(true);
-    }
-    if (ownsScheduler) {
-      ses.shutdownNow();
-    }
-  }
+    String serviceResourceId =
+        Strings.requireNonBlank(service.resourceId(), "service.resourceId");
+    ServiceRoutingMode routingMode =
+        ServiceRoutingMode.requireSupported(
+            service.arrow() == null || service.arrow().routing() == null
+                ? null
+                : service.arrow().routing().mode(),
+            serviceResourceId,
+            "arrow.routing.mode",
+            "client");
+    boolean tlsEnabled = arrow.tls() != null && Boolean.TRUE.equals(arrow.tls().enabled());
+    boolean kerberosEnabled = arrow.kerberos() != null && arrow.kerberos().enabled();
+    String kerberosSpn = arrow.kerberos() == null ? null : Strings.trimToNull(arrow.kerberos().spn());
 
-  private void publishHeartbeatSafe() {
-    try {
-      publishServiceHeartbeat(STATUS_ONLINE);
-    } catch (Exception e) {
-      LOGGER.error("[Status] service heartbeat publish failed", e);
-    }
-  }
-
-  private void publishStatusSafe() {
-    publishStatusSafe(STATUS_ONLINE);
-  }
-
-  private void publishStatusSafe(String status) {
-    try {
-      publishServiceStatus(status);
-    } catch (Exception e) {
-      LOGGER.error("[Status] service status publish failed for status={}", status, e);
-    }
-  }
-
-  private void publishServiceStartOrThrow() {
-    validateServiceHeartbeatContract();
-    try {
-      publishServiceStatus(STATUS_ONLINE);
-      publishServiceHeartbeat(STATUS_ONLINE);
-    } catch (Exception ex) {
+    if (endpointResolver == null) {
       throw new IllegalStateException(
-          "Failed to publish initial service heartbeat/status: serviceId="
-              + valueOrUnknown(group)
-              + "/"
-              + valueOrUnknown(serviceName)
-              + ", instanceId="
-              + valueOrUnknown(serviceInstanceId),
+          "Arrow service endpoint resolver is not initialized for service: " + serviceResourceId);
+    }
+    ServiceHbCache.Target target =
+        routingMode == ServiceRoutingMode.ROUND_ROBIN
+            ? endpointResolver.chooseRoundRobin(
+                resolvedGroup, resolvedServiceName, serviceResourceId)
+            : endpointResolver.choose(
+                resolvedGroup,
+                resolvedServiceName,
+                serviceResourceId,
+                routingMode,
+                routingContext == null
+                    ? ServiceRoutingContext.minimal(serviceResourceId, transportName(expectedType))
+                    : new ServiceRoutingContext(
+                        serviceResourceId,
+                        Strings.firstNonBlank(routingContext.transport(), transportName(expectedType)),
+                        routingContext.effectiveSubject(),
+                        routingContext.callerAppSubject(),
+                        routingContext.routingKey(),
+                        routingContext.requestId(),
+                        routingContext.operation()),
+                routingState);
+    if (target == null) {
+      throw new IllegalStateException("No available instances for service: " + serviceResourceId);
+    }
+    if (LOGGER.isDebugEnabled()) {
+      LOGGER.debug(
+          "[RemoteFlightClient][routing] mode={} serviceId={} group={} service={} endpoint={} instance={} subject={} callerApp={} routingKey={} transport={}",
+          routingMode,
+          serviceResourceId,
+          resolvedGroup,
+          resolvedServiceName,
+          target.host + ":" + target.port,
+          target.instanceId,
+          routingContext == null ? null : routingContext.effectiveSubject(),
+          routingContext == null ? null : routingContext.callerAppSubject(),
+          routingContext == null ? null : routingContext.routingKey(),
+          transportName(expectedType));
+    }
+    String connectHost = ServiceAdvertise.requireRoutableHost(target.host, "grpc target host");
+    int port = target.port;
+    boolean resolvedTls = tlsEnabled || target.tls;
+    return new ServiceEndpoint(
+        resolvedGroup,
+        resolvedServiceName,
+        serviceResourceId,
+        service,
+        connectHost,
+        port,
+        resolvedTls,
+        kerberosEnabled,
+        kerberosSpn);
+  }
+
+  static ClientResources openClient(
+      ServiceEndpoint endpoint,
+      ServiceRunOptions runOptions,
+      String sessionKerberosPrincipal,
+      java.nio.file.Path sessionKerberosKeytab) {
+    Objects.requireNonNull(endpoint, "endpoint");
+    ServiceRunOptions options = runOptions == null ? ServiceRunOptions.defaults() : runOptions;
+
+    RootAllocator allocator = new RootAllocator(MAX_ALLOCATOR_BYTES);
+    ManagedChannel channel = null;
+    FlightClient client = null;
+    String derivedSpn = null;
+    String diagnostics = null;
+    try {
+      if (endpoint.kerberosEnabled()) {
+        derivedSpn = deriveClientSpn(endpoint, sessionKerberosPrincipal);
+      }
+      diagnostics = clientDiagnostics(endpoint, options, sessionKerberosPrincipal, sessionKerberosKeytab, derivedSpn);
+      channel =
+          FlightClientChannelSupport.createChannel(
+              endpoint.connectHost(),
+              endpoint.port(),
+              endpoint.tlsEnabled(),
+              endpoint.kerberosEnabled(),
+              endpoint.kerberosSpn(),
+              options,
+              sessionKerberosPrincipal,
+              sessionKerberosKeytab);
+      client = FlightGrpcUtils.createFlightClient(allocator, channel, List.of());
+      return new ClientResources(allocator, channel, client);
+    } catch (Exception ex) {
+      CloseSupport.closeQuietly(client);
+      shutdownQuietly(channel);
+      CloseSupport.closeQuietly(allocator);
+      throw new IllegalStateException(
+          "Failed to open Arrow Flight client for service "
+              + endpoint.serviceName()
+              + " at "
+              + endpoint.connectHost()
+              + ":"
+              + endpoint.port()
+              + " derivedSpn="
+              + derivedSpn
+              + " diagnostics="
+              + diagnostics,
           ex);
     }
   }
 
-  private void validateServiceHeartbeatContract() {
-    ServiceAdvertise.requireRoutableHost(serviceHost, "advertiseHost");
-    if (servicePort <= 0) {
-      throw new IllegalStateException(
-          "Failed to publish service heartbeat: serviceId="
-              + valueOrUnknown(group)
-              + "/"
-              + valueOrUnknown(serviceName)
-              + ", instanceId="
-              + valueOrUnknown(serviceInstanceId)
-              + ", advertisePort is missing/invalid. Configure bind.port or advertise.port.");
-    }
-    if (tlsRequired) {
-      String tlsTermination = Strings.trimToNull(attrs.get("tlsTermination"));
-      if (tlsTermination == null) {
-        throw new IllegalStateException(
-            "Failed to publish service heartbeat: serviceId="
-                + valueOrUnknown(group)
-                + "/"
-                + valueOrUnknown(serviceName)
-                + ", instanceId="
-                + valueOrUnknown(serviceInstanceId)
-                + ", tlsEnabled=true but tlsTermination is missing.");
-      }
-    }
+  static CallOption[] buildCallOptions(
+      CallerAppIdentity callerApp,
+      String env,
+      String region,
+      String site,
+      ClientResources client,
+      String datasetId) {
+    return buildCallOptions(callerApp, env, region, site, client, datasetId, true);
   }
 
-  private void publishServiceStatus(String status) throws Exception {
-    DefinitionStatusService definition = buildServiceStatus(status);
-    if (definition == null) {
-      return;
+  static CallOption[] buildCallOptions(
+      CallerAppIdentity callerApp,
+      String env,
+      String region,
+      String site,
+      ClientResources client,
+      String datasetId,
+      boolean includeDelegatedUser) {
+    Objects.requireNonNull(callerApp, "callerApp");
+    Objects.requireNonNull(client, "client");
+
+    FlightCallHeaders headers = new FlightCallHeaders();
+    UserPrincipal principal = UserContext.get().orElse(null);
+    String oboUser =
+        includeDelegatedUser && principal != null ? Strings.trimToNull(principal.username()) : null;
+    FabricRequestHeaders requestHeaders =
+        FabricRequestHeaders.outbound(
+            callerApp,
+            oboUser,
+            new FabricRequestHeaders.RequestMetadata(
+                FabricRequestHeaders.generateRequestId(),
+                UUID.randomUUID().toString(),
+                env,
+                region,
+                site));
+    requestHeaders.applyToFlightHeaders(headers);
+    if (Strings.isNotBlank(datasetId)) {
+      headers.insert(FlightSqlRequestHeadersMiddleware.HEADER_DATASET_ID, datasetId);
     }
-    publishStatusDefinition(definition);
+    return new CallOption[] {new HeaderCallOption(headers)};
   }
 
-  private void publishServiceHeartbeat(String status) throws Exception {
-    DefinitionHbService heartbeat = buildServiceHeartbeat();
-    if (heartbeat == null) {
-      return;
-    }
-    String payload = om.writeValueAsString(heartbeat);
-    if (STATUS_DEBUG) {
-      LOGGER.debug("[Status] publish topic={} status={} payload={}", DiscoveryTopics.HEARTBEAT, status, payload);
-    }
-    int ttl = ttlSeconds > 0 ? ttlSeconds : 0;
-    control.amps().publish(DiscoveryTopics.HEARTBEAT, payload, ttl);
+  static String kerberosAuthFailureDetails(ServiceEndpoint endpoint, Throwable error) {
+    return kerberosAuthFailureDetails(endpoint, error, null);
   }
 
-  private void publishStatusDefinition(
-      org.pronzato.fabric.api.control.discovery.definitions.Definition definition) throws Exception {
-    if (definition == null) {
-      return;
-    }
-    String payload = om.writeValueAsString(definition);
-    if (STATUS_DEBUG) {
-      LOGGER.debug("[Status] publish topic={} payload={}", DiscoveryTopics.STATUS, payload);
-    }
-    control.amps().publish(DiscoveryTopics.STATUS, payload);
-  }
-
-  private DefinitionStatusService buildServiceStatus(String status) {
-    String normalizedGroup = Strings.trimToNull(group);
-    String normalizedName = Strings.trimToNull(serviceName);
-    String normalizedInstance = Strings.trimToNull(serviceInstanceId);
-    if (normalizedGroup == null || normalizedName == null || normalizedInstance == null) {
+  static String kerberosAuthFailureDetails(
+      ServiceEndpoint endpoint, Throwable error, String sessionKerberosPrincipal) {
+    if (!isKerberosAuthFailure(error)) {
       return null;
     }
-    DefinitionEnvelope envelope = statusEnvelope(DefinitionType.STATUS_SERVICE, normalizedName);
-    if (envelope == null) {
-      return null;
-    }
-    long nowMs = System.currentTimeMillis();
-    Integer port = servicePort > 0 ? servicePort : null;
-    String transport = resolveTransport();
-    String uri = resolveUri(port);
-    Map<String, String> tagsSnapshot = attrs.isEmpty() ? Map.of() : Map.copyOf(attrs);
-    String advertiseHost = Strings.trimToNull(serviceHost);
-    Integer advertisePort = port;
-    String bindHost = Strings.trimToNull(attrs.get("bindHost"));
-    Integer bindPort = parseInteger(attrs.get("bindPort"));
-    Boolean tlsEnabled = tlsRequired;
-    String tlsTermination =
-        firstNonBlank(Strings.trimToNull(attrs.get("tlsTermination")), tlsRequired ? "PASSTHROUGH" : null);
-    Boolean kerberosEnabled = parseBoolean(attrs.get("kerberosEnabled"));
-    if (kerberosEnabled == null) {
-      kerberosEnabled = false;
-    }
-    String kerberosSpn = Strings.trimToNull(attrs.get("kerberosSpn"));
-    String derivedSpn = Strings.trimToNull(attrs.get("derivedSpn"));
-    Long startEpochMs = serviceStartEpochMs > 0L ? serviceStartEpochMs : null;
-    DefinitionStatusService.State state = null;
-    if (status != null) {
-      try {
-        state = DefinitionStatusService.State.valueOf(status);
-      } catch (IllegalArgumentException ignore) {
-        state = DefinitionStatusService.State.UNKNOWN;
-      }
-    }
-    if (state == null) {
-      state = DefinitionStatusService.State.UNKNOWN;
-    }
-    return new DefinitionStatusService(
-        envelope,
-        normalizedGroup,
-        DefinitionType.STATUS_SERVICE,
-        normalizedName,
-        normalizedInstance,
-        state,
-        nowMs,
-        startEpochMs,
-        null,
-        transport,
-        uri,
-        advertiseHost,
-        advertisePort,
-        bindHost,
-        bindPort,
-        tlsEnabled,
-        tlsTermination,
-        kerberosEnabled,
-        kerberosSpn,
-        derivedSpn,
-        Strings.trimToNull(serviceHost),
-        port,
-        tlsRequired,
-        Strings.trimToNull(routeHost),
-        routePort,
-        Strings.trimToNull(routeAuthority),
-        Strings.trimToNull(region),
-        Strings.trimToNull(serviceAppName),
-        Strings.trimToNull(serviceAppInstanceId),
-        Strings.trimToNull(serviceAppGroup),
-        tagsSnapshot,
-        sessionId,
-        sessionKey);
-  }
-
-  private DefinitionHbService buildServiceHeartbeat() {
-    String normalizedGroup = Strings.trimToNull(group);
-    String normalizedName = Strings.trimToNull(serviceName);
-    String normalizedInstance = Strings.trimToNull(serviceInstanceId);
-    if (normalizedGroup == null || normalizedName == null || normalizedInstance == null) {
-      return null;
-    }
-    DefinitionEnvelope envelope = statusEnvelope(DefinitionType.HEARTBEAT_SERVICE, normalizedName);
-    if (envelope == null) {
-      return null;
-    }
-    Integer port = servicePort > 0 ? servicePort : null;
-    String transport = resolveTransport();
-    String uri = resolveUri(port);
-    Map<String, String> tagsSnapshot = attrs.isEmpty() ? Map.of() : Map.copyOf(attrs);
-    String advertiseHost = Strings.trimToNull(serviceHost);
-    Integer advertisePort = port;
-    String bindHost = Strings.trimToNull(attrs.get("bindHost"));
-    Integer bindPort = parseInteger(attrs.get("bindPort"));
-    Boolean tlsEnabled = tlsRequired;
-    String tlsTermination =
-        firstNonBlank(Strings.trimToNull(attrs.get("tlsTermination")), tlsRequired ? "PASSTHROUGH" : null);
-    Boolean kerberosEnabled = parseBoolean(attrs.get("kerberosEnabled"));
-    if (kerberosEnabled == null) {
-      kerberosEnabled = false;
-    }
-    String kerberosSpn = Strings.trimToNull(attrs.get("kerberosSpn"));
-    String derivedSpn = Strings.trimToNull(attrs.get("derivedSpn"));
-    long nowMs = System.currentTimeMillis();
-    return new DefinitionHbService(
-        envelope,
-        normalizedGroup,
-        DefinitionType.HEARTBEAT_SERVICE,
-        normalizedName,
-        normalizedInstance,
-        transport,
-        uri,
-        advertiseHost,
-        advertisePort,
-        bindHost,
-        bindPort,
-        tlsEnabled,
-        tlsTermination,
-        kerberosEnabled,
-        kerberosSpn,
-        derivedSpn,
-        Strings.trimToNull(serviceHost),
-        port,
-        tlsRequired,
-        Strings.trimToNull(routeHost),
-        routePort,
-        Strings.trimToNull(routeAuthority),
-        Strings.trimToNull(region),
-        nowMs,
-        tagsSnapshot);
-  }
-
-  private DefinitionEnvelope statusEnvelope(DefinitionType type, String name) {
-    String normalizedGroup = Strings.trimToNull(group);
-    String normalizedName = Strings.trimToNull(name);
-    if (normalizedGroup == null || normalizedName == null || type == null) {
-      return null;
-    }
-    return new DefinitionEnvelope(
-        normalizedGroup,
-        type,
-        normalizedName,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null);
-  }
-
-  private String resolveTransport() {
-    if (Strings.isEmpty(attrs)) {
-      return null;
-    }
-    return firstNonBlank(attrs.get("transport"), attrs.get("protocol"), attrs.get("serviceType"));
-  }
-
-  private String resolveUri(Integer port) {
-    String authority = firstNonBlank(routeAuthority, routeHost, serviceHost);
-    if (authority == null) {
-      return null;
-    }
-    if (authority.contains(":")) {
-      return authority;
-    }
-    int resolvedPort = port == null ? 0 : port;
-    if (resolvedPort <= 0 && routePort != null) {
-      resolvedPort = routePort;
-    }
-    return resolvedPort > 0 ? authority + ":" + resolvedPort : authority;
-  }
-
-  private static String firstNonBlank(String... values) {
-    if (values == null) {
-      return null;
-    }
-    for (String value : values) {
-      if (Strings.isNotBlank(value)) {
-        return value.trim();
-      }
-    }
-    return null;
-  }
-
-  private static Integer parseInteger(String value) {
-    if (Strings.isBlank(value)) {
-      return null;
-    }
+    Objects.requireNonNull(endpoint, "endpoint");
+    String derivedSpn = null;
     try {
-      return Integer.parseInt(value.trim());
-    } catch (NumberFormatException ignore) {
-      return null;
+      derivedSpn = deriveClientSpn(endpoint, sessionKerberosPrincipal);
+    } catch (RuntimeException ignore) {
+      derivedSpn = Strings.trimToNull(endpoint.kerberosSpn());
     }
+    return "kerberosAuthContext{serviceId="
+        + endpoint.serviceResourceId()
+        + ",connectHost="
+        + endpoint.connectHost()
+        + ",port="
+        + endpoint.port()
+        + ",derivedSpn="
+        + derivedSpn
+        + "}";
   }
 
-  private static Boolean parseBoolean(String value) {
-    if (Strings.isBlank(value)) {
-      return null;
+  static boolean isKerberosAuthFailure(Throwable error) {
+    Throwable cursor = error;
+    while (cursor != null) {
+      if (cursor instanceof FlightRuntimeException flightEx
+          && flightEx.status() != null
+          && flightEx.status().code() == FlightStatusCode.UNAUTHENTICATED
+          && containsIgnoreCase(flightEx.getMessage(), KERBEROS_AUTH_FAILURE)) {
+        return true;
+      }
+      String message = cursor.getMessage();
+      if (containsIgnoreCase(message, UNAUTHENTICATED)
+          && containsIgnoreCase(message, KERBEROS_AUTH_FAILURE)) {
+        return true;
+      }
+      cursor = cursor.getCause();
     }
-    String normalized = value.trim();
-    if ("true".equalsIgnoreCase(normalized) || "yes".equalsIgnoreCase(normalized)) {
-      return true;
+    return false;
+  }
+
+  static String clientDiagnostics(
+      ServiceEndpoint endpoint,
+      ServiceRunOptions runOptions,
+      String sessionKerberosPrincipal,
+      java.nio.file.Path sessionKerberosKeytab,
+      String derivedSpn) {
+    Objects.requireNonNull(endpoint, "endpoint");
+    ServiceRunOptions options = runOptions == null ? ServiceRunOptions.defaults() : runOptions;
+    java.nio.file.Path trustCert =
+        options.tlsTrustCert() == null ? options.clientTrustCert() : options.tlsTrustCert();
+    return "client{"
+        + "serviceGroup="
+        + endpoint.group()
+        + ",serviceName="
+        + endpoint.serviceName()
+        + ",tlsEnabled="
+        + endpoint.tlsEnabled()
+        + ",trustCert="
+        + safePath(trustCert)
+        + ",trustCertExists="
+        + pathExists(trustCert)
+        + ",kerberosEnabled="
+        + endpoint.kerberosEnabled()
+        + ",kerberosSpn="
+        + Strings.trimToNull(endpoint.kerberosSpn())
+        + ",derivedSpn="
+        + Strings.trimToNull(derivedSpn)
+        + ",sessionPrincipal="
+        + Strings.trimToNull(sessionKerberosPrincipal)
+        + ",keytab="
+        + safePath(sessionKerberosKeytab)
+        + ",keytabExists="
+        + pathExists(sessionKerberosKeytab)
+        + "}";
+  }
+
+  static String summarizeThrowable(Throwable error) {
+    if (error == null) {
+      return "<none>";
     }
-    if ("false".equalsIgnoreCase(normalized) || "no".equalsIgnoreCase(normalized)) {
+    StringBuilder summary = new StringBuilder();
+    Throwable cursor = error;
+    int depth = 0;
+    while (cursor != null && depth < 8) {
+      if (depth > 0) {
+        summary.append(" <- ");
+      }
+      summary
+          .append(cursor.getClass().getSimpleName())
+          .append(":")
+          .append(Strings.firstNonBlank(Strings.trimToNull(cursor.getMessage()), "<empty>"));
+      cursor = cursor.getCause();
+      depth++;
+    }
+    if (cursor != null) {
+      summary.append(" <- ...");
+    }
+    return summary.toString();
+  }
+
+  private static String safePath(java.nio.file.Path path) {
+    return path == null ? null : path.toAbsolutePath().normalize().toString();
+  }
+
+  private static boolean pathExists(java.nio.file.Path path) {
+    return path != null && java.nio.file.Files.exists(path);
+  }
+
+  private static boolean containsIgnoreCase(String value, String needle) {
+    if (value == null || needle == null) {
       return false;
     }
-    return null;
+    return value.toLowerCase(java.util.Locale.ROOT).contains(needle.toLowerCase(java.util.Locale.ROOT));
   }
 
-  private static String valueOrUnknown(String value) {
-    return Strings.isBlank(value) ? "<unknown>" : value;
+  private static String deriveClientSpn(ServiceEndpoint endpoint, String sessionKerberosPrincipal) {
+    Objects.requireNonNull(endpoint, "endpoint");
+    String baseSpn = KerberosSpn.resolveSpn(endpoint.kerberosSpn(), endpoint.connectHost());
+    String realm = KerberosSpn.extractRealm(sessionKerberosPrincipal);
+    if (realm == null) {
+      realm = KerberosConfig.DEFAULT_REALM;
+    }
+    return KerberosSpn.normalizeSpnWithRealm(baseSpn, realm);
+  }
+
+  private static String transportName(DefinitionService.ServiceType expectedType) {
+    if (expectedType == DefinitionService.ServiceType.ARROW_FLIGHT_SQL) {
+      return "ARROW_FLIGHT_SQL";
+    }
+    if (expectedType == DefinitionService.ServiceType.ARROW_FLIGHT_INGEST) {
+      return "ARROW_FLIGHT";
+    }
+    return "ARROW";
+  }
+
+
+  private static void shutdownQuietly(ManagedChannel channel) {
+    if (channel == null) {
+      return;
+    }
+    try {
+      channel.shutdownNow();
+      channel.awaitTermination(250, TimeUnit.MILLISECONDS);
+    } catch (Exception ignore) {
+    }
+  }
+
+  record ServiceEndpoint(
+      String group,
+      String serviceName,
+      String serviceResourceId,
+      DefinitionService definition,
+      String connectHost,
+      int port,
+      boolean tlsEnabled,
+      boolean kerberosEnabled,
+      String kerberosSpn) {}
+
+  static final class ClientResources implements AutoCloseable {
+    private final BufferAllocator allocator;
+    private final ManagedChannel channel;
+    private final FlightClient flightClient;
+
+    ClientResources(BufferAllocator allocator, ManagedChannel channel, FlightClient flightClient) {
+      this.allocator = Objects.requireNonNull(allocator, "allocator");
+      this.channel = Objects.requireNonNull(channel, "channel");
+      this.flightClient = Objects.requireNonNull(flightClient, "flightClient");
+    }
+
+    BufferAllocator allocator() {
+      return allocator;
+    }
+
+    FlightClient flightClient() {
+      return flightClient;
+    }
+
+    @Override
+    public void close() {
+      try {
+        flightClient.close();
+      } catch (InterruptedException ex) {
+        Thread.currentThread().interrupt();
+      } catch (Exception ignore) {
+      }
+      shutdownQuietly(channel);
+      CloseSupport.closeQuietly(allocator);
+    }
   }
 }
-
 
 
 
