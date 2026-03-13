@@ -1,1482 +1,1352 @@
-package org.pronzato.fabric.api.data.manager;
+package org.pronzato.fabric.api.services.flight;
 
-import org.pronzato.fabric.api.util.CloseSupport;
-import com.crankuptheamps.client.Message;
-import java.sql.SQLException;
+import com.google.protobuf.Any;
+import com.google.protobuf.ByteString;
+import com.google.protobuf.InvalidProtocolBufferException;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
 import java.util.ArrayList;
-import java.util.Comparator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.IntSupplier;
+import org.apache.arrow.flight.CallStatus;
+import org.apache.arrow.flight.Criteria;
+import org.apache.arrow.flight.FlightDescriptor;
+import org.apache.arrow.flight.FlightEndpoint;
+import org.apache.arrow.flight.FlightInfo;
+import org.apache.arrow.flight.FlightProducer;
+import org.apache.arrow.flight.FlightRuntimeException;
+import org.apache.arrow.flight.Location;
+import org.apache.arrow.flight.SchemaResult;
+import org.apache.arrow.flight.Ticket;
+import org.apache.arrow.flight.sql.NoOpFlightSqlProducer;
+import org.apache.arrow.flight.sql.FlightSqlProducer;
+import org.apache.arrow.flight.sql.impl.FlightSql;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.VarBinaryVector;
+import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.ipc.WriteChannel;
+import org.apache.arrow.vector.ipc.message.MessageSerializer;
+import org.apache.arrow.vector.types.DateUnit;
+import org.apache.arrow.vector.types.FloatingPointPrecision;
+import org.apache.arrow.vector.types.TimeUnit;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConnection;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngest;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngestSource;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStatusData;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
-import org.pronzato.fabric.api.control.status.data.DataStatusPublisher;
-import org.pronzato.fabric.api.Fabric;
+import org.pronzato.fabric.api.util.Bytes;
+import org.pronzato.fabric.api.data.catalog.DuckdbCatalogImpl;
 import org.pronzato.fabric.api.data.checkpoints.CheckpointStore;
 import org.pronzato.fabric.api.data.checkpoints.CheckpointStores;
-import org.pronzato.fabric.api.data.IngestAdmin;
-import org.pronzato.fabric.api.data.RowManager;
-import org.pronzato.fabric.api.data.RowResult;
-import org.pronzato.fabric.api.data.IngestManager;
+import org.pronzato.fabric.api.data.TabularManager;
 import org.pronzato.fabric.api.data.dataset.DatasetId;
-import org.pronzato.fabric.api.data.ingest.IngestPayload;
-import org.pronzato.fabric.api.data.ingest.IngestPayloadJson;
-import org.pronzato.fabric.api.data.ingest.IngestPayloadNvFix;
-import org.pronzato.fabric.api.data.ingest.IngestRuntimeStatus;
-import org.pronzato.fabric.api.data.ingest.SchemaSampleOptions;
-import org.pronzato.fabric.api.data.ingest.SchemaSampleRequest;
-import org.pronzato.fabric.api.data.ingest.agent.IngestAgent;
-import org.pronzato.fabric.api.data.ingest.source.IngestAmpsPump;
-import org.pronzato.fabric.api.data.ingest.model.IngestFormat;
-import org.pronzato.fabric.api.data.ingest.model.IngestModel;
-import org.pronzato.fabric.api.data.ingest.IngestRuntime;
-import org.pronzato.fabric.api.data.ingest.model.IngestSourceAmpsModel;
-import org.pronzato.fabric.api.data.ingest.model.IngestSourceModel;
-import org.pronzato.fabric.api.data.ingest.model.IngestTargetModel;
-import org.pronzato.fabric.api.data.ingest.model.IngestTargetParquetModel;
-import org.pronzato.fabric.api.data.ingest.model.IngestModelMapper;
-import org.pronzato.fabric.api.data.ParquetManager;
-import org.pronzato.fabric.api.data.duckdb.OdbcSessionSupport;
-import org.pronzato.fabric.api.data.duckdb.OdbcRuntimeGuard;
-import org.pronzato.fabric.api.data.parquet.ParquetManagerImpl;
-import org.pronzato.fabric.api.data.parquet.ParquetMaintenanceManagerUnsupported;
-import org.pronzato.fabric.api.control.plugins.FabricPlugins;
-import org.pronzato.fabric.api.control.plugins.IngestSourceProvider;
-import org.pronzato.fabric.api.control.plugins.IngestSourceRuntimeContext;
-import org.pronzato.fabric.api.schemas.SchemaCompatibility;
-import org.pronzato.fabric.api.schemas.SchemaManager;
+import org.pronzato.fabric.api.data.manager.RowManagerImpl;
+import org.pronzato.fabric.api.data.manager.TabularManagerImpl;
+import org.pronzato.fabric.api.data.duckdb.DuckdbNotifier;
+import org.pronzato.fabric.api.control.entitlements.core.data.DataEntitlements;
+import org.pronzato.fabric.api.control.entitlements.core.services.ServiceEntitlements;
+import org.pronzato.fabric.api.control.security.headers.FabricRequestHeaders;
+import org.pronzato.fabric.api.control.security.identity.RequestIdentity;
+import org.pronzato.fabric.api.control.security.identity.RequestIdentityResolver;
 import org.pronzato.fabric.api.schemas.SchemaModel;
-import org.pronzato.fabric.api.schemas.SchemaModels;
-import org.pronzato.fabric.api.schemas.SchemaType;
-import org.pronzato.fabric.api.schemas.manager.SchemaManagerImpl;
-import org.pronzato.fabric.api.connectors.amps.AmpsConnection;
-import org.pronzato.fabric.api.control.discovery.lifecycle.DeleteOutcome;
-import org.pronzato.fabric.api.control.discovery.lifecycle.DeleteResult;
-import org.pronzato.fabric.api.control.discovery.DeleteManager;
-import org.pronzato.fabric.api.control.session.SessionImpl;
-import org.pronzato.fabric.api.control.session.SessionContext;
+import org.pronzato.fabric.api.services.flight.streaming.FlightDatasetStreamProducer;
 import org.pronzato.fabric.api.util.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public final class IngestManagerImpl implements IngestManager, IngestAdmin, AutoCloseable {
-  static final Logger LOGGER = LoggerFactory.getLogger(IngestManagerImpl.class);
-  static final String INPUT_TYPE_API_IPC = "API_IPC";
-  private static final long MAX_SCHEMA_ALLOCATOR_BYTES = 8L * 1024L * 1024L;
-  private static final long MAX_ROLL_ALLOCATOR_BYTES = 64L * 1024L * 1024L;
-  static final long ROLL_SCAN_INTERVAL_MILLIS = 250L;
-  static final int DEFAULT_PARQUET_MAX_ROWS_PER_FILE = 10_000;
-  static final long DEFAULT_PARQUET_MAX_IDLE_MILLIS = 30_000L;
-  static final String FORMAT_JSON = "JSON";
-  static final String FORMAT_NVFIX = "NVFIX";
-  private static final String SOURCE_API = "API";
-  private static final String SOURCE_AMPS = "AMPS";
-  private static final String MODE_DIRECT = "DIRECT";
-  private static final String MODE_SERVICE = "SERVICE";
-  static final String DEFAULT_ACTOR = "fabric-lite";
-  static final String PLATFORM_GROUP = "platform";
-  static final String S3_MANAGED_ROOT = "fabric/data";
-  private static final String COUNT_SQL_PREFIX = "select count(*) as row_count from ";
-  static final String OPERATION_APPEND = "APPEND";
-  static final String OPERATION_INGEST = "INGEST";
+public final class FlightSqlServiceProducer extends NoOpFlightSqlProducer implements AutoCloseable {
+  private static final Logger LOGGER = LoggerFactory.getLogger(FlightSqlServiceProducer.class);
+  private static final long IPC_READ_ALLOCATOR_BYTES = 64L * 1024L * 1024L;
+  private static final String DATASET_TOKEN_MARKER = datasetTokenMarker();
+  private static final String METADATA_CATALOG_NAME = "fabric";
+  private static final String TABLE_TYPE_TABLE = "TABLE";
+  private static final String TABLE_TYPE_VIEW = "VIEW";
+  private static final String TABLE_TYPE_STREAM = "STREAM";
+  private static final Set<String> SUPPORTED_TABLE_TYPES =
+      Set.of(TABLE_TYPE_TABLE, TABLE_TYPE_VIEW, TABLE_TYPE_STREAM);
+  private static final String OPERATION_STATEMENT_EXECUTE = "flight.sql.statement.execute";
+  private static final String OPERATION_STATEMENT_SCHEMA = "flight.sql.statement.schema";
+  private static final String OPERATION_STATEMENT_FETCH = "flight.sql.statement.fetch";
+  private static final String OPERATION_METADATA_CATALOGS = "flight.sql.metadata.catalogs";
+  private static final String OPERATION_METADATA_SCHEMAS = "flight.sql.metadata.schemas";
+  private static final String OPERATION_METADATA_TABLE_TYPES = "flight.sql.metadata.tableTypes";
+  private static final String OPERATION_METADATA_TABLES = "flight.sql.metadata.tables";
+  private static final String OPERATION_METADATA_TABLE_SCHEMA = "flight.sql.metadata.tableSchema";
 
-  final RowManager rowManager;
-  final DiscoveryCache DiscoveryCache;
-  final String group;
-  final SchemaManager schemaManager;
-  final IngestModelMapper modelMapper;
-  final FabricPlugins plugins;
-  final Fabric.Session session;
-  final DeleteManager deleteManager;
-  final CheckpointStore checkpointStore;
-  final ParquetManager parquetManager;
-  final String runtimeMode;
-  final boolean serviceMode;
-  final ScheduledExecutorService rollScheduler;
-  final AtomicReference<ScheduledFuture<?>> rollScanTask = new AtomicReference<>();
-  final ConcurrentMap<String, IngestRuntimeImpl> runtimes = new ConcurrentHashMap<>();
-  final ConcurrentMap<String, ActiveTableDescriptor> activeTableDescriptors = new ConcurrentHashMap<>();
-  final ConcurrentMap<String, ParquetRollBuffer> parquetRollBuffers = new ConcurrentHashMap<>();
-  final ConcurrentMap<String, ParquetRollPolicy> parquetRollPolicies = new ConcurrentHashMap<>();
-  final ConcurrentMap<String, String> parquetFilenamePrefixes = new ConcurrentHashMap<>();
-  final ThreadLocal<String> parquetFilenamePrefixOverride = new ThreadLocal<>();
-  final RootAllocator schemaIpcAllocator = new RootAllocator(MAX_SCHEMA_ALLOCATOR_BYTES);
-  final RootAllocator rollIpcAllocator = new RootAllocator(MAX_ROLL_ALLOCATOR_BYTES);
+  private final TabularManager tabularManager;
+  private final ServiceEntitlements serviceEntitlements;
+  private final String serviceResourceId;
+  private final DiscoveryCache DiscoveryCache;
+  private final String runtimeEnvironment;
+  private final String advertiseHost;
+  private final IntSupplier portSupplier;
+  private final boolean tlsEnabled;
+  private final ConcurrentMap<String, PendingStatement> statements = new ConcurrentHashMap<>();
+  private final RootAllocator ipcReadAllocator = new RootAllocator(IPC_READ_ALLOCATOR_BYTES);
+  private final CheckpointStore checkpointStore;
+  private final FlightDatasetStreamProducer datasetStreamProducer;
+  private final Set<DatasetId> allowedDatasetIds;
 
-  public IngestManagerImpl(RowManager rowManager, DiscoveryCache DiscoveryCache, String group) {
-    this(
-        rowManager,
-        DiscoveryCache,
-        group,
-        null,
-        null,
-        CheckpointStores.failFast(
-            "IngestManager checkpoint store is not configured. Configure session with withCheckpointPath(...)"));
-  }
-
-  public IngestManagerImpl(
-      RowManager rowManager, DiscoveryCache DiscoveryCache, String group, Fabric.Session session) {
-    this(
-        rowManager,
-        DiscoveryCache,
-        group,
-        session,
-        null,
-        CheckpointStores.failFast(
-            "IngestManager checkpoint store is not configured. Configure session with withCheckpointPath(...)"));
-  }
-
-  public IngestManagerImpl(
-      RowManager rowManager,
+  public FlightSqlServiceProducer(
+      TabularManager tabularManager,
+      ServiceEntitlements serviceEntitlements,
+      String serviceResourceId,
       DiscoveryCache DiscoveryCache,
-      String group,
-      Fabric.Session session,
-      ScheduledExecutorService rollScheduler) {
+      String runtimeEnvironment,
+      String advertiseHost,
+      IntSupplier portSupplier,
+      boolean tlsEnabled) {
     this(
-        rowManager,
+        tabularManager,
+        serviceEntitlements,
+        serviceResourceId,
         DiscoveryCache,
-        group,
-        session,
-        rollScheduler,
+        runtimeEnvironment,
+        advertiseHost,
+        portSupplier,
+        tlsEnabled,
         CheckpointStores.failFast(
-            "IngestManager checkpoint store is not configured. Configure session with withCheckpointPath(...)"));
+            "FlightSqlServiceProducer checkpoint store is not configured. Configure session with withCheckpointPath(...)"));
   }
 
-  public IngestManagerImpl(
-      RowManager rowManager,
+  public FlightSqlServiceProducer(
+      TabularManager tabularManager,
+      ServiceEntitlements serviceEntitlements,
+      String serviceResourceId,
       DiscoveryCache DiscoveryCache,
-      String group,
-      Fabric.Session session,
-      ScheduledExecutorService rollScheduler,
+      String runtimeEnvironment,
+      String advertiseHost,
+      IntSupplier portSupplier,
+      boolean tlsEnabled,
       CheckpointStore checkpointStore) {
-    this.rowManager = Objects.requireNonNull(rowManager, "rowManager");
-    this.DiscoveryCache = Objects.requireNonNull(DiscoveryCache, "DiscoveryCache");
-    this.group = Strings.requireNonBlank(group, "session group");
-    this.serviceMode = rowManager instanceof RemoteRowManager;
-    this.runtimeMode = serviceMode ? MODE_SERVICE : MODE_DIRECT;
-    this.rollScheduler = rollScheduler;
-    this.schemaManager =
-        session == null
-            ? new SchemaManagerImpl(() -> this.DiscoveryCache, () -> this.group, () -> null)
-            : Objects.requireNonNull(session.schemas(), "session.schemas");
-    this.modelMapper = new IngestModelMapper();
-    this.plugins = FabricPlugins.system();
-    this.session = session;
-    DeleteManager sessionDeleteManager =
-        session instanceof SessionImpl sessionImpl ? sessionImpl.deletes() : null;
-    this.deleteManager =
-        sessionDeleteManager != null
-            ? sessionDeleteManager
-            : new DeleteManager(
-                () -> this.DiscoveryCache.allDefinitions(),
-                (type, definitionGroup, definitionName) ->
-                    this.DiscoveryCache.delete(type, definitionGroup, definitionName));
+    this(
+        tabularManager,
+        serviceEntitlements,
+        serviceResourceId,
+        DiscoveryCache,
+        runtimeEnvironment,
+        advertiseHost,
+        portSupplier,
+        tlsEnabled,
+        checkpointStore,
+        Set.of());
+  }
+
+  public FlightSqlServiceProducer(
+      TabularManager tabularManager,
+      ServiceEntitlements serviceEntitlements,
+      String serviceResourceId,
+      DiscoveryCache DiscoveryCache,
+      String runtimeEnvironment,
+      String advertiseHost,
+      IntSupplier portSupplier,
+      boolean tlsEnabled,
+      CheckpointStore checkpointStore,
+      Set<DatasetId> allowedDatasetIds) {
+    this.tabularManager = Objects.requireNonNull(tabularManager, "tabularManager");
+    this.serviceEntitlements = Objects.requireNonNull(serviceEntitlements, "serviceEntitlements");
+    this.serviceResourceId = Objects.requireNonNull(serviceResourceId, "serviceResourceId");
+    this.DiscoveryCache = DiscoveryCache;
+    this.runtimeEnvironment = Strings.trimToNull(runtimeEnvironment);
+    this.advertiseHost = Objects.requireNonNull(advertiseHost, "advertiseHost");
+    this.portSupplier = Objects.requireNonNull(portSupplier, "portSupplier");
+    this.tlsEnabled = tlsEnabled;
     this.checkpointStore = Objects.requireNonNull(checkpointStore, "checkpointStore");
-    this.parquetManager =
-        rowManager instanceof RowManagerImpl
-            ? new ParquetManagerImpl(rowManager, DiscoveryCache, group, session, checkpointStore)
-            : new ParquetMaintenanceManagerUnsupported(
-                "Parquet maintenance requires DIRECT mode local data manager");
+    this.allowedDatasetIds =
+        allowedDatasetIds == null || allowedDatasetIds.isEmpty()
+            ? Set.of()
+            : Set.copyOf(allowedDatasetIds);
+    this.datasetStreamProducer =
+        new FlightDatasetStreamProducer(
+            this.tabularManager,
+            this.serviceEntitlements,
+            this.serviceResourceId,
+            this.DiscoveryCache,
+            this.checkpointStore,
+            DuckdbNotifier.shared(),
+            this.allowedDatasetIds);
   }
 
   @Override
-  public ParquetManager parquet() {
-    return parquetManager;
-  }
+  public FlightInfo getFlightInfoStatement(
+      FlightSql.CommandStatementQuery command,
+      FlightProducer.CallContext context,
+      FlightDescriptor descriptor) {
+    RequestIdentity identity = resolveIdentity(context);
+    return RequestIdentityResolver.callAsRequestIdentity(
+        identity,
+        () -> {
+          String subject = identity.effectiveUserSubject();
+          authorizeInvoke(subject, OPERATION_STATEMENT_EXECUTE, command == null ? null : command.getQuery());
 
-  public CheckpointStore checkpointStore() {
-    return checkpointStore;
+          DatasetId datasetId = resolveDatasetId(context);
+          installDatasetIfPresent(datasetId);
+          String sql = rewriteDatasetPlaceholder(requireSql(command), datasetId);
+          logSqlRequest(identity, OPERATION_STATEMENT_EXECUTE, datasetId, sql);
+          ByteBuffer ipc = queryIpcSqlAsCaller(identity, sql, datasetId);
+          IpcSummary summary = inspectIpc(ipc);
+
+          String statementHandle = UUID.randomUUID().toString();
+          statements.put(
+              statementHandle, new PendingStatement(subject, summary.schema(), summary.rowCount(), ipc));
+
+          FlightSql.TicketStatementQuery ticketMessage =
+              FlightSql.TicketStatementQuery.newBuilder()
+                  .setStatementHandle(ByteString.copyFromUtf8(statementHandle))
+                  .build();
+          Ticket ticket = new Ticket(ticketMessage.toByteArray());
+          FlightDescriptor responseDescriptor =
+              descriptor != null
+                  ? descriptor
+                  : FlightDescriptor.command(Any.pack(command).toByteArray());
+          FlightEndpoint endpoint = new FlightEndpoint(ticket, location());
+          return new FlightInfo(
+              summary.schema(),
+              responseDescriptor,
+              List.of(endpoint),
+              summary.rowCount(),
+              summary.rowCount());
+        });
   }
 
   @Override
-  public IngestAdmin admin() {
-    return this;
+  public SchemaResult getSchemaStatement(
+      FlightSql.CommandStatementQuery command,
+      FlightProducer.CallContext context,
+      FlightDescriptor descriptor) {
+    RequestIdentity identity = resolveIdentity(context);
+    return RequestIdentityResolver.callAsRequestIdentity(
+        identity,
+        () -> {
+          authorizeInvoke(
+              identity.effectiveUserSubject(),
+              OPERATION_STATEMENT_SCHEMA,
+              command == null ? null : command.getQuery());
+
+          DatasetId datasetId = resolveDatasetId(context);
+          installDatasetIfPresent(datasetId);
+          String sql = rewriteDatasetPlaceholder(requireSql(command), datasetId);
+          logSqlRequest(identity, OPERATION_STATEMENT_SCHEMA, datasetId, sql);
+          ByteBuffer ipc = queryIpcSqlAsCaller(identity, sql, datasetId);
+          return new SchemaResult(inspectIpc(ipc).schema());
+        });
   }
 
   @Override
-  public IngestAgent agent(IngestAgent.Options options) {
-    if (session == null) {
-      throw new IllegalStateException("IngestAgent requires a session-backed ingest manager");
+  public FlightInfo getFlightInfoCatalogs(
+      FlightSql.CommandGetCatalogs command,
+      FlightProducer.CallContext context,
+      FlightDescriptor descriptor) {
+    RequestIdentity identity = resolveIdentity(context);
+    return RequestIdentityResolver.callAsRequestIdentity(
+        identity,
+        () -> {
+          authorizeInvoke(identity.effectiveUserSubject(), OPERATION_METADATA_CATALOGS, null);
+          FlightSql.CommandGetCatalogs resolved =
+              command == null ? FlightSql.CommandGetCatalogs.getDefaultInstance() : command;
+          return metadataFlightInfo(
+              FlightSqlProducer.Schemas.GET_CATALOGS_SCHEMA, descriptor, resolved);
+        });
+  }
+
+  @Override
+  public FlightInfo getFlightInfoSchemas(
+      FlightSql.CommandGetDbSchemas command,
+      FlightProducer.CallContext context,
+      FlightDescriptor descriptor) {
+    RequestIdentity identity = resolveIdentity(context);
+    return RequestIdentityResolver.callAsRequestIdentity(
+        identity,
+        () -> {
+          authorizeInvoke(identity.effectiveUserSubject(), OPERATION_METADATA_SCHEMAS, null);
+          FlightSql.CommandGetDbSchemas resolved =
+              command == null ? FlightSql.CommandGetDbSchemas.getDefaultInstance() : command;
+          validateExactPatternOrAll(
+              resolved.getDbSchemaFilterPattern(), "db_schema_name_pattern");
+          validateExactPatternOrAll(resolved.getCatalog(), "catalog");
+          return metadataFlightInfo(
+              FlightSqlProducer.Schemas.GET_SCHEMAS_SCHEMA, descriptor, resolved);
+        });
+  }
+
+  @Override
+  public FlightInfo getFlightInfoTableTypes(
+      FlightSql.CommandGetTableTypes command,
+      FlightProducer.CallContext context,
+      FlightDescriptor descriptor) {
+    RequestIdentity identity = resolveIdentity(context);
+    return RequestIdentityResolver.callAsRequestIdentity(
+        identity,
+        () -> {
+          authorizeInvoke(identity.effectiveUserSubject(), OPERATION_METADATA_TABLE_TYPES, null);
+          FlightSql.CommandGetTableTypes resolved =
+              command == null ? FlightSql.CommandGetTableTypes.getDefaultInstance() : command;
+          return metadataFlightInfo(
+              FlightSqlProducer.Schemas.GET_TABLE_TYPES_SCHEMA, descriptor, resolved);
+        });
+  }
+
+  @Override
+  public FlightInfo getFlightInfoTables(
+      FlightSql.CommandGetTables command,
+      FlightProducer.CallContext context,
+      FlightDescriptor descriptor) {
+    RequestIdentity identity = resolveIdentity(context);
+    return RequestIdentityResolver.callAsRequestIdentity(
+        identity,
+        () -> {
+          authorizeInvoke(identity.effectiveUserSubject(), OPERATION_METADATA_TABLES, null);
+          FlightSql.CommandGetTables resolved =
+              command == null ? FlightSql.CommandGetTables.getDefaultInstance() : command;
+          validateExactPatternOrAll(resolved.getCatalog(), "catalog");
+          validateExactPatternOrAll(
+              resolved.getDbSchemaFilterPattern(), "db_schema_name_pattern");
+          validateExactPatternOrAll(
+              resolved.getTableNameFilterPattern(), "table_name_pattern");
+          validateRequestedTableTypes(resolved.getTableTypesList());
+          Schema responseSchema =
+              resolved.getIncludeSchema()
+                  ? FlightSqlProducer.Schemas.GET_TABLES_SCHEMA
+                  : FlightSqlProducer.Schemas.GET_TABLES_SCHEMA_NO_SCHEMA;
+          return metadataFlightInfo(responseSchema, descriptor, resolved);
+        });
+  }
+
+  @Override
+  public SchemaResult getSchema(
+      FlightProducer.CallContext context, FlightDescriptor descriptor) {
+    if (descriptor == null || !descriptor.isCommand()) {
+      return super.getSchema(context, descriptor);
     }
-    IngestAgent.Options resolved = options == null ? IngestAgent.Options.defaults() : options;
-    return IngestAgent.create(session, resolved);
-  }
-
-  @Override
-  public void setParquetRollPolicy(String ingestName, Integer maxRowsPerFile, Long maxIdleMillis) {
-    String normalizedName = Strings.requireNonBlank(ingestName, "ingestName");
-    flushPendingParquetBuffer(normalizedName, "runtime-roll-policy-update");
-    if (maxRowsPerFile == null && maxIdleMillis == null) {
-      parquetRollPolicies.remove(normalizedName);
-      return;
-    }
-    ParquetRollPolicy policy =
-        new ParquetRollPolicy(
-            resolveMaxRowsPerFile(maxRowsPerFile),
-            resolveMaxIdleMillis(maxIdleMillis));
-    parquetRollPolicies.put(normalizedName, policy);
-  }
-
-  @Override
-  public void setParquetFilenamePrefix(String ingestName, String parquetFilenamePrefix) {
-    String normalizedName = Strings.requireNonBlank(ingestName, "ingestName");
-    flushPendingParquetBuffer(normalizedName, "runtime-filename-prefix-update");
-    String normalizedPrefix = Strings.trimToNull(parquetFilenamePrefix);
-    if (normalizedPrefix == null) {
-      parquetFilenamePrefixes.remove(normalizedName);
-      return;
-    }
-    parquetFilenamePrefixes.put(normalizedName, normalizedPrefix);
-  }
-
-  @Override
-  public SchemaModel sampleSchema(SchemaSampleRequest request) {
-    SchemaSampleRequest resolvedRequest = Objects.requireNonNull(request, "request");
-    org.pronzato.fabric.api.data.ingest.SchemaSampleOptions options = resolvedRequest.options();
-    org.pronzato.fabric.api.data.schema.client.SchemaSampleOptions schemaOptions =
-        new org.pronzato.fabric.api.data.schema.client.SchemaSampleOptions(
-            options.maxSamples(),
-            options.maxBytes(),
-            org.pronzato.fabric.api.data.schema.client.SchemaSampleOptions.DEFAULT_MAX_MILLIS,
-            true,
-            resolvedRequest.format().name());
-    org.pronzato.fabric.api.data.schema.client.SchemaSampleResult sampled =
-        schemaManager instanceof SchemaManagerImpl manager
-            ? manager.samplePayloadsConfigured(
-                "payloads",
-                resolvedRequest.format(),
-                options.jsonMode(),
-                options.jsonRootField(),
-                options.nvFixPairDelimiter(),
-                options.nvFixKvDelimiter(),
-                options.nvFixTrimKeys(),
-                options.nvFixTrimValues(),
-                resolvedRequest.samples(),
-                schemaOptions)
-            : schemaManager.samplePayloads(resolvedRequest.format(), resolvedRequest.samples(), schemaOptions);
-    return SchemaModels.fromSample(
-        sampled.ingestName(),
-        SchemaType.TABULAR,
-        SchemaCompatibility.BACKWARDS,
-        sampled);
-  }
-
-  @Override
-  public SchemaModel sampleSchemaFromAmps(SchemaSampleOptions options) {
-    SchemaSampleOptions resolvedOptions =
-        options == null ? SchemaSampleOptions.defaults() : options;
-    if (session == null) {
-      throw new IllegalStateException("AMPS schema sampling requires a session-backed ingest manager");
-    }
-    String connectionName =
-        Strings.requireNonBlank(resolvedOptions.connectionName(), "options.connectionName");
-    String topic = Strings.requireNonBlank(resolvedOptions.topic(), "options.topic");
-    IngestFormat format =
-        resolvedOptions.format() == null ? IngestFormat.NVFIX : resolvedOptions.format();
-    List<String> samples =
-        collectAmpsPayloadSamples(
-            connectionName,
-            topic,
-            resolvedOptions.ampsOptions(),
-            resolvedOptions.ampsFilter(),
-            resolvedOptions.ampsSow(),
-            resolvedOptions.maxSamples(),
-            resolvedOptions.ampsWaitMillis());
-    if (samples.isEmpty()) {
-      throw new IllegalStateException(
-          "No payload samples received from AMPS connection="
-              + connectionName
-              + " topic="
-              + topic);
-    }
-    SchemaModel sampled =
-        sampleSchema(
-            new SchemaSampleRequest(
-                format,
-                samples,
-                resolvedOptions));
-    return toRegistrationSchema(sampled);
-  }
-
-  private List<String> collectAmpsPayloadSamples(
-      String connectionName,
-      String topic,
-      String options,
-      String filter,
-      boolean sow,
-      int maxSamples,
-      long waitMillis) {
-    List<String> samples = new ArrayList<>();
-    Object monitor = new Object();
-    AtomicBoolean done = new AtomicBoolean(false);
-    AmpsConnection.SubscriptionSpec spec =
-        new AmpsConnection.SubscriptionSpec(sow, topic, options, filter);
-    try (AmpsConnection amps = session.connections().amps(connectionName);
-        AmpsConnection.Subscription ignored =
-            amps.subscribe(
-                spec,
-                (AmpsConnection.SubscriptionListener)
-                    message -> {
-                  if (message == null || done.get()) {
-                    return;
-                  }
-                  Message raw = message.raw();
-                  if (raw != null && raw.getCommand() == Message.Command.GroupEnd && sow) {
-                    synchronized (monitor) {
-                      done.set(true);
-                      monitor.notifyAll();
-                    }
-                    return;
-                  }
-                  String payload = Strings.trimToNull(message.data());
-                  if (payload == null) {
-                    return;
-                  }
-                  synchronized (monitor) {
-                    if (done.get()) {
-                      return;
-                    }
-                    if (samples.size() >= maxSamples) {
-                      done.set(true);
-                      monitor.notifyAll();
-                      return;
-                    }
-                    samples.add(payload);
-                    if (samples.size() >= maxSamples) {
-                      done.set(true);
-                    }
-                    monitor.notifyAll();
-                  }
-                })) {
-      long deadline = System.currentTimeMillis() + Math.max(1_000L, waitMillis);
-      synchronized (monitor) {
-        while (!done.get() && samples.size() < maxSamples) {
-          long remaining = deadline - System.currentTimeMillis();
-          if (remaining <= 0L) {
-            break;
-          }
-          monitor.wait(Math.min(500L, remaining));
-        }
-      }
-    } catch (Exception ex) {
-      if (ex instanceof InterruptedException) {
-        Thread.currentThread().interrupt();
-      }
-      throw new IllegalStateException(
-          "Failed to sample AMPS payloads connection="
-              + connectionName
-              + " topic="
-              + topic,
-          ex);
-    }
-    LOGGER.info("[Ingest][SchemaSample][AMPS] connectionName={} topic={} requested={} received={} sow={} waitMillis={}", connectionName, topic, maxSamples, samples.size(), sow, waitMillis);
-    return List.copyOf(samples);
-  }
-
-  private SchemaModel toRegistrationSchema(SchemaModel schema) {
-    if (schema == null || schema.getFields() == null || schema.getFields().isEmpty()) {
-      return schema;
-    }
-    List<SchemaModel.Field> nullableFields = new ArrayList<>(schema.getFields().size());
-    for (SchemaModel.Field field : schema.getFields()) {
-      if (field == null) {
-        continue;
-      }
-      nullableFields.add(field.toBuilder().withNullable(true).build());
-    }
-    return schema.toBuilder().withFields(nullableFields).build();
-  }
-
-  @Override
-  public org.pronzato.fabric.api.data.schema.client.SchemaSampleResult sampleSchema(
-      String ingestName, org.pronzato.fabric.api.data.schema.client.SchemaSampleOptions options) {
-    String normalizedIngestName = Strings.requireNonBlank(ingestName, "ingestName");
-    org.pronzato.fabric.api.data.schema.client.SchemaSampleOptions resolvedOptions =
-        options == null
-            ? org.pronzato.fabric.api.data.schema.client.SchemaSampleOptions.defaults()
-            : options;
-    return schemaManager.sample(normalizedIngestName, resolvedOptions);
-  }
-
-  @Override
-  public SchemaModel sampleSchemaModel(
-      String ingestName,
-      org.pronzato.fabric.api.data.schema.client.SchemaSampleOptions options,
-      String schemaName,
-      SchemaCompatibility compatibility) {
-    String normalizedSchemaName = Strings.requireNonBlank(schemaName, "schemaName");
-    SchemaCompatibility resolvedCompatibility =
-        compatibility == null ? SchemaCompatibility.BACKWARDS : compatibility;
-    org.pronzato.fabric.api.data.schema.client.SchemaSampleResult sampled =
-        sampleSchema(ingestName, options);
-    SchemaModel inferred =
-        SchemaModels.fromSample(
-            normalizedSchemaName, SchemaType.TABULAR, resolvedCompatibility, sampled);
-    return schemaManager.register(normalizedSchemaName, SchemaType.TABULAR, inferred);
-  }
-
-  @Override
-  public IngestModel sampleAndUpdateSchema(
-      String ingestName,
-      org.pronzato.fabric.api.data.schema.client.SchemaSampleOptions options,
-      String schemaName,
-      SchemaCompatibility compatibility) {
-    String normalizedIngestName = Strings.requireNonBlank(ingestName, "ingestName");
-    IngestModel existing =
-        getModel(normalizedIngestName)
-            .orElseThrow(() -> new IllegalArgumentException("Unknown ingest: " + group + "/" + normalizedIngestName));
-    SchemaModel registeredSchema =
-        sampleSchemaModel(normalizedIngestName, options, schemaName, compatibility);
-    IngestModel updated = existing.toBuilder().withSchema(registeredSchema).build();
-    register(updated);
-    return getModel(normalizedIngestName).orElse(updated);
-  }
-
-  @Override
-  public void register(IngestModel model) {
-    IngestManagerImplDataset.register(this, model);
-  }
-
-  @Override
-  public void delete(String ingestName) {
-    delete(ingestName, IngestAdmin.DeleteOptions.ingestOnly());
-  }
-
-  @Override
-  public void delete(String ingestName, IngestAdmin.DeleteOptions options) {
-    String normalizedName = Strings.requireNonBlank(ingestName, "ingestName");
-    IngestAdmin.DeleteOptions resolvedOptions =
-        options == null ? IngestAdmin.DeleteOptions.ingestOnly() : options;
-    resolveIngestDefinition(normalizedName);
-
-    stop(normalizedName);
-    activeTableDescriptors.remove(normalizedName);
-    parquetRollPolicies.remove(normalizedName);
-    parquetFilenamePrefixes.remove(normalizedName);
-    parquetRollBuffers.remove(normalizedName);
-    runtimes.remove(normalizedName);
-
-    DeleteResult result =
-        deleteManager.delete(
-            "ingest:" + group + "/" + normalizedName,
-            toLifecycleDeleteOptions(resolvedOptions));
-    if (result.outcome() == DeleteOutcome.BLOCKED) {
-      throw new IllegalStateException(
-          "Delete blocked for ingest " + normalizedName + ": " + result.blockers());
-    }
-    if (result.outcome() == DeleteOutcome.PARTIAL) {
-      throw new IllegalStateException(
-          "Delete partially completed for ingest "
-              + normalizedName
-              + ": "
-              + result.warnings());
-    }
-  }
-
-  @Override
-  public void deleteDatasetDefinition(String datasetId) {
-    IngestManagerImplDataset.deleteDatasetDefinition(this, datasetId);
-  }
-
-  private org.pronzato.fabric.api.control.discovery.lifecycle.DeleteOptions toLifecycleDeleteOptions(
-      IngestAdmin.DeleteOptions options) {
-    List<DefinitionType> cascadeTypes = new ArrayList<>();
-    cascadeTypes.add(DefinitionType.INGEST_SOURCE);
-    if (options != null && options.deleteDatasetDefinition()) {
-      cascadeTypes.add(DefinitionType.DATASET);
-    }
-    return new org.pronzato.fabric.api.control.discovery.lifecycle.DeleteOptions(
-        true,
-        options != null && options.deleteSchemaDefinition(),
-        false,
-        false,
-        false,
-        false,
-        true,
-        false,
-        List.copyOf(cascadeTypes));
-  }
-
-  private String toClientVisibleS3Path(String parquetPath, String connectionName) {
-    return IngestManagerImplDataset.toClientVisibleS3Path(this, parquetPath, connectionName);
-  }
-
-  @Override
-  public Optional<IngestModel> getModel(String ingestName) {
-    String normalizedName = Strings.requireNonBlank(ingestName, "ingestName");
-    Optional<DefinitionIngest> ingest = DiscoveryCache.get(DefinitionIngest.class, group, normalizedName);
-    if (ingest.isEmpty()) {
-      return Optional.empty();
-    }
-    Optional<DefinitionIngestSource> source =
-        DiscoveryCache.get(DefinitionIngestSource.class, group, normalizedName);
-    SchemaModel schema = resolveSchemaModel(ingest.get());
-    IngestModel model = modelMapper.fromDefinitions(ingest.get(), source.orElse(null), schema);
-    DefinitionDataset dataset = resolveDatasetDefinition(ingest.get().datasetId());
-    if (dataset != null) {
-      IngestTargetModel target = modelMapper.fromDefinitionDataset(dataset);
-      if (target != null) {
-        if (target instanceof IngestTargetParquetModel parquetTarget) {
-          String clientPath =
-              toClientVisibleS3Path(parquetTarget.parquetPath(), parquetTarget.connectionName());
-          if (!Objects.equals(clientPath, parquetTarget.parquetPath())) {
-            target = parquetTarget.toBuilder().withParquetPath(clientPath).build();
-          }
-        }
-        model = model.toBuilder().withTarget(target).build();
-      }
-    }
-    return Optional.of(model);
-  }
-
-  @Override
-  public List<IngestModel> listModels() {
-    List<DefinitionIngest> definitions = new ArrayList<>(DiscoveryCache.list(DefinitionIngest.class, group));
-    definitions.sort(
-        Comparator.comparing(
-            definition ->
-                Strings.requireNonBlank(
-                    definition.envelope() == null ? null : definition.envelope().name(),
-                    "ingest.envelope.name"),
-            String.CASE_INSENSITIVE_ORDER));
-    List<IngestModel> models = new ArrayList<>(definitions.size());
-    for (DefinitionIngest definition : definitions) {
-      String name =
-          Strings.requireNonBlank(
-              definition.envelope() == null ? null : definition.envelope().name(),
-              "ingest.envelope.name");
-      getModel(name).ifPresent(models::add);
-    }
-    return List.copyOf(models);
-  }
-
-  @Override
-  public IngestRuntime open(String ingestName) {
-    String normalizedName = Strings.requireNonBlank(ingestName, "ingestName");
-    DefinitionIngest ingestDefinition = resolveIngestDefinition(normalizedName);
-    DefinitionIngestSource sourceDefinition =
-        DiscoveryCache
-            .get(DefinitionIngestSource.class, group, normalizedName)
-            .orElseThrow(
-                () ->
-                    new IllegalStateException("IngestSource not found for ingest: " + group + "/" + normalizedName));
-    DatasetId datasetId =
-        DatasetId.parse(Strings.requireNonBlank(ingestDefinition.datasetId(), "ingest.datasetId"));
-    prepareActiveDataset(ingestDefinition, datasetId);
-    boolean apiSource = sourceDefinition.amps() == null && sourceDefinition.external() == null;
-    String source = resolveSourceKind(sourceDefinition, apiSource);
-    IngestRuntimeImpl runtime = new IngestRuntimeImpl(normalizedName, datasetId, apiSource, source);
-    IngestRuntimeImpl existing = runtimes.putIfAbsent(normalizedName, runtime);
-    if (existing != null && !existing.closed()) {
-      LOGGER.info("[IngestRuntime] open ingestName={} mode={} source={} bytes=0", normalizedName, runtimeMode, existing.sourceKind());
-      return existing;
-    }
-    if (existing != null) {
-      runtimes.put(normalizedName, runtime);
-    }
-    LOGGER.info("[IngestRuntime] open ingestName={} mode={} source={} bytes=0", normalizedName, runtimeMode, source);
-    return runtime;
-  }
-
-  @Override
-  public IngestRuntime start(String ingestName) {
-    IngestRuntime runtime = open(ingestName);
-    if (runtime instanceof IngestRuntimeImpl impl) {
-      LOGGER.info("[IngestRuntime] start ingestName={} mode={} source={} bytes=0", impl.ingestName, runtimeMode, impl.sourceKind());
-      impl.startManagedSource();
-    }
-    return runtime;
-  }
-
-  @Override
-  public IngestRuntime start(String ingestName, IngestManager.IngestRuntimeOptions options) {
-    String normalizedName = Strings.requireNonBlank(ingestName, "ingestName");
-    IngestManager.IngestRuntimeOptions resolved =
-        options == null ? IngestManager.IngestRuntimeOptions.builder().build() : options;
-    if (options != null) {
-      setParquetRollPolicy(
-          normalizedName, resolved.parquetMaxRowsPerFile(), resolved.parquetMaxIdleMillis());
-      setParquetFilenamePrefix(normalizedName, resolved.parquetFilenamePrefix());
-    }
-    return start(normalizedName);
-  }
-
-  @Override
-  public void stop(String ingestName) {
-    String normalizedName = Strings.requireNonBlank(ingestName, "ingestName");
-    IngestRuntimeImpl runtime = runtimes.get(normalizedName);
-    if (runtime != null) {
-      LOGGER.info("[IngestRuntime] stop ingestName={} mode={} source={} bytes=0", normalizedName, runtimeMode, runtime.sourceKind());
-      runtime.stop();
-      if (runtime.closed()) {
-        runtimes.remove(normalizedName, runtime);
-      }
-    }
-    flushPendingParquetBuffer(normalizedName, "runtime-stop");
-  }
-
-  @Override
-  public void append(String ingestName, IngestPayload payload) {
-    IngestManagerImplAppend.append(this, ingestName, payload);
-  }
-
-  private void append(String ingestName, IngestPayload payload, DuckDbActiveMutation mutation) {
-    IngestManagerImplAppend.append(this, ingestName, payload, mutation);
-  }
-
-  private void append(
-      String ingestName,
-      IngestPayload payload,
-      DuckDbActiveMutation mutation,
-      boolean enforceWriteGate) {
-    IngestManagerImplAppend.append(this, ingestName, payload, mutation, enforceWriteGate);
-  }
-
-  @Override
-  public void appendIpc(String ingestName, byte[] arrowIpcStreamBytes) {
-    IngestManagerImplAppend.appendIpc(this, ingestName, arrowIpcStreamBytes);
-  }
-
-  private void appendIpc(String ingestName, byte[] arrowIpcStreamBytes, DuckDbActiveMutation mutation) {
-    IngestManagerImplAppend.appendIpc(this, ingestName, arrowIpcStreamBytes, mutation);
-  }
-
-  private void appendIpc(
-      String ingestName,
-      byte[] arrowIpcStreamBytes,
-      DuckDbActiveMutation mutation,
-      boolean enforceWriteGate) {
-    IngestManagerImplAppend.appendIpc(
-        this, ingestName, arrowIpcStreamBytes, mutation, enforceWriteGate);
-  }
-
-  private void flushPendingParquetBuffer(String ingestName, String reason) {
-    IngestManagerImplAppend.flushPendingParquetBuffer(this, ingestName, reason);
-  }
-
-  private void flushAllPendingParquetBuffers(String reason) {
-    IngestManagerImplAppend.flushAllPendingParquetBuffers(this, reason);
-  }
-
-  private void ensureRollScanTask() {
-    IngestManagerImplAppend.ensureRollScanTask(this);
-  }
-
-  private void cancelRollScanTask() {
-    IngestManagerImplAppend.cancelRollScanTask(this);
-  }
-
-  public void requireWrite(String datasetId, String operation) {
-    IngestManagerImplAppend.requireWrite(this, datasetId, operation);
-  }
-
-  public void appendFromAmps(
-      String ingestName,
-      String payloadText,
-      IngestAmpsPump.PayloadFormat payloadFormat,
-      int ampsCommand,
-      IngestAmpsPump.OofHandling oofHandling,
-      String parquetFilenamePrefix) {
-    String priorPrefix = parquetFilenamePrefixOverride.get();
-    String resolvedPrefix = Strings.trimToNull(parquetFilenamePrefix);
-    if (resolvedPrefix == null) {
-      parquetFilenamePrefixOverride.remove();
-    } else {
-      parquetFilenamePrefixOverride.set(resolvedPrefix);
-    }
+    Any packed;
     try {
-      handleAmpsMessage(ingestName, payloadText, payloadFormat, ampsCommand, oofHandling, true);
-    } finally {
-      if (priorPrefix == null) {
-        parquetFilenamePrefixOverride.remove();
-      } else {
-        parquetFilenamePrefixOverride.set(priorPrefix);
-      }
+      packed = Any.parseFrom(descriptor.getCommand());
+    } catch (Exception ex) {
+      return super.getSchema(context, descriptor);
     }
+    if (!packed.is(FlightSql.CommandGetTables.class)) {
+      return super.getSchema(context, descriptor);
+    }
+    FlightSql.CommandGetTables command;
+    try {
+      command = packed.unpack(FlightSql.CommandGetTables.class);
+    } catch (InvalidProtocolBufferException ex) {
+      throw CallStatus.INVALID_ARGUMENT
+          .withDescription("Invalid Flight SQL GetTableSchema descriptor payload")
+          .withCause(ex)
+          .toRuntimeException();
+    }
+    return getTableSchema(command, context);
   }
 
-  private void enforceWrite(String datasetId, String operation, List<String> columnsOrNull) {
-    IngestManagerImplAppend.enforceWrite(this, datasetId, operation, columnsOrNull);
-  }
-
-  private void handleAmpsMessage(
-      String ingestName,
-      String payloadText,
-      IngestAmpsPump.PayloadFormat payloadFormat,
-      int ampsCommand,
-      IngestAmpsPump.OofHandling oofHandling,
-      boolean enforceWriteGate) {
-    IngestPayload payload =
-        payloadFormat == IngestAmpsPump.PayloadFormat.JSON
-            ? new IngestPayloadJson(payloadText)
-            : new IngestPayloadNvFix(payloadText);
-    if (ampsCommand == com.crankuptheamps.client.Message.Command.OOF
-        || ampsCommand == com.crankuptheamps.client.Message.Command.SOWDelete) {
-      DuckDbActiveMutation mutation =
-          oofHandling == IngestAmpsPump.OofHandling.MARK_AS_DELETED
-              ? DuckDbActiveMutation.MARK_AS_DELETED
-              : DuckDbActiveMutation.DELETE;
-      append(ingestName, payload, mutation, enforceWriteGate);
-      markRuntimeMessageIngested(ingestName);
+  @Override
+  public void getStream(
+      FlightProducer.CallContext context,
+      Ticket ticket,
+      FlightProducer.ServerStreamListener listener) {
+    Objects.requireNonNull(ticket, "ticket");
+    if (FlightDatasetStreamTicketCodec.isStreamTicket(ticket)) {
+      handleDatasetStream(context, ticket, listener);
       return;
     }
-    append(ingestName, payload, DuckDbActiveMutation.UPSERT, enforceWriteGate);
-    markRuntimeMessageIngested(ingestName);
-  }
-
-  private void prepareActiveDataset(DefinitionIngest ingestDefinition, DatasetId datasetId) {
-    IngestManagerImplDataset.prepareActiveDataset(this, ingestDefinition, datasetId);
-  }
-
-  private DefinitionIngest resolveIngestDefinition(String ingestName) {
-    return IngestManagerImplDataset.resolveIngestDefinition(this, ingestName);
-  }
-
-  private SchemaModel resolveSchemaModel(DefinitionIngest ingest) {
-    return IngestManagerImplDataset.resolveSchemaModel(this, ingest);
-  }
-
-  private DefinitionDataset resolveDatasetDefinition(String datasetCanonicalId) {
-    return IngestManagerImplDataset.resolveDatasetDefinition(this, datasetCanonicalId);
-  }
-
-  private static String ensureSubscribeOption(String options, String optionToken) {
-    String normalizedToken = Strings.requireNonBlank(optionToken, "optionToken");
-    String normalizedOptions = Strings.trimToNull(options);
-    if (normalizedOptions == null) {
-      return normalizedToken;
+    if (dispatchMetadataTicket(context, ticket, listener)) {
+      return;
     }
-    for (String token : normalizedOptions.split(";")) {
-      String normalized = Strings.trimToNull(token);
-      if (normalized != null && normalizedToken.equalsIgnoreCase(normalized)) {
-        return normalizedOptions;
-      }
+    if (dispatchStatementTicket(context, ticket, listener)) {
+      return;
     }
-    return normalizedOptions + ";" + normalizedToken;
+    throw CallStatus.INVALID_ARGUMENT.withDescription("Invalid Flight SQL ticket").toRuntimeException();
   }
 
-  private static String removeSubscribeOption(String options, String optionToken) {
-    String normalizedToken = Strings.requireNonBlank(optionToken, "optionToken");
-    String normalizedOptions = Strings.trimToNull(options);
-    if (normalizedOptions == null) {
-      return null;
-    }
-    List<String> retained = new ArrayList<>();
-    for (String token : normalizedOptions.split(";")) {
-      String normalized = Strings.trimToNull(token);
-      if (normalized == null) {
-        continue;
-      }
-      if (!normalizedToken.equalsIgnoreCase(normalized)) {
-        retained.add(normalized);
-      }
-    }
-    if (retained.isEmpty()) {
-      return null;
-    }
-    return String.join(";", retained);
+  @Override
+  public void getStreamStatement(
+      FlightSql.TicketStatementQuery ticket,
+      FlightProducer.CallContext context,
+      FlightProducer.ServerStreamListener listener) {
+    RequestIdentity identity = resolveIdentity(context);
+    RequestIdentityResolver.runAsRequestIdentity(
+        identity,
+        () -> {
+          String caller = identity.effectiveUserSubject();
+          authorizeInvoke(caller, OPERATION_STATEMENT_FETCH, null);
+
+          String handle =
+              ticket == null || ticket.getStatementHandle() == null
+                  ? null
+                  : Strings.trimToNull(ticket.getStatementHandle().toStringUtf8());
+          if (handle == null) {
+            throw CallStatus.INVALID_ARGUMENT
+                .withDescription("Ticket statement handle is required")
+                .toRuntimeException();
+          }
+          PendingStatement pending = statements.remove(handle);
+          if (pending == null) {
+            throw CallStatus.NOT_FOUND
+                .withDescription("Unknown statement handle: " + handle)
+                .toRuntimeException();
+          }
+          LOGGER.info("[FlightSQL][request] requestId={} operation={} subject={} statementHandle={} cachedRows={}", identity.requestId(), OPERATION_STATEMENT_FETCH, safeSubject(caller), handle, pending.rowCount());
+          if (!Objects.equals(pending.callerSubject(), caller)) {
+            throw CallStatus.UNAUTHORIZED
+                .withDescription("Statement handle is not owned by caller")
+                .toRuntimeException();
+          }
+          streamIpc(listener, pending.ipcBytes());
+        });
   }
 
-  private static String resolveAmpsSubscribeOptions(DefinitionIngestSource.AmpsSource amps) {
-    boolean sowEnabled = Boolean.TRUE.equals(amps.sow()) || Boolean.TRUE.equals(amps.sowOnly());
-    String options = removeSubscribeOption(amps.options(), "no_bookmark");
-    options = removeSubscribeOption(options, "nobookmark");
-    if (!sowEnabled) {
-      return removeSubscribeOption(options, "oof");
-    }
-    if (amps.oofHandling() == null) {
-      return options;
-    }
-    return ensureSubscribeOption(options, "oof");
+  @Override
+  public void getStreamCatalogs(
+      FlightProducer.CallContext context, FlightProducer.ServerStreamListener listener) {
+    RequestIdentity identity = resolveIdentity(context);
+    RequestIdentityResolver.runAsRequestIdentity(
+        identity,
+        () -> {
+          authorizeInvoke(identity.effectiveUserSubject(), OPERATION_METADATA_CATALOGS, null);
+          List<String> catalogs = List.of(METADATA_CATALOG_NAME);
+          VectorSchemaRoot root =
+              buildCatalogsRoot(catalogs, FlightSqlProducer.Schemas.GET_CATALOGS_SCHEMA);
+          streamSingleBatch(listener, root);
+        });
   }
 
-  private static boolean resolveAmpsBookmarkResume(DefinitionIngestSource.AmpsSource amps) {
-    return !hasSubscribeOption(amps.options(), "no_bookmark")
-        && !hasSubscribeOption(amps.options(), "nobookmark");
+  @Override
+  public void getStreamSchemas(
+      FlightSql.CommandGetDbSchemas command,
+      FlightProducer.CallContext context,
+      FlightProducer.ServerStreamListener listener) {
+    RequestIdentity identity = resolveIdentity(context);
+    RequestIdentityResolver.runAsRequestIdentity(
+        identity,
+        () -> {
+          authorizeInvoke(identity.effectiveUserSubject(), OPERATION_METADATA_SCHEMAS, null);
+          FlightSql.CommandGetDbSchemas resolved =
+              command == null ? FlightSql.CommandGetDbSchemas.getDefaultInstance() : command;
+          String catalog = validateExactPatternOrAll(resolved.getCatalog(), "catalog");
+          String schemaPattern =
+              validateExactPatternOrAll(
+                  resolved.getDbSchemaFilterPattern(), "db_schema_name_pattern");
+          List<String> schemas = listSchemas(identity, catalog, schemaPattern);
+          VectorSchemaRoot root =
+              buildSchemasRoot(schemas, FlightSqlProducer.Schemas.GET_SCHEMAS_SCHEMA);
+          streamSingleBatch(listener, root);
+        });
   }
 
-  private static boolean hasSubscribeOption(String options, String optionToken) {
-    String normalizedToken = Strings.requireNonBlank(optionToken, "optionToken");
-    String normalizedOptions = Strings.trimToNull(options);
-    if (normalizedOptions == null) {
+  @Override
+  public void getStreamTableTypes(
+      FlightProducer.CallContext context, FlightProducer.ServerStreamListener listener) {
+    RequestIdentity identity = resolveIdentity(context);
+    RequestIdentityResolver.runAsRequestIdentity(
+        identity,
+        () -> {
+          authorizeInvoke(identity.effectiveUserSubject(), OPERATION_METADATA_TABLE_TYPES, null);
+          VectorSchemaRoot root =
+              buildTableTypesRoot(
+                  List.of(TABLE_TYPE_TABLE, TABLE_TYPE_VIEW, TABLE_TYPE_STREAM),
+                  FlightSqlProducer.Schemas.GET_TABLE_TYPES_SCHEMA);
+          streamSingleBatch(listener, root);
+        });
+  }
+
+  @Override
+  public void getStreamTables(
+      FlightSql.CommandGetTables command,
+      FlightProducer.CallContext context,
+      FlightProducer.ServerStreamListener listener) {
+    RequestIdentity identity = resolveIdentity(context);
+    RequestIdentityResolver.runAsRequestIdentity(
+        identity,
+        () -> {
+          authorizeInvoke(identity.effectiveUserSubject(), OPERATION_METADATA_TABLES, null);
+          FlightSql.CommandGetTables resolved =
+              command == null ? FlightSql.CommandGetTables.getDefaultInstance() : command;
+          String catalog = validateExactPatternOrAll(resolved.getCatalog(), "catalog");
+          String schemaPattern =
+              validateExactPatternOrAll(
+                  resolved.getDbSchemaFilterPattern(), "db_schema_name_pattern");
+          String tablePattern =
+              validateExactPatternOrAll(
+                  resolved.getTableNameFilterPattern(), "table_name_pattern");
+          Set<String> requestedTypes = validateRequestedTableTypes(resolved.getTableTypesList());
+          List<DuckdbCatalogImpl.MetadataTable> rows =
+              listTables(identity, catalog, schemaPattern, tablePattern, requestedTypes);
+          if (resolved.getIncludeSchema()) {
+            VectorSchemaRoot root =
+                buildTablesWithSchemaRoot(rows, FlightSqlProducer.Schemas.GET_TABLES_SCHEMA, false);
+            streamSingleBatch(listener, root);
+            return;
+          }
+          VectorSchemaRoot root =
+              buildTablesRoot(rows, FlightSqlProducer.Schemas.GET_TABLES_SCHEMA_NO_SCHEMA);
+          streamSingleBatch(listener, root);
+        });
+  }
+
+  private void handleDatasetStream(
+      FlightProducer.CallContext context,
+      Ticket ticket,
+      FlightProducer.ServerStreamListener listener) {
+    RequestIdentity identity = resolveIdentity(context);
+    FlightSqlRequestHeadersMiddleware middleware =
+        context == null ? null : context.getMiddleware(FlightSqlRequestHeadersMiddleware.KEY);
+    org.pronzato.fabric.api.control.security.headers.FabricRequestHeaders requestHeaders =
+        middleware == null ? null : middleware.requestHeaders();
+    RequestIdentityResolver.runAsRequestIdentity(
+        identity, () -> datasetStreamProducer.start(identity, requestHeaders, ticket, listener, null));
+  }
+
+  @Override
+  public void listFlights(
+      FlightProducer.CallContext context,
+      Criteria criteria,
+      FlightProducer.StreamListener<FlightInfo> listener) {
+    listener.onCompleted();
+  }
+
+  private FlightInfo metadataFlightInfo(
+      Schema schema, FlightDescriptor descriptor, com.google.protobuf.Message command) {
+    Objects.requireNonNull(schema, "schema");
+    Objects.requireNonNull(command, "command");
+    byte[] commandBytes = Any.pack(command).toByteArray();
+    FlightDescriptor responseDescriptor =
+        descriptor != null ? descriptor : FlightDescriptor.command(commandBytes);
+    Ticket ticket = new Ticket(commandBytes);
+    FlightEndpoint endpoint = new FlightEndpoint(ticket, location());
+    return new FlightInfo(schema, responseDescriptor, List.of(endpoint), -1L, -1L);
+  }
+
+  private boolean dispatchStatementTicket(
+      FlightProducer.CallContext context,
+      Ticket ticket,
+      FlightProducer.ServerStreamListener listener) {
+    FlightSql.TicketStatementQuery statementTicket;
+    try {
+      statementTicket = FlightSql.TicketStatementQuery.parseFrom(ticket.getBytes());
+    } catch (Exception ex) {
       return false;
     }
-    for (String token : normalizedOptions.split(";")) {
-      String normalized = Strings.trimToNull(token);
-      if (normalized != null && normalizedToken.equalsIgnoreCase(normalized)) {
+    String handle =
+        statementTicket == null || statementTicket.getStatementHandle() == null
+            ? null
+            : Strings.trimToNull(statementTicket.getStatementHandle().toStringUtf8());
+    if (handle == null || !statements.containsKey(handle)) {
+      return false;
+    }
+    getStreamStatement(statementTicket, context, listener);
+    return true;
+  }
+
+  private boolean dispatchMetadataTicket(
+      FlightProducer.CallContext context,
+      Ticket ticket,
+      FlightProducer.ServerStreamListener listener) {
+    final Any packed;
+    try {
+      packed = Any.parseFrom(ticket.getBytes());
+    } catch (Exception ex) {
+      return false;
+    }
+    try {
+      if (packed.is(FlightSql.CommandGetCatalogs.class)) {
+        getStreamCatalogs(context, listener);
         return true;
       }
+      if (packed.is(FlightSql.CommandGetDbSchemas.class)) {
+        getStreamSchemas(packed.unpack(FlightSql.CommandGetDbSchemas.class), context, listener);
+        return true;
+      }
+      if (packed.is(FlightSql.CommandGetTableTypes.class)) {
+        getStreamTableTypes(context, listener);
+        return true;
+      }
+      if (packed.is(FlightSql.CommandGetTables.class)) {
+        getStreamTables(packed.unpack(FlightSql.CommandGetTables.class), context, listener);
+        return true;
+      }
+    } catch (InvalidProtocolBufferException ex) {
+      throw CallStatus.INVALID_ARGUMENT
+          .withDescription("Invalid Flight SQL metadata ticket payload")
+          .withCause(ex)
+          .toRuntimeException();
     }
     return false;
   }
 
-  @Override
-  public void close() {
-    cancelRollScanTask();
-    flushAllPendingParquetBuffers("manager-close");
-    for (IngestRuntimeImpl runtime : runtimes.values()) {
-      runtime.stop();
-    }
-    runtimes.clear();
-    parquetRollBuffers.clear();
-    parquetRollPolicies.clear();
-    parquetFilenamePrefixes.clear();
-    parquetFilenamePrefixOverride.remove();
-    CloseSupport.closeQuietly(schemaIpcAllocator);
-    CloseSupport.closeQuietly(rollIpcAllocator);
-  }
-
-  private static int payloadBytes(IngestPayload payload) {
-    return IngestManagerImplAppend.payloadBytes(payload);
-  }
-
-  private static String resolveSourceKind(DefinitionIngestSource sourceDefinition, boolean apiSource) {
-    if (sourceDefinition != null && sourceDefinition.external() != null) {
-      return Strings.firstNonBlank(
-              Strings.trimToNull(sourceDefinition.external().sourceType()),
-              SOURCE_API)
-          .toUpperCase(Locale.ROOT);
-    }
-    return apiSource ? SOURCE_API : SOURCE_AMPS;
-  }
-
-  private DataStatusPublisher createDataStatusPublisher(
-      String statusName,
-      DefinitionStatusData.ProducerType producerType,
-      String producerId,
-      String datasetId,
-      Map<String, String> tags) {
-    if (!(session instanceof SessionImpl sessionImpl)) {
-      return null;
-    }
-    if (sessionImpl.controlPlaneConnection() == null) {
-      return null;
-    }
-    SessionContext context = sessionImpl.context();
-    if (context == null) {
-      return null;
-    }
-    String resolvedGroup = Strings.trimToNull(context.getGroup());
-    String resolvedName = Strings.trimToNull(statusName);
-    String resolvedInstance = Strings.trimToNull(context.getInstance());
-    if (resolvedGroup == null || resolvedName == null || resolvedInstance == null) {
-      return null;
-    }
-    return new DataStatusPublisher(
-        sessionImpl.controlPlaneConnection(),
-        resolvedGroup,
-        resolvedName,
-        resolvedInstance,
-        producerType,
-        producerId,
-        datasetId,
-        sessionImpl.runtimePlacementHost(),
-        Strings.trimToNull(context.getAppName()),
-        Strings.trimToNull(context.getInstance()),
-        Strings.trimToNull(context.getGroup()),
-        tags,
-        sessionImpl.dataStatusCadenceSeconds(),
-        sessionImpl.statusScheduler());
-  }
-
-  private void removeRuntime(String ingestName, IngestRuntimeImpl runtime) {
-    runtimes.remove(ingestName, runtime);
-  }
-
-  private void markRuntimeMessageIngested(String ingestName) {
-    String normalized = Strings.trimToNull(ingestName);
-    if (normalized == null) {
-      return;
-    }
-    IngestRuntimeImpl runtime = runtimes.get(normalized);
-    if (runtime != null) {
-      runtime.recordMessageIngested();
-    }
-  }
-
-  private final class IngestRuntimeImpl implements IngestRuntime {
-    private final String ingestName;
-    private final DatasetId datasetId;
-    private final boolean apiSource;
-    private final boolean managedSource;
-    private final String sourceKind;
-    private final DataStatusPublisher statusPublisher;
-    private final AtomicLong messagesIngested = new AtomicLong(0L);
-    private final AtomicReference<Throwable> failure = new AtomicReference<>();
-    private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean(false);
-    private volatile IngestAmpsPump pump;
-    private volatile AutoCloseable sourceHandle;
-
-    private IngestRuntimeImpl(
-        String ingestName, DatasetId datasetId, boolean apiSource, String sourceKind) {
-      this.ingestName = ingestName;
-      this.datasetId = datasetId;
-      this.apiSource = apiSource;
-      this.managedSource = !apiSource && !serviceMode;
-      this.sourceKind = Strings.requireNonBlank(sourceKind, "sourceKind");
-      this.statusPublisher =
-          createDataStatusPublisher(
-              "runtime/" + ingestName,
-              DefinitionStatusData.ProducerType.INGEST_RUNTIME,
-              "ingest-runtime:" + group + "/" + ingestName,
-              datasetId.toString(),
-              Map.of(
-                  "sourceKind", this.sourceKind,
-                  "runtimeMode", runtimeMode,
-                  "managedSource", Boolean.toString(this.managedSource)));
-      if (statusPublisher != null) {
-        statusPublisher.start();
-        statusPublisher.publishOnline(
-            managedSource ? "runtime opened (managed source)" : "runtime opened (api source)");
-        statusPublisher.putTag("messagesIngested", "0");
-      }
-    }
-
-    @Override
-    public void append(IngestPayload payload) {
-      if (closed()) {
-        throw new IllegalStateException("IngestRuntime is closed: " + ingestName);
-      }
-      if (!apiSource) {
-        throw new IllegalStateException("append(payload) is supported for API source only: " + ingestName);
-      }
-      try {
-        LOGGER.info("[IngestRuntime] append ingestName={} mode={} source={} bytes={}", ingestName, runtimeMode, sourceKind, payloadBytes(payload));
-        IngestManagerImpl.this.append(ingestName, payload);
-        recordMessageIngested();
-      } catch (RuntimeException ex) {
-        failure.compareAndSet(null, ex);
-        if (statusPublisher != null) {
-          statusPublisher.publishError(
-              "append failed: "
-                  + Strings.firstNonBlank(
-                      Strings.trimToNull(ex.getMessage()), ex.getClass().getSimpleName()));
-        }
-        throw ex;
-      }
-    }
-
-    @Override
-    public Optional<Throwable> failure() {
-      return Optional.ofNullable(failure.get());
-    }
-
-    @Override
-    public long queryCount() {
-      RowResult result;
-      try {
-        result = rowManager.querySql(COUNT_SQL_PREFIX + sqlToken(datasetId), 1);
-      } catch (RuntimeException ex) {
-        if (isMissingActiveTable(ex)) {
-          return 0L;
-        }
-        throw ex;
-      }
-      if (result.rows().isEmpty() || result.rows().get(0).isEmpty()) {
-        return 0L;
-      }
-      Object count = result.rows().get(0).get(0);
-      if (count instanceof Number number) {
-        return number.longValue();
-      }
-      String text = Strings.trimToNull(String.valueOf(count));
-      return text == null ? 0L : Long.parseLong(text);
-    }
-
-    private static boolean isMissingActiveTable(Throwable error) {
-      Throwable current = error;
-      while (current != null) {
-        String message = Strings.trimToNull(current.getMessage());
-        if (message != null) {
-          String normalized = message.toLowerCase(Locale.ROOT);
-          if (normalized.contains("table with name")
-              && normalized.contains("does not exist")) {
-            return true;
+  private SchemaResult getTableSchema(
+      FlightSql.CommandGetTables command, FlightProducer.CallContext context) {
+    RequestIdentity identity = resolveIdentity(context);
+    return RequestIdentityResolver.callAsRequestIdentity(
+        identity,
+        () -> {
+          authorizeInvoke(identity.effectiveUserSubject(), OPERATION_METADATA_TABLE_SCHEMA, null);
+          FlightSql.CommandGetTables resolved =
+              command == null ? FlightSql.CommandGetTables.getDefaultInstance() : command;
+          String catalog = validateExactPatternOrAll(resolved.getCatalog(), "catalog");
+          String schemaPattern =
+              validateExactPatternOrAll(
+                  resolved.getDbSchemaFilterPattern(), "db_schema_name_pattern");
+          String tablePattern =
+              validateExactPatternOrAll(
+                  resolved.getTableNameFilterPattern(), "table_name_pattern");
+          if (schemaPattern == null || tablePattern == null) {
+            throw CallStatus.INVALID_ARGUMENT
+                .withDescription(
+                    "GetTableSchema requires exact db_schema_name_pattern and table_name_pattern")
+                .toRuntimeException();
           }
-        }
-        current = current.getCause();
+          Set<String> requestedTypes = validateRequestedTableTypes(resolved.getTableTypesList());
+          List<DuckdbCatalogImpl.MetadataTable> rows =
+              listTables(identity, catalog, schemaPattern, tablePattern, requestedTypes);
+          if (rows.isEmpty()) {
+            throw CallStatus.NOT_FOUND
+                .withDescription("Table not found: " + schemaPattern + "." + tablePattern)
+                .toRuntimeException();
+          }
+          if (rows.size() > 1) {
+            List<DatasetId> distinctDatasets =
+                rows.stream().map(DuckdbCatalogImpl.MetadataTable::datasetId).distinct().toList();
+            if (distinctDatasets.size() > 1) {
+              throw CallStatus.INVALID_ARGUMENT
+                  .withDescription(
+                      "Ambiguous table reference for GetTableSchema: "
+                          + schemaPattern
+                          + "."
+                          + tablePattern)
+                  .toRuntimeException();
+            }
+            return new SchemaResult(tableSchemaForDataset(distinctDatasets.get(0), true));
+          }
+          return new SchemaResult(tableSchemaForDataset(rows.get(0).datasetId(), true));
+        });
+  }
+
+  private List<String> listSchemas(
+      RequestIdentity identity, String catalog, String schemaPattern) {
+    if (catalog != null && !matchesExactIgnoreCase(catalog, METADATA_CATALOG_NAME)) {
+      return List.of();
+    }
+    LinkedHashSet<String> schemas = new LinkedHashSet<>();
+    for (DuckdbCatalogImpl.MetadataTable table : listReadableTables(identity)) {
+      if (schemaPattern != null && !matchesExactIgnoreCase(table.namespace(), schemaPattern)) {
+        continue;
       }
+      schemas.add(table.namespace());
+    }
+    return List.copyOf(schemas);
+  }
+
+  private List<DuckdbCatalogImpl.MetadataTable> listTables(
+      RequestIdentity identity,
+      String catalog,
+      String schemaPattern,
+      String tablePattern,
+      Set<String> requestedTypes) {
+    if (catalog != null && !matchesExactIgnoreCase(catalog, METADATA_CATALOG_NAME)) {
+      LOGGER.info("[FlightSQL][metadata][tables] requestId={} serviceId={} subject={} catalog={} schemaPattern={} tablePattern={} types={} rowCount=0 tables=[] datasetIds=[]", identity.requestId(), serviceResourceId, safeSubject(identity.effectiveUserSubject()), catalog, schemaPattern, tablePattern, summarizeValues(requestedTypes, 10));
+      return List.of();
+    }
+    List<DuckdbCatalogImpl.MetadataTable> rows = new ArrayList<>();
+    for (DuckdbCatalogImpl.MetadataTable table : listReadableTables(identity)) {
+      if (schemaPattern != null && !matchesExactIgnoreCase(table.namespace(), schemaPattern)) {
+        continue;
+      }
+      if (tablePattern != null && !matchesExactIgnoreCase(table.name(), tablePattern)) {
+        continue;
+      }
+      if (!requestedTypes.isEmpty()
+          && !requestedTypes.contains(table.tableType().toUpperCase(Locale.ROOT))) {
+        continue;
+      }
+      rows.add(table);
+    }
+    List<DuckdbCatalogImpl.MetadataTable> resolvedRows = List.copyOf(rows);
+    List<String> tableRefs = new ArrayList<>(resolvedRows.size());
+    LinkedHashSet<String> datasetIds = new LinkedHashSet<>();
+    for (DuckdbCatalogImpl.MetadataTable row : resolvedRows) {
+      if (row == null) {
+        continue;
+      }
+      tableRefs.add(
+          Strings.firstNonBlank(row.namespace(), "<null>")
+              + "."
+              + Strings.firstNonBlank(row.name(), "<null>")
+              + "("
+              + Strings.firstNonBlank(row.tableType(), "<null>")
+              + ")");
+      if (row.datasetId() != null) {
+        datasetIds.add(row.datasetId().toString());
+      }
+    }
+    LOGGER.info("[FlightSQL][metadata][tables] requestId={} serviceId={} subject={} catalog={} schemaPattern={} tablePattern={} types={} rowCount={} tables={} datasetIds={}", identity.requestId(), serviceResourceId, safeSubject(identity.effectiveUserSubject()), Strings.firstNonBlank(catalog, "<none>"), Strings.firstNonBlank(schemaPattern, "<none>"), Strings.firstNonBlank(tablePattern, "<none>"), summarizeValues(requestedTypes, 10), resolvedRows.size(), summarizeValues(tableRefs, 40), summarizeValues(datasetIds, 40));
+    return resolvedRows;
+  }
+
+  private List<DuckdbCatalogImpl.MetadataTable> listReadableTables(RequestIdentity identity) {
+    DuckdbCatalogImpl catalog = requireMetadataCatalog();
+    RowManagerImpl rowManager = requireLocalRowManager();
+    DataEntitlements entitlements = rowManager.dataEntitlementsForSqlPlanning();
+    DataEntitlements.Identity entitlementsIdentity =
+        new DataEntitlements.Identity(identity.effectiveUserSubject(), null);
+    List<DuckdbCatalogImpl.MetadataTable> catalogTables = catalog.metadataTables();
+    if (catalogTables.isEmpty()) {
+      LOGGER.info("[FlightSQL][metadata][visibility] requestId={} serviceId={} subject={} catalogTableCount=0 visibleTableCount=0 deniedTableCount=0 deniedSamples=[]", identity.requestId(), serviceResourceId, safeSubject(identity.effectiveUserSubject()));
+      return List.of();
+    }
+    List<DuckdbCatalogImpl.MetadataTable> visible = new ArrayList<>();
+    int deniedCount = 0;
+    List<String> deniedSamples = new ArrayList<>();
+    for (DuckdbCatalogImpl.MetadataTable table : catalogTables) {
+      DataEntitlements.Decision decision =
+          entitlements.authorizeRead(entitlementsIdentity, table.datasetId().toString());
+      if (decision != null && decision.allowed()) {
+        visible.add(table);
+      } else {
+        deniedCount++;
+        if (deniedSamples.size() < 5) {
+          deniedSamples.add(
+              table.datasetId()
+                  + "("
+                  + Strings.firstNonBlank(decision == null ? null : decision.reason(), "DENIED")
+                  + ")");
+        }
+      }
+    }
+    LOGGER.info("[FlightSQL][metadata][visibility] requestId={} serviceId={} subject={} catalogTableCount={} visibleTableCount={} deniedTableCount={} deniedSamples={}", identity.requestId(), serviceResourceId, safeSubject(identity.effectiveUserSubject()), catalogTables.size(), visible.size(), deniedCount, summarizeValues(deniedSamples, 5));
+    return List.copyOf(visible);
+  }
+
+  private TabularManagerImpl requireLocalTabularManager() {
+    if (tabularManager instanceof TabularManagerImpl local) {
+      return local;
+    }
+    throw CallStatus.UNIMPLEMENTED
+        .withDescription("Flight SQL metadata requires DIRECT mode tabular manager")
+        .toRuntimeException();
+  }
+
+  private RowManagerImpl requireLocalRowManager() {
+    return requireLocalTabularManager().rowManager();
+  }
+
+  private DuckdbCatalogImpl requireMetadataCatalog() {
+    TabularManagerImpl local = requireLocalTabularManager();
+    if (local.catalog() instanceof DuckdbCatalogImpl catalog) {
+      return catalog;
+    }
+    throw CallStatus.UNIMPLEMENTED
+        .withDescription("Flight SQL metadata requires DuckdbCatalogImpl")
+        .toRuntimeException();
+  }
+
+  private static String validateExactPatternOrAll(String value, String label) {
+    String normalized = Strings.trimToNull(value);
+    if (normalized == null) {
+      return null;
+    }
+    if (containsWildcardPattern(normalized)) {
+      throw CallStatus.INVALID_ARGUMENT
+          .withDescription("unsupported pattern for " + label + ": " + normalized)
+          .toRuntimeException();
+    }
+    return normalized;
+  }
+
+  private static Set<String> validateRequestedTableTypes(List<String> values) {
+    if (values == null || values.isEmpty()) {
+      return Set.of();
+    }
+    LinkedHashSet<String> normalized = new LinkedHashSet<>();
+    for (String raw : values) {
+      String type = Strings.trimToNull(raw);
+      if (type == null) {
+        continue;
+      }
+      if (containsWildcardPattern(type)) {
+        throw CallStatus.INVALID_ARGUMENT
+            .withDescription("unsupported pattern for table_type: " + type)
+            .toRuntimeException();
+      }
+      String upper = type.toUpperCase(Locale.ROOT);
+      if (!SUPPORTED_TABLE_TYPES.contains(upper)) {
+        throw CallStatus.INVALID_ARGUMENT
+            .withDescription("unsupported table_type: " + type)
+            .toRuntimeException();
+      }
+      normalized.add(upper);
+    }
+    return normalized.isEmpty() ? Set.of() : Set.copyOf(normalized);
+  }
+
+  private static boolean containsWildcardPattern(String value) {
+    if (value == null || value.isEmpty()) {
       return false;
     }
+    return value.contains("%")
+        || value.contains("*")
+        || value.contains("?")
+        || value.contains("[")
+        || value.contains("]")
+        || value.contains(".*");
+  }
 
-    private static String sqlToken(DatasetId datasetId) {
-      return quoteIdentifier(datasetId.namespace()) + "." + quoteIdentifier(datasetId.name());
+  private static boolean matchesExactIgnoreCase(String left, String right) {
+    if (left == null || right == null) {
+      return false;
     }
+    return left.equalsIgnoreCase(right);
+  }
 
-    private static String quoteIdentifier(String identifier) {
-      return "\"" + identifier.replace("\"", "\"\"") + "\"";
+  private VectorSchemaRoot buildCatalogsRoot(List<String> catalogs, Schema schema) {
+    VectorSchemaRoot root = VectorSchemaRoot.create(schema, ipcReadAllocator);
+    int rowCount = catalogs == null ? 0 : catalogs.size();
+    VarCharVector catalogVector = (VarCharVector) root.getVector("catalog_name");
+    catalogVector.allocateNew(Math.max(1, rowCount));
+    for (int index = 0; index < rowCount; index++) {
+      putUtf8(catalogVector, index, catalogs.get(index));
     }
+    catalogVector.setValueCount(rowCount);
+    root.setRowCount(rowCount);
+    return root;
+  }
 
-    @Override
-    public IngestRuntimeStatus status() {
-      Throwable currentFailure = failure.get();
-      String lastError =
-          currentFailure == null
-              ? null
-              : Strings.firstNonBlank(
-                  Strings.trimToNull(currentFailure.getMessage()),
-                  currentFailure.getClass().getSimpleName());
-      IngestAmpsPump active = pump;
-      return new IngestRuntimeStatus(
-          queryCount(),
-          lastError,
-          active == null ? null : active.lastCheckpoint(),
-          active == null ? null : active.lastCheckpointFlushUtc());
+  private VectorSchemaRoot buildSchemasRoot(List<String> schemas, Schema schema) {
+    VectorSchemaRoot root = VectorSchemaRoot.create(schema, ipcReadAllocator);
+    int rowCount = schemas == null ? 0 : schemas.size();
+    VarCharVector catalogVector = (VarCharVector) root.getVector("catalog_name");
+    VarCharVector schemaVector = (VarCharVector) root.getVector("db_schema_name");
+    catalogVector.allocateNew(Math.max(1, rowCount));
+    schemaVector.allocateNew(Math.max(1, rowCount));
+    for (int index = 0; index < rowCount; index++) {
+      putUtf8(catalogVector, index, METADATA_CATALOG_NAME);
+      putUtf8(schemaVector, index, schemas.get(index));
     }
+    catalogVector.setValueCount(rowCount);
+    schemaVector.setValueCount(rowCount);
+    root.setRowCount(rowCount);
+    return root;
+  }
 
-    @Override
-    public void stop() {
-      if (!managedSource) {
-        if (!closed.compareAndSet(false, true)) {
-          return;
-        }
-        CloseSupport.closeQuietly(statusPublisher);
-        removeRuntime(ingestName, this);
-        return;
-      }
-      if (!closed.compareAndSet(false, true)) {
-        return;
-      }
-      IngestAmpsPump active = pump;
-      pump = null;
-      if (active != null) {
-        active.close();
-      }
-      AutoCloseable managed = sourceHandle;
-      sourceHandle = null;
-      CloseSupport.closeQuietly(managed);
-      CloseSupport.closeQuietly(statusPublisher);
-      removeRuntime(ingestName, this);
+  private VectorSchemaRoot buildTableTypesRoot(List<String> tableTypes, Schema schema) {
+    VectorSchemaRoot root = VectorSchemaRoot.create(schema, ipcReadAllocator);
+    int rowCount = tableTypes == null ? 0 : tableTypes.size();
+    VarCharVector typeVector = (VarCharVector) root.getVector("table_type");
+    typeVector.allocateNew(Math.max(1, rowCount));
+    for (int index = 0; index < rowCount; index++) {
+      putUtf8(typeVector, index, tableTypes.get(index));
     }
+    typeVector.setValueCount(rowCount);
+    root.setRowCount(rowCount);
+    return root;
+  }
 
-    private boolean closed() {
-      return closed.get();
+  private VectorSchemaRoot buildTablesRoot(List<DuckdbCatalogImpl.MetadataTable> rows, Schema schema) {
+    VectorSchemaRoot root = VectorSchemaRoot.create(schema, ipcReadAllocator);
+    int rowCount = rows == null ? 0 : rows.size();
+    VarCharVector catalogVector = (VarCharVector) root.getVector("catalog_name");
+    VarCharVector schemaVector = (VarCharVector) root.getVector("db_schema_name");
+    VarCharVector tableVector = (VarCharVector) root.getVector("table_name");
+    VarCharVector typeVector = (VarCharVector) root.getVector("table_type");
+    catalogVector.allocateNew(Math.max(1, rowCount));
+    schemaVector.allocateNew(Math.max(1, rowCount));
+    tableVector.allocateNew(Math.max(1, rowCount));
+    typeVector.allocateNew(Math.max(1, rowCount));
+    for (int index = 0; index < rowCount; index++) {
+      DuckdbCatalogImpl.MetadataTable row = rows.get(index);
+      putUtf8(catalogVector, index, METADATA_CATALOG_NAME);
+      putUtf8(schemaVector, index, row.namespace());
+      putUtf8(tableVector, index, row.name());
+      putUtf8(typeVector, index, row.tableType());
     }
+    catalogVector.setValueCount(rowCount);
+    schemaVector.setValueCount(rowCount);
+    tableVector.setValueCount(rowCount);
+    typeVector.setValueCount(rowCount);
+    root.setRowCount(rowCount);
+    return root;
+  }
 
-    private void recordMessageIngested() {
-      long ingested = messagesIngested.incrementAndGet();
-      if (statusPublisher != null) {
-        statusPublisher.putTag("messagesIngested", Long.toString(ingested));
-      }
-    }
-
-    private String sourceKind() {
-      return sourceKind;
-    }
-
-    private synchronized void startManagedSource() {
-      if (!managedSource) {
-        return;
-      }
-      if (closed()) {
-        throw new IllegalStateException("IngestRuntime is closed: " + ingestName);
-      }
-      if (pump != null || sourceHandle != null) {
-        return;
-      }
-      if (statusPublisher != null) {
-        statusPublisher.publishOnline("starting managed source");
-      }
-      DefinitionIngestSource source =
-          DiscoveryCache
-              .get(DefinitionIngestSource.class, group, ingestName)
-              .orElseThrow(
-                  () ->
-                      new IllegalStateException("IngestSource not found for ingest: " + group + "/" + ingestName));
-      if (source.amps() != null) {
-        startAmpsSource(source);
-        if (statusPublisher != null) {
-          statusPublisher.publishOnline("managed AMPS source running");
-        }
-        return;
-      }
-      if (source.odbc() != null) {
-        startOdbcSource(source.odbc());
-        if (statusPublisher != null) {
-          statusPublisher.publishOnline("managed ODBC source running");
-        }
-        return;
-      }
-      if (source.external() != null) {
-        startExternalSource(source);
-        if (statusPublisher != null) {
-          statusPublisher.publishOnline("managed external source running");
-        }
-        return;
-      }
-      throw new IllegalStateException(
-          "Unsupported managed ingest source for " + group + "/" + ingestName);
-    }
-
-    private void startAmpsSource(DefinitionIngestSource source) {
-      if (session == null) {
-        throw new IllegalStateException("AMPS runtime requires session-backed ingest manager");
-      }
-      DefinitionIngestSource.AmpsSource amps =
-          Objects.requireNonNull(source.amps(), "ingestSource.amps");
-      String format = Strings.requireNonBlank(source.format(), "ingestSource.format");
-      IngestAmpsPump.PayloadFormat payloadFormat = payloadFormat(format, ingestName);
-
-      IngestAmpsPump created =
-          IngestAmpsPump.builder(session)
-              .withIngestName(ingestName)
-              .withIngestSourceName(ingestName)
-              .withDatasetId(datasetId.toString())
-              .withConnectionName(Strings.requireNonBlank(amps.connectionName(), "amps.connectionName"))
-              .withTopic(Strings.requireNonBlank(amps.topic(), "amps.topic"))
-              .withSowSubscribe(amps.sow())
-              .withSow(amps.sowOnly())
-              .withOptions(resolveAmpsSubscribeOptions(amps))
-              .withBookmarkResume(resolveAmpsBookmarkResume(amps))
-              .withFilter(amps.filter())
-              .withMode(
-                  amps.mode() == DefinitionIngestSource.Mode.BATCH
-                      ? AmpsConnection.BatchMode.BATCH
-                      : AmpsConnection.BatchMode.STREAM)
-              .withBatchMaxMessages(
-                  sanitizePositiveInt(amps.batchMaxMessages(), AmpsConnection.DEFAULT_BATCH_MAX_MESSAGES))
-              .withBatchMaxBytes(
-                  sanitizePositiveInt(amps.batchMaxBytes(), AmpsConnection.DEFAULT_BATCH_MAX_BYTES))
-              .withBatchFlushMillis(
-                  sanitizePositiveLong(amps.batchFlushMillis(), AmpsConnection.DEFAULT_BATCH_FLUSH_MILLIS))
-              .withPayloadFormat(payloadFormat)
-              .withOofHandling(
-                  amps.oofHandling() == DefinitionIngestSource.OofHandling.MARK_AS_DELETED
-                      ? IngestAmpsPump.OofHandling.MARK_AS_DELETED
-                      : IngestAmpsPump.OofHandling.DELETE_EVENT)
-              .withWriteAuthorizer(
-                  (datasetIdArg, operation) ->
-                      IngestManagerImpl.this.enforceWrite(datasetIdArg, operation, null))
-              .withAmpsMessageHandler(
-                  (ingestNameArg,
-                      payloadText,
-                      payloadFormatArg,
-                      ampsCommand,
-                      oofHandling,
-                      parquetFilenamePrefix) ->
-                      IngestManagerImpl.this.handleAmpsMessage(
-                          ingestNameArg,
-                          payloadText,
-                          payloadFormatArg,
-                          ampsCommand,
-                          oofHandling,
-                          false))
-              .withErrorListener(
-                  error -> {
-                    failure.compareAndSet(null, error);
-                    if (statusPublisher != null && error != null) {
-                      statusPublisher.publishError(
-                          "pump error: "
-                              + Strings.firstNonBlank(
-                                  Strings.trimToNull(error.getMessage()),
-                                  error.getClass().getSimpleName()));
-                    }
-                  })
-              .withCheckpointStore(checkpointStore)
-              .build();
-      try {
-        created.start();
-        pump = created;
-      } catch (Exception ex) {
-        failure.compareAndSet(null, ex);
-        if (statusPublisher != null) {
-          statusPublisher.publishError(
-              "managed AMPS source failed: "
-                  + Strings.firstNonBlank(
-                      Strings.trimToNull(ex.getMessage()), ex.getClass().getSimpleName()));
-        }
-        throw new IllegalStateException("Failed to start ingest AMPS runtime: " + ingestName, ex);
+  private VectorSchemaRoot buildTablesWithSchemaRoot(
+      List<DuckdbCatalogImpl.MetadataTable> rows, Schema schema, boolean strictSchema) {
+    VectorSchemaRoot root = VectorSchemaRoot.create(schema, ipcReadAllocator);
+    int rowCount = rows == null ? 0 : rows.size();
+    VarCharVector catalogVector = (VarCharVector) root.getVector("catalog_name");
+    VarCharVector schemaVector = (VarCharVector) root.getVector("db_schema_name");
+    VarCharVector tableVector = (VarCharVector) root.getVector("table_name");
+    VarCharVector typeVector = (VarCharVector) root.getVector("table_type");
+    VarBinaryVector tableSchemaVector = (VarBinaryVector) root.getVector("table_schema");
+    catalogVector.allocateNew(Math.max(1, rowCount));
+    schemaVector.allocateNew(Math.max(1, rowCount));
+    tableVector.allocateNew(Math.max(1, rowCount));
+    typeVector.allocateNew(Math.max(1, rowCount));
+    tableSchemaVector.allocateNew();
+    for (int index = 0; index < rowCount; index++) {
+      DuckdbCatalogImpl.MetadataTable row = rows.get(index);
+      putUtf8(catalogVector, index, METADATA_CATALOG_NAME);
+      putUtf8(schemaVector, index, row.namespace());
+      putUtf8(tableVector, index, row.name());
+      putUtf8(typeVector, index, row.tableType());
+      byte[] tableSchema = tableSchemaBytes(row.datasetId(), strictSchema);
+      if (tableSchema == null) {
+        tableSchemaVector.setNull(index);
+      } else {
+        tableSchemaVector.setSafe(index, tableSchema);
       }
     }
+    catalogVector.setValueCount(rowCount);
+    schemaVector.setValueCount(rowCount);
+    tableVector.setValueCount(rowCount);
+    typeVector.setValueCount(rowCount);
+    tableSchemaVector.setValueCount(rowCount);
+    root.setRowCount(rowCount);
+    return root;
+  }
 
-    private void startExternalSource(DefinitionIngestSource source) {
-      if (session == null) {
-        throw new IllegalStateException("External source runtime requires session-backed ingest manager");
-      }
-      DefinitionIngestSource.ExternalSource external =
-          Objects.requireNonNull(source.external(), "ingestSource.external");
-      String providerId =
-          Strings.requireNonBlank(external.sourceType(), "ingestSource.external.sourceType");
-      if (OdbcRuntimeGuard.isOdbcType(providerId)) {
-        startOdbcSource(toOdbcSource(external));
-        return;
-      }
-      IngestSourceProvider provider = plugins.findIngestSourceProvider(providerId);
-      if (provider == null) {
-        throw new IllegalStateException(
-            "No ingest source provider registered for external source type '" + providerId + "'");
-      }
-      if (!provider.supportsRuntime()) {
-        throw new IllegalStateException(
-            "Ingest source provider '" + provider.providerId() + "' does not support runtime execution");
-      }
-      try {
-        AutoCloseable handle =
-            provider.startRuntime(
-                new IngestSourceRuntimeContext(
-                    session,
-                    ingestName,
-                    source,
-                    external,
-                    new IngestSourceRuntimeContext.Sink() {
-                      @Override
-                      public void appendJson(String payload) {
-                        IngestManagerImpl.this.append(ingestName, new IngestPayloadJson(payload));
-                      }
-
-                      @Override
-                      public void appendNvfix(String payload) {
-                        IngestManagerImpl.this.append(ingestName, new IngestPayloadNvFix(payload));
-                      }
-
-                      @Override
-                      public void appendIpc(byte[] arrowIpcStreamBytes) {
-                        IngestManagerImpl.this.appendIpc(ingestName, arrowIpcStreamBytes);
-                      }
-                    }));
-        sourceHandle = handle == null ? () -> {} : handle;
-      } catch (RuntimeException ex) {
-        failure.compareAndSet(null, ex);
-        if (statusPublisher != null) {
-          statusPublisher.publishError(
-              "managed external source failed: "
-                  + Strings.firstNonBlank(
-                      Strings.trimToNull(ex.getMessage()), ex.getClass().getSimpleName()));
-        }
-        throw ex;
-      } catch (Exception ex) {
-        failure.compareAndSet(null, ex);
-        if (statusPublisher != null) {
-          statusPublisher.publishError(
-              "managed external source failed: "
-                  + Strings.firstNonBlank(
-                      Strings.trimToNull(ex.getMessage()), ex.getClass().getSimpleName()));
-        }
-        throw new IllegalStateException(
-            "Failed to start ingest external runtime: " + ingestName + " provider=" + provider.providerId(),
-            ex);
-      }
-    }
-
-    private void startOdbcSource(DefinitionIngestSource.OdbcSource odbcSource) {
-      if (!(rowManager instanceof RowManagerImpl localRowManager)) {
-        throw OdbcSessionSupport.ingestSourceFailed(
-            ingestName,
-            odbcSource == null ? null : odbcSource.connectionName(),
-            odbcSource == null ? null : odbcSource.databaseType(),
-            "direct_mode_required",
-            null);
-      }
-      DefinitionIngestSource.OdbcSource source =
-          Objects.requireNonNull(odbcSource, "ingestSource.odbc");
-      String requestedConnectionName =
-          Strings.requireNonBlank(source.connectionName(), "ingestSource.odbc.connectionName");
-      DefinitionConnection.Odbc.DatabaseType requestedDatabaseType = source.databaseType();
-      try {
-        byte[] arrowIpcStreamBytes =
-            localRowManager.withDuckdbSession(
-                session -> {
-                  OdbcSessionSupport.OdbcConnectionSpec connection =
-                      OdbcSessionSupport.resolveConnection(
-                          DiscoveryCache,
-                          group,
-                          requestedConnectionName,
-                          requestedDatabaseType,
-                          ingestName);
-                  String remoteSql =
-                      OdbcSessionSupport.ingestSourceSql(source, ingestName, connection.connectionName());
-                  try (OdbcSessionSupport.OdbcQueryResult queryResult =
-                      OdbcSessionSupport.openQueryResult(session, connection, remoteSql)) {
-                    return TabularManagerImpl.toArrowIpcBytes(
-                        queryResult.resultSet(), datasetId.toString(), schemaIpcAllocator);
-                  } catch (SQLException ex) {
-                    throw OdbcSessionSupport.ingestSourceFailed(
-                        ingestName,
-                        connection.connectionName(),
-                        connection.databaseType(),
-                        ex.getMessage(),
-                        ex);
-                  } catch (RuntimeException ex) {
-                    if (isDeterministicOdbcFailure(ex)) {
-                      throw ex;
-                    }
-                    throw OdbcSessionSupport.ingestSourceFailed(
-                        ingestName,
-                        connection.connectionName(),
-                        connection.databaseType(),
-                        ex.getMessage(),
-                        ex);
-                  }
-                });
-        if (arrowIpcStreamBytes != null && arrowIpcStreamBytes.length > 0) {
-          IngestManagerImpl.this.appendIpc(ingestName, arrowIpcStreamBytes);
-        }
-        sourceHandle = () -> {};
-      } catch (RuntimeException ex) {
-        failure.compareAndSet(null, ex);
-        if (statusPublisher != null) {
-          statusPublisher.publishError(
-              "managed ODBC source failed: "
-                  + Strings.firstNonBlank(
-                      Strings.trimToNull(ex.getMessage()), ex.getClass().getSimpleName()));
-        }
-        if (isDeterministicOdbcFailure(ex)) {
-          throw ex;
-        }
-        throw OdbcSessionSupport.ingestSourceFailed(
-            ingestName, requestedConnectionName, requestedDatabaseType, ex.getMessage(), ex);
-      }
-    }
-
-    private static boolean isDeterministicOdbcFailure(RuntimeException ex) {
-      String message = Strings.trimToNull(ex == null ? null : ex.getMessage());
-      return message != null && message.startsWith("ODBC_");
-    }
-
-    private static DefinitionIngestSource.OdbcSource toOdbcSource(
-        DefinitionIngestSource.ExternalSource external) {
-      Map<String, String> options = external.options();
-      String connectionName =
-          Strings.firstNonBlank(
-              Strings.trimToNull(external.reference()),
-              Strings.trimToNull(options == null ? null : options.get("connectionName")));
-      String tableName = Strings.trimToNull(options == null ? null : options.get("tableName"));
-      String querySql = Strings.trimToNull(options == null ? null : options.get("querySql"));
-      DefinitionConnection.Odbc.DatabaseType databaseType =
-          parseDatabaseType(options == null ? null : options.get("databaseType"));
-      return new DefinitionIngestSource.OdbcSource(
-          connectionName,
-          databaseType,
-          tableName,
-          querySql,
-          options == null ? Map.of() : Map.copyOf(options));
-    }
-
-    private static DefinitionConnection.Odbc.DatabaseType parseDatabaseType(String value) {
-      String normalized = Strings.trimToNull(value);
-      if (normalized == null) {
-        return DefinitionConnection.Odbc.DatabaseType.OTHER;
-      }
-      try {
-        return DefinitionConnection.Odbc.DatabaseType.valueOf(normalized.toUpperCase(Locale.ROOT));
-      } catch (IllegalArgumentException ex) {
-        return DefinitionConnection.Odbc.DatabaseType.OTHER;
-      }
-    }
-
-    private static IngestAmpsPump.PayloadFormat payloadFormat(String format, String ingestName) {
-      String normalized = Strings.requireNonBlank(format, "format").toUpperCase(Locale.ROOT);
-      return switch (normalized) {
-        case FORMAT_JSON -> IngestAmpsPump.PayloadFormat.JSON;
-        case FORMAT_NVFIX -> IngestAmpsPump.PayloadFormat.NVFIX;
-        default ->
-            throw new IllegalStateException(
-                "IngestSource format must be JSON or NVFIX: " + ingestName + " format=" + format);
-      };
+  private void streamSingleBatch(
+      FlightProducer.ServerStreamListener listener, VectorSchemaRoot root) {
+    Objects.requireNonNull(listener, "listener");
+    Objects.requireNonNull(root, "root");
+    try (root) {
+      listener.start(root);
+      listener.putNext();
+      listener.completed();
+    } catch (RuntimeException ex) {
+      throw ex;
+    } catch (Exception ex) {
+      throw CallStatus.INTERNAL
+          .withDescription("Failed to stream Flight SQL metadata")
+          .withCause(ex)
+          .toRuntimeException();
     }
   }
 
-  private static int sanitizePositiveInt(Integer value, int defaultValue) {
-    if (value == null || value <= 0) {
-      return defaultValue;
-    }
-    return value;
-  }
-
-  private static long sanitizePositiveLong(Long value, long defaultValue) {
-    if (value == null || value <= 0L) {
-      return defaultValue;
-    }
-    return value;
-  }
-
-  static int resolveMaxRowsPerFile(Integer value) {
+  private static void putUtf8(VarCharVector vector, int index, String value) {
     if (value == null) {
-      return DEFAULT_PARQUET_MAX_ROWS_PER_FILE;
+      vector.setNull(index);
+      return;
     }
-    if (value <= 0) {
-      throw new IllegalArgumentException("maxRowsPerFile must be > 0");
-    }
-    return value;
+    vector.setSafe(index, value.getBytes(java.nio.charset.StandardCharsets.UTF_8));
   }
 
-  static long resolveMaxIdleMillis(Long value) {
-    if (value == null) {
-      return DEFAULT_PARQUET_MAX_IDLE_MILLIS;
+  private byte[] tableSchemaBytes(DatasetId datasetId, boolean required) {
+    Schema schema = tableSchemaForDataset(datasetId, required);
+    if (schema == null) {
+      return null;
     }
-    if (value <= 0L) {
-      throw new IllegalArgumentException("maxIdleMillis must be > 0");
-    }
-    return value;
+    return serializeSchema(schema);
   }
 
-  static final class ParquetRollBuffer {
-    final Object monitor = new Object();
-    final List<byte[]> pendingIpcBatches = new ArrayList<>();
-    DatasetId datasetId;
-    ParquetRollPolicy policy;
-    String parquetFilenamePrefix;
-    long pendingRows;
-    long lastAppendMillis;
-    Schema schema;
+  private Schema tableSchemaForDataset(DatasetId datasetId, boolean required) {
+    DuckdbCatalogImpl catalog = requireMetadataCatalog();
+    Optional<SchemaModel> model = catalog.metadataSchemaModel(datasetId);
+    if (model.isEmpty()) {
+      if (!required) {
+        return null;
+      }
+      throw CallStatus.NOT_FOUND
+          .withDescription("Schema definition not found for dataset " + datasetId)
+          .toRuntimeException();
+    }
+    return toArrowSchema(model.get());
+  }
 
-    ParquetRollBuffer(
-        DatasetId datasetId, ParquetRollPolicy policy, String parquetFilenamePrefix) {
-      this.datasetId = Objects.requireNonNull(datasetId, "datasetId");
-      this.policy = Objects.requireNonNull(policy, "policy");
-      this.parquetFilenamePrefix = Strings.trimToNull(parquetFilenamePrefix);
+  private static Schema toArrowSchema(SchemaModel model) {
+    if (model == null || model.getFields() == null || model.getFields().isEmpty()) {
+      throw CallStatus.NOT_FOUND
+          .withDescription("Schema definition is empty for dataset")
+          .toRuntimeException();
+    }
+    List<Field> fields = new ArrayList<>();
+    for (SchemaModel.Field field : model.getFields()) {
+      if (field == null) {
+        continue;
+      }
+      fields.add(
+          new Field(
+              Strings.requireNonBlank(field.getName(), "field.name"),
+              new FieldType(field.isNullable(), toArrowType(field.getType()), null, null),
+              null));
+    }
+    if (fields.isEmpty()) {
+      throw CallStatus.NOT_FOUND
+          .withDescription("Schema definition is empty for dataset")
+          .toRuntimeException();
+    }
+    return new Schema(List.copyOf(fields));
+  }
+
+  private static ArrowType toArrowType(SchemaModel.FieldType type) {
+    if (type == null) {
+      throw CallStatus.NOT_FOUND.withDescription("Schema field type is required").toRuntimeException();
+    }
+    return switch (type) {
+      case STRING -> new ArrowType.Utf8();
+      case BOOL -> new ArrowType.Bool();
+      case INT32 -> new ArrowType.Int(32, true);
+      case INT64 -> new ArrowType.Int(64, true);
+      case FLOAT64 -> new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE);
+      case DATE -> new ArrowType.Date(DateUnit.DAY);
+      case TIMESTAMP -> new ArrowType.Timestamp(TimeUnit.MICROSECOND, null);
+      case BINARY -> new ArrowType.Binary();
+    };
+  }
+
+  private static byte[] serializeSchema(Schema schema) {
+    try (ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+      MessageSerializer.serialize(new WriteChannel(Channels.newChannel(out)), schema);
+      return out.toByteArray();
+    } catch (IOException ex) {
+      throw CallStatus.INTERNAL
+          .withDescription("Failed to serialize table schema")
+          .withCause(ex)
+          .toRuntimeException();
     }
   }
 
-  record ParquetRollPolicy(int maxRowsPerFile, long maxIdleMillis) {
-    static ParquetRollPolicy disabled() {
-      return new ParquetRollPolicy(0, 0L);
-    }
-
-    boolean enabled() {
-      return maxRowsPerFile > 0 || maxIdleMillis > 0L;
+  @Override
+  public void close() {
+    statements.clear();
+    datasetStreamProducer.close();
+    try {
+      ipcReadAllocator.close();
+    } catch (Exception ignore) {
     }
   }
 
-  record ArrowIpcBatchMeta(long rowCount, Schema schema) {}
+  private RequestIdentity resolveIdentity(FlightProducer.CallContext context) {
+    FlightSqlRequestHeadersMiddleware middleware =
+        context == null ? null : context.getMiddleware(FlightSqlRequestHeadersMiddleware.KEY);
+    FabricRequestHeaders baseHeaders =
+        middleware == null ? FabricRequestHeaders.empty(null) : middleware.requestHeaders();
+    String principal = kerberosPrincipal(context);
+    FabricRequestHeaders headers = baseHeaders.withAuthenticatedPrincipal(principal);
+    try {
+      RequestIdentity identity =
+          RequestIdentityResolver.resolve(headers, DiscoveryCache, runtimeEnvironment);
+      logRequestEntry(identity, middleware);
+      return identity;
+    } catch (RequestIdentityResolver.ResolutionException ex) {
+      throw toFlightRuntime(ex);
+    }
+  }
 
-  record ActiveTableDescriptor(
-      String ingestName,
-      String tableName,
-      List<String> primaryKey,
-      boolean memory,
-      String databasePath,
-      String parquetHistoryPath,
-      boolean persistOnStop,
-      boolean createIfMissing,
-      List<String> schemaFields) {}
+  private void logRequestEntry(
+      RequestIdentity identity, FlightSqlRequestHeadersMiddleware middleware) {
+    String datasetId = middleware == null ? null : middleware.datasetId();
+    String callSummary = middleware == null ? null : middleware.callSummary();
+    Map<String, String> headers = middleware == null ? Map.of() : middleware.headerSnapshot();
+    LOGGER.info("[Request] transport=ARROW_FLIGHT_SQL call={} requestId={} caller={} user={} delegatedUser={} datasetId={} headers={}", Strings.firstNonBlank(callSummary, "<unknown>"), identity.requestId(), safeCaller(identity.callerAppSubject()), identity.effectiveUserSubject(), Strings.firstNonBlank(identity.delegatedUserSubject(), "<none>"), Strings.firstNonBlank(datasetId, "<none>"), headers);
+  }
 
-  record S3PathRoot(String bucket, String basePrefix) {}
+  private void logSqlRequest(
+      RequestIdentity identity, String operation, DatasetId datasetId, String sql) {
+    LOGGER.info("[FlightSQL][request] requestId={} operation={} subject={} datasetId={} sql={}", identity.requestId(), operation, safeSubject(identity.effectiveUserSubject()), datasetId == null ? "<none>" : datasetId, summarizeSql(sql));
+  }
 
-  record ScopedConnectionRef(String group, String name) {}
+  private static String summarizeSql(String sql) {
+    String normalized = Strings.trimToNull(sql);
+    if (normalized == null) {
+      return "<empty>";
+    }
+    if (normalized.length() > 512) {
+      return normalized.substring(0, 512) + "...";
+    }
+    return normalized;
+  }
 
+  private static String summarizeValues(Iterable<String> values, int max) {
+    if (values == null) {
+      return "[]";
+    }
+    int limit = Math.max(1, max);
+    List<String> preview = new ArrayList<>();
+    int total = 0;
+    for (String value : values) {
+      if (value == null) {
+        continue;
+      }
+      total++;
+      if (preview.size() < limit) {
+        preview.add(value);
+      }
+    }
+    if (total == 0) {
+      return "[]";
+    }
+    if (total <= limit) {
+      return preview.toString();
+    }
+    return preview + "...(" + (total - limit) + " more)";
+  }
+
+  private void authorizeInvoke(String callerSubject, String operationName, String requestPayload) {
+    ServiceEntitlements.Decision decision =
+        serviceEntitlements.authorize(
+            new ServiceEntitlements.Identity(callerSubject, null),
+            new ServiceEntitlements.Request(
+                ServiceEntitlements.Transport.ARROW_FLIGHT_SQL,
+                ServiceEntitlements.Action.INVOKE,
+                serviceResourceId,
+                operationName,
+                null,
+                requestPayload,
+                Map.of(),
+                Map.of()));
+    if (decision == null || !decision.allowed()) {
+      String reason = decision == null ? "DENIED" : Strings.firstNonBlank(decision.reason(), "DENIED");
+      LOGGER.info("[FlightSQL][deny] serviceId={} operation={} subject={} reason={}", serviceResourceId, operationName, safeSubject(callerSubject), reason);
+      throw CallStatus.UNAUTHORIZED
+          .withDescription(
+              reason
+                  + " [serviceId="
+                  + serviceResourceId
+                  + ", operation="
+                  + operationName
+                  + ", subject="
+                  + safeSubject(callerSubject)
+                  + "]")
+          .toRuntimeException();
+    }
+  }
+
+  private static String requireSql(FlightSql.CommandStatementQuery command) {
+    return FlightSqlServiceProducerHeaders.requireSql(command);
+  }
+
+  private static DatasetId resolveDatasetId(FlightProducer.CallContext context) {
+    return FlightSqlServiceProducerHeaders.resolveDatasetId(context);
+  }
+
+  private void installDatasetIfPresent(DatasetId datasetId) {
+    if (datasetId == null) {
+      return;
+    }
+    if (!isAllowedDataset(datasetId)) {
+      throw CallStatus.INVALID_ARGUMENT
+          .withDescription(
+              "Dataset is not allowed for this service datasetId="
+                  + datasetId
+                  + " serviceId="
+                  + serviceResourceId)
+          .toRuntimeException();
+    }
+    if (!(tabularManager instanceof TabularManagerImpl localTabularManager)) {
+      return;
+    }
+    try {
+      localTabularManager.installDataset(datasetId.toString());
+    } catch (RuntimeException ex) {
+      throw CallStatus.INVALID_ARGUMENT
+          .withDescription(
+              "Dataset definition not available for query datasetId="
+                  + datasetId
+                  + " serviceId="
+                  + serviceResourceId)
+          .withCause(ex)
+          .toRuntimeException();
+    }
+  }
+
+  private ByteBuffer queryIpcSqlAsCaller(
+      RequestIdentity identity, String sql, DatasetId datasetId) {
+    String plannedSql = Strings.requireNonBlank(sql, "sql");
+    String callerSubject = identity.effectiveUserSubject();
+    try {
+      return tabularManager.queryIpcBuffer(plannedSql);
+    } catch (IllegalArgumentException ex) {
+      String details = errorContext(callerSubject, datasetId);
+      throw CallStatus.INVALID_ARGUMENT
+          .withDescription(ex.getMessage() + " [" + details + "]")
+          .withCause(ex)
+          .toRuntimeException();
+    } catch (IllegalStateException ex) {
+      throw mapQueryFailure(ex, callerSubject, datasetId);
+    } catch (RuntimeException ex) {
+      String details = errorContext(callerSubject, datasetId);
+      LOGGER.error("[FlightSQL][query][unexpected] {}", details, ex);
+      throw CallStatus.INTERNAL
+          .withDescription("Query execution failed [" + details + "]")
+          .withCause(ex)
+          .toRuntimeException();
+    }
+  }
+
+  private static String rewriteDatasetPlaceholder(String sql, DatasetId datasetId) {
+    if (datasetId == null) {
+      return sql;
+    }
+    int first = sql.indexOf(DATASET_TOKEN_MARKER);
+    if (first < 0) {
+      throw CallStatus.INVALID_ARGUMENT
+          .withDescription(
+              "query.sql must contain placeholder "
+                  + DATASET_TOKEN_MARKER
+                  + " for dataset "
+                  + datasetId)
+          .toRuntimeException();
+    }
+    int second = sql.indexOf(DATASET_TOKEN_MARKER, first + DATASET_TOKEN_MARKER.length());
+    if (second >= 0) {
+      throw CallStatus.INVALID_ARGUMENT
+          .withDescription(
+              "query.sql must contain placeholder "
+                  + DATASET_TOKEN_MARKER
+                  + " exactly once for dataset "
+                  + datasetId)
+          .toRuntimeException();
+    }
+    return sql.replace(DATASET_TOKEN_MARKER, sqlToken(datasetId));
+  }
+
+  private static String datasetTokenMarker() {
+    return "$" + "{DATASET}";
+  }
+
+  private boolean isAllowedDataset(DatasetId datasetId) {
+    if (datasetId == null) {
+      return true;
+    }
+    return allowedDatasetIds.isEmpty() || allowedDatasetIds.contains(datasetId);
+  }
+
+  private static String sqlToken(DatasetId datasetId) {
+    return quoteIdentifier(datasetId.group())
+        + "."
+        + quoteIdentifier(datasetId.namespace())
+        + "."
+        + quoteIdentifier(datasetId.name());
+  }
+
+  private static String quoteIdentifier(String identifier) {
+    return "\"" + identifier.replace("\"", "\"\"") + "\"";
+  }
+
+  private RuntimeException mapQueryFailure(
+      IllegalStateException ex, String callerSubject, DatasetId datasetId) {
+    String message = Strings.trimToNull(ex.getMessage());
+    String details = errorContext(callerSubject, datasetId);
+    if (message == null) {
+      LOGGER.error("[FlightSQL][query][unexpected] {} message=<empty>", details, ex);
+      return CallStatus.INTERNAL
+          .withDescription("Query execution failed [" + details + "]")
+          .withCause(ex)
+          .toRuntimeException();
+    }
+    String lower = message.toLowerCase();
+    if (lower.contains("access denied for dataset")) {
+      return CallStatus.UNAUTHORIZED
+          .withDescription(message + " [" + details + "]")
+          .withCause(ex)
+          .toRuntimeException();
+    }
+    if (lower.contains("${dataset}")
+        || lower.contains("dataset not found")
+        || lower.contains("unknown table token")
+        || lower.contains("ambiguous table token")) {
+      return CallStatus.INVALID_ARGUMENT
+          .withDescription(message + " [" + details + "]")
+          .withCause(ex)
+          .toRuntimeException();
+    }
+    if (lower.contains("duckdb sql failed")) {
+      return CallStatus.INVALID_ARGUMENT
+          .withDescription(message + " [" + details + "]")
+          .withCause(ex)
+          .toRuntimeException();
+    }
+    LOGGER.error("[FlightSQL][query][unexpected] {} message={}", details, message, ex);
+    return CallStatus.INTERNAL
+        .withDescription(message + " [" + details + "]")
+        .withCause(ex)
+        .toRuntimeException();
+  }
+
+  private IpcSummary inspectIpc(ByteBuffer ipc) {
+    if (ipc == null || !ipc.hasRemaining()) {
+      throw CallStatus.INTERNAL.withDescription("Query returned empty Arrow IPC payload").toRuntimeException();
+    }
+    try (ArrowStreamReader reader =
+        new ArrowStreamReader(Bytes.asInputStream(ipc), ipcReadAllocator)) {
+      VectorSchemaRoot root = reader.getVectorSchemaRoot();
+      Schema schema = root.getSchema();
+      long rowCount = 0L;
+      while (reader.loadNextBatch()) {
+        rowCount += root.getRowCount();
+      }
+      return new IpcSummary(schema, rowCount);
+    } catch (Exception ex) {
+      throw CallStatus.INTERNAL
+          .withDescription("Failed to inspect Arrow IPC payload")
+          .withCause(ex)
+          .toRuntimeException();
+    }
+  }
+
+  private void streamIpc(FlightProducer.ServerStreamListener listener, ByteBuffer ipc) {
+    Objects.requireNonNull(listener, "listener");
+    try (ArrowStreamReader reader =
+        new ArrowStreamReader(Bytes.asInputStream(ipc), ipcReadAllocator)) {
+      VectorSchemaRoot root = reader.getVectorSchemaRoot();
+      listener.start(root);
+      while (reader.loadNextBatch()) {
+        listener.putNext();
+      }
+      listener.completed();
+    } catch (Exception ex) {
+      throw CallStatus.INTERNAL
+          .withDescription("Failed to stream Arrow IPC payload")
+          .withCause(ex)
+          .toRuntimeException();
+    }
+  }
+
+  private Location location() {
+    int port = portSupplier.getAsInt();
+    return tlsEnabled
+        ? Location.forGrpcTls(advertiseHost, port)
+        : Location.forGrpcInsecure(advertiseHost, port);
+  }
+
+  private String errorContext(String callerSubject, DatasetId datasetId) {
+    return "serviceId="
+        + serviceResourceId
+        + ", datasetId="
+        + (datasetId == null ? "<unknown>" : datasetId)
+        + ", subject="
+        + safeSubject(callerSubject);
+  }
+
+  private static String safeSubject(String subject) {
+    return FlightSqlServiceProducerHeaders.safeSubject(subject);
+  }
+
+  private static String safeCaller(String callerAppSubject) {
+    return FlightSqlServiceProducerHeaders.safeCaller(callerAppSubject);
+  }
+
+  private static String kerberosPrincipal(FlightProducer.CallContext context) {
+    return FlightSqlServiceProducerHeaders.kerberosPrincipal(context);
+  }
+
+  private static RuntimeException toFlightRuntime(RequestIdentityResolver.ResolutionException ex) {
+    return FlightSqlServiceProducerHeaders.toFlightRuntime(ex);
+  }
+
+  private record IpcSummary(Schema schema, long rowCount) {}
+
+  private record PendingStatement(
+      String callerSubject, Schema schema, long rowCount, ByteBuffer ipcBytes) {}
 }
-
-
-
-
-
-
-
-
