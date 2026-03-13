@@ -1,418 +1,407 @@
-package org.pronzato.fabric.api.control.discovery.lifecycle;
+package org.pronzato.fabric.api.control.discovery.scope;
 
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
+import org.pronzato.fabric.api.control.discovery.CanonicalIds;
+import org.pronzato.fabric.api.control.discovery.definitions.Definition;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEntitlement;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionPlatform;
+import org.pronzato.fabric.api.control.entitlements.simple.PlatformModelMembership;
+import org.pronzato.fabric.api.util.Strings;
 
-public final class DeletePlanner {
-  private DeletePlanner() {}
+public final class DiscoveryScopeResolver {
+  private static final String PLATFORM_GROUP = "platform";
 
-  public static DeletePlan plan(AssetLifecycleGraph graph, String rootAssetIdOrToken) {
-    return plan(graph, rootAssetIdOrToken, DeleteOptions.defaults());
-  }
+  public DiscoveryScope resolve(
+      String primaryGroup,
+      String subject,
+      String delegatedSubject,
+      List<Definition> definitions) {
+    List<Definition> records = definitions == null ? List.of() : definitions;
+    DiscoveryScope base = DiscoveryScope.primaryOnly(primaryGroup, subject, delegatedSubject);
 
-  public static DeletePlan plan(
-      AssetLifecycleGraph graph, String rootAssetIdOrToken, DeleteOptions options) {
-    DeleteOptions resolvedOptions = options == null ? DeleteOptions.defaults() : options;
-    String normalizedRootToken = trim(rootAssetIdOrToken);
-    String resolvedRoot = resolveRootAssetId(graph, normalizedRootToken);
-
-    List<DeleteBlocker> blockers = new ArrayList<>();
-    LinkedHashSet<String> assetsToDelete = new LinkedHashSet<>();
-    LinkedHashSet<String> assetsToDetach = new LinkedHashSet<>();
-    LinkedHashSet<String> assetsRetained = new LinkedHashSet<>();
-    LinkedHashSet<String> storageToDelete = new LinkedHashSet<>();
-    LinkedHashSet<String> historyToDelete = new LinkedHashSet<>();
-    LinkedHashSet<String> warnings = new LinkedHashSet<>();
-    LinkedHashSet<String> manualActions = new LinkedHashSet<>();
-
-    if (graph == null) {
-      blockers.add(
-          new DeleteBlocker(
-              normalizedRootToken,
-              "<graph>",
-              "GRAPH_UNAVAILABLE",
-              "Lifecycle graph is required for delete planning."));
-      return emptyPlan(normalizedRootToken, resolvedOptions, blockers);
-    }
-    if (resolvedRoot == null || !graph.hasAsset(resolvedRoot)) {
-      blockers.add(
-          new DeleteBlocker(
-              normalizedRootToken,
-              "<graph>",
-              "ROOT_NOT_FOUND",
-              "Root asset was not found in lifecycle graph."));
-      return emptyPlan(normalizedRootToken, resolvedOptions, blockers);
+    String effectiveSubject = firstNonBlank(normalize(delegatedSubject), normalize(subject));
+    if (effectiveSubject == null) {
+      return base;
     }
 
-    ArrayDeque<String> queue = new ArrayDeque<>();
-    assetsToDelete.add(resolvedRoot);
-    queue.add(resolvedRoot);
-    while (!queue.isEmpty()) {
-      String current = queue.removeFirst();
-      for (AssetLifecycleEdge edge : graph.outgoing(current)) {
-        String target = edge.toAssetId();
-        if (target == null || target.equals(current)) {
-          continue;
-        }
-        DefinitionType targetType =
-            graph.node(target).map(AssetLifecycleNode::type).orElse(DefinitionType.UNKNOWN);
-        if (targetType == DefinitionType.UNKNOWN && isInternalAssetId(target)) {
-          warnings.add(
-              "Compatibility: unresolved dependency type for internal asset "
-                  + target
-                  + "; dependency retained");
-          assetsToDetach.add(target);
-          assetsRetained.add(target);
-          if (edge.required() && !resolvedOptions.force()) {
-            blockers.add(
-                new DeleteBlocker(
-                    current,
-                    target,
-                    "UNKNOWN_DEPENDENCY_TYPE",
-                    "Dependency type is UNKNOWN for internal asset; cannot safely cascade delete."));
-          }
-          continue;
-        }
-        switch (edge.deleteBehavior()) {
-          case CASCADE_SOFT, CASCADE_HARD -> {
-            boolean cascadeAllowed =
-                resolvedOptions.deleteOwnedDependencies()
-                    && (edge.ownershipType() == OwnershipType.OWNED
-                        || edge.ownershipType() == OwnershipType.DERIVED);
-            boolean cascadeTypeAllowed = resolvedOptions.allowsCascadeType(targetType);
-            if (!cascadeTypeAllowed) {
-              warnings.add(
-                  "Cascade suppressed by options for "
-                      + targetType.name().toLowerCase()
-                      + " dependency "
-                      + target);
-              assetsToDetach.add(target);
-              assetsRetained.add(target);
-              continue;
-            }
-            if (!cascadeAllowed) {
-              if (edge.required() && !resolvedOptions.force()) {
-                blockers.add(
-                    new DeleteBlocker(
-                        current,
-                        target,
-                        "DEPENDENCY_NOT_OWNED",
-                        "Dependency cannot be cascaded because it is not owned."));
-              } else {
-                assetsToDetach.add(target);
-                assetsRetained.add(target);
-              }
-              continue;
-            }
-            if (isStorageOrExternalTarget(graph, target, edge)) {
-              if (resolvedOptions.deleteData()
-                  && (resolvedOptions.hardDeleteData()
-                      || edge.deleteBehavior() == DeleteBehavior.CASCADE_HARD)) {
-                storageToDelete.add(target);
-              } else {
-                assetsRetained.add(target);
-                manualActions.add("Manual data deletion required for " + target);
-              }
-              if (resolvedOptions.deleteHistory()
-                  && edge.retentionBehavior() == RetentionBehavior.DELETE_HISTORY) {
-                historyToDelete.add(target);
-              }
-              continue;
-            }
-            if (assetsToDelete.add(target)) {
-              queue.addLast(target);
-            }
-          }
-          case DETACH -> {
-            assetsToDetach.add(target);
-            assetsRetained.add(target);
-          }
-          case BLOCK -> {
-            if (!resolvedOptions.force()) {
-              blockers.add(
-                  new DeleteBlocker(
-                      current, target, "BLOCKING_DEPENDENCY", "Dependency blocks delete cascade."));
-            } else {
-              warnings.add("Force delete bypassed blocker: " + current + " -> " + target);
-            }
-            assetsRetained.add(target);
-          }
-          case MANUAL -> {
-            manualActions.add("Manual delete action required: " + current + " -> " + target);
-            assetsRetained.add(target);
-          }
-        }
+    Set<String> subjectGroups = resolveSubjectGroups(effectiveSubject, records);
+    LinkedHashSet<String> visibleGroups = new LinkedHashSet<>(base.visibleGroups());
+    LinkedHashSet<String> visibleAssetIds = new LinkedHashSet<>(base.visibleAssetIds());
+    LinkedHashMap<String, LinkedHashSet<String>> reasons = mutableReasons(base.visibilityReasons());
+
+    if (isPlatformAdmin(subjectGroups)) {
+      for (String group : groupsFromDefinitions(records)) {
+        addGroupVisibility(visibleGroups, reasons, group, "platform-admin");
       }
     }
 
-    addIncomingDependencyBlockers(graph, assetsToDelete, assetsToDetach, assetsRetained, blockers, warnings, resolvedOptions);
-    if (resolvedOptions.deleteOrphanedSchemas()) {
-      addOrphanedAssetsByType(graph, assetsToDelete, DefinitionType.SCHEMA, warnings);
-    }
-    if (resolvedOptions.deleteOrphanedEntitlements()) {
-      addOrphanedAssetsByType(graph, assetsToDelete, DefinitionType.ENTITLEMENT, warnings);
-    }
-    populateStorageAndHistoryEffects(
-        graph,
-        assetsToDelete,
-        resolvedOptions,
-        storageToDelete,
-        historyToDelete,
-        assetsRetained,
-        manualActions);
-
-    // Final normalization: an asset cannot be both scheduled for delete and retained/detached.
-    assetsToDetach.removeAll(assetsToDelete);
-    assetsRetained.removeAll(assetsToDelete);
-
-    List<String> deleteList = sortStrings(assetsToDelete);
-    List<String> detachList = sortStrings(assetsToDetach);
-    List<String> retainedList = sortStrings(assetsRetained);
-    List<String> storageList = sortStrings(storageToDelete);
-    List<String> historyList = sortStrings(historyToDelete);
-    List<String> warningList = sortStrings(warnings);
-    List<String> manualList = sortStrings(manualActions);
-    List<String> order = buildDeleteExecutionOrder(graph, assetsToDelete);
-    blockers.sort(
-        Comparator.comparing(DeleteBlocker::assetId)
-            .thenComparing(DeleteBlocker::blockedByAssetId)
-            .thenComparing(DeleteBlocker::code));
-
-    return new DeletePlan(
-        resolvedRoot,
-        resolvedOptions,
-        deleteList,
-        detachList,
-        retainedList,
-        storageList,
-        historyList,
-        blockers,
-        warningList,
-        order,
-        manualList);
-  }
-
-  private static void addIncomingDependencyBlockers(
-      AssetLifecycleGraph graph,
-      Set<String> assetsToDelete,
-      Set<String> assetsToDetach,
-      Set<String> assetsRetained,
-      List<DeleteBlocker> blockers,
-      Set<String> warnings,
-      DeleteOptions options) {
-    for (String deleting : assetsToDelete) {
-      for (AssetLifecycleEdge incoming : graph.incoming(deleting)) {
-        String dependent = incoming.fromAssetId();
-        if (dependent == null || assetsToDelete.contains(dependent)) {
-          continue;
-        }
-        boolean blocking = incoming.deleteBehavior() == DeleteBehavior.BLOCK || incoming.required();
-        if (blocking && !options.force()) {
-          blockers.add(
-              new DeleteBlocker(
-                  deleting,
-                  dependent,
-                  "INCOMING_DEPENDENT",
-                  "External dependent asset still references asset slated for delete."));
-        } else if (blocking) {
-          warnings.add("Force delete bypassed incoming dependency: " + dependent + " -> " + deleting);
-        } else if (incoming.deleteBehavior() == DeleteBehavior.DETACH) {
-          assetsToDetach.add(dependent);
-        }
-        assetsRetained.add(dependent);
-      }
-    }
-  }
-
-  private static void addOrphanedAssetsByType(
-      AssetLifecycleGraph graph, Set<String> assetsToDelete, DefinitionType type, Set<String> warnings) {
-    boolean changed = true;
-    while (changed) {
-      changed = false;
-      for (AssetLifecycleNode node : graph.nodes().values()) {
-        if (node == null || node.type() != type || assetsToDelete.contains(node.assetId())) {
-          continue;
-        }
-        if (isOrphanAfterDelete(graph, node.assetId(), assetsToDelete)) {
-          assetsToDelete.add(node.assetId());
-          warnings.add("Deleting orphaned " + type.name().toLowerCase() + ": " + node.assetId());
-          changed = true;
-        }
-      }
-    }
-  }
-
-  private static boolean isOrphanAfterDelete(
-      AssetLifecycleGraph graph, String candidateAssetId, Set<String> assetsToDelete) {
-    for (AssetLifecycleEdge incoming : graph.incoming(candidateAssetId)) {
-      String from = incoming.fromAssetId();
-      if (from == null || from.equals(candidateAssetId) || assetsToDelete.contains(from)) {
+    for (Definition definition : records) {
+      if (!(definition instanceof DefinitionEntitlement entitlement)) {
         continue;
       }
-      if (isInternalAssetId(from)) {
-        return false;
+      if (!enabled(entitlement.envelope() == null ? null : entitlement.envelope().enabled())) {
+        continue;
       }
-    }
-    return true;
-  }
-
-  private static void populateStorageAndHistoryEffects(
-      AssetLifecycleGraph graph,
-      Set<String> assetsToDelete,
-      DeleteOptions options,
-      Set<String> storageToDelete,
-      Set<String> historyToDelete,
-      Set<String> assetsRetained,
-      Set<String> manualActions) {
-    for (String deleting : assetsToDelete) {
-      for (AssetLifecycleEdge edge : graph.outgoing(deleting)) {
-        String target = edge.toAssetId();
-        if (target == null) {
+      if (!isEntitlementAllowed(entitlement, effectiveSubject, subjectGroups)) {
+        continue;
+      }
+      String source = entitlementSource(entitlement.envelope());
+      for (String target : entitlementTargets(entitlement)) {
+        String normalizedTarget = normalize(target);
+        if (normalizedTarget == null) {
           continue;
         }
-        if (edge.relationshipType() == RelationshipType.STORES_IN || target.startsWith("storage:")) {
-          if (options.deleteData() && (options.hardDeleteData() || edge.deleteBehavior() == DeleteBehavior.CASCADE_HARD)) {
-            storageToDelete.add(target);
-          } else {
-            assetsRetained.add(target);
-            manualActions.add("Data retained unless hard delete is requested: " + target);
+        visibleAssetIds.add(normalizedTarget);
+        String group = groupFromResourceId(normalizedTarget);
+        if (group != null) {
+          addGroupVisibility(visibleGroups, reasons, group, source);
+        }
+      }
+    }
+
+    return base.withGroupVisibility(visibleGroups, visibleAssetIds, immutableReasons(reasons));
+  }
+
+  private static Set<String> resolveSubjectGroups(String effectiveSubject, List<Definition> definitions) {
+    DefinitionPlatform platform = findPlatformModel(definitions);
+    if (platform == null || platform.root() == null) {
+      return Set.of();
+    }
+    Map<String, Set<String>> membership = PlatformModelMembership.buildMembershipIndex(platform);
+    if (membership.isEmpty()) {
+      return Set.of();
+    }
+
+    LinkedHashSet<String> groups = new LinkedHashSet<>();
+    Set<String> candidates = PlatformModelMembership.membershipSubjectCandidates(effectiveSubject);
+    for (String candidate : candidates) {
+      Set<String> candidateGroups = membership.get(candidate);
+      if (candidateGroups != null) {
+        for (String group : candidateGroups) {
+          String normalized = normalizeGroup(group);
+          if (normalized != null) {
+            groups.add(normalized);
           }
         }
-        if (options.deleteHistory() && edge.retentionBehavior() == RetentionBehavior.DELETE_HISTORY) {
-          historyToDelete.add(target);
-        }
       }
     }
+
+    String directGroup = normalizeGroup(effectiveSubject);
+    if (directGroup != null) {
+      groups.add(directGroup);
+    }
+    return groups.isEmpty() ? Set.of() : Set.copyOf(groups);
   }
 
-  private static List<String> buildDeleteExecutionOrder(
-      AssetLifecycleGraph graph, Set<String> selectedAssets) {
-    Map<String, Integer> indegree = new LinkedHashMap<>();
-    Map<String, LinkedHashSet<String>> edges = new LinkedHashMap<>();
-    for (String asset : selectedAssets) {
-      indegree.put(asset, 0);
-      edges.put(asset, new LinkedHashSet<>());
+  private static DefinitionPlatform findPlatformModel(List<Definition> definitions) {
+    for (Definition definition : definitions) {
+      if (!(definition instanceof DefinitionPlatform platform)) {
+        continue;
+      }
+      DefinitionEnvelope envelope = platform.envelope();
+      if (envelope == null) {
+        continue;
+      }
+      if (PLATFORM_GROUP.equalsIgnoreCase(normalize(envelope.group()))
+          && "platform".equalsIgnoreCase(normalize(envelope.name()))) {
+        return platform;
+      }
     }
-    for (String dependent : selectedAssets) {
-      for (AssetLifecycleEdge edge : graph.outgoing(dependent)) {
-        String dependency = edge.toAssetId();
-        if (!selectedAssets.contains(dependency) || dependent.equals(dependency)) {
+    return null;
+  }
+
+  private static Set<String> groupsFromDefinitions(List<Definition> definitions) {
+    LinkedHashSet<String> groups = new LinkedHashSet<>();
+    for (Definition definition : definitions) {
+      DefinitionEnvelope envelope = definition == null ? null : definition.envelope();
+      String group = envelope == null ? null : normalize(envelope.group());
+      if (group != null) {
+        groups.add(group);
+      }
+    }
+    return groups.isEmpty() ? Set.of() : Set.copyOf(groups);
+  }
+
+  private static boolean isEntitlementAllowed(
+      DefinitionEntitlement entitlement,
+      String effectiveSubject,
+      Set<String> subjectGroups) {
+    boolean allow = false;
+    boolean deny = false;
+
+    if (entitlement.policies() != null) {
+      for (DefinitionEntitlement.PolicyDocument policy : entitlement.policies()) {
+        if (policy == null || !enabled(policy.enabled()) || policy.bindings() == null) {
           continue;
         }
-        if (edges.get(dependent).add(dependency)) {
-          indegree.put(dependency, indegree.get(dependency) + 1);
+        for (DefinitionEntitlement.PolicyBinding binding : policy.bindings()) {
+          if (binding == null || !enabled(binding.enabled())) {
+            continue;
+          }
+          if (!subjectMatches(binding.subject(), effectiveSubject, subjectGroups)) {
+            continue;
+          }
+          String effect = normalize(binding.effect());
+          if (effect == null) {
+            continue;
+          }
+          if ("DENY".equalsIgnoreCase(effect)) {
+            deny = true;
+          } else if ("ALLOW".equalsIgnoreCase(effect)) {
+            allow = true;
+          }
         }
       }
     }
 
-    ArrayDeque<String> queue = new ArrayDeque<>();
-    List<String> roots = new ArrayList<>();
-    for (Map.Entry<String, Integer> entry : indegree.entrySet()) {
-      if (entry.getValue() == 0) {
-        roots.add(entry.getKey());
-      }
-    }
-    roots.sort(String::compareToIgnoreCase);
-    queue.addAll(roots);
-
-    List<String> order = new ArrayList<>(selectedAssets.size());
-    while (!queue.isEmpty()) {
-      String next = queue.removeFirst();
-      order.add(next);
-      List<String> dependencies = new ArrayList<>(edges.getOrDefault(next, new LinkedHashSet<>()));
-      dependencies.sort(String::compareToIgnoreCase);
-      for (String dependency : dependencies) {
-        int remaining = indegree.get(dependency) - 1;
-        indegree.put(dependency, remaining);
-        if (remaining == 0) {
-          queue.addLast(dependency);
+    if (entitlement.relationships() != null) {
+      for (DefinitionEntitlement.RelationshipTuple relationship : entitlement.relationships()) {
+        if (relationship == null) {
+          continue;
+        }
+        if (!subjectMatches(relationship.subject(), effectiveSubject, subjectGroups)) {
+          continue;
+        }
+        String relation = normalize(relationship.relation());
+        if (relation == null) {
+          continue;
+        }
+        String token = relation.toLowerCase(Locale.ROOT);
+        if (token.contains("deny")) {
+          deny = true;
+          continue;
+        }
+        if (token.contains("allow")
+            || token.contains("read")
+            || token.contains("invoke")
+            || token.contains("write")
+            || token.contains("start")) {
+          allow = true;
         }
       }
     }
-    if (order.size() < selectedAssets.size()) {
-      List<String> unresolved = new ArrayList<>();
-      for (String asset : selectedAssets) {
-        if (!order.contains(asset)) {
-          unresolved.add(asset);
-        }
-      }
-      unresolved.sort(String::compareToIgnoreCase);
-      order.addAll(unresolved);
-    }
-    return List.copyOf(order);
-  }
 
-  private static boolean isStorageOrExternalTarget(
-      AssetLifecycleGraph graph, String targetAssetId, AssetLifecycleEdge edge) {
-    if (targetAssetId.startsWith("storage:")
-        || targetAssetId.startsWith("external:")
-        || edge.ownershipType() == OwnershipType.EXTERNAL) {
-      return true;
-    }
-    DefinitionType type = graph.node(targetAssetId).map(AssetLifecycleNode::type).orElse(DefinitionType.UNKNOWN);
-    return type == DefinitionType.UNKNOWN && !isInternalAssetId(targetAssetId);
-  }
-
-  private static boolean isInternalAssetId(String assetId) {
-    String value = trim(assetId);
-    if (value == null) {
+    if (deny) {
       return false;
     }
-    return value.startsWith("dataset:")
-        || value.startsWith("service:")
-        || value.startsWith("stream:")
-        || value.startsWith("schema:")
-        || value.startsWith("config:")
-        || value.startsWith("connection:")
-        || value.startsWith("ingest:")
-        || value.startsWith("ingest-source:")
-        || value.startsWith("entitlement:");
+    return allow;
   }
 
-  private static DeletePlan emptyPlan(
-      String rootAssetId, DeleteOptions options, List<DeleteBlocker> blockers) {
-    return new DeletePlan(
-        rootAssetId,
-        options,
-        List.of(),
-        List.of(),
-        List.of(),
-        List.of(),
-        List.of(),
-        blockers,
-        List.of(),
-        List.of(),
-        List.of());
+  private static List<String> entitlementTargets(DefinitionEntitlement entitlement) {
+    LinkedHashSet<String> targets = new LinkedHashSet<>();
+    addTarget(targets, entitlement.scopeId());
+
+    if (entitlement.policies() != null) {
+      for (DefinitionEntitlement.PolicyDocument policy : entitlement.policies()) {
+        if (policy == null || !enabled(policy.enabled())) {
+          continue;
+        }
+        addTarget(targets, policy.resourceId());
+        if (policy.bindings() == null) {
+          continue;
+        }
+        for (DefinitionEntitlement.PolicyBinding binding : policy.bindings()) {
+          if (binding == null || !enabled(binding.enabled()) || binding.obligations() == null) {
+            continue;
+          }
+          List<String> datasetScope = binding.obligations().datasetScope();
+          if (datasetScope == null) {
+            continue;
+          }
+          for (String resourceId : datasetScope) {
+            addTarget(targets, resourceId);
+          }
+        }
+      }
+    }
+
+    if (entitlement.relationships() != null) {
+      for (DefinitionEntitlement.RelationshipTuple tuple : entitlement.relationships()) {
+        if (tuple == null) {
+          continue;
+        }
+        addTarget(targets, tuple.resourceId());
+        addTarget(targets, tuple.resourceSubject());
+      }
+    }
+
+    return targets.isEmpty() ? List.of() : List.copyOf(targets);
   }
 
-  private static String resolveRootAssetId(AssetLifecycleGraph graph, String rootAssetIdOrToken) {
-    if (graph == null || rootAssetIdOrToken == null || rootAssetIdOrToken.isBlank()) {
+  private static void addTarget(LinkedHashSet<String> targets, String value) {
+    String normalized = normalize(value);
+    if (normalized != null) {
+      targets.add(normalized);
+    }
+  }
+
+  private static String groupFromResourceId(String resourceId) {
+    String normalized = normalize(resourceId);
+    if (normalized == null) {
       return null;
     }
-    if (graph.hasAsset(rootAssetIdOrToken)) {
-      return rootAssetIdOrToken;
+    try {
+      CanonicalIds.ParsedId parsed = CanonicalIds.parse(normalized);
+      String group = normalize(parsed.group());
+      if (group != null) {
+        return group;
+      }
+    } catch (RuntimeException ignored) {
+      // fall through to lenient parse for non-canonical config scope ids.
     }
-    return graph.resolveAssetId(rootAssetIdOrToken);
-  }
 
-  private static List<String> sortStrings(Set<String> values) {
-    List<String> sorted = new ArrayList<>(values);
-    sorted.sort(String::compareToIgnoreCase);
-    return List.copyOf(sorted);
-  }
-
-  private static String trim(String value) {
-    if (value == null) {
+    int separator = normalized.indexOf(':');
+    if (separator <= 0 || separator >= normalized.length() - 1) {
       return null;
     }
-    String trimmed = value.trim();
-    return trimmed.isEmpty() ? null : trimmed;
+    String payload = normalized.substring(separator + 1);
+    String[] parts = payload.split("/");
+    if (parts.length == 0) {
+      return null;
+    }
+    String type = normalized.substring(0, separator).toLowerCase(Locale.ROOT);
+    if ("group".equals(type)) {
+      return normalizeGroup(normalized);
+    }
+    if ("external".equals(type)
+        || "storage".equals(type)
+        || "user".equals(type)
+        || "role".equals(type)) {
+      return null;
+    }
+    return normalize(parts[0]);
+  }
+
+  private static void addGroupVisibility(
+      Set<String> visibleGroups,
+      Map<String, LinkedHashSet<String>> reasons,
+      String group,
+      String sourceReason) {
+    String normalizedGroup = normalize(group);
+    if (normalizedGroup == null) {
+      return;
+    }
+    visibleGroups.add(normalizedGroup);
+    String reason = normalize(sourceReason);
+    if (reason == null) {
+      return;
+    }
+    reasons.computeIfAbsent(normalizedGroup, ignored -> new LinkedHashSet<>()).add(reason);
+  }
+
+  private static boolean subjectMatches(String configuredSubject, String subject, Set<String> groups) {
+    String normalizedConfigured = normalize(configuredSubject);
+    if (normalizedConfigured == null) {
+      return false;
+    }
+    if (normalizedConfigured.startsWith("group:")) {
+      String configuredGroup = normalizeGroup(normalizedConfigured);
+      if (configuredGroup == null || groups == null || groups.isEmpty()) {
+        return false;
+      }
+      for (String group : groups) {
+        if (Objects.equals(configuredGroup, normalizeGroup(group))) {
+          return true;
+        }
+      }
+      return false;
+    }
+    return Objects.equals(normalizedConfigured, normalize(subject));
+  }
+
+  private static String entitlementSource(DefinitionEnvelope envelope) {
+    String group = envelope == null ? null : normalize(envelope.group());
+    String name = envelope == null ? null : normalize(envelope.name());
+    if (group == null || name == null) {
+      return "entitlement";
+    }
+    return "entitlement:" + group + "/" + name;
+  }
+
+  private static boolean enabled(Boolean value) {
+    return value == null || value.booleanValue();
+  }
+
+  private static boolean isPlatformAdmin(Set<String> groups) {
+    if (groups == null || groups.isEmpty()) {
+      return false;
+    }
+    for (String group : groups) {
+      String normalized = normalizeGroup(group);
+      if (normalized != null && PLATFORM_GROUP.equalsIgnoreCase(normalized)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static LinkedHashMap<String, LinkedHashSet<String>> mutableReasons(
+      Map<String, List<String>> source) {
+    LinkedHashMap<String, LinkedHashSet<String>> reasons = new LinkedHashMap<>();
+    if (source == null || source.isEmpty()) {
+      return reasons;
+    }
+    for (Map.Entry<String, List<String>> entry : source.entrySet()) {
+      String group = normalize(entry.getKey());
+      if (group == null) {
+        continue;
+      }
+      LinkedHashSet<String> values = new LinkedHashSet<>();
+      List<String> reasonValues = entry.getValue();
+      if (reasonValues != null) {
+        for (String reason : reasonValues) {
+          String normalizedReason = normalize(reason);
+          if (normalizedReason != null) {
+            values.add(normalizedReason);
+          }
+        }
+      }
+      reasons.put(group, values);
+    }
+    return reasons;
+  }
+
+  private static Map<String, List<String>> immutableReasons(Map<String, LinkedHashSet<String>> source) {
+    if (source == null || source.isEmpty()) {
+      return Map.of();
+    }
+    LinkedHashMap<String, List<String>> reasons = new LinkedHashMap<>();
+    for (Map.Entry<String, LinkedHashSet<String>> entry : source.entrySet()) {
+      if (entry.getValue() == null || entry.getValue().isEmpty()) {
+        reasons.put(entry.getKey(), List.of());
+      } else {
+        reasons.put(entry.getKey(), List.copyOf(entry.getValue()));
+      }
+    }
+    return Map.copyOf(reasons);
+  }
+
+  private static String firstNonBlank(String first, String second) {
+    if (first != null) {
+      return first;
+    }
+    return second;
+  }
+
+  private static String normalizeGroup(String value) {
+    String normalized = normalize(value);
+    if (normalized == null) {
+      return null;
+    }
+    if (normalized.startsWith("group:") && normalized.length() > "group:".length()) {
+      return normalize(normalized.substring("group:".length()));
+    }
+    return normalized;
+  }
+
+  private static String normalize(String value) {
+    return Strings.trimToNull(value);
   }
 }
