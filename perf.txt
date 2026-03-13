@@ -1,1352 +1,1302 @@
-package org.pronzato.fabric.api.services.flight;
+package org.pronzato.fabric.api.control.session;
 
-import com.google.protobuf.Any;
-import com.google.protobuf.ByteString;
-import com.google.protobuf.InvalidProtocolBufferException;
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.nio.channels.Channels;
-import java.util.ArrayList;
-import java.util.LinkedHashSet;
+import org.pronzato.fabric.api.access.AccessManager;
+import org.pronzato.fabric.api.access.manager.AccessManagerImpl;
+import org.pronzato.fabric.api.util.CloseSupport;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
-import java.util.Locale;
-import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
-import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.function.IntSupplier;
-import org.apache.arrow.flight.CallStatus;
-import org.apache.arrow.flight.Criteria;
-import org.apache.arrow.flight.FlightDescriptor;
-import org.apache.arrow.flight.FlightEndpoint;
-import org.apache.arrow.flight.FlightInfo;
-import org.apache.arrow.flight.FlightProducer;
-import org.apache.arrow.flight.FlightRuntimeException;
-import org.apache.arrow.flight.Location;
-import org.apache.arrow.flight.SchemaResult;
-import org.apache.arrow.flight.Ticket;
-import org.apache.arrow.flight.sql.NoOpFlightSqlProducer;
-import org.apache.arrow.flight.sql.FlightSqlProducer;
-import org.apache.arrow.flight.sql.impl.FlightSql;
-import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.vector.VarBinaryVector;
-import org.apache.arrow.vector.VarCharVector;
-import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.ipc.ArrowStreamReader;
-import org.apache.arrow.vector.ipc.WriteChannel;
-import org.apache.arrow.vector.ipc.message.MessageSerializer;
-import org.apache.arrow.vector.types.DateUnit;
-import org.apache.arrow.vector.types.FloatingPointPrecision;
-import org.apache.arrow.vector.types.TimeUnit;
-import org.apache.arrow.vector.types.pojo.ArrowType;
-import org.apache.arrow.vector.types.pojo.Field;
-import org.apache.arrow.vector.types.pojo.FieldType;
-import org.apache.arrow.vector.types.pojo.Schema;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
+import org.pronzato.fabric.api.Fabric;
+import org.pronzato.fabric.api.catalog.CatalogManager;
+import org.pronzato.fabric.api.connections.manager.ConnectionManagerImpl;
+import org.pronzato.fabric.api.connections.ConnectionManager;
+import org.pronzato.fabric.api.connectors.amps.AmpsConfig;
+import org.pronzato.fabric.api.control.ControlConnection;
 import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
-import org.pronzato.fabric.api.util.Bytes;
-import org.pronzato.fabric.api.data.catalog.DuckdbCatalogImpl;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryTopics;
+import org.pronzato.fabric.api.control.discovery.DeleteManager;
+import org.pronzato.fabric.api.control.discovery.DiscoveryManager;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionApp;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvironment;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
 import org.pronzato.fabric.api.data.checkpoints.CheckpointStore;
 import org.pronzato.fabric.api.data.checkpoints.CheckpointStores;
-import org.pronzato.fabric.api.data.TabularManager;
-import org.pronzato.fabric.api.data.dataset.DatasetId;
-import org.pronzato.fabric.api.data.manager.RowManagerImpl;
-import org.pronzato.fabric.api.data.manager.TabularManagerImpl;
-import org.pronzato.fabric.api.data.duckdb.DuckdbNotifier;
+import org.pronzato.fabric.api.data.DataManagers;
+import org.pronzato.fabric.api.data.DataOptions;
+import org.pronzato.fabric.api.data.manager.DataPlanesImpl;
 import org.pronzato.fabric.api.control.entitlements.core.data.DataEntitlements;
+import org.pronzato.fabric.api.control.entitlements.manager.EntitlementsManagerImpl;
+import org.pronzato.fabric.api.schemas.SchemaManager;
+import org.pronzato.fabric.api.control.status.app.AppStatusCache;
+import org.pronzato.fabric.api.control.status.app.AppStatusPublisher;
+import org.pronzato.fabric.api.control.status.data.DataStatusCache;
+import org.pronzato.fabric.api.control.status.service.ServiceStatusCache;
 import org.pronzato.fabric.api.control.entitlements.core.services.ServiceEntitlements;
-import org.pronzato.fabric.api.control.security.headers.FabricRequestHeaders;
-import org.pronzato.fabric.api.control.security.identity.RequestIdentity;
-import org.pronzato.fabric.api.control.security.identity.RequestIdentityResolver;
-import org.pronzato.fabric.api.schemas.SchemaModel;
-import org.pronzato.fabric.api.services.flight.streaming.FlightDatasetStreamProducer;
+import org.pronzato.fabric.api.configs.ConfigManager;
+import org.pronzato.fabric.api.configs.manager.ConfigManagerImpl;
+import org.pronzato.fabric.api.configs.workflow.ConfigAdminService;
+import org.pronzato.fabric.api.recovery.RecoveryManager;
+import org.pronzato.fabric.api.recovery.manager.DiscoveryCacheRecoveryResult;
+import org.pronzato.fabric.api.recovery.manager.DiscoveryCacheSnapshotManifest;
+import org.pronzato.fabric.api.recovery.manager.DiscoveryCacheSnapshotService;
+import org.pronzato.fabric.api.recovery.manager.RecoveryManagerImpl;
+import org.pronzato.fabric.api.control.security.SecurityManager;
+import org.pronzato.fabric.api.control.security.manager.SecurityManagerImpl;
+import org.pronzato.fabric.api.services.ServiceManager;
+import org.pronzato.fabric.api.services.common.ServiceInstanceResolver;
+import org.pronzato.fabric.api.control.security.secrets.SessionSecrets;
+import org.pronzato.fabric.api.streams.StreamManager;
+import org.pronzato.fabric.api.streams.manager.StreamManagerImpl;
+import org.pronzato.fabric.api.telemetry.manager.FabricOtelEnablement;
+import org.pronzato.fabric.api.telemetry.OtelManager;
+import org.pronzato.fabric.api.telemetry.manager.OtelManagerImpl;
+import org.pronzato.fabric.api.telemetry.manager.OtelManagerNoop;
 import org.pronzato.fabric.api.util.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public final class FlightSqlServiceProducer extends NoOpFlightSqlProducer implements AutoCloseable {
-  private static final Logger LOGGER = LoggerFactory.getLogger(FlightSqlServiceProducer.class);
-  private static final long IPC_READ_ALLOCATOR_BYTES = 64L * 1024L * 1024L;
-  private static final String DATASET_TOKEN_MARKER = datasetTokenMarker();
-  private static final String METADATA_CATALOG_NAME = "fabric";
-  private static final String TABLE_TYPE_TABLE = "TABLE";
-  private static final String TABLE_TYPE_VIEW = "VIEW";
-  private static final String TABLE_TYPE_STREAM = "STREAM";
-  private static final Set<String> SUPPORTED_TABLE_TYPES =
-      Set.of(TABLE_TYPE_TABLE, TABLE_TYPE_VIEW, TABLE_TYPE_STREAM);
-  private static final String OPERATION_STATEMENT_EXECUTE = "flight.sql.statement.execute";
-  private static final String OPERATION_STATEMENT_SCHEMA = "flight.sql.statement.schema";
-  private static final String OPERATION_STATEMENT_FETCH = "flight.sql.statement.fetch";
-  private static final String OPERATION_METADATA_CATALOGS = "flight.sql.metadata.catalogs";
-  private static final String OPERATION_METADATA_SCHEMAS = "flight.sql.metadata.schemas";
-  private static final String OPERATION_METADATA_TABLE_TYPES = "flight.sql.metadata.tableTypes";
-  private static final String OPERATION_METADATA_TABLES = "flight.sql.metadata.tables";
-  private static final String OPERATION_METADATA_TABLE_SCHEMA = "flight.sql.metadata.tableSchema";
+public final class SessionImpl implements Fabric.Session {
+  private static final Logger LOGGER = LoggerFactory.getLogger(SessionImpl.class);
+  private static final String UNKNOWN = "UNKNOWN";
+  private static final String DEFAULT_KERBEROS_REALM = "FABRIC.TEST.REALM";
+  private static final int DEFAULT_DUPLICATE_INSTANCE_CHECK_ATTEMPTS = 6;
+  private static final long DEFAULT_DUPLICATE_INSTANCE_CHECK_DELAY_MILLIS = 3_000L;
+  private static final Duration DEFAULT_DUPLICATE_HEARTBEAT_GRACE = Duration.ofSeconds(12);
+  private static final long DEFAULT_SERVICE_HEARTBEAT_CADENCE_SECONDS = 10L;
+  private static final long DEFAULT_SERVICE_STATUS_CADENCE_SECONDS = 30L;
+  private static final long DEFAULT_DATA_STATUS_CADENCE_SECONDS = 30L;
+  private static final int STATUS_SCHEDULER_THREADS = 2;
+  private static final AtomicInteger STATUS_SCHEDULER_THREAD_ID = new AtomicInteger(0);
 
-  private final TabularManager tabularManager;
-  private final ServiceEntitlements serviceEntitlements;
-  private final String serviceResourceId;
-  private final DiscoveryCache DiscoveryCache;
-  private final String runtimeEnvironment;
-  private final String advertiseHost;
-  private final IntSupplier portSupplier;
-  private final boolean tlsEnabled;
-  private final ConcurrentMap<String, PendingStatement> statements = new ConcurrentHashMap<>();
-  private final RootAllocator ipcReadAllocator = new RootAllocator(IPC_READ_ALLOCATOR_BYTES);
-  private final CheckpointStore checkpointStore;
-  private final FlightDatasetStreamProducer datasetStreamProducer;
-  private final Set<DatasetId> allowedDatasetIds;
+  private final SessionConfig cfg;
+  private final String sessionId = UUID.randomUUID().toString();
+  private final Object lifecycleLock = new Object();
+  private final AtomicBoolean started = new AtomicBoolean(false);
+  private final AtomicBoolean closed = new AtomicBoolean(false);
+  private final AtomicBoolean shutdownHookRegistered = new AtomicBoolean(false);
+  private final Thread shutdownHook;
+  private final ConnectionManagerImpl connectionManager;
+  private final SecurityManager securityManager;
 
-  public FlightSqlServiceProducer(
-      TabularManager tabularManager,
-      ServiceEntitlements serviceEntitlements,
-      String serviceResourceId,
-      DiscoveryCache DiscoveryCache,
-      String runtimeEnvironment,
-      String advertiseHost,
-      IntSupplier portSupplier,
-      boolean tlsEnabled) {
-    this(
-        tabularManager,
-        serviceEntitlements,
-        serviceResourceId,
-        DiscoveryCache,
-        runtimeEnvironment,
-        advertiseHost,
-        portSupplier,
-        tlsEnabled,
-        CheckpointStores.failFast(
-            "FlightSqlServiceProducer checkpoint store is not configured. Configure session with withCheckpointPath(...)"));
+  private volatile String group;
+  private volatile String appName;
+  private volatile String instance;
+  private volatile String env = UNKNOWN;
+  private volatile String region = UNKNOWN;
+  private volatile String site = UNKNOWN;
+  private volatile boolean configCacheAdmin;
+  private volatile List<String> normalizedDiscoveryUrls = List.of();
+  private volatile List<String> discoveryUris = List.of();
+  private volatile ControlConnection controlPlaneConnection;
+  private volatile String runtimePlacementHost;
+  private volatile DiscoveryManager discoveryManager;
+  private volatile DeleteManager deleteManager;
+  private volatile DefinitionEnvironment environmentDefinition;
+  private volatile DefinitionApp appDefinition;
+  private volatile AppStatusPublisher statusPublisher;
+  private volatile SessionVmArgs kerberosPropertyScope;
+  private volatile SessionContext sessionContext;
+  private volatile ScheduledExecutorService statusScheduler;
+  private volatile Path checkpointPath;
+  private volatile CheckpointStore checkpointStore;
+  private volatile DiscoveryCacheRecoveryResult discoveryRecoveryStatus =
+      DiscoveryCacheRecoveryResult.notStarted();
+  private final DiscoveryCacheSnapshotService discoverySnapshotService =
+      new DiscoveryCacheSnapshotService();
+  private final RecoveryManager recoveryManager;
+
+  private volatile ServiceManager serviceManager;
+  private final AccessManagerImpl accessManager;
+  private volatile DataManagers dataPlanes;
+  private volatile ConfigManagerImpl configsCore;
+  private volatile SchemaManager schemaRegistryManager;
+  private volatile StreamManagerImpl streamManager;
+  private volatile CatalogManager assetCatalogService;
+  private volatile ServiceEntitlements serviceEntitlements;
+  private volatile DataEntitlements dataEntitlements;
+  private volatile EntitlementsManagerImpl entitlementsManager;
+  private volatile OtelManager otelManager;
+  private final boolean serviceEntitlementsLogDecisions;
+  private final boolean grpcRoutingLogSelections;
+  private final String statusUserTag;
+
+  public SessionImpl(SessionConfig config) {
+    this.cfg = Objects.requireNonNull(config, "config");
+    this.group = Strings.trimToNull(config.group());
+    this.appName = Strings.trimToNull(config.appName());
+    this.instance = SessionBootstrap.resolveInstanceName(config.instance());
+    this.normalizedDiscoveryUrls = SessionBootstrap.normalizeDiscoveryUrls(config.discoveryUrls());
+    this.shutdownHook = new Thread(this::closeQuietlyFromShutdownHook, "fabric-session-" + sessionId);
+    this.serviceEntitlementsLogDecisions = config.entitlementsDecisionLogging();
+    this.grpcRoutingLogSelections = config.grpcRoutingLogSelections();
+    this.statusUserTag = config.statusUserTag();
+    this.connectionManager =
+        new ConnectionManagerImpl(
+            this::discoveryCache, () -> group, () -> sessionContext, cfg, this::decryptS3Credential);
+    this.securityManager =
+        new SecurityManagerImpl(this::discoveryCache, () -> group, connectionManager::evictS3Connection);
+    this.accessManager =
+        new AccessManagerImpl(
+            this, () -> entitlementsManager, this::discoveryCache, this::serviceStatusCache);
+    this.recoveryManager =
+        new RecoveryManagerImpl(
+            this::dumpConfiguredRecoverySnapshot, this::currentDiscoveryRecoveryStatus);
+    refreshSessionViews();
   }
 
-  public FlightSqlServiceProducer(
-      TabularManager tabularManager,
-      ServiceEntitlements serviceEntitlements,
-      String serviceResourceId,
-      DiscoveryCache DiscoveryCache,
-      String runtimeEnvironment,
-      String advertiseHost,
-      IntSupplier portSupplier,
-      boolean tlsEnabled,
-      CheckpointStore checkpointStore) {
-    this(
-        tabularManager,
-        serviceEntitlements,
-        serviceResourceId,
-        DiscoveryCache,
-        runtimeEnvironment,
-        advertiseHost,
-        portSupplier,
-        tlsEnabled,
-        checkpointStore,
-        Set.of());
-  }
 
-  public FlightSqlServiceProducer(
-      TabularManager tabularManager,
-      ServiceEntitlements serviceEntitlements,
-      String serviceResourceId,
-      DiscoveryCache DiscoveryCache,
-      String runtimeEnvironment,
-      String advertiseHost,
-      IntSupplier portSupplier,
-      boolean tlsEnabled,
-      CheckpointStore checkpointStore,
-      Set<DatasetId> allowedDatasetIds) {
-    this.tabularManager = Objects.requireNonNull(tabularManager, "tabularManager");
-    this.serviceEntitlements = Objects.requireNonNull(serviceEntitlements, "serviceEntitlements");
-    this.serviceResourceId = Objects.requireNonNull(serviceResourceId, "serviceResourceId");
-    this.DiscoveryCache = DiscoveryCache;
-    this.runtimeEnvironment = Strings.trimToNull(runtimeEnvironment);
-    this.advertiseHost = Objects.requireNonNull(advertiseHost, "advertiseHost");
-    this.portSupplier = Objects.requireNonNull(portSupplier, "portSupplier");
-    this.tlsEnabled = tlsEnabled;
-    this.checkpointStore = Objects.requireNonNull(checkpointStore, "checkpointStore");
-    this.allowedDatasetIds =
-        allowedDatasetIds == null || allowedDatasetIds.isEmpty()
-            ? Set.of()
-            : Set.copyOf(allowedDatasetIds);
-    this.datasetStreamProducer =
-        new FlightDatasetStreamProducer(
-            this.tabularManager,
-            this.serviceEntitlements,
-            this.serviceResourceId,
-            this.DiscoveryCache,
-            this.checkpointStore,
-            DuckdbNotifier.shared(),
-            this.allowedDatasetIds);
+  @Override
+  public SessionContext context() {
+    return sessionContext;
   }
 
   @Override
-  public FlightInfo getFlightInfoStatement(
-      FlightSql.CommandStatementQuery command,
-      FlightProducer.CallContext context,
-      FlightDescriptor descriptor) {
-    RequestIdentity identity = resolveIdentity(context);
-    return RequestIdentityResolver.callAsRequestIdentity(
-        identity,
-        () -> {
-          String subject = identity.effectiveUserSubject();
-          authorizeInvoke(subject, OPERATION_STATEMENT_EXECUTE, command == null ? null : command.getQuery());
-
-          DatasetId datasetId = resolveDatasetId(context);
-          installDatasetIfPresent(datasetId);
-          String sql = rewriteDatasetPlaceholder(requireSql(command), datasetId);
-          logSqlRequest(identity, OPERATION_STATEMENT_EXECUTE, datasetId, sql);
-          ByteBuffer ipc = queryIpcSqlAsCaller(identity, sql, datasetId);
-          IpcSummary summary = inspectIpc(ipc);
-
-          String statementHandle = UUID.randomUUID().toString();
-          statements.put(
-              statementHandle, new PendingStatement(subject, summary.schema(), summary.rowCount(), ipc));
-
-          FlightSql.TicketStatementQuery ticketMessage =
-              FlightSql.TicketStatementQuery.newBuilder()
-                  .setStatementHandle(ByteString.copyFromUtf8(statementHandle))
-                  .build();
-          Ticket ticket = new Ticket(ticketMessage.toByteArray());
-          FlightDescriptor responseDescriptor =
-              descriptor != null
-                  ? descriptor
-                  : FlightDescriptor.command(Any.pack(command).toByteArray());
-          FlightEndpoint endpoint = new FlightEndpoint(ticket, location());
-          return new FlightInfo(
-              summary.schema(),
-              responseDescriptor,
-              List.of(endpoint),
-              summary.rowCount(),
-              summary.rowCount());
-        });
+  public ServiceManager services() {
+    return serviceManager;
   }
 
   @Override
-  public SchemaResult getSchemaStatement(
-      FlightSql.CommandStatementQuery command,
-      FlightProducer.CallContext context,
-      FlightDescriptor descriptor) {
-    RequestIdentity identity = resolveIdentity(context);
-    return RequestIdentityResolver.callAsRequestIdentity(
-        identity,
-        () -> {
-          authorizeInvoke(
-              identity.effectiveUserSubject(),
-              OPERATION_STATEMENT_SCHEMA,
-              command == null ? null : command.getQuery());
+  public AccessManager access() {
+    return accessManager;
+  }
 
-          DatasetId datasetId = resolveDatasetId(context);
-          installDatasetIfPresent(datasetId);
-          String sql = rewriteDatasetPlaceholder(requireSql(command), datasetId);
-          logSqlRequest(identity, OPERATION_STATEMENT_SCHEMA, datasetId, sql);
-          ByteBuffer ipc = queryIpcSqlAsCaller(identity, sql, datasetId);
-          return new SchemaResult(inspectIpc(ipc).schema());
-        });
+  public ServiceEntitlements serviceEntitlements() {
+    return serviceEntitlements;
   }
 
   @Override
-  public FlightInfo getFlightInfoCatalogs(
-      FlightSql.CommandGetCatalogs command,
-      FlightProducer.CallContext context,
-      FlightDescriptor descriptor) {
-    RequestIdentity identity = resolveIdentity(context);
-    return RequestIdentityResolver.callAsRequestIdentity(
-        identity,
-        () -> {
-          authorizeInvoke(identity.effectiveUserSubject(), OPERATION_METADATA_CATALOGS, null);
-          FlightSql.CommandGetCatalogs resolved =
-              command == null ? FlightSql.CommandGetCatalogs.getDefaultInstance() : command;
-          return metadataFlightInfo(
-              FlightSqlProducer.Schemas.GET_CATALOGS_SCHEMA, descriptor, resolved);
-        });
+  public DataManagers data() {
+    return dataPlanes;
   }
 
   @Override
-  public FlightInfo getFlightInfoSchemas(
-      FlightSql.CommandGetDbSchemas command,
-      FlightProducer.CallContext context,
-      FlightDescriptor descriptor) {
-    RequestIdentity identity = resolveIdentity(context);
-    return RequestIdentityResolver.callAsRequestIdentity(
-        identity,
-        () -> {
-          authorizeInvoke(identity.effectiveUserSubject(), OPERATION_METADATA_SCHEMAS, null);
-          FlightSql.CommandGetDbSchemas resolved =
-              command == null ? FlightSql.CommandGetDbSchemas.getDefaultInstance() : command;
-          validateExactPatternOrAll(
-              resolved.getDbSchemaFilterPattern(), "db_schema_name_pattern");
-          validateExactPatternOrAll(resolved.getCatalog(), "catalog");
-          return metadataFlightInfo(
-              FlightSqlProducer.Schemas.GET_SCHEMAS_SCHEMA, descriptor, resolved);
-        });
+  public ConfigManager configs() {
+    return configsCore;
   }
 
   @Override
-  public FlightInfo getFlightInfoTableTypes(
-      FlightSql.CommandGetTableTypes command,
-      FlightProducer.CallContext context,
-      FlightDescriptor descriptor) {
-    RequestIdentity identity = resolveIdentity(context);
-    return RequestIdentityResolver.callAsRequestIdentity(
-        identity,
-        () -> {
-          authorizeInvoke(identity.effectiveUserSubject(), OPERATION_METADATA_TABLE_TYPES, null);
-          FlightSql.CommandGetTableTypes resolved =
-              command == null ? FlightSql.CommandGetTableTypes.getDefaultInstance() : command;
-          return metadataFlightInfo(
-              FlightSqlProducer.Schemas.GET_TABLE_TYPES_SCHEMA, descriptor, resolved);
-        });
+  public SchemaManager schemas() {
+    return schemaRegistryManager;
   }
 
   @Override
-  public FlightInfo getFlightInfoTables(
-      FlightSql.CommandGetTables command,
-      FlightProducer.CallContext context,
-      FlightDescriptor descriptor) {
-    RequestIdentity identity = resolveIdentity(context);
-    return RequestIdentityResolver.callAsRequestIdentity(
-        identity,
-        () -> {
-          authorizeInvoke(identity.effectiveUserSubject(), OPERATION_METADATA_TABLES, null);
-          FlightSql.CommandGetTables resolved =
-              command == null ? FlightSql.CommandGetTables.getDefaultInstance() : command;
-          validateExactPatternOrAll(resolved.getCatalog(), "catalog");
-          validateExactPatternOrAll(
-              resolved.getDbSchemaFilterPattern(), "db_schema_name_pattern");
-          validateExactPatternOrAll(
-              resolved.getTableNameFilterPattern(), "table_name_pattern");
-          validateRequestedTableTypes(resolved.getTableTypesList());
-          Schema responseSchema =
-              resolved.getIncludeSchema()
-                  ? FlightSqlProducer.Schemas.GET_TABLES_SCHEMA
-                  : FlightSqlProducer.Schemas.GET_TABLES_SCHEMA_NO_SCHEMA;
-          return metadataFlightInfo(responseSchema, descriptor, resolved);
-        });
+  public StreamManager streams() {
+    return streamManager;
+  }
+
+  public DeleteManager deletes() {
+    return deleteManager;
   }
 
   @Override
-  public SchemaResult getSchema(
-      FlightProducer.CallContext context, FlightDescriptor descriptor) {
-    if (descriptor == null || !descriptor.isCommand()) {
-      return super.getSchema(context, descriptor);
-    }
-    Any packed;
-    try {
-      packed = Any.parseFrom(descriptor.getCommand());
-    } catch (Exception ex) {
-      return super.getSchema(context, descriptor);
-    }
-    if (!packed.is(FlightSql.CommandGetTables.class)) {
-      return super.getSchema(context, descriptor);
-    }
-    FlightSql.CommandGetTables command;
-    try {
-      command = packed.unpack(FlightSql.CommandGetTables.class);
-    } catch (InvalidProtocolBufferException ex) {
-      throw CallStatus.INVALID_ARGUMENT
-          .withDescription("Invalid Flight SQL GetTableSchema descriptor payload")
-          .withCause(ex)
-          .toRuntimeException();
-    }
-    return getTableSchema(command, context);
+  public ConnectionManager connections() {
+    return connectionManager;
   }
 
   @Override
-  public void getStream(
-      FlightProducer.CallContext context,
-      Ticket ticket,
-      FlightProducer.ServerStreamListener listener) {
-    Objects.requireNonNull(ticket, "ticket");
-    if (FlightDatasetStreamTicketCodec.isStreamTicket(ticket)) {
-      handleDatasetStream(context, ticket, listener);
-      return;
-    }
-    if (dispatchMetadataTicket(context, ticket, listener)) {
-      return;
-    }
-    if (dispatchStatementTicket(context, ticket, listener)) {
-      return;
-    }
-    throw CallStatus.INVALID_ARGUMENT.withDescription("Invalid Flight SQL ticket").toRuntimeException();
+  public CatalogManager catalog() {
+    return assetCatalogService;
   }
 
   @Override
-  public void getStreamStatement(
-      FlightSql.TicketStatementQuery ticket,
-      FlightProducer.CallContext context,
-      FlightProducer.ServerStreamListener listener) {
-    RequestIdentity identity = resolveIdentity(context);
-    RequestIdentityResolver.runAsRequestIdentity(
-        identity,
-        () -> {
-          String caller = identity.effectiveUserSubject();
-          authorizeInvoke(caller, OPERATION_STATEMENT_FETCH, null);
+  public SecurityManager security() {
+    return securityManager;
+  }
 
-          String handle =
-              ticket == null || ticket.getStatementHandle() == null
-                  ? null
-                  : Strings.trimToNull(ticket.getStatementHandle().toStringUtf8());
-          if (handle == null) {
-            throw CallStatus.INVALID_ARGUMENT
-                .withDescription("Ticket statement handle is required")
-                .toRuntimeException();
-          }
-          PendingStatement pending = statements.remove(handle);
-          if (pending == null) {
-            throw CallStatus.NOT_FOUND
-                .withDescription("Unknown statement handle: " + handle)
-                .toRuntimeException();
-          }
-          LOGGER.info("[FlightSQL][request] requestId={} operation={} subject={} statementHandle={} cachedRows={}", identity.requestId(), OPERATION_STATEMENT_FETCH, safeSubject(caller), handle, pending.rowCount());
-          if (!Objects.equals(pending.callerSubject(), caller)) {
-            throw CallStatus.UNAUTHORIZED
-                .withDescription("Statement handle is not owned by caller")
-                .toRuntimeException();
-          }
-          streamIpc(listener, pending.ipcBytes());
-        });
+  public boolean grpcRoutingLogSelections() {
+    return grpcRoutingLogSelections;
+  }
+
+  public String statusUserTag() {
+    return statusUserTag;
+  }
+
+  Path checkpointPath() {
+    return checkpointPath;
+  }
+
+  Path configuredCheckpointPath() {
+    return cfg.checkpointPath();
+  }
+
+  public DefinitionApp appDefinition() {
+    return appDefinition;
   }
 
   @Override
-  public void getStreamCatalogs(
-      FlightProducer.CallContext context, FlightProducer.ServerStreamListener listener) {
-    RequestIdentity identity = resolveIdentity(context);
-    RequestIdentityResolver.runAsRequestIdentity(
-        identity,
-        () -> {
-          authorizeInvoke(identity.effectiveUserSubject(), OPERATION_METADATA_CATALOGS, null);
-          List<String> catalogs = List.of(METADATA_CATALOG_NAME);
-          VectorSchemaRoot root =
-              buildCatalogsRoot(catalogs, FlightSqlProducer.Schemas.GET_CATALOGS_SCHEMA);
-          streamSingleBatch(listener, root);
-        });
+  public OtelManager telemetry() {
+    return otelManager;
   }
-
+  
   @Override
-  public void getStreamSchemas(
-      FlightSql.CommandGetDbSchemas command,
-      FlightProducer.CallContext context,
-      FlightProducer.ServerStreamListener listener) {
-    RequestIdentity identity = resolveIdentity(context);
-    RequestIdentityResolver.runAsRequestIdentity(
-        identity,
-        () -> {
-          authorizeInvoke(identity.effectiveUserSubject(), OPERATION_METADATA_SCHEMAS, null);
-          FlightSql.CommandGetDbSchemas resolved =
-              command == null ? FlightSql.CommandGetDbSchemas.getDefaultInstance() : command;
-          String catalog = validateExactPatternOrAll(resolved.getCatalog(), "catalog");
-          String schemaPattern =
-              validateExactPatternOrAll(
-                  resolved.getDbSchemaFilterPattern(), "db_schema_name_pattern");
-          List<String> schemas = listSchemas(identity, catalog, schemaPattern);
-          VectorSchemaRoot root =
-              buildSchemasRoot(schemas, FlightSqlProducer.Schemas.GET_SCHEMAS_SCHEMA);
-          streamSingleBatch(listener, root);
-        });
-  }
-
-  @Override
-  public void getStreamTableTypes(
-      FlightProducer.CallContext context, FlightProducer.ServerStreamListener listener) {
-    RequestIdentity identity = resolveIdentity(context);
-    RequestIdentityResolver.runAsRequestIdentity(
-        identity,
-        () -> {
-          authorizeInvoke(identity.effectiveUserSubject(), OPERATION_METADATA_TABLE_TYPES, null);
-          VectorSchemaRoot root =
-              buildTableTypesRoot(
-                  List.of(TABLE_TYPE_TABLE, TABLE_TYPE_VIEW, TABLE_TYPE_STREAM),
-                  FlightSqlProducer.Schemas.GET_TABLE_TYPES_SCHEMA);
-          streamSingleBatch(listener, root);
-        });
-  }
-
-  @Override
-  public void getStreamTables(
-      FlightSql.CommandGetTables command,
-      FlightProducer.CallContext context,
-      FlightProducer.ServerStreamListener listener) {
-    RequestIdentity identity = resolveIdentity(context);
-    RequestIdentityResolver.runAsRequestIdentity(
-        identity,
-        () -> {
-          authorizeInvoke(identity.effectiveUserSubject(), OPERATION_METADATA_TABLES, null);
-          FlightSql.CommandGetTables resolved =
-              command == null ? FlightSql.CommandGetTables.getDefaultInstance() : command;
-          String catalog = validateExactPatternOrAll(resolved.getCatalog(), "catalog");
-          String schemaPattern =
-              validateExactPatternOrAll(
-                  resolved.getDbSchemaFilterPattern(), "db_schema_name_pattern");
-          String tablePattern =
-              validateExactPatternOrAll(
-                  resolved.getTableNameFilterPattern(), "table_name_pattern");
-          Set<String> requestedTypes = validateRequestedTableTypes(resolved.getTableTypesList());
-          List<DuckdbCatalogImpl.MetadataTable> rows =
-              listTables(identity, catalog, schemaPattern, tablePattern, requestedTypes);
-          if (resolved.getIncludeSchema()) {
-            VectorSchemaRoot root =
-                buildTablesWithSchemaRoot(rows, FlightSqlProducer.Schemas.GET_TABLES_SCHEMA, false);
-            streamSingleBatch(listener, root);
-            return;
-          }
-          VectorSchemaRoot root =
-              buildTablesRoot(rows, FlightSqlProducer.Schemas.GET_TABLES_SCHEMA_NO_SCHEMA);
-          streamSingleBatch(listener, root);
-        });
-  }
-
-  private void handleDatasetStream(
-      FlightProducer.CallContext context,
-      Ticket ticket,
-      FlightProducer.ServerStreamListener listener) {
-    RequestIdentity identity = resolveIdentity(context);
-    FlightSqlRequestHeadersMiddleware middleware =
-        context == null ? null : context.getMiddleware(FlightSqlRequestHeadersMiddleware.KEY);
-    org.pronzato.fabric.api.control.security.headers.FabricRequestHeaders requestHeaders =
-        middleware == null ? null : middleware.requestHeaders();
-    RequestIdentityResolver.runAsRequestIdentity(
-        identity, () -> datasetStreamProducer.start(identity, requestHeaders, ticket, listener, null));
-  }
-
-  @Override
-  public void listFlights(
-      FlightProducer.CallContext context,
-      Criteria criteria,
-      FlightProducer.StreamListener<FlightInfo> listener) {
-    listener.onCompleted();
-  }
-
-  private FlightInfo metadataFlightInfo(
-      Schema schema, FlightDescriptor descriptor, com.google.protobuf.Message command) {
-    Objects.requireNonNull(schema, "schema");
-    Objects.requireNonNull(command, "command");
-    byte[] commandBytes = Any.pack(command).toByteArray();
-    FlightDescriptor responseDescriptor =
-        descriptor != null ? descriptor : FlightDescriptor.command(commandBytes);
-    Ticket ticket = new Ticket(commandBytes);
-    FlightEndpoint endpoint = new FlightEndpoint(ticket, location());
-    return new FlightInfo(schema, responseDescriptor, List.of(endpoint), -1L, -1L);
-  }
-
-  private boolean dispatchStatementTicket(
-      FlightProducer.CallContext context,
-      Ticket ticket,
-      FlightProducer.ServerStreamListener listener) {
-    FlightSql.TicketStatementQuery statementTicket;
-    try {
-      statementTicket = FlightSql.TicketStatementQuery.parseFrom(ticket.getBytes());
-    } catch (Exception ex) {
-      return false;
-    }
-    String handle =
-        statementTicket == null || statementTicket.getStatementHandle() == null
-            ? null
-            : Strings.trimToNull(statementTicket.getStatementHandle().toStringUtf8());
-    if (handle == null || !statements.containsKey(handle)) {
-      return false;
-    }
-    getStreamStatement(statementTicket, context, listener);
-    return true;
-  }
-
-  private boolean dispatchMetadataTicket(
-      FlightProducer.CallContext context,
-      Ticket ticket,
-      FlightProducer.ServerStreamListener listener) {
-    final Any packed;
-    try {
-      packed = Any.parseFrom(ticket.getBytes());
-    } catch (Exception ex) {
-      return false;
-    }
-    try {
-      if (packed.is(FlightSql.CommandGetCatalogs.class)) {
-        getStreamCatalogs(context, listener);
-        return true;
+  public void start() throws Exception {
+    synchronized (lifecycleLock) {
+      if (closed.get()) {
+        throw new IllegalStateException("Session is closed");
       }
-      if (packed.is(FlightSql.CommandGetDbSchemas.class)) {
-        getStreamSchemas(packed.unpack(FlightSql.CommandGetDbSchemas.class), context, listener);
-        return true;
+      if (started.get()) {
+        return;
       }
-      if (packed.is(FlightSql.CommandGetTableTypes.class)) {
-        getStreamTableTypes(context, listener);
-        return true;
-      }
-      if (packed.is(FlightSql.CommandGetTables.class)) {
-        getStreamTables(packed.unpack(FlightSql.CommandGetTables.class), context, listener);
-        return true;
-      }
-    } catch (InvalidProtocolBufferException ex) {
-      throw CallStatus.INVALID_ARGUMENT
-          .withDescription("Invalid Flight SQL metadata ticket payload")
-          .withCause(ex)
-          .toRuntimeException();
-    }
-    return false;
-  }
 
-  private SchemaResult getTableSchema(
-      FlightSql.CommandGetTables command, FlightProducer.CallContext context) {
-    RequestIdentity identity = resolveIdentity(context);
-    return RequestIdentityResolver.callAsRequestIdentity(
-        identity,
-        () -> {
-          authorizeInvoke(identity.effectiveUserSubject(), OPERATION_METADATA_TABLE_SCHEMA, null);
-          FlightSql.CommandGetTables resolved =
-              command == null ? FlightSql.CommandGetTables.getDefaultInstance() : command;
-          String catalog = validateExactPatternOrAll(resolved.getCatalog(), "catalog");
-          String schemaPattern =
-              validateExactPatternOrAll(
-                  resolved.getDbSchemaFilterPattern(), "db_schema_name_pattern");
-          String tablePattern =
-              validateExactPatternOrAll(
-                  resolved.getTableNameFilterPattern(), "table_name_pattern");
-          if (schemaPattern == null || tablePattern == null) {
-            throw CallStatus.INVALID_ARGUMENT
-                .withDescription(
-                    "GetTableSchema requires exact db_schema_name_pattern and table_name_pattern")
-                .toRuntimeException();
-          }
-          Set<String> requestedTypes = validateRequestedTableTypes(resolved.getTableTypesList());
-          List<DuckdbCatalogImpl.MetadataTable> rows =
-              listTables(identity, catalog, schemaPattern, tablePattern, requestedTypes);
-          if (rows.isEmpty()) {
-            throw CallStatus.NOT_FOUND
-                .withDescription("Table not found: " + schemaPattern + "." + tablePattern)
-                .toRuntimeException();
-          }
-          if (rows.size() > 1) {
-            List<DatasetId> distinctDatasets =
-                rows.stream().map(DuckdbCatalogImpl.MetadataTable::datasetId).distinct().toList();
-            if (distinctDatasets.size() > 1) {
-              throw CallStatus.INVALID_ARGUMENT
-                  .withDescription(
-                      "Ambiguous table reference for GetTableSchema: "
-                          + schemaPattern
-                          + "."
-                          + tablePattern)
-                  .toRuntimeException();
-            }
-            return new SchemaResult(tableSchemaForDataset(distinctDatasets.get(0), true));
-          }
-          return new SchemaResult(tableSchemaForDataset(rows.get(0).datasetId(), true));
-        });
-  }
+      long startupStartNanos = System.nanoTime();
+      LOGGER.info(
+          "[Session][StartupTiming] phase=start group={} app={} instance={} recoveryEnabled={}",
+          cfg.group(),
+          cfg.appName(),
+          cfg.instance(),
+          cfg.discoveryCacheRecoveryEnabled());
 
-  private List<String> listSchemas(
-      RequestIdentity identity, String catalog, String schemaPattern) {
-    if (catalog != null && !matchesExactIgnoreCase(catalog, METADATA_CATALOG_NAME)) {
-      return List.of();
-    }
-    LinkedHashSet<String> schemas = new LinkedHashSet<>();
-    for (DuckdbCatalogImpl.MetadataTable table : listReadableTables(identity)) {
-      if (schemaPattern != null && !matchesExactIgnoreCase(table.namespace(), schemaPattern)) {
-        continue;
-      }
-      schemas.add(table.namespace());
-    }
-    return List.copyOf(schemas);
-  }
+      long phaseStartNanos = System.nanoTime();
+      SessionBootstrap.BootstrapResult result = bootstrapWithRecoveryFallback();
+      LOGGER.info(
+          "[Session][StartupTiming] phase=bootstrap elapsedMs={} mode={}",
+          elapsedMillis(phaseStartNanos),
+          discoveryRecoveryStatus.recoveryUsed() ? "recovered" : "live");
 
-  private List<DuckdbCatalogImpl.MetadataTable> listTables(
-      RequestIdentity identity,
-      String catalog,
-      String schemaPattern,
-      String tablePattern,
-      Set<String> requestedTypes) {
-    if (catalog != null && !matchesExactIgnoreCase(catalog, METADATA_CATALOG_NAME)) {
-      LOGGER.info("[FlightSQL][metadata][tables] requestId={} serviceId={} subject={} catalog={} schemaPattern={} tablePattern={} types={} rowCount=0 tables=[] datasetIds=[]", identity.requestId(), serviceResourceId, safeSubject(identity.effectiveUserSubject()), catalog, schemaPattern, tablePattern, summarizeValues(requestedTypes, 10));
-      return List.of();
-    }
-    List<DuckdbCatalogImpl.MetadataTable> rows = new ArrayList<>();
-    for (DuckdbCatalogImpl.MetadataTable table : listReadableTables(identity)) {
-      if (schemaPattern != null && !matchesExactIgnoreCase(table.namespace(), schemaPattern)) {
-        continue;
-      }
-      if (tablePattern != null && !matchesExactIgnoreCase(table.name(), tablePattern)) {
-        continue;
-      }
-      if (!requestedTypes.isEmpty()
-          && !requestedTypes.contains(table.tableType().toUpperCase(Locale.ROOT))) {
-        continue;
-      }
-      rows.add(table);
-    }
-    List<DuckdbCatalogImpl.MetadataTable> resolvedRows = List.copyOf(rows);
-    List<String> tableRefs = new ArrayList<>(resolvedRows.size());
-    LinkedHashSet<String> datasetIds = new LinkedHashSet<>();
-    for (DuckdbCatalogImpl.MetadataTable row : resolvedRows) {
-      if (row == null) {
-        continue;
-      }
-      tableRefs.add(
-          Strings.firstNonBlank(row.namespace(), "<null>")
-              + "."
-              + Strings.firstNonBlank(row.name(), "<null>")
-              + "("
-              + Strings.firstNonBlank(row.tableType(), "<null>")
-              + ")");
-      if (row.datasetId() != null) {
-        datasetIds.add(row.datasetId().toString());
-      }
-    }
-    LOGGER.info("[FlightSQL][metadata][tables] requestId={} serviceId={} subject={} catalog={} schemaPattern={} tablePattern={} types={} rowCount={} tables={} datasetIds={}", identity.requestId(), serviceResourceId, safeSubject(identity.effectiveUserSubject()), Strings.firstNonBlank(catalog, "<none>"), Strings.firstNonBlank(schemaPattern, "<none>"), Strings.firstNonBlank(tablePattern, "<none>"), summarizeValues(requestedTypes, 10), resolvedRows.size(), summarizeValues(tableRefs, 40), summarizeValues(datasetIds, 40));
-    return resolvedRows;
-  }
+      phaseStartNanos = System.nanoTime();
+      this.kerberosPropertyScope = result.kerberosPropertyScope();
+      this.group = result.group();
+      this.appName = result.appName();
+      this.instance = result.instance();
+      this.normalizedDiscoveryUrls = result.discoveryUrls();
+      this.env = result.environment();
+      this.region = result.region();
+      this.site = result.site();
+      this.configCacheAdmin = result.configCacheAdmin();
+      this.discoveryUris = result.discoveryUris();
+      this.controlPlaneConnection = result.controlPlaneConnection();
+      this.runtimePlacementHost = resolveHostname();
+      this.environmentDefinition = result.environmentDefinition();
+      this.appDefinition = result.appDefinition();
+      this.otelManager = createOtelManager(result.environmentDefinition(), result.appDefinition());
+      LOGGER.info(
+          "[Session][StartupTiming] phase=bootstrap-assign elapsedMs={}",
+          elapsedMillis(phaseStartNanos));
 
-  private List<DuckdbCatalogImpl.MetadataTable> listReadableTables(RequestIdentity identity) {
-    DuckdbCatalogImpl catalog = requireMetadataCatalog();
-    RowManagerImpl rowManager = requireLocalRowManager();
-    DataEntitlements entitlements = rowManager.dataEntitlementsForSqlPlanning();
-    DataEntitlements.Identity entitlementsIdentity =
-        new DataEntitlements.Identity(identity.effectiveUserSubject(), null);
-    List<DuckdbCatalogImpl.MetadataTable> catalogTables = catalog.metadataTables();
-    if (catalogTables.isEmpty()) {
-      LOGGER.info("[FlightSQL][metadata][visibility] requestId={} serviceId={} subject={} catalogTableCount=0 visibleTableCount=0 deniedTableCount=0 deniedSamples=[]", identity.requestId(), serviceResourceId, safeSubject(identity.effectiveUserSubject()));
-      return List.of();
-    }
-    List<DuckdbCatalogImpl.MetadataTable> visible = new ArrayList<>();
-    int deniedCount = 0;
-    List<String> deniedSamples = new ArrayList<>();
-    for (DuckdbCatalogImpl.MetadataTable table : catalogTables) {
-      DataEntitlements.Decision decision =
-          entitlements.authorizeRead(entitlementsIdentity, table.datasetId().toString());
-      if (decision != null && decision.allowed()) {
-        visible.add(table);
+      phaseStartNanos = System.nanoTime();
+      Path configuredCheckpointPath = cfg.checkpointPath();
+      if (configuredCheckpointPath != null) {
+        Path resolvedCheckpointPath = configuredCheckpointPath.toAbsolutePath().normalize();
+        this.checkpointPath = resolvedCheckpointPath;
+        this.checkpointStore = CheckpointStores.local(resolvedCheckpointPath);
+        LOGGER.info("[Checkpoint] usingConfiguredPath path={}", resolvedCheckpointPath);
       } else {
-        deniedCount++;
-        if (deniedSamples.size() < 5) {
-          deniedSamples.add(
-              table.datasetId()
-                  + "("
-                  + Strings.firstNonBlank(decision == null ? null : decision.reason(), "DENIED")
-                  + ")");
-        }
+        this.checkpointPath = null;
+        this.checkpointStore =
+            CheckpointStores.noOp(
+                "checkpointPath not configured for session "
+                    + Strings.firstNonBlank(group, "<group>")
+                    + "/"
+                    + Strings.firstNonBlank(appName, "<app>"));
+        LOGGER.info("[Checkpoint] disabled (no checkpointPath configured)");
       }
-    }
-    LOGGER.info("[FlightSQL][metadata][visibility] requestId={} serviceId={} subject={} catalogTableCount={} visibleTableCount={} deniedTableCount={} deniedSamples={}", identity.requestId(), serviceResourceId, safeSubject(identity.effectiveUserSubject()), catalogTables.size(), visible.size(), deniedCount, summarizeValues(deniedSamples, 5));
-    return List.copyOf(visible);
-  }
+      LOGGER.info(
+          "[Session][StartupTiming] phase=checkpoint elapsedMs={}",
+          elapsedMillis(phaseStartNanos));
 
-  private TabularManagerImpl requireLocalTabularManager() {
-    if (tabularManager instanceof TabularManagerImpl local) {
-      return local;
-    }
-    throw CallStatus.UNIMPLEMENTED
-        .withDescription("Flight SQL metadata requires DIRECT mode tabular manager")
-        .toRuntimeException();
-  }
+      phaseStartNanos = System.nanoTime();
+      SessionImplManagers.StartedManagers startedManagers =
+          SessionImplManagers.initialize(
+              this,
+              cfg,
+              result,
+              sessionId,
+              checkpointStore,
+              connectionManager,
+              serviceEntitlementsLogDecisions,
+              LOGGER);
+      DiscoveryCache cache = startedManagers.discoveryCache();
+      LOGGER.info(
+          "[Session][StartupTiming] phase=managers.initialize elapsedMs={}",
+          elapsedMillis(phaseStartNanos));
 
-  private RowManagerImpl requireLocalRowManager() {
-    return requireLocalTabularManager().rowManager();
-  }
+      phaseStartNanos = System.nanoTime();
+      this.discoveryManager = startedManagers.discoveryManager();
+      this.deleteManager = startedManagers.deleteManager();
+      this.entitlementsManager = startedManagers.entitlementsManager();
+      this.serviceEntitlements = startedManagers.serviceEntitlements();
+      this.dataEntitlements = startedManagers.dataEntitlements();
+      this.serviceManager = startedManagers.serviceManager();
+      this.schemaRegistryManager = startedManagers.schemaRegistryManager();
+      this.streamManager = startedManagers.streamManager();
+      this.dataPlanes = startedManagers.dataPlanes();
+      this.assetCatalogService = startedManagers.assetCatalogService();
+      this.configsCore = startedManagers.configsCore();
+      LOGGER.info(
+          "[Session][StartupTiming] phase=managers.publish elapsedMs={}",
+          elapsedMillis(phaseStartNanos));
 
-  private DuckdbCatalogImpl requireMetadataCatalog() {
-    TabularManagerImpl local = requireLocalTabularManager();
-    if (local.catalog() instanceof DuckdbCatalogImpl catalog) {
-      return catalog;
-    }
-    throw CallStatus.UNIMPLEMENTED
-        .withDescription("Flight SQL metadata requires DuckdbCatalogImpl")
-        .toRuntimeException();
-  }
+      phaseStartNanos = System.nanoTime();
+      registerShutdownHook();
+      this.started.set(true);
+      refreshSessionViews();
+      LOGGER.info(
+          "[Session][StartupTiming] phase=session-mark-started elapsedMs={}",
+          elapsedMillis(phaseStartNanos));
 
-  private static String validateExactPatternOrAll(String value, String label) {
-    String normalized = Strings.trimToNull(value);
-    if (normalized == null) {
-      return null;
-    }
-    if (containsWildcardPattern(normalized)) {
-      throw CallStatus.INVALID_ARGUMENT
-          .withDescription("unsupported pattern for " + label + ": " + normalized)
-          .toRuntimeException();
-    }
-    return normalized;
-  }
+      phaseStartNanos = System.nanoTime();
+      SessionImplLifecycle.runDuplicateInstanceCheck(
+          LOGGER,
+          controlPlaneConnection,
+          appDefinition,
+          cfg,
+          group,
+          appName,
+          instance,
+          DEFAULT_DUPLICATE_HEARTBEAT_GRACE,
+          DEFAULT_DUPLICATE_INSTANCE_CHECK_ATTEMPTS,
+          DEFAULT_DUPLICATE_INSTANCE_CHECK_DELAY_MILLIS);
+      LOGGER.info(
+          "[Session][StartupTiming] phase=duplicate-instance-check elapsedMs={}",
+          elapsedMillis(phaseStartNanos));
 
-  private static Set<String> validateRequestedTableTypes(List<String> values) {
-    if (values == null || values.isEmpty()) {
-      return Set.of();
-    }
-    LinkedHashSet<String> normalized = new LinkedHashSet<>();
-    for (String raw : values) {
-      String type = Strings.trimToNull(raw);
-      if (type == null) {
-        continue;
-      }
-      if (containsWildcardPattern(type)) {
-        throw CallStatus.INVALID_ARGUMENT
-            .withDescription("unsupported pattern for table_type: " + type)
-            .toRuntimeException();
-      }
-      String upper = type.toUpperCase(Locale.ROOT);
-      if (!SUPPORTED_TABLE_TYPES.contains(upper)) {
-        throw CallStatus.INVALID_ARGUMENT
-            .withDescription("unsupported table_type: " + type)
-            .toRuntimeException();
-      }
-      normalized.add(upper);
-    }
-    return normalized.isEmpty() ? Set.of() : Set.copyOf(normalized);
-  }
+      phaseStartNanos = System.nanoTime();
+      startStatusPublisher();
+      LOGGER.info(
+          "[Session][StartupTiming] phase=status-publisher-start elapsedMs={}",
+          elapsedMillis(phaseStartNanos));
 
-  private static boolean containsWildcardPattern(String value) {
-    if (value == null || value.isEmpty()) {
-      return false;
-    }
-    return value.contains("%")
-        || value.contains("*")
-        || value.contains("?")
-        || value.contains("[")
-        || value.contains("]")
-        || value.contains(".*");
-  }
+      phaseStartNanos = System.nanoTime();
+      refreshSessionViews();
+      LOGGER.info(
+          "[Session][StartupTiming] phase=session-refresh-final elapsedMs={}",
+          elapsedMillis(phaseStartNanos));
 
-  private static boolean matchesExactIgnoreCase(String left, String right) {
-    if (left == null || right == null) {
-      return false;
-    }
-    return left.equalsIgnoreCase(right);
-  }
-
-  private VectorSchemaRoot buildCatalogsRoot(List<String> catalogs, Schema schema) {
-    VectorSchemaRoot root = VectorSchemaRoot.create(schema, ipcReadAllocator);
-    int rowCount = catalogs == null ? 0 : catalogs.size();
-    VarCharVector catalogVector = (VarCharVector) root.getVector("catalog_name");
-    catalogVector.allocateNew(Math.max(1, rowCount));
-    for (int index = 0; index < rowCount; index++) {
-      putUtf8(catalogVector, index, catalogs.get(index));
-    }
-    catalogVector.setValueCount(rowCount);
-    root.setRowCount(rowCount);
-    return root;
-  }
-
-  private VectorSchemaRoot buildSchemasRoot(List<String> schemas, Schema schema) {
-    VectorSchemaRoot root = VectorSchemaRoot.create(schema, ipcReadAllocator);
-    int rowCount = schemas == null ? 0 : schemas.size();
-    VarCharVector catalogVector = (VarCharVector) root.getVector("catalog_name");
-    VarCharVector schemaVector = (VarCharVector) root.getVector("db_schema_name");
-    catalogVector.allocateNew(Math.max(1, rowCount));
-    schemaVector.allocateNew(Math.max(1, rowCount));
-    for (int index = 0; index < rowCount; index++) {
-      putUtf8(catalogVector, index, METADATA_CATALOG_NAME);
-      putUtf8(schemaVector, index, schemas.get(index));
-    }
-    catalogVector.setValueCount(rowCount);
-    schemaVector.setValueCount(rowCount);
-    root.setRowCount(rowCount);
-    return root;
-  }
-
-  private VectorSchemaRoot buildTableTypesRoot(List<String> tableTypes, Schema schema) {
-    VectorSchemaRoot root = VectorSchemaRoot.create(schema, ipcReadAllocator);
-    int rowCount = tableTypes == null ? 0 : tableTypes.size();
-    VarCharVector typeVector = (VarCharVector) root.getVector("table_type");
-    typeVector.allocateNew(Math.max(1, rowCount));
-    for (int index = 0; index < rowCount; index++) {
-      putUtf8(typeVector, index, tableTypes.get(index));
-    }
-    typeVector.setValueCount(rowCount);
-    root.setRowCount(rowCount);
-    return root;
-  }
-
-  private VectorSchemaRoot buildTablesRoot(List<DuckdbCatalogImpl.MetadataTable> rows, Schema schema) {
-    VectorSchemaRoot root = VectorSchemaRoot.create(schema, ipcReadAllocator);
-    int rowCount = rows == null ? 0 : rows.size();
-    VarCharVector catalogVector = (VarCharVector) root.getVector("catalog_name");
-    VarCharVector schemaVector = (VarCharVector) root.getVector("db_schema_name");
-    VarCharVector tableVector = (VarCharVector) root.getVector("table_name");
-    VarCharVector typeVector = (VarCharVector) root.getVector("table_type");
-    catalogVector.allocateNew(Math.max(1, rowCount));
-    schemaVector.allocateNew(Math.max(1, rowCount));
-    tableVector.allocateNew(Math.max(1, rowCount));
-    typeVector.allocateNew(Math.max(1, rowCount));
-    for (int index = 0; index < rowCount; index++) {
-      DuckdbCatalogImpl.MetadataTable row = rows.get(index);
-      putUtf8(catalogVector, index, METADATA_CATALOG_NAME);
-      putUtf8(schemaVector, index, row.namespace());
-      putUtf8(tableVector, index, row.name());
-      putUtf8(typeVector, index, row.tableType());
-    }
-    catalogVector.setValueCount(rowCount);
-    schemaVector.setValueCount(rowCount);
-    tableVector.setValueCount(rowCount);
-    typeVector.setValueCount(rowCount);
-    root.setRowCount(rowCount);
-    return root;
-  }
-
-  private VectorSchemaRoot buildTablesWithSchemaRoot(
-      List<DuckdbCatalogImpl.MetadataTable> rows, Schema schema, boolean strictSchema) {
-    VectorSchemaRoot root = VectorSchemaRoot.create(schema, ipcReadAllocator);
-    int rowCount = rows == null ? 0 : rows.size();
-    VarCharVector catalogVector = (VarCharVector) root.getVector("catalog_name");
-    VarCharVector schemaVector = (VarCharVector) root.getVector("db_schema_name");
-    VarCharVector tableVector = (VarCharVector) root.getVector("table_name");
-    VarCharVector typeVector = (VarCharVector) root.getVector("table_type");
-    VarBinaryVector tableSchemaVector = (VarBinaryVector) root.getVector("table_schema");
-    catalogVector.allocateNew(Math.max(1, rowCount));
-    schemaVector.allocateNew(Math.max(1, rowCount));
-    tableVector.allocateNew(Math.max(1, rowCount));
-    typeVector.allocateNew(Math.max(1, rowCount));
-    tableSchemaVector.allocateNew();
-    for (int index = 0; index < rowCount; index++) {
-      DuckdbCatalogImpl.MetadataTable row = rows.get(index);
-      putUtf8(catalogVector, index, METADATA_CATALOG_NAME);
-      putUtf8(schemaVector, index, row.namespace());
-      putUtf8(tableVector, index, row.name());
-      putUtf8(typeVector, index, row.tableType());
-      byte[] tableSchema = tableSchemaBytes(row.datasetId(), strictSchema);
-      if (tableSchema == null) {
-        tableSchemaVector.setNull(index);
+      if (discoveryRecoveryStatus.recoveryUsed()) {
+        LOGGER.info(
+            "[Session][DiscoveryRecovery] startup=recovered sessionId={} app={}/{} instance={} snapshotPath={} definitions={}",
+            sessionId,
+            group,
+            appName,
+            instance,
+            discoveryRecoveryStatus.snapshotPath(),
+            discoveryRecoveryStatus.definitionCount());
       } else {
-        tableSchemaVector.setSafe(index, tableSchema);
+        LOGGER.info(
+            "[Session][DiscoveryRecovery] startup=live sessionId={} app={}/{} instance={} endpoints={} definitions={}",
+            sessionId,
+            group,
+            appName,
+            instance,
+            discoveryUris,
+            cache == null ? 0 : cache.size());
       }
-    }
-    catalogVector.setValueCount(rowCount);
-    schemaVector.setValueCount(rowCount);
-    tableVector.setValueCount(rowCount);
-    typeVector.setValueCount(rowCount);
-    tableSchemaVector.setValueCount(rowCount);
-    root.setRowCount(rowCount);
-    return root;
-  }
-
-  private void streamSingleBatch(
-      FlightProducer.ServerStreamListener listener, VectorSchemaRoot root) {
-    Objects.requireNonNull(listener, "listener");
-    Objects.requireNonNull(root, "root");
-    try (root) {
-      listener.start(root);
-      listener.putNext();
-      listener.completed();
-    } catch (RuntimeException ex) {
-      throw ex;
-    } catch (Exception ex) {
-      throw CallStatus.INTERNAL
-          .withDescription("Failed to stream Flight SQL metadata")
-          .withCause(ex)
-          .toRuntimeException();
+      LOGGER.info(
+          "[Session][StartupTiming] phase=complete sessionId={} totalElapsedMs={} mode={}",
+          sessionId,
+          elapsedMillis(startupStartNanos),
+          discoveryRecoveryStatus.recoveryUsed() ? "recovered" : "live");
+      LOGGER.debug("L0 bootstrap complete sessionId={} app={}/{} instance={} env={} region={} site={} endpoints={} configCount={}", sessionId, group, appName, instance, env, region, site, discoveryUris, cache == null ? 0 : cache.size());
     }
   }
 
-  private static void putUtf8(VarCharVector vector, int index, String value) {
-    if (value == null) {
-      vector.setNull(index);
-      return;
-    }
-    vector.setSafe(index, value.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+  @Override
+  public boolean started() {
+    return started.get();
   }
 
-  private byte[] tableSchemaBytes(DatasetId datasetId, boolean required) {
-    Schema schema = tableSchemaForDataset(datasetId, required);
-    if (schema == null) {
-      return null;
-    }
-    return serializeSchema(schema);
+  @Override
+  public RecoveryManager recovery() {
+    return recoveryManager;
   }
 
-  private Schema tableSchemaForDataset(DatasetId datasetId, boolean required) {
-    DuckdbCatalogImpl catalog = requireMetadataCatalog();
-    Optional<SchemaModel> model = catalog.metadataSchemaModel(datasetId);
-    if (model.isEmpty()) {
-      if (!required) {
-        return null;
+  @Override
+  public void stop() {
+    synchronized (lifecycleLock) {
+      if (!started.get()
+          && controlPlaneConnection == null
+          && discoveryManager == null
+          && statusScheduler == null
+          && configsCore == null
+          && dataPlanes == null) {
+        return;
       }
-      throw CallStatus.NOT_FOUND
-          .withDescription("Schema definition not found for dataset " + datasetId)
-          .toRuntimeException();
-    }
-    return toArrowSchema(model.get());
-  }
-
-  private static Schema toArrowSchema(SchemaModel model) {
-    if (model == null || model.getFields() == null || model.getFields().isEmpty()) {
-      throw CallStatus.NOT_FOUND
-          .withDescription("Schema definition is empty for dataset")
-          .toRuntimeException();
-    }
-    List<Field> fields = new ArrayList<>();
-    for (SchemaModel.Field field : model.getFields()) {
-      if (field == null) {
-        continue;
-      }
-      fields.add(
-          new Field(
-              Strings.requireNonBlank(field.getName(), "field.name"),
-              new FieldType(field.isNullable(), toArrowType(field.getType()), null, null),
-              null));
-    }
-    if (fields.isEmpty()) {
-      throw CallStatus.NOT_FOUND
-          .withDescription("Schema definition is empty for dataset")
-          .toRuntimeException();
-    }
-    return new Schema(List.copyOf(fields));
-  }
-
-  private static ArrowType toArrowType(SchemaModel.FieldType type) {
-    if (type == null) {
-      throw CallStatus.NOT_FOUND.withDescription("Schema field type is required").toRuntimeException();
-    }
-    return switch (type) {
-      case STRING -> new ArrowType.Utf8();
-      case BOOL -> new ArrowType.Bool();
-      case INT32 -> new ArrowType.Int(32, true);
-      case INT64 -> new ArrowType.Int(64, true);
-      case FLOAT64 -> new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE);
-      case DATE -> new ArrowType.Date(DateUnit.DAY);
-      case TIMESTAMP -> new ArrowType.Timestamp(TimeUnit.MICROSECOND, null);
-      case BINARY -> new ArrowType.Binary();
-    };
-  }
-
-  private static byte[] serializeSchema(Schema schema) {
-    try (ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-      MessageSerializer.serialize(new WriteChannel(Channels.newChannel(out)), schema);
-      return out.toByteArray();
-    } catch (IOException ex) {
-      throw CallStatus.INTERNAL
-          .withDescription("Failed to serialize table schema")
-          .withCause(ex)
-          .toRuntimeException();
+      SessionImplShutdown.stopManagedServices(serviceManager, LOGGER);
+      serviceManager = null;
+      CloseSupport.closeQuietly(dataPlanes instanceof AutoCloseable closeable ? closeable : null);
+      dataPlanes = null;
+      CloseSupport.closeQuietly(streamManager);
+      streamManager = null;
+      assetCatalogService = null;
+      CloseSupport.closeQuietly(configsCore);
+      configsCore = null;
+      CloseSupport.closeQuietly(connectionManager);
+      schemaRegistryManager = null;
+      CloseSupport.closeQuietly(statusPublisher);
+      statusPublisher = null;
+      CloseSupport.closeQuietly(entitlementsManager);
+      entitlementsManager = null;
+      CloseSupport.closeQuietly(accessManager);
+      serviceEntitlements = null;
+      dataEntitlements = null;
+      CloseSupport.closeQuietly(deleteManager);
+      deleteManager = null;
+      CloseSupport.closeQuietly(otelManager);
+      otelManager = null;
+      CloseSupport.closeQuietly(discoveryManager);
+      discoveryManager = null;
+      SessionImplShutdown.closeControlConnection(controlPlaneConnection);
+      controlPlaneConnection = null;
+      runtimePlacementHost = null;
+      environmentDefinition = null;
+      appDefinition = null;
+      configCacheAdmin = false;
+      discoveryUris = List.of();
+      discoveryRecoveryStatus = DiscoveryCacheRecoveryResult.notStarted();
+      started.set(false);
+      closeStatusScheduler();
+      refreshSessionViews();
     }
   }
 
   @Override
   public void close() {
-    statements.clear();
-    datasetStreamProducer.close();
-    try {
-      ipcReadAllocator.close();
-    } catch (Exception ignore) {
-    }
-  }
-
-  private RequestIdentity resolveIdentity(FlightProducer.CallContext context) {
-    FlightSqlRequestHeadersMiddleware middleware =
-        context == null ? null : context.getMiddleware(FlightSqlRequestHeadersMiddleware.KEY);
-    FabricRequestHeaders baseHeaders =
-        middleware == null ? FabricRequestHeaders.empty(null) : middleware.requestHeaders();
-    String principal = kerberosPrincipal(context);
-    FabricRequestHeaders headers = baseHeaders.withAuthenticatedPrincipal(principal);
-    try {
-      RequestIdentity identity =
-          RequestIdentityResolver.resolve(headers, DiscoveryCache, runtimeEnvironment);
-      logRequestEntry(identity, middleware);
-      return identity;
-    } catch (RequestIdentityResolver.ResolutionException ex) {
-      throw toFlightRuntime(ex);
-    }
-  }
-
-  private void logRequestEntry(
-      RequestIdentity identity, FlightSqlRequestHeadersMiddleware middleware) {
-    String datasetId = middleware == null ? null : middleware.datasetId();
-    String callSummary = middleware == null ? null : middleware.callSummary();
-    Map<String, String> headers = middleware == null ? Map.of() : middleware.headerSnapshot();
-    LOGGER.info("[Request] transport=ARROW_FLIGHT_SQL call={} requestId={} caller={} user={} delegatedUser={} datasetId={} headers={}", Strings.firstNonBlank(callSummary, "<unknown>"), identity.requestId(), safeCaller(identity.callerAppSubject()), identity.effectiveUserSubject(), Strings.firstNonBlank(identity.delegatedUserSubject(), "<none>"), Strings.firstNonBlank(datasetId, "<none>"), headers);
-  }
-
-  private void logSqlRequest(
-      RequestIdentity identity, String operation, DatasetId datasetId, String sql) {
-    LOGGER.info("[FlightSQL][request] requestId={} operation={} subject={} datasetId={} sql={}", identity.requestId(), operation, safeSubject(identity.effectiveUserSubject()), datasetId == null ? "<none>" : datasetId, summarizeSql(sql));
-  }
-
-  private static String summarizeSql(String sql) {
-    String normalized = Strings.trimToNull(sql);
-    if (normalized == null) {
-      return "<empty>";
-    }
-    if (normalized.length() > 512) {
-      return normalized.substring(0, 512) + "...";
-    }
-    return normalized;
-  }
-
-  private static String summarizeValues(Iterable<String> values, int max) {
-    if (values == null) {
-      return "[]";
-    }
-    int limit = Math.max(1, max);
-    List<String> preview = new ArrayList<>();
-    int total = 0;
-    for (String value : values) {
-      if (value == null) {
-        continue;
+    synchronized (lifecycleLock) {
+      if (!closed.compareAndSet(false, true)) {
+        return;
       }
-      total++;
-      if (preview.size() < limit) {
-        preview.add(value);
+      unregisterShutdownHook();
+      stop();
+      CloseSupport.closeQuietly(kerberosPropertyScope);
+      kerberosPropertyScope = null;
+    }
+  }
+
+  public InternalAccess internal() {
+    if (cfg.type() != SessionType.PLATFORM) {
+      throw new IllegalStateException("internal access denied");
+    }
+    return new InternalAccess();
+  }
+
+  public DiscoveryCache discoveryCache() {
+    synchronized (lifecycleLock) {
+      DiscoveryManager manager = discoveryManager;
+      return manager == null ? null : manager.discoveryCache();
+    }
+  }
+
+  public AppStatusCache appStatusCache() {
+    synchronized (lifecycleLock) {
+      DiscoveryManager manager = discoveryManager;
+      return manager == null ? null : manager.appStatusCache();
+    }
+  }
+
+  public ServiceStatusCache serviceStatusCache() {
+    synchronized (lifecycleLock) {
+      DiscoveryManager manager = discoveryManager;
+      return manager == null ? null : manager.serviceStatusCache();
+    }
+  }
+
+  public DataStatusCache dataStatusCache() {
+    synchronized (lifecycleLock) {
+      DiscoveryManager manager = discoveryManager;
+      return manager == null ? null : manager.dataStatusCache();
+    }
+  }
+
+  public DefinitionEnvironment environmentDefinition() {
+    return environmentDefinition;
+  }
+
+  public long serviceHeartbeatCadenceSeconds() {
+    DefinitionEnvironment.Cadence configuredCadence =
+        environmentDefinition == null ? null : environmentDefinition.cadence();
+    Integer configured =
+        configuredCadence == null ? null : configuredCadence.serviceHeartbeatSeconds();
+    return resolveCadenceSeconds(configured, DEFAULT_SERVICE_HEARTBEAT_CADENCE_SECONDS);
+  }
+
+  public long serviceStatusCadenceSeconds() {
+    DefinitionEnvironment.Cadence configuredCadence =
+        environmentDefinition == null ? null : environmentDefinition.cadence();
+    Integer configured = configuredCadence == null ? null : configuredCadence.serviceStatusSeconds();
+    return resolveCadenceSeconds(configured, DEFAULT_SERVICE_STATUS_CADENCE_SECONDS);
+  }
+
+  public long dataStatusCadenceSeconds() {
+    DefinitionEnvironment.Cadence configuredCadence =
+        environmentDefinition == null ? null : environmentDefinition.cadence();
+    Integer configured = configuredCadence == null ? null : configuredCadence.dataStatusSeconds();
+    return resolveCadenceSeconds(configured, DEFAULT_DATA_STATUS_CADENCE_SECONDS);
+  }
+
+  public String kerberosPrincipal() {
+    return cfg.kerberosPrincipal();
+  }
+
+  public Path kerberosKeytab() {
+    return cfg.kerberosKeytab();
+  }
+
+  public Path trustCert() {
+    return cfg.trustCert();
+  }
+
+  public Path serviceTlsCertChain() {
+    return cfg.serviceTlsCertChain();
+  }
+
+  public Path serviceTlsPrivateKey() {
+    return cfg.serviceTlsPrivateKey();
+  }
+
+  public ControlConnection controlPlaneConnection() {
+    return controlPlaneConnection;
+  }
+
+  public ScheduledExecutorService statusScheduler() {
+    synchronized (lifecycleLock) {
+      if (statusScheduler == null || statusScheduler.isShutdown()) {
+        statusScheduler =
+            Executors.newScheduledThreadPool(
+                STATUS_SCHEDULER_THREADS,
+                runnable -> {
+                  Thread thread =
+                      new Thread(
+                          runnable,
+                          "fabric-status-" + STATUS_SCHEDULER_THREAD_ID.incrementAndGet());
+                  thread.setDaemon(true);
+                  return thread;
+                });
+      }
+      return statusScheduler;
+    }
+  }
+
+  public String runtimePlacementHost() {
+    String configured = Strings.trimToNull(runtimePlacementHost);
+    return configured == null ? resolveHostname() : configured;
+  }
+
+  public final class InternalAccess {
+    public ControlConnection controlPlaneConnection() {
+      return controlPlaneConnection;
+    }
+
+    public DiscoveryCache discoveryCache() {
+      return SessionImpl.this.discoveryCache();
+    }
+
+    public AppStatusCache statusCache() {
+      return SessionImpl.this.appStatusCache();
+    }
+
+    public AppStatusCache appStatusCache() {
+      return SessionImpl.this.appStatusCache();
+    }
+
+    public ServiceStatusCache serviceStatusCache() {
+      return SessionImpl.this.serviceStatusCache();
+    }
+
+    public DataStatusCache dataStatusCache() {
+      return SessionImpl.this.dataStatusCache();
+    }
+
+    public ConfigAdminService configAdminService() {
+      ConfigAdminService service = configsCore;
+      if (service == null) {
+        throw new IllegalStateException("Config manager is not available");
+      }
+      return service;
+    }
+  }
+
+  String decryptS3Credential(String alias, String encryptedValue) {
+    SessionSecrets secrets = cfg.sessionSecrets();
+    if (secrets == null) {
+      throw new IllegalStateException(
+          "S3 credentials are encrypted but no KEK was provided (alias="
+              + Strings.firstNonBlank(alias, SessionSecrets.DEFAULT_KEK_ALIAS)
+              + ")");
+    }
+    return secrets.decrypt(alias, encryptedValue);
+  }
+
+  public ServiceInstanceResolver serviceInstanceResolver() {
+    DataManagers manager = dataPlanes;
+    if (manager instanceof DataPlanesImpl impl) {
+      ServiceInstanceResolver resolver = impl.serviceInstanceResolverIfInitialized();
+      if (resolver != null) {
+        return resolver;
       }
     }
-    if (total == 0) {
-      return "[]";
+    throw new IllegalStateException("ServiceInstanceResolver is not initialized");
+  }
+
+  public ServiceInstanceResolver serviceInstanceResolverIfInitialized() {
+    DataManagers manager = dataPlanes;
+    if (manager instanceof DataPlanesImpl impl) {
+      return impl.serviceInstanceResolverIfInitialized();
     }
-    if (total <= limit) {
-      return preview.toString();
+    return null;
+  }
+
+  private void dumpConfiguredRecoverySnapshot() {
+    Path configuredPath = cfg.discoveryCacheRecoveryPath();
+    if (configuredPath == null) {
+      throw new IllegalStateException(
+          "Discovery cache recovery path is not configured; set withRecoveryPath(...)");
     }
-    return preview + "...(" + (total - limit) + " more)";
+    dumpRecoverySnapshot(configuredPath);
   }
 
-  private void authorizeInvoke(String callerSubject, String operationName, String requestPayload) {
-    ServiceEntitlements.Decision decision =
-        serviceEntitlements.authorize(
-            new ServiceEntitlements.Identity(callerSubject, null),
-            new ServiceEntitlements.Request(
-                ServiceEntitlements.Transport.ARROW_FLIGHT_SQL,
-                ServiceEntitlements.Action.INVOKE,
-                serviceResourceId,
-                operationName,
-                null,
-                requestPayload,
-                Map.of(),
-                Map.of()));
-    if (decision == null || !decision.allowed()) {
-      String reason = decision == null ? "DENIED" : Strings.firstNonBlank(decision.reason(), "DENIED");
-      LOGGER.info("[FlightSQL][deny] serviceId={} operation={} subject={} reason={}", serviceResourceId, operationName, safeSubject(callerSubject), reason);
-      throw CallStatus.UNAUTHORIZED
-          .withDescription(
-              reason
-                  + " [serviceId="
-                  + serviceResourceId
-                  + ", operation="
-                  + operationName
-                  + ", subject="
-                  + safeSubject(callerSubject)
-                  + "]")
-          .toRuntimeException();
+  private void dumpRecoverySnapshot(Path path) {
+    DiscoveryCache cache = discoveryCache();
+    if (cache == null) {
+      throw new IllegalStateException("DiscoveryCache is not initialized");
+    }
+    DiscoveryCacheSnapshotManifest manifest =
+        discoverySnapshotService.dump(
+            cache,
+            Objects.requireNonNull(path, "path"),
+            new DiscoveryCacheSnapshotService.SnapshotMetadata(sessionId, group, appName, instance));
+    LOGGER.info(
+        "[Session][DiscoveryRecovery][Dump] path={} createdTimeUtc={} definitions={}",
+        path.toAbsolutePath().normalize(),
+        manifest.createdTimeUtc(),
+        manifest.definitionCount());
+  }
+
+  private DiscoveryCacheRecoveryResult currentDiscoveryRecoveryStatus() {
+    return discoveryRecoveryStatus;
+  }
+
+  private SessionBootstrap.BootstrapResult bootstrapWithRecoveryFallback() throws Exception {
+    LOGGER.info(
+        "[Session][DiscoveryRecovery] config enabled={} path={} ttl={}",
+        cfg.discoveryCacheRecoveryEnabled(),
+        cfg.discoveryCacheRecoveryPath(),
+        cfg.discoveryCacheRecoveryTtl());
+    LOGGER.info(
+        "[Session][DiscoveryRecovery] live-bootstrap-start app={}/{} instance={} discoveryUrls={}",
+        cfg.group(),
+        cfg.appName(),
+        cfg.instance(),
+        cfg.discoveryUrls());
+    try {
+      SessionBootstrap.BootstrapResult liveResult =
+          SessionBootstrap.bootstrap(cfg, sessionId, kerberosPropertyScope);
+      discoveryRecoveryStatus =
+          DiscoveryCacheRecoveryResult.live(
+              cfg.discoveryCacheRecoveryEnabled(), "live DiscoveryCache bootstrap succeeded");
+      LOGGER.info(
+          "[Session][DiscoveryRecovery] live-bootstrap-succeeded app={}/{} instance={}",
+          cfg.group(),
+          cfg.appName(),
+          cfg.instance());
+      return liveResult;
+    } catch (Exception liveFailure) {
+      LOGGER.warn(
+          "[Session][DiscoveryRecovery] live-bootstrap-failed app={}/{} instance={} message={}",
+          cfg.group(),
+          cfg.appName(),
+          cfg.instance(),
+          Strings.firstNonBlank(liveFailure.getMessage(), liveFailure.getClass().getSimpleName()));
+      return recoverBootstrapOrThrow(liveFailure);
     }
   }
 
-  private static String requireSql(FlightSql.CommandStatementQuery command) {
-    return FlightSqlServiceProducerHeaders.requireSql(command);
+  private SessionBootstrap.BootstrapResult recoverBootstrapOrThrow(Exception liveFailure)
+      throws Exception {
+    if (!cfg.discoveryCacheRecoveryEnabled()) {
+      LOGGER.info("[Session][DiscoveryRecovery] recovery-disabled; startup will fail if live bootstrap fails");
+      discoveryRecoveryStatus =
+          DiscoveryCacheRecoveryResult.failed(
+              false,
+              null,
+              null,
+              null,
+              null,
+              "Recovery disabled and live bootstrap failed");
+      throw liveFailure;
+    }
+
+    Path snapshotPath = cfg.discoveryCacheRecoveryPath();
+    Duration snapshotTtl = cfg.discoveryCacheRecoveryTtl();
+    if (snapshotPath == null) {
+      discoveryRecoveryStatus =
+          DiscoveryCacheRecoveryResult.failed(
+              true,
+              null,
+              null,
+              null,
+              snapshotTtl,
+              "Recovery enabled but snapshot path is not configured");
+      IllegalStateException error =
+          new IllegalStateException(
+              "DiscoveryCache recovery is enabled but no snapshot path is configured");
+      error.addSuppressed(liveFailure);
+      throw error;
+    }
+
+    LOGGER.info(
+        "[Session][DiscoveryRecovery] recovery-attempt-enabled=true path={} ttl={}",
+        snapshotPath.toAbsolutePath().normalize(),
+        snapshotTtl);
+    DiscoveryCache probeCache = null;
+    DiscoveryCache runtimeCache = null;
+    boolean published = false;
+    try {
+      DiscoveryCacheSnapshotService.LoadedSnapshot loaded =
+          discoverySnapshotService.load(snapshotPath, snapshotTtl);
+      String sessionGroup = Strings.trimToNull(cfg.group());
+      probeCache =
+          DiscoveryCache.recoveredSnapshotCache(
+              sessionGroup, true, cfg.verbose(), loaded.definitions());
+      SessionBootstrap.BootstrapResult recoveredResult =
+          SessionBootstrap.bootstrapFromRecoveredSnapshot(
+              cfg, sessionId, kerberosPropertyScope, probeCache);
+      runtimeCache = probeCache;
+      if (!recoveredResult.configCacheAdmin()) {
+        runtimeCache =
+            DiscoveryCache.recoveredSnapshotCache(
+                recoveredResult.group(), false, cfg.verbose(), loaded.definitions());
+        probeCache.close();
+        probeCache = null;
+      }
+      publishDiscoveryManager(
+          DiscoveryManager.recoveredSnapshot(
+              runtimeCache, recoveredResult.group(), this::defaultCatalogSubject, () -> null));
+      published = true;
+      discoveryRecoveryStatus =
+          DiscoveryCacheRecoveryResult.recovered(
+              loaded.snapshotPath(),
+              loaded.createdTimeUtc(),
+              loaded.age(),
+              loaded.ttl(),
+              loaded.manifest().definitionCount(),
+              "Recovered DiscoveryCache from disk snapshot");
+      LOGGER.info(
+          "[Session][DiscoveryRecovery] recovery-accepted path={} createdTimeUtc={} age={} ttl={} definitions={}",
+          loaded.snapshotPath(),
+          loaded.createdTimeUtc(),
+          loaded.age(),
+          loaded.ttl(),
+          loaded.manifest().definitionCount());
+      return recoveredResult;
+    } catch (Exception recoveryFailure) {
+      CloseSupport.closeQuietly(probeCache);
+      if (!published) {
+        CloseSupport.closeQuietly(runtimeCache);
+      }
+      discoveryRecoveryStatus =
+          DiscoveryCacheRecoveryResult.failed(
+              true,
+              snapshotPath,
+              null,
+              null,
+              snapshotTtl,
+              Strings.firstNonBlank(
+                  recoveryFailure.getMessage(), recoveryFailure.getClass().getSimpleName()));
+      LOGGER.error(
+          "[Session][DiscoveryRecovery] recovery-rejected path={} ttl={} reason={}",
+          snapshotPath.toAbsolutePath().normalize(),
+          snapshotTtl,
+          Strings.firstNonBlank(
+              recoveryFailure.getMessage(), recoveryFailure.getClass().getSimpleName()));
+      IllegalStateException startupFailure =
+          new IllegalStateException(
+              "Live bootstrap failed and DiscoveryCache recovery failed: "
+                  + Strings.firstNonBlank(
+                      recoveryFailure.getMessage(),
+                      recoveryFailure.getClass().getSimpleName()),
+              recoveryFailure);
+      startupFailure.addSuppressed(liveFailure);
+      throw startupFailure;
+    }
   }
 
-  private static DatasetId resolveDatasetId(FlightProducer.CallContext context) {
-    return FlightSqlServiceProducerHeaders.resolveDatasetId(context);
+  OtelManager createOtelManager(
+      DefinitionEnvironment environment, DefinitionApp app) {
+    if (!FabricOtelEnablement.isEnvironmentOtelEnabled(environment)
+        || !FabricOtelEnablement.isAppOtelEnabled(app)) {
+      return OtelManagerNoop.instance();
+    }
+    String defaultServiceName =
+        Strings.firstNonBlank(
+            app == null || app.envelope() == null ? null : app.envelope().name(),
+            appName,
+            "fabric-lite");
+    return OtelManagerImpl.create(environment, app, defaultServiceName);
   }
 
-  private void installDatasetIfPresent(DatasetId datasetId) {
-    if (datasetId == null) {
+  private void refreshSessionViews() {
+    DiscoveryCache cache = discoveryCache();
+    SessionContext context =
+        new SessionContext(
+            cfg.type(),
+            group,
+            appName,
+            instance,
+            env,
+            region,
+            site,
+            sessionId,
+            normalizedDiscoveryUrls,
+            discoveryUris,
+            configCacheAdmin,
+            cache != null && cache.recovered(),
+            cache == null ? 0 : cache.size(),
+            statusPublisher == null ? 0 : statusPublisher.publishIntervalSeconds(),
+            statusPublisher == null ? null : statusPublisher.intervalSource(),
+            statusPublisher != null && statusPublisher.started(),
+            statusPublisher == null ? null : statusPublisher.lastPublishedPayload(),
+            statusPublisher == null ? 0L : statusPublisher.lastPublishedEpochMs(),
+            statusPublisher == null ? 0L : statusPublisher.publishCount());
+    this.sessionContext = context;
+  }
+
+  private void startStatusPublisher() {
+    DiscoveryCache cache = discoveryCache();
+    if (controlPlaneConnection == null || cache == null || !cache.recovered()) {
       return;
     }
-    if (!isAllowedDataset(datasetId)) {
-      throw CallStatus.INVALID_ARGUMENT
-          .withDescription(
-              "Dataset is not allowed for this service datasetId="
-                  + datasetId
-                  + " serviceId="
-                  + serviceResourceId)
-          .toRuntimeException();
+    AppStatusPublisher publisher =
+        new AppStatusPublisher(
+            controlPlaneConnection,
+            sessionContext,
+            appDefinition,
+            statusUserTag,
+            otelManager.enabled(),
+            statusScheduler(),
+            (publishEpochMs, status, payload) -> {
+              synchronized (lifecycleLock) {
+                if (!started.get() || statusPublisher == null) {
+                  return;
+                }
+                refreshSessionViews();
+              }
+            });
+    statusPublisher = publisher;
+    publisher.start();
+  }
+
+  public record SessionConfig(
+      String group,
+      String appName,
+      List<String> discoveryUrls,
+      String instance,
+      String kerberosUsername,
+      String kerberosPrincipal,
+      Path kerberosKeytab,
+      Path trustCert,
+      Path serviceTlsCertChain,
+      Path serviceTlsPrivateKey,
+      SessionType type,
+      boolean verbose,
+      Integer duplicateInstanceCheckAttempts,
+      Duration duplicateInstanceCheckDelay,
+      DataOptions dataOptions,
+      boolean entitlementsDecisionLogging,
+      boolean grpcRoutingLogSelections,
+      String statusUserTag,
+      Path checkpointPath,
+      boolean discoveryCacheRecoveryEnabled,
+      Path discoveryCacheRecoveryPath,
+      Duration discoveryCacheRecoveryTtl,
+      SessionSecrets sessionSecrets) {
+    public SessionConfig(
+        String group,
+        String appName,
+        List<String> discoveryUrls,
+        String instance,
+        String kerberosUsername,
+        String kerberosPrincipal,
+        Path kerberosKeytab,
+        Path trustCert,
+        Path serviceTlsCertChain,
+        Path serviceTlsPrivateKey,
+        SessionType type,
+        boolean verbose,
+        Integer duplicateInstanceCheckAttempts,
+        Duration duplicateInstanceCheckDelay,
+        DataOptions dataOptions,
+        boolean entitlementsDecisionLogging,
+        boolean grpcRoutingLogSelections,
+        String statusUserTag,
+        Path checkpointPath,
+        boolean discoveryCacheRecoveryEnabled,
+        Path discoveryCacheRecoveryPath,
+        Duration discoveryCacheRecoveryTtl) {
+      this(
+          group,
+          appName,
+          discoveryUrls,
+          instance,
+          kerberosUsername,
+          kerberosPrincipal,
+          kerberosKeytab,
+          trustCert,
+          serviceTlsCertChain,
+          serviceTlsPrivateKey,
+          type,
+          verbose,
+          duplicateInstanceCheckAttempts,
+          duplicateInstanceCheckDelay,
+          dataOptions,
+          entitlementsDecisionLogging,
+          grpcRoutingLogSelections,
+          statusUserTag,
+          checkpointPath,
+          discoveryCacheRecoveryEnabled,
+          discoveryCacheRecoveryPath,
+          discoveryCacheRecoveryTtl,
+          SessionSecrets.empty());
     }
-    if (!(tabularManager instanceof TabularManagerImpl localTabularManager)) {
-      return;
-    }
-    try {
-      localTabularManager.installDataset(datasetId.toString());
-    } catch (RuntimeException ex) {
-      throw CallStatus.INVALID_ARGUMENT
-          .withDescription(
-              "Dataset definition not available for query datasetId="
-                  + datasetId
-                  + " serviceId="
-                  + serviceResourceId)
-          .withCause(ex)
-          .toRuntimeException();
+
+    public SessionConfig {
+      discoveryUrls = discoveryUrls == null ? Collections.emptyList() : List.copyOf(discoveryUrls);
+      type = type == null ? SessionType.CLIENT : type;
+      duplicateInstanceCheckAttempts =
+          duplicateInstanceCheckAttempts != null && duplicateInstanceCheckAttempts > 0
+              ? duplicateInstanceCheckAttempts
+              : null;
+      duplicateInstanceCheckDelay =
+          duplicateInstanceCheckDelay != null
+                  && !duplicateInstanceCheckDelay.isNegative()
+                  && !duplicateInstanceCheckDelay.isZero()
+              ? duplicateInstanceCheckDelay
+              : null;
+      dataOptions = dataOptions == null ? DataOptions.builder().build() : dataOptions;
+      statusUserTag = Strings.trimToNull(statusUserTag);
+      checkpointPath = checkpointPath == null ? null : checkpointPath.normalize();
+      discoveryCacheRecoveryPath =
+          discoveryCacheRecoveryPath == null ? null : discoveryCacheRecoveryPath.normalize();
+      discoveryCacheRecoveryTtl =
+          discoveryCacheRecoveryTtl == null || discoveryCacheRecoveryTtl.isNegative()
+              ? null
+              : discoveryCacheRecoveryTtl;
+      trustCert = trustCert == null ? null : trustCert.normalize();
+      serviceTlsCertChain =
+          serviceTlsCertChain == null ? null : serviceTlsCertChain.normalize();
+      serviceTlsPrivateKey =
+          serviceTlsPrivateKey == null ? null : serviceTlsPrivateKey.normalize();
+      sessionSecrets = sessionSecrets == null ? SessionSecrets.empty() : sessionSecrets;
     }
   }
 
-  private ByteBuffer queryIpcSqlAsCaller(
-      RequestIdentity identity, String sql, DatasetId datasetId) {
-    String plannedSql = Strings.requireNonBlank(sql, "sql");
-    String callerSubject = identity.effectiveUserSubject();
-    try {
-      return tabularManager.queryIpcBuffer(plannedSql);
-    } catch (IllegalArgumentException ex) {
-      String details = errorContext(callerSubject, datasetId);
-      throw CallStatus.INVALID_ARGUMENT
-          .withDescription(ex.getMessage() + " [" + details + "]")
-          .withCause(ex)
-          .toRuntimeException();
-    } catch (IllegalStateException ex) {
-      throw mapQueryFailure(ex, callerSubject, datasetId);
-    } catch (RuntimeException ex) {
-      String details = errorContext(callerSubject, datasetId);
-      LOGGER.error("[FlightSQL][query][unexpected] {}", details, ex);
-      throw CallStatus.INTERNAL
-          .withDescription("Query execution failed [" + details + "]")
-          .withCause(ex)
-          .toRuntimeException();
+  void deleteDefinition(DefinitionType type, String definitionGroup, String definitionName) {
+    DiscoveryCache cache = discoveryCache();
+    if (cache == null) {
+      throw new IllegalStateException("DiscoveryCache is not initialized");
     }
+    cache.delete(type, definitionGroup, definitionName);
   }
 
-  private static String rewriteDatasetPlaceholder(String sql, DatasetId datasetId) {
-    if (datasetId == null) {
-      return sql;
-    }
-    int first = sql.indexOf(DATASET_TOKEN_MARKER);
-    if (first < 0) {
-      throw CallStatus.INVALID_ARGUMENT
-          .withDescription(
-              "query.sql must contain placeholder "
-                  + DATASET_TOKEN_MARKER
-                  + " for dataset "
-                  + datasetId)
-          .toRuntimeException();
-    }
-    int second = sql.indexOf(DATASET_TOKEN_MARKER, first + DATASET_TOKEN_MARKER.length());
-    if (second >= 0) {
-      throw CallStatus.INVALID_ARGUMENT
-          .withDescription(
-              "query.sql must contain placeholder "
-                  + DATASET_TOKEN_MARKER
-                  + " exactly once for dataset "
-                  + datasetId)
-          .toRuntimeException();
-    }
-    return sql.replace(DATASET_TOKEN_MARKER, sqlToken(datasetId));
+  void publishDiscoveryManager(DiscoveryManager manager) {
+    this.discoveryManager = manager;
   }
 
-  private static String datasetTokenMarker() {
-    return "$" + "{DATASET}";
+  DiscoveryManager publishedDiscoveryManager() {
+    return discoveryManager;
   }
 
-  private boolean isAllowedDataset(DatasetId datasetId) {
-    if (datasetId == null) {
-      return true;
-    }
-    return allowedDatasetIds.isEmpty() || allowedDatasetIds.contains(datasetId);
+  void publishDeleteManager(DeleteManager manager) {
+    this.deleteManager = manager;
   }
 
-  private static String sqlToken(DatasetId datasetId) {
-    return quoteIdentifier(datasetId.group())
-        + "."
-        + quoteIdentifier(datasetId.namespace())
-        + "."
-        + quoteIdentifier(datasetId.name());
+  void publishSchemaRegistryManager(SchemaManager manager) {
+    this.schemaRegistryManager = manager;
   }
 
-  private static String quoteIdentifier(String identifier) {
-    return "\"" + identifier.replace("\"", "\"\"") + "\"";
+  void publishServiceEntitlements(ServiceEntitlements entitlements) {
+    this.serviceEntitlements = entitlements;
   }
 
-  private RuntimeException mapQueryFailure(
-      IllegalStateException ex, String callerSubject, DatasetId datasetId) {
-    String message = Strings.trimToNull(ex.getMessage());
-    String details = errorContext(callerSubject, datasetId);
-    if (message == null) {
-      LOGGER.error("[FlightSQL][query][unexpected] {} message=<empty>", details, ex);
-      return CallStatus.INTERNAL
-          .withDescription("Query execution failed [" + details + "]")
-          .withCause(ex)
-          .toRuntimeException();
-    }
-    String lower = message.toLowerCase();
-    if (lower.contains("access denied for dataset")) {
-      return CallStatus.UNAUTHORIZED
-          .withDescription(message + " [" + details + "]")
-          .withCause(ex)
-          .toRuntimeException();
-    }
-    if (lower.contains("${dataset}")
-        || lower.contains("dataset not found")
-        || lower.contains("unknown table token")
-        || lower.contains("ambiguous table token")) {
-      return CallStatus.INVALID_ARGUMENT
-          .withDescription(message + " [" + details + "]")
-          .withCause(ex)
-          .toRuntimeException();
-    }
-    if (lower.contains("duckdb sql failed")) {
-      return CallStatus.INVALID_ARGUMENT
-          .withDescription(message + " [" + details + "]")
-          .withCause(ex)
-          .toRuntimeException();
-    }
-    LOGGER.error("[FlightSQL][query][unexpected] {} message={}", details, message, ex);
-    return CallStatus.INTERNAL
-        .withDescription(message + " [" + details + "]")
-        .withCause(ex)
-        .toRuntimeException();
+  void publishDataEntitlements(DataEntitlements entitlements) {
+    this.dataEntitlements = entitlements;
   }
 
-  private IpcSummary inspectIpc(ByteBuffer ipc) {
-    if (ipc == null || !ipc.hasRemaining()) {
-      throw CallStatus.INTERNAL.withDescription("Query returned empty Arrow IPC payload").toRuntimeException();
+
+
+  public static final class Builder {
+    private String group;
+    private String appName;
+    private List<String> discoveryUrls = List.of();
+    private String instance;
+    private String kerberosUsername;
+    private String kerberosPrincipal;
+    private Path kerberosKeytab;
+    private Path trustCert;
+    private Path serviceTlsCertChain;
+    private Path serviceTlsPrivateKey;
+    private SessionType type = SessionType.CLIENT;
+    private boolean verbose;
+    private Integer duplicateInstanceCheckAttempts;
+    private Duration duplicateInstanceCheckDelay;
+    private DataOptions dataOptions = DataOptions.builder().build();
+    private boolean entitlementsDecisionLogging;
+    private boolean grpcRoutingLogSelections;
+    private String statusUserTag;
+    private Path checkpointPath;
+    private boolean discoveryCacheRecoveryEnabled;
+    private Path discoveryCacheRecoveryPath;
+    private Duration discoveryCacheRecoveryTtl;
+    private final SessionSecrets.Builder sessionSecrets = SessionSecrets.builder();
+
+    public Builder withGroup(String value) {
+      group = Strings.trimToNull(value);
+      return this;
     }
-    try (ArrowStreamReader reader =
-        new ArrowStreamReader(Bytes.asInputStream(ipc), ipcReadAllocator)) {
-      VectorSchemaRoot root = reader.getVectorSchemaRoot();
-      Schema schema = root.getSchema();
-      long rowCount = 0L;
-      while (reader.loadNextBatch()) {
-        rowCount += root.getRowCount();
+
+    public Builder withName(String value) {
+      appName = Strings.trimToNull(value);
+      return this;
+    }
+
+    public Builder withDiscoveryUrls(String value) {
+      discoveryUrls = AmpsConfig.parseDiscoveryUrls(value == null ? List.of() : List.of(value));
+      return this;
+    }
+
+    public Builder withDiscoveryUrls(String... values) {
+      discoveryUrls =
+          AmpsConfig.parseDiscoveryUrls(values == null ? List.of() : Arrays.asList(values));
+      return this;
+    }
+
+    public Builder withDiscoveryUrls(List<String> values) {
+      discoveryUrls = AmpsConfig.parseDiscoveryUrls(values);
+      return this;
+    }
+
+    public Builder withInstance(String value) {
+      instance = Strings.trimToNull(value);
+      return this;
+    }
+
+    public Builder withKerberosUsername(String value) {
+      if (Strings.isBlank(value)) {
+        throw new IllegalArgumentException("Kerberos username is required");
       }
-      return new IpcSummary(schema, rowCount);
-    } catch (Exception ex) {
-      throw CallStatus.INTERNAL
-          .withDescription("Failed to inspect Arrow IPC payload")
-          .withCause(ex)
-          .toRuntimeException();
+      kerberosUsername = value.trim();
+      return this;
     }
-  }
 
-  private void streamIpc(FlightProducer.ServerStreamListener listener, ByteBuffer ipc) {
-    Objects.requireNonNull(listener, "listener");
-    try (ArrowStreamReader reader =
-        new ArrowStreamReader(Bytes.asInputStream(ipc), ipcReadAllocator)) {
-      VectorSchemaRoot root = reader.getVectorSchemaRoot();
-      listener.start(root);
-      while (reader.loadNextBatch()) {
-        listener.putNext();
+    public Builder withKerberosPrincipal(String value) {
+      kerberosPrincipal = Strings.trimToNull(value);
+      return this;
+    }
+
+    public Builder withKerberosKeytab(Path value) {
+      kerberosKeytab = value;
+      return this;
+    }
+
+    public Builder withTlsTrustCert(Path value) {
+      trustCert = value;
+      return this;
+    }
+
+    public Builder withTlsCertChain(Path value) {
+      serviceTlsCertChain = value;
+      return this;
+    }
+
+    public Builder withTlsPrivateKey(Path value) {
+      serviceTlsPrivateKey = value;
+      return this;
+    }
+
+    public Builder withType(SessionType value) {
+      type = value == null ? SessionType.CLIENT : value;
+      return this;
+    }
+
+    public Builder withVerbose(boolean value) {
+      verbose = value;
+      return this;
+    }
+
+    public Builder withDiscoveryVerbose(boolean value) {
+      verbose = value;
+      return this;
+    }
+
+    public Builder withVerbos(boolean value) {
+      return withVerbose(value);
+    }
+
+    public Builder withDuplicateInstanceCheckAttempts(int value) {
+      if (value <= 0) {
+        throw new IllegalArgumentException("duplicate instance check attempts must be > 0");
       }
-      listener.completed();
-    } catch (Exception ex) {
-      throw CallStatus.INTERNAL
-          .withDescription("Failed to stream Arrow IPC payload")
-          .withCause(ex)
-          .toRuntimeException();
+      duplicateInstanceCheckAttempts = value;
+      return this;
+    }
+
+    public Builder withDuplicateInstanceCheckDelay(Duration value) {
+      if (value == null || value.isNegative() || value.isZero()) {
+        throw new IllegalArgumentException("duplicate instance check delay must be > 0");
+      }
+      duplicateInstanceCheckDelay = value;
+      return this;
+    }
+
+    public Builder withDataOptions(DataOptions options) {
+      dataOptions = options == null ? DataOptions.builder().build() : options;
+      return this;
+    }
+
+    public Builder withEntitlementsDecisionLogging(boolean value) {
+      entitlementsDecisionLogging = value;
+      return this;
+    }
+
+    public Builder withGrpcRoutingLogging(boolean value) {
+      grpcRoutingLogSelections = value;
+      return this;
+    }
+
+    public Builder withStatusUserTag(String value) {
+      statusUserTag = Strings.trimToNull(value);
+      return this;
+    }
+
+    public Builder withCheckpointPath(Path value) {
+      checkpointPath = Objects.requireNonNull(value, "checkpointPath");
+      return this;
+    }
+
+    public Builder withRecoveryEnabled(boolean enabled) {
+      discoveryCacheRecoveryEnabled = enabled;
+      return this;
+    }
+
+    public Builder withRecoveryPath(Path path) {
+      discoveryCacheRecoveryPath = Objects.requireNonNull(path, "path");
+      return this;
+    }
+
+    public Builder withRecoveryTtl(Duration ttl) {
+      if (ttl != null && ttl.isNegative()) {
+        throw new IllegalArgumentException("discovery cache recovery TTL must be >= 0");
+      }
+      discoveryCacheRecoveryTtl = ttl;
+      return this;
+    }
+
+    public Builder withSecrets(Consumer<SessionSecrets.Builder> customizer) {
+      Objects.requireNonNull(customizer, "customizer");
+      customizer.accept(sessionSecrets);
+      return this;
+    }
+
+    public Builder withKekFile(String alias, Path kekFile) {
+      sessionSecrets.withClientKekFile(alias, kekFile);
+      return this;
+    }
+
+    public Builder withKekFile(Path kekFile) {
+      sessionSecrets.withClientKekFile(kekFile);
+      return this;
+    }
+
+    public Fabric.Session build() {
+      String principal = Strings.trimToNull(kerberosPrincipal);
+      if (principal == null && Strings.isNotBlank(kerberosUsername)) {
+        principal = kerberosUsername.trim() + "@" + DEFAULT_KERBEROS_REALM;
+      }
+      return new SessionImpl(
+          new SessionConfig(
+              group,
+              appName,
+              discoveryUrls,
+              instance,
+              Strings.trimToNull(kerberosUsername),
+              principal,
+              kerberosKeytab,
+              trustCert,
+              serviceTlsCertChain,
+              serviceTlsPrivateKey,
+              type == null ? SessionType.CLIENT : type,
+              verbose,
+              duplicateInstanceCheckAttempts,
+              duplicateInstanceCheckDelay,
+              dataOptions,
+              entitlementsDecisionLogging,
+              grpcRoutingLogSelections,
+              statusUserTag,
+              checkpointPath,
+              discoveryCacheRecoveryEnabled,
+              discoveryCacheRecoveryPath,
+              discoveryCacheRecoveryTtl,
+              sessionSecrets.build()));
     }
   }
 
-  private Location location() {
-    int port = portSupplier.getAsInt();
-    return tlsEnabled
-        ? Location.forGrpcTls(advertiseHost, port)
-        : Location.forGrpcInsecure(advertiseHost, port);
+  private void closeStatusScheduler() {
+    ScheduledExecutorService scheduler = statusScheduler;
+    statusScheduler = null;
+    SessionImplShutdown.closeStatusScheduler(scheduler);
   }
 
-  private String errorContext(String callerSubject, DatasetId datasetId) {
-    return "serviceId="
-        + serviceResourceId
-        + ", datasetId="
-        + (datasetId == null ? "<unknown>" : datasetId)
-        + ", subject="
-        + safeSubject(callerSubject);
+  private static String resolveHostname() {
+    try {
+      return InetAddress.getLocalHost().getHostName();
+    } catch (UnknownHostException ex) {
+      return "localhost";
+    }
   }
 
-  private static String safeSubject(String subject) {
-    return FlightSqlServiceProducerHeaders.safeSubject(subject);
+  private void registerShutdownHook() {
+    SessionImplShutdown.registerShutdownHook(shutdownHookRegistered, shutdownHook);
   }
 
-  private static String safeCaller(String callerAppSubject) {
-    return FlightSqlServiceProducerHeaders.safeCaller(callerAppSubject);
+  private void unregisterShutdownHook() {
+    SessionImplShutdown.unregisterShutdownHook(shutdownHookRegistered, shutdownHook);
   }
 
-  private static String kerberosPrincipal(FlightProducer.CallContext context) {
-    return FlightSqlServiceProducerHeaders.kerberosPrincipal(context);
+  private void closeQuietlyFromShutdownHook() {
+    SessionImplShutdown.closeQuietlyFromShutdownHook(this::close);
   }
 
-  private static RuntimeException toFlightRuntime(RequestIdentityResolver.ResolutionException ex) {
-    return FlightSqlServiceProducerHeaders.toFlightRuntime(ex);
+  String defaultCatalogSubject() {
+    String resolvedGroup = Strings.trimToNull(group);
+    String resolvedApp = Strings.trimToNull(appName);
+    if (resolvedGroup == null || resolvedApp == null) {
+      return "app:catalog/system";
+    }
+    return "app:" + resolvedGroup + "/" + resolvedApp;
   }
 
-  private record IpcSummary(Schema schema, long rowCount) {}
+  private static long elapsedMillis(long startNanos) {
+    return Math.max(0L, (System.nanoTime() - startNanos) / 1_000_000L);
+  }
 
-  private record PendingStatement(
-      String callerSubject, Schema schema, long rowCount, ByteBuffer ipcBytes) {}
+  private static long resolveCadenceSeconds(Integer configuredSeconds, long defaultSeconds) {
+    if (configuredSeconds != null && configuredSeconds > 0) {
+      return configuredSeconds.longValue();
+    }
+    return defaultSeconds;
+  }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
