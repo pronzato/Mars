@@ -1,902 +1,828 @@
-package org.pronzato.fabric.api.data.ingest.agent;
+package org.pronzato.fabric.api.data.manager;
 
-import org.pronzato.fabric.api.util.CloseSupport;
-import com.crankuptheamps.client.Message;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Timestamp;
+import java.sql.Types;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
-import java.util.Set;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.function.BiFunction;
-import java.util.function.UnaryOperator;
-import org.pronzato.fabric.api.Fabric;
-import org.pronzato.fabric.api.connectors.amps.AmpsConnection;
-import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
-import org.pronzato.fabric.api.control.discovery.cache.DiscoveryTopics;
-import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
-import org.pronzato.fabric.api.control.discovery.definitions.Definition;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngest;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngestSource;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStatusData;
-import org.pronzato.fabric.api.control.status.data.DataStatusPublisher;
-import org.pronzato.fabric.api.data.IngestManager;
-import org.pronzato.fabric.api.data.DataManager;
+import java.util.function.Function;
+import org.apache.arrow.vector.FieldVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
 import org.pronzato.fabric.api.data.dataset.DatasetId;
-import org.pronzato.fabric.api.data.manager.IngestManagerImpl;
-import org.pronzato.fabric.api.data.ingest.source.IngestAmpsPump;
-import org.pronzato.fabric.api.control.session.SessionImpl;
-import org.pronzato.fabric.api.control.session.SessionContext;
-import org.pronzato.fabric.api.util.Exceptions;
-import org.pronzato.fabric.api.util.IdentityParsingSupport;
-import org.pronzato.fabric.api.util.Strings;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.pronzato.fabric.api.data.duckdb.DuckdbSession;
 
-public final class IngestAgentImpl implements IngestAgent {
-  private static final Logger LOGGER = LoggerFactory.getLogger(IngestAgentImpl.class);
+final class RowManagerImplMerge {
+  private RowManagerImplMerge() {}
 
-  static final long[] RESTART_BACKOFF_MILLIS = new long[] {1_000L, 5_000L, 15_000L};
-  private static final String CONFIG_CONNECTION_NAME = "amps-fabric-discovery";
-
-  private final Fabric.Session session;
-  private final DiscoveryCache DiscoveryCache;
-  private final String sessionGroup;
-  private final IngestAgent.Options options;
-  private final PumpFactory pumpFactory;
-  private final Sleeper sleeper;
-  private final ExecutorService retryExecutor;
-
-  private final Object lock = new Object();
-  private final Map<IngestKey, DefinitionIngestSource> desiredSources = new HashMap<>();
-  private final Map<IngestKey, RunningPump> runningPumps = new HashMap<>();
-  private final Map<IngestKey, DataStatusPublisher> statusPublishers = new HashMap<>();
-  private final Map<IngestKey, Integer> restartAttempts = new HashMap<>();
-  private final Set<IngestKey> restartInFlight = new HashSet<>();
-  private final Set<IngestKey> onceCompleted = new HashSet<>();
-
-  private final AtomicBoolean started = new AtomicBoolean(false);
-  private final AtomicBoolean closed = new AtomicBoolean(false);
-  private final AtomicBoolean initialSyncComplete = new AtomicBoolean(false);
-  private final AtomicBoolean initialConfigRefreshPending = new AtomicBoolean(false);
-
-  private volatile AmpsConnection.Subscription configSubscription;
-
-  public IngestAgentImpl(Fabric.Session session, IngestAgent.Options options) {
-    this(
-        session,
-        requireConfigCache(session),
-        requireGroup(session),
-        options == null ? IngestAgent.Options.defaults() : options,
-        PumpFactory.DEFAULT,
-        Sleeper.SYSTEM,
-        newRetryExecutor());
-  }
-
-  IngestAgentImpl(
-      Fabric.Session session,
-      DiscoveryCache DiscoveryCache,
-      String sessionGroup,
-      IngestAgent.Options options,
-      PumpFactory pumpFactory,
-      Sleeper sleeper,
-      ExecutorService retryExecutor) {
-    this.session = Objects.requireNonNull(session, "session");
-    this.DiscoveryCache = Objects.requireNonNull(DiscoveryCache, "DiscoveryCache");
-    this.sessionGroup = Strings.requireNonBlank(sessionGroup, "sessionGroup");
-    this.options = options == null ? IngestAgent.Options.defaults() : options;
-    this.pumpFactory = Objects.requireNonNull(pumpFactory, "pumpFactory");
-    this.sleeper = Objects.requireNonNull(sleeper, "sleeper");
-    this.retryExecutor = Objects.requireNonNull(retryExecutor, "retryExecutor");
-  }
-
-  @Override
-  public void start() throws Exception {
-    if (closed.get()) {
-      throw new IllegalStateException("IngestAgent is closed");
-    }
-    if (!session.started()) {
-      throw new IllegalStateException("Session must be started before IngestAgent");
-    }
-    if (!started.compareAndSet(false, true)) {
+  static void prepareDuckDbActive(RowManagerImpl self, DatasetId datasetId) {
+    Objects.requireNonNull(self, "self");
+    Objects.requireNonNull(datasetId, "datasetId");
+    DefinitionDataset definition = self.resolveDatasetDefinition(datasetId);
+    if (definition.binding() == null || definition.binding().duckdb() == null) {
       return;
     }
-
-    subscribeConfig();
-    try {
-      List<DefinitionIngestSource> discovered =
-          new ArrayList<>(DiscoveryCache.list(DefinitionIngestSource.class, sessionGroup));
-      List<String> names = new ArrayList<>();
-      for (DefinitionIngestSource source : discovered) {
-        IngestKey key = keyOf(source == null ? null : source.envelope());
-        if (key != null) {
-          names.add(key.ingestName());
-        }
-      }
-      LOGGER.info("[IngestAgent][start] discovered={} dryRun={} once={} ingests={}", names.size(), options.dryRun(), options.once(), names);
-      for (DefinitionIngestSource source : discovered) {
-        onSourceUpsert(source);
-      }
-    } finally {
-      initialSyncComplete.set(true);
-    }
-    if (initialConfigRefreshPending.getAndSet(false)) {
-      refreshFromCache();
-    }
-  }
-
-  @Override
-  public boolean started() {
-    return started.get() && !closed.get();
-  }
-
-  @Override
-  public void close() {
-    if (!closed.compareAndSet(false, true)) {
+    DefinitionDataset.DuckdbBinding binding = definition.binding().duckdb();
+    if (!self.isDuckDbActive(binding)) {
       return;
     }
-    started.set(false);
-
-    AmpsConnection.Subscription activeSubscription = configSubscription;
-    configSubscription = null;
-    CloseSupport.closeQuietly(activeSubscription);
-
-    synchronized (lock) {
-      List<IngestKey> keys = new ArrayList<>(runningPumps.keySet());
-      for (IngestKey key : keys) {
-        stopRunningLocked(key, "shutdown");
-      }
-      for (DataStatusPublisher publisher : statusPublishers.values()) {
-        CloseSupport.closeQuietly(publisher);
-      }
-      statusPublishers.clear();
-      desiredSources.clear();
-      restartAttempts.clear();
-      restartInFlight.clear();
-      onceCompleted.clear();
-    }
-    initialConfigRefreshPending.set(false);
-    initialSyncComplete.set(false);
-    retryExecutor.shutdownNow();
-  }
-
-  void onSourceUpsert(DefinitionIngestSource source) {
-    IngestKey key = keyOf(source == null ? null : source.envelope());
-    if (key == null || !isManagedGroup(key.group())) {
-      return;
-    }
-    synchronized (lock) {
-      desiredSources.put(key, source);
-      onceCompleted.remove(key);
-      reconcileLocked(key);
-    }
-  }
-
-  void onSourceDelete(String group, String ingestName) {
-    onSourceDelete(group, ingestName, "deleted");
-  }
-
-  private void onSourceDelete(String group, String ingestName, String reason) {
-    IngestKey key = keyOf(group, ingestName);
-    if (key == null || !isManagedGroup(key.group())) {
-      return;
-    }
-    synchronized (lock) {
-      desiredSources.remove(key);
-      onceCompleted.remove(key);
-      restartAttempts.remove(key);
-      stopRunningLocked(key, reason);
-      closeStatusPublisherLocked(key);
-    }
-  }
-
-  private void subscribeConfig() throws Exception {
-    String filter =
-        "(/envelope/type='INGEST_SOURCE' AND /envelope/group='"
-            + escapeFilterValue(sessionGroup)
-            + "')";
-    AmpsConnection.SubscriptionSpec spec =
-        new AmpsConnection.SubscriptionSpec(true, DiscoveryTopics.DISCOVERY, "oof", filter);
-    AmpsConnection connection = session.connections().amps(CONFIG_CONNECTION_NAME);
-    configSubscription =
-        connection.sowAndSubscribe(
-            spec,
-            (AmpsConnection.SubscriptionListener) message -> onConfigMessage(message.raw()));
-  }
-
-  private void onConfigMessage(Message raw) {
-    if (raw == null) {
-      return;
-    }
-    int command = raw.getCommand();
-    if (command == Message.Command.GroupEnd) {
-      return;
-    }
-    if (command != Message.Command.SOW
-        && command != Message.Command.Publish
-        && command != Message.Command.OOF) {
-      return;
-    }
-    if (!initialSyncComplete.get()) {
-      initialConfigRefreshPending.set(true);
-      return;
-    }
-
-    String payload = raw.getData();
-    if (Strings.isBlank(payload)) {
-      if (command == Message.Command.OOF) {
-        refreshFromCache();
+    if (Boolean.TRUE.equals(binding.memory())) {
+      synchronized (self.sharedSessionLockInternal()) {
+        ensureDuckDbActiveInitialized(
+            self, self.requireSharedSession(), datasetId.toString(), binding.relationName(), binding);
       }
       return;
     }
-
-    final Definition definition;
-    try {
-      definition = DiscoveryCodec.decode(payload);
-    } catch (Exception ignore) {
-      return;
-    }
-    if (!(definition instanceof DefinitionIngestSource source)) {
-      return;
-    }
-    IngestKey key = keyOf(source.envelope());
-    if (key == null || !isManagedGroup(key.group())) {
-      return;
-    }
-    if (command == Message.Command.OOF) {
-      onSourceDelete(key.group(), key.ingestName(), "deleted");
-      return;
-    }
-    onSourceUpsert(source);
-  }
-
-  private void refreshFromCache() {
-    List<DefinitionIngestSource> snapshot =
-        new ArrayList<>(DiscoveryCache.list(DefinitionIngestSource.class, sessionGroup));
-    Set<IngestKey> seen = new HashSet<>();
-    for (DefinitionIngestSource source : snapshot) {
-      IngestKey key = keyOf(source == null ? null : source.envelope());
-      if (key == null || !isManagedGroup(key.group())) {
-        continue;
-      }
-      seen.add(key);
-      onSourceUpsert(source);
-    }
-    synchronized (lock) {
-      List<IngestKey> existing = new ArrayList<>(desiredSources.keySet());
-      for (IngestKey key : existing) {
-        if (!seen.contains(key)) {
-          desiredSources.remove(key);
-          restartAttempts.remove(key);
-          stopRunningLocked(key, "deleted");
-          closeStatusPublisherLocked(key);
-        }
-      }
+    try (DuckdbSession session = openDuckDbActiveSession(self, binding)) {
+      ensureDuckDbActiveInitialized(self, session, datasetId.toString(), binding.relationName(), binding);
     }
   }
 
-  private void reconcileLocked(IngestKey key) {
-    DefinitionIngestSource source = desiredSources.get(key);
-    if (source == null) {
-      restartAttempts.remove(key);
-      stopRunningLocked(key, "deleted");
-      closeStatusPublisherLocked(key);
-      return;
-    }
-
-    PipelineSpec desired = buildSpec(source, key);
-    if (desired == null) {
-      desiredSources.remove(key);
-      restartAttempts.remove(key);
-      stopRunningLocked(key, "disabled");
-      closeStatusPublisherLocked(key);
-      return;
-    }
-    DataStatusPublisher statusPublisher = ensureStatusPublisherLocked(key, desired);
-
-    RunningPump running = runningPumps.get(key);
-    if (running != null && running.spec().equals(desired)) {
-      if (statusPublisher != null) {
-        statusPublisher.publishOnline("ingest pipeline running");
-      }
-      return;
-    }
-    if (running != null) {
-      stopRunningLocked(key, "reconfigure");
-    }
-
-    if (options.dryRun()) {
-      logStart(desired, true);
-      restartAttempts.remove(key);
-      if (statusPublisher != null) {
-        statusPublisher.publishOnline("dry-run active");
-      }
-      return;
-    }
-
-    startPumpLocked(key, desired);
-  }
-
-  private void startPumpLocked(IngestKey key, PipelineSpec spec) {
-    try {
-      applyRuntimeOptions(key);
-      PumpController pump =
-          pumpFactory.create(
-              session,
-              spec,
-              error -> onPumpError(key, error),
-              options.once() || spec.sowOnly() ? () -> onSowComplete(key) : null);
-      pump.start();
-      runningPumps.put(key, new RunningPump(spec, pump));
-      restartAttempts.remove(key);
-      DataStatusPublisher statusPublisher = statusPublishers.get(key);
-      if (statusPublisher != null) {
-        statusPublisher.putTag("restartAttempts", "0");
-        statusPublisher.putTag("connectionName", spec.connectionName());
-        statusPublisher.putTag("topic", spec.topic());
-        statusPublisher.putTag("mode", spec.mode() == null ? null : spec.mode().name());
-        statusPublisher.putTag("sow", Boolean.toString(spec.sow()));
-        statusPublisher.putTag("sowOnly", Boolean.toString(spec.sowOnly()));
-        statusPublisher.publishOnline("ingest pipeline running");
-      }
-      logStart(spec, false);
-    } catch (Exception ex) {
-      logError(key.ingestName(), spec.topic(), ex);
-      DataStatusPublisher statusPublisher = statusPublishers.get(key);
-      if (statusPublisher != null) {
-        statusPublisher.publishError(
-            "start failed: "
-                + Strings.firstNonBlank(
-                    Strings.trimToNull(ex.getMessage()), ex.getClass().getSimpleName()));
-      }
-      scheduleRestartLocked(key);
-    }
-  }
-
-  private void applyRuntimeOptions(IngestKey key) {
-    IngestManager.IngestRuntimeOptions runtimeOptions = options.ingestRuntimeOptions();
-    if (runtimeOptions == null) {
-      return;
-    }
-    Integer maxRowsPerFile = runtimeOptions.parquetMaxRowsPerFile();
-    Long maxIdleMillis = runtimeOptions.parquetMaxIdleMillis();
-    if (maxRowsPerFile == null && maxIdleMillis == null) {
-      return;
-    }
-    IngestManagerImpl ingestManager = resolveIngestManagerImpl(session);
-    if (ingestManager == null) {
-      throw new IllegalStateException(
-          "Ingest runtime options require a local IngestManager implementation");
-    }
-    ingestManager.setParquetRollPolicy(key.ingestName(), maxRowsPerFile, maxIdleMillis);
-  }
-
-  private void onPumpError(IngestKey key, Throwable error) {
-    synchronized (lock) {
-      RunningPump running = runningPumps.get(key);
-      if (closed.get() || running == null) {
-        return;
-      }
-      logError(key.ingestName(), running.spec().topic(), error);
-      DataStatusPublisher statusPublisher = statusPublishers.get(key);
-      if (statusPublisher != null) {
-        statusPublisher.publishError(
-            "pipeline error: "
-                + Strings.firstNonBlank(
-                    Strings.trimToNull(error == null ? null : error.getMessage()),
-                    error == null ? "unknown" : error.getClass().getSimpleName()));
-      }
-      stopRunningLocked(key, "error");
-      scheduleRestartLocked(key);
-    }
-  }
-
-  private void onSowComplete(IngestKey key) {
-    synchronized (lock) {
-      if (!runningPumps.containsKey(key) || !onceCompleted.add(key)) {
-        return;
-      }
-      desiredSources.remove(key);
-      restartAttempts.remove(key);
-      stopRunningLocked(key, "sow-complete");
-      closeStatusPublisherLocked(key);
-    }
-  }
-
-  private void scheduleRestartLocked(IngestKey key) {
-    if (closed.get() || options.dryRun() || !desiredSources.containsKey(key)) {
-      return;
-    }
-    if (!restartInFlight.add(key)) {
-      return;
-    }
-    retryExecutor.execute(() -> runRestartLoop(key));
-  }
-
-  private void runRestartLoop(IngestKey key) {
-    try {
-      while (!closed.get()) {
-        long delayMs;
-        synchronized (lock) {
-          if (closed.get()
-              || options.dryRun()
-              || !desiredSources.containsKey(key)
-              || runningPumps.containsKey(key)) {
-            return;
-          }
-          int attempt = restartAttempts.getOrDefault(key, 0) + 1;
-          restartAttempts.put(key, attempt);
-          DataStatusPublisher statusPublisher = statusPublishers.get(key);
-          if (statusPublisher != null) {
-            statusPublisher.putTag("restartAttempts", Integer.toString(attempt));
-          }
-          delayMs = restartDelayMs(attempt);
-        }
-
-        try {
-          sleeper.sleep(delayMs);
-        } catch (InterruptedException ex) {
-          Thread.currentThread().interrupt();
-          return;
-        }
-
-        synchronized (lock) {
-          if (closed.get()
-              || options.dryRun()
-              || !desiredSources.containsKey(key)
-              || runningPumps.containsKey(key)) {
-            return;
-          }
-          reconcileLocked(key);
-          if (runningPumps.containsKey(key) || !desiredSources.containsKey(key)) {
-            return;
-          }
-        }
-      }
-    } finally {
-      synchronized (lock) {
-        restartInFlight.remove(key);
-      }
-    }
-  }
-
-  private void stopRunningLocked(IngestKey key, String reason) {
-    RunningPump running = runningPumps.remove(key);
-    if (running == null) {
-      return;
-    }
-    CloseSupport.closeQuietly(running.controller());
-    LOGGER.info("[IngestAgent][stop] ingest={} reason={}", key.ingestName(), reason);
-  }
-
-  private PipelineSpec buildSpec(DefinitionIngestSource source, IngestKey key) {
-    if (!isEnabled(source == null ? null : source.envelope())) {
-      return null;
-    }
-    if (!options.allowIngest(key.ingestName())) {
-      return null;
-    }
-    DefinitionIngest ingest = resolveEnabledIngest(key);
-    if (ingest == null) {
-      return null;
-    }
-    String datasetId =
-        Strings.requireNonBlank(
-            Strings.trimToNull(ingest.datasetId()),
-            "Ingest datasetId is required: " + key.group() + "/" + key.ingestName());
-    DatasetId.parse(datasetId);
-    DefinitionIngestSource.AmpsSource amps = source.amps();
-    if (amps == null) {
-      return null;
-    }
-
-    String connectionName = Strings.trimToNull(amps.connectionName());
-    String topic = Strings.trimToNull(amps.topic());
-    if (connectionName == null) {
-      throw new IllegalStateException(
-          "IngestSource amps.connectionName is required: " + key.group() + "/" + key.ingestName());
-    }
-    if (topic == null) {
-      throw new IllegalStateException(
-          "IngestSource amps.topic is required: " + key.group() + "/" + key.ingestName());
-    }
-
-    IngestAmpsPump.PayloadFormat format;
-    try {
-      String normalizedFormat =
-          Strings.requireNonBlank(source.format(), "ingestSource.format").toUpperCase(Locale.ROOT);
-      format = IngestAmpsPump.PayloadFormat.valueOf(normalizedFormat);
-    } catch (RuntimeException ex) {
-      throw new IllegalStateException(
-          "IngestSource format must be JSON or NVFIX: "
-              + key.group()
-              + "/"
-              + key.ingestName()
-              + " format="
-              + source.format());
-    }
-
-    boolean sowOnly = Boolean.TRUE.equals(amps.sowOnly());
-    boolean sow = !sowOnly && (options.once() || Boolean.TRUE.equals(amps.sow()));
-    AmpsConnection.BatchMode mode =
-        amps.mode() == DefinitionIngestSource.Mode.BATCH
-            ? AmpsConnection.BatchMode.BATCH
-            : AmpsConnection.BatchMode.STREAM;
-    String connectionInstanceName = resolveAmpsConnectionInstance();
-    String parquetFilenamePrefix = resolveParquetFilenamePrefix();
-    boolean ampsLogIncoming = resolveAmpsLogIncoming();
-    boolean ampsLogOutgoing = resolveAmpsLogOutgoing();
-    UnaryOperator<String> ampsPayloadTransformer = resolveAmpsPayloadTransformer();
-    BiFunction<String, Integer, String> ampsPayloadTransformerWithCommand =
-        resolveAmpsPayloadTransformerWithCommand();
-    boolean ampsPersistOofAsRows = resolveAmpsPersistOofAsRows();
-    return new PipelineSpec(
-        key.group(),
-        key.ingestName(),
-        format,
-        connectionName,
-        connectionInstanceName,
-        parquetFilenamePrefix,
-        ampsLogIncoming,
-        ampsLogOutgoing,
-        ampsPayloadTransformer,
-        ampsPayloadTransformerWithCommand,
-        ampsPersistOofAsRows,
-        topic,
-        sow,
-        sowOnly,
-        Strings.trimToNull(amps.options()),
-        Strings.trimToNull(amps.filter()),
-        datasetId,
-        mode,
-        sanitizePositiveInt(amps.batchMaxMessages(), AmpsConnection.DEFAULT_BATCH_MAX_MESSAGES),
-        sanitizePositiveInt(amps.batchMaxBytes(), AmpsConnection.DEFAULT_BATCH_MAX_BYTES),
-        sanitizePositiveLong(amps.batchFlushMillis(), AmpsConnection.DEFAULT_BATCH_FLUSH_MILLIS));
-  }
-
-  private DefinitionIngest resolveEnabledIngest(IngestKey key) {
-    Optional<DefinitionIngest> ingest =
-        DiscoveryCache.get(DefinitionIngest.class, key.group(), key.ingestName());
-    if (ingest.isEmpty()) {
-      return null;
-    }
-    return isEnabled(ingest.get().envelope()) ? ingest.get() : null;
-  }
-
-  private boolean isManagedGroup(String group) {
-    return sessionGroup.equals(Strings.trimToNull(group));
-  }
-
-  private DataStatusPublisher ensureStatusPublisherLocked(IngestKey key, PipelineSpec spec) {
-    DataStatusPublisher existing = statusPublishers.get(key);
-    if (existing != null) {
-      return existing;
-    }
-    DataStatusPublisher created = createStatusPublisher(key, spec);
-    if (created == null) {
-      return null;
-    }
-    statusPublishers.put(key, created);
-    created.start();
-    created.publishOnline("ingest pipeline opened");
-    return created;
-  }
-
-  private void closeStatusPublisherLocked(IngestKey key) {
-    DataStatusPublisher publisher = statusPublishers.remove(key);
-    CloseSupport.closeQuietly(publisher);
-  }
-
-  private DataStatusPublisher createStatusPublisher(IngestKey key, PipelineSpec spec) {
-    if (!(session instanceof SessionImpl sessionImpl)) {
-      return null;
-    }
-    if (sessionImpl.controlPlaneConnection() == null || sessionImpl.context() == null) {
-      return null;
-    }
-    SessionContext context = sessionImpl.context();
-    String group = Strings.trimToNull(context.getGroup());
-    String instance = Strings.trimToNull(context.getInstance());
-    if (group == null || instance == null) {
-      return null;
-    }
-    String statusName = "agent/" + key.ingestName();
-    Map<String, String> tags = new HashMap<>();
-    if (spec != null) {
-      tags.put("datasetId", Strings.trimToNull(spec.datasetId()));
-      tags.put("connectionName", Strings.trimToNull(spec.connectionName()));
-      tags.put("topic", Strings.trimToNull(spec.topic()));
-    }
-    return new DataStatusPublisher(
-        sessionImpl.controlPlaneConnection(),
-        group,
-        statusName,
-        instance,
-        DefinitionStatusData.ProducerType.INGEST_AGENT,
-        "ingest-agent:" + key.group() + "/" + key.ingestName(),
-        spec == null ? null : Strings.trimToNull(spec.datasetId()),
-        sessionImpl.runtimePlacementHost(),
-        Strings.trimToNull(context.getAppName()),
-        Strings.trimToNull(context.getInstance()),
-        Strings.trimToNull(context.getGroup()),
-        tags,
-        sessionImpl.dataStatusCadenceSeconds(),
-        sessionImpl.statusScheduler());
-  }
-
-  private static boolean isEnabled(DefinitionEnvelope envelope) {
-    if (envelope == null) {
-      return false;
-    }
-    if (Boolean.FALSE.equals(envelope.enabled())) {
-      return false;
-    }
-    String lifecycle = Strings.trimToNull(envelope.lifecycleStatus());
-    return lifecycle == null || "ACTIVE".equalsIgnoreCase(lifecycle);
-  }
-
-  private static IngestKey keyOf(DefinitionEnvelope envelope) {
-    if (envelope == null) {
-      return null;
-    }
-    return keyOf(envelope.group(), envelope.name());
-  }
-
-  private static IngestKey keyOf(String group, String ingestName) {
-    String normalizedGroup = Strings.trimToNull(group);
-    String normalizedIngest = Strings.trimToNull(ingestName);
-    if (normalizedGroup == null || normalizedIngest == null) {
-      return null;
-    }
-    return new IngestKey(normalizedGroup, normalizedIngest);
-  }
-
-  private static long restartDelayMs(int attempt) {
-    int idx = Math.max(0, attempt - 1);
-    if (idx >= RESTART_BACKOFF_MILLIS.length) {
-      idx = RESTART_BACKOFF_MILLIS.length - 1;
-    }
-    return RESTART_BACKOFF_MILLIS[idx];
-  }
-
-  private static int sanitizePositiveInt(Integer value, int defaultValue) {
-    if (value == null || value <= 0) {
-      return defaultValue;
-    }
-    return value;
-  }
-
-  private static long sanitizePositiveLong(Long value, long defaultValue) {
-    if (value == null || value <= 0L) {
-      return defaultValue;
-    }
-    return value;
-  }
-
-  private static String escapeFilterValue(String value) {
-    return value == null ? "" : value.replace("'", "''");
-  }
-
-
-  private static void logStart(PipelineSpec spec, boolean dryRun) {
-    boolean transformerEnabled =
-        spec.ampsPayloadTransformer() != null || spec.ampsPayloadTransformerWithCommand() != null;
-    if (dryRun) {
-      LOGGER.info("[IngestAgent][start] ingest={} group={} connectionName={} connectionInstance={} topic={} format={} mode={} sowSubscribe={} sowOnly={} options={} filter={} logIncoming={} logOutgoing={} persistOofAsRows={} transformerEnabled={} dryRun=true", spec.ingestName(), spec.group(), spec.connectionName(), spec.connectionInstanceName(), spec.topic(), spec.format(), spec.mode(), spec.sow(), spec.sowOnly(), spec.options(), spec.filter(), spec.ampsLogIncoming(), spec.ampsLogOutgoing(), spec.ampsPersistOofAsRows(), transformerEnabled);
-      return;
-    }
-    LOGGER.info("[IngestAgent][start] ingest={} group={} connectionName={} connectionInstance={} topic={} format={} mode={} sowSubscribe={} sowOnly={} options={} filter={} logIncoming={} logOutgoing={} persistOofAsRows={} transformerEnabled={}", spec.ingestName(), spec.group(), spec.connectionName(), spec.connectionInstanceName(), spec.topic(), spec.format(), spec.mode(), spec.sow(), spec.sowOnly(), spec.options(), spec.filter(), spec.ampsLogIncoming(), spec.ampsLogOutgoing(), spec.ampsPersistOofAsRows(), transformerEnabled);
-  }
-
-  private static void logError(String ingestName, String topic, Throwable error) {
-    Throwable root = Exceptions.rootCause(error);
-    if (root == null) {
-      root = new IllegalStateException("unknown");
-    }
-    LOGGER.warn("[IngestAgent][error] ingest={} topic={} exceptionClass={} message={}", ingestName, topic, root.getClass().getName(), Strings.firstNonBlank(root.getMessage(), "unknown"));
-  }
-
-  private static DiscoveryCache requireConfigCache(Fabric.Session session) {
-    SessionImpl impl = requireSessionImpl(session);
-    DiscoveryCache cache = impl.discoveryCache();
-    if (cache == null) {
-      throw new IllegalStateException("Session DiscoveryCache is not available");
-    }
-    return cache;
-  }
-
-  private static String requireGroup(Fabric.Session session) {
-    if (session == null || session.context() == null) {
-      throw new IllegalStateException("Session context is not available");
-    }
-    return IdentityParsingSupport.requireGroup(session.context().getGroup(), "session group");
-  }
-
-  private static SessionImpl requireSessionImpl(Fabric.Session session) {
-    Objects.requireNonNull(session, "session");
-    if (session instanceof SessionImpl impl) {
-      return impl;
-    }
-    throw new IllegalArgumentException(
-        "IngestAgent requires SessionImpl-backed Fabric.Session");
-  }
-
-  private static ExecutorService newRetryExecutor() {
-    return Executors.newCachedThreadPool(
-        runnable -> {
-          Thread thread = new Thread(runnable, "ingest-agent-retry");
-          thread.setDaemon(true);
-          return thread;
+  static long duckDbActiveChangeMaxSeq(RowManagerImpl self, DatasetId datasetId) {
+    Objects.requireNonNull(self, "self");
+    Objects.requireNonNull(datasetId, "datasetId");
+    RowManagerImpl.ActiveDatasetBinding active = resolveActiveDatasetBinding(self, datasetId);
+    return withActiveDatasetSession(
+        self,
+        active,
+        session -> {
+          ensureDuckDbActiveChangeTable(session, active.datasetId());
+          return queryDuckDbActiveChangeMaxSeq(session, active.datasetId(), active.canonicalDatasetId());
         });
   }
 
-  interface Sleeper {
-    Sleeper SYSTEM = Thread::sleep;
-
-    void sleep(long millis) throws InterruptedException;
-  }
-
-  interface PumpFactory {
-    PumpFactory DEFAULT =
-        (session, spec, errorListener, sowCompleteListener) -> {
-          IngestAmpsPump.Builder builder =
-              IngestAmpsPump.builder(session)
-                  .withIngestName(spec.ingestName())
-                  .withIngestSourceName(spec.ingestName())
-                  .withDatasetId(spec.datasetId())
-                  .withConnectionName(spec.connectionName())
-                  .withConnectionInstanceName(spec.connectionInstanceName())
-                  .withParquetFilenamePrefix(spec.parquetFilenamePrefix())
-                  .withLogIncomingMessages(spec.ampsLogIncoming())
-                  .withLogOutgoingMessages(spec.ampsLogOutgoing())
-                  .withPayloadTransformer(spec.ampsPayloadTransformer())
-                  .withPayloadTransformerWithCommand(spec.ampsPayloadTransformerWithCommand())
-                  .withPersistOofAsRows(spec.ampsPersistOofAsRows())
-                  .withTopic(spec.topic())
-                  .withSowSubscribe(spec.sow())
-                  .withSow(spec.sowOnly())
-                  .withOptions(spec.options())
-                  .withFilter(spec.filter())
-                  .withMode(spec.mode())
-                  .withBatchMaxMessages(spec.batchMaxMessages())
-                  .withBatchMaxBytes(spec.batchMaxBytes())
-                  .withBatchFlushMillis(spec.batchFlushMillis())
-                  .withPayloadFormat(spec.format())
-                  .withErrorListener(errorListener)
-                  .withSowCompleteListener(sowCompleteListener);
-          IngestManagerImpl ingestManager = resolveIngestManagerImpl(session);
-          if (ingestManager != null) {
-            builder
-                .withWriteAuthorizer(ingestManager::requireWrite)
-                .withAmpsMessageHandler(ingestManager::appendFromAmps)
-                .withCheckpointStore(ingestManager.checkpointStore());
+  static List<DuckdbActiveChangeLog.ChangeEvent> readDuckDbActiveChanges(
+      RowManagerImpl self, DatasetId datasetId, long afterSeq, int limit) {
+    Objects.requireNonNull(self, "self");
+    Objects.requireNonNull(datasetId, "datasetId");
+    if (afterSeq < 0L) {
+      throw new IllegalArgumentException("afterSeq must be >= 0");
+    }
+    int resolvedLimit = limit <= 0 ? 1 : limit;
+    RowManagerImpl.ActiveDatasetBinding active = resolveActiveDatasetBinding(self, datasetId);
+    return withActiveDatasetSession(
+        self,
+        active,
+        session -> {
+          ensureDuckDbActiveChangeTable(session, active.datasetId());
+          String sql =
+              "select seq, pk, op from "
+                  + DuckdbActiveChangeLog.quoteIdentifier(
+                      DuckdbActiveChangeLog.tableName(active.datasetId()))
+                  + " where seq > ? order by seq limit ?";
+          try (PreparedStatement statement = session.prepareStatement(sql)) {
+            statement.setLong(1, afterSeq);
+            statement.setInt(2, resolvedLimit);
+            boolean hasResult = statement.execute();
+            if (!hasResult) {
+              return List.of();
+            }
+            List<DuckdbActiveChangeLog.ChangeEvent> changes = new ArrayList<>();
+            try (ResultSet resultSet = statement.getResultSet()) {
+              while (resultSet.next()) {
+                changes.add(
+                    new DuckdbActiveChangeLog.ChangeEvent(
+                        Math.max(0L, resultSet.getLong(1)),
+                        RowManagerImpl.trimToNull(resultSet.getString(2)),
+                        RowManagerImpl.trimToNull(resultSet.getString(3))));
+              }
+            }
+            return List.copyOf(changes);
+          } catch (SQLException ex) {
+            throw new IllegalStateException(
+                "Failed to read DUCKDB_ACTIVE changes for " + active.canonicalDatasetId(), ex);
           }
-          return new IngestPumpController(builder.build());
-        };
-
-    PumpController create(
-        Fabric.Session session,
-        PipelineSpec spec,
-        IngestAmpsPump.ErrorListener errorListener,
-        Runnable sowCompleteListener);
+        });
   }
 
-  interface PumpController extends AutoCloseable {
-    void start() throws Exception;
+  static void appendArrowIpcToDuckdbActive(
+      RowManagerImpl self,
+      String canonicalDatasetId,
+      String relationName,
+      DefinitionDataset.DuckdbBinding binding,
+      byte[] arrowIpcStreamBytes,
+      DuckDbActiveMutation mutation) {
+    String tableName = RowManagerImpl.requireNonBlank(relationName, "Dataset DUCKDB relationName is required");
+    List<String> primaryKey = normalizePrimaryKey(binding.primaryKey(), canonicalDatasetId);
 
-    @Override
-    void close();
-  }
-
-  private static final class IngestPumpController implements PumpController {
-    private final IngestAmpsPump pump;
-
-    private IngestPumpController(IngestAmpsPump pump) {
-      this.pump = Objects.requireNonNull(pump, "pump");
+    try (ArrowStreamReader reader =
+        new ArrowStreamReader(new ByteArrayInputStream(arrowIpcStreamBytes), self.ipcAllocatorInternal())) {
+      if (Boolean.TRUE.equals(binding.memory())) {
+        synchronized (self.sharedSessionLockInternal()) {
+          appendArrowIpcToDuckdbActiveInSession(
+              self,
+              self.requireSharedSession(),
+              canonicalDatasetId,
+              tableName,
+              binding,
+              primaryKey,
+              reader,
+              mutation);
+        }
+      } else {
+        try (DuckdbSession session = openDuckDbActiveSession(self, binding)) {
+          appendArrowIpcToDuckdbActiveInSession(
+              self, session, canonicalDatasetId, tableName, binding, primaryKey, reader, mutation);
+        }
+      }
+    } catch (IllegalStateException ex) {
+      throw ex;
+    } catch (RuntimeException | IOException ex) {
+      throw new IllegalStateException(
+          "Arrow IPC append failed for dataset " + canonicalDatasetId + ": " + ex.getMessage(), ex);
     }
+  }
 
-    @Override
-    public void start() throws Exception {
-      pump.start();
+  static void appendArrowIpcToDuckdbActiveInSession(
+      RowManagerImpl self,
+      DuckdbSession session,
+      String canonicalDatasetId,
+      String tableName,
+      DefinitionDataset.DuckdbBinding binding,
+      List<String> primaryKey,
+      ArrowStreamReader reader,
+      DuckDbActiveMutation mutation)
+      throws IOException {
+    ensureDuckDbActiveInitialized(self, session, canonicalDatasetId, tableName, binding);
+
+    VectorSchemaRoot root = reader.getVectorSchemaRoot();
+    List<Field> fields = root.getSchema().getFields();
+    if (fields == null || fields.isEmpty()) {
+      throw new IllegalStateException("Arrow IPC stream schema is empty for dataset " + canonicalDatasetId);
     }
+    List<RowManagerImpl.AppendColumn> sortedColumns = self.sortedAppendColumns(fields, canonicalDatasetId);
+    validatePrimaryKeyColumns(primaryKey, sortedColumns, canonicalDatasetId, tableName);
+    ensureDuckDbActiveTable(self, session, canonicalDatasetId, tableName, sortedColumns, binding);
 
-    @Override
-    public void close() {
-      pump.close();
+    String tempTableName = self.nextTempTableName("active_");
+    String createTempSql = RowManagerImplSql.buildCreateActiveTempTableSql(tempTableName, sortedColumns);
+    String insertSql = RowManagerImplSql.buildInsertActiveTempSql(tempTableName, sortedColumns);
+    boolean tempCreated = false;
+    RuntimeException failure = null;
+    try {
+      session.exec(createTempSql);
+      tempCreated = true;
+      long insertedRows =
+          insertArrowRowsIntoActiveTemp(self, session, insertSql, sortedColumns, root, reader, canonicalDatasetId);
+      if (insertedRows <= 0L) {
+        return;
+      }
+      applyDuckDbActiveMutation(
+          session, canonicalDatasetId, tableName, tempTableName, sortedColumns, primaryKey, mutation);
+      DatasetId datasetId = DatasetId.parse(canonicalDatasetId);
+      long latestSeq = appendDuckDbActiveChangeLog(session, datasetId, tempTableName, primaryKey, mutation);
+      self.changeNotifierInternal().notifyChanged(datasetId.toString(), latestSeq);
+      writeDuckDbActiveHistory(
+          self, session, canonicalDatasetId, tableName, tempTableName, sortedColumns, mutation, binding);
+    } catch (RuntimeException ex) {
+      failure = ex;
+      throw ex;
+    } finally {
+      if (tempCreated) {
+        try {
+          session.exec("drop table if exists " + RowManagerImpl.quoteIdentifier(tempTableName));
+        } catch (RuntimeException cleanupEx) {
+          if (failure != null) {
+            failure.addSuppressed(cleanupEx);
+          } else {
+            throw cleanupEx;
+          }
+        }
+      }
     }
   }
 
-  private record IngestKey(String group, String ingestName) {}
-
-  private record RunningPump(PipelineSpec spec, PumpController controller) {}
-
-  record PipelineSpec(
-      String group,
-      String ingestName,
-      IngestAmpsPump.PayloadFormat format,
-      String connectionName,
-      String connectionInstanceName,
-      String parquetFilenamePrefix,
-      boolean ampsLogIncoming,
-      boolean ampsLogOutgoing,
-      UnaryOperator<String> ampsPayloadTransformer,
-      BiFunction<String, Integer, String> ampsPayloadTransformerWithCommand,
-      boolean ampsPersistOofAsRows,
-      String topic,
-      boolean sow,
-      boolean sowOnly,
-      String options,
-      String filter,
-      String datasetId,
-      AmpsConnection.BatchMode mode,
-      int batchMaxMessages,
-      int batchMaxBytes,
-      long batchFlushMillis) {
-  }
-
-  private String resolveAmpsConnectionInstance() {
-    IngestManager.IngestRuntimeOptions runtimeOptions = options.ingestRuntimeOptions();
-    if (runtimeOptions == null) {
-      return null;
+  static DuckdbSession openDuckDbActiveSession(
+      RowManagerImpl self, DefinitionDataset.DuckdbBinding binding) {
+    if (Boolean.TRUE.equals(binding.memory())) {
+      throw new IllegalStateException(
+          "DUCKDB_ACTIVE memory=true uses shared in-process DuckDB session and must not open a file-backed session");
     }
-    return Strings.trimToNull(runtimeOptions.ampsConnectionInstance());
+    String databasePath = resolveDuckDbActiveDatabasePath(binding);
+    return self.engineInternal().openSession(databasePath);
   }
 
-  private String resolveParquetFilenamePrefix() {
-    IngestManager.IngestRuntimeOptions runtimeOptions = options.ingestRuntimeOptions();
-    if (runtimeOptions == null) {
-      return null;
+  static String resolveDuckDbActiveDatabasePath(DefinitionDataset.DuckdbBinding binding) {
+    String configuredPath = RowManagerImpl.trimToNull(binding.databasePath());
+    if (Boolean.FALSE.equals(binding.memory())) {
+      return RowManagerImpl.requireNonBlank(configuredPath, "DUCKDB_ACTIVE databasePath is required");
     }
-    return Strings.trimToNull(runtimeOptions.parquetFilenamePrefix());
-  }
-
-  private boolean resolveAmpsLogIncoming() {
-    IngestManager.IngestRuntimeOptions runtimeOptions = options.ingestRuntimeOptions();
-    return runtimeOptions != null && Boolean.TRUE.equals(runtimeOptions.ampsLogIncoming());
-  }
-
-  private boolean resolveAmpsLogOutgoing() {
-    IngestManager.IngestRuntimeOptions runtimeOptions = options.ingestRuntimeOptions();
-    return runtimeOptions != null && Boolean.TRUE.equals(runtimeOptions.ampsLogOutgoing());
-  }
-
-  private UnaryOperator<String> resolveAmpsPayloadTransformer() {
-    IngestManager.IngestRuntimeOptions runtimeOptions = options.ingestRuntimeOptions();
-    return runtimeOptions == null ? null : runtimeOptions.ampsPayloadTransformer();
-  }
-
-  private BiFunction<String, Integer, String> resolveAmpsPayloadTransformerWithCommand() {
-    IngestManager.IngestRuntimeOptions runtimeOptions = options.ingestRuntimeOptions();
-    return runtimeOptions == null ? null : runtimeOptions.ampsPayloadTransformerWithCommand();
-  }
-
-  private boolean resolveAmpsPersistOofAsRows() {
-    IngestManager.IngestRuntimeOptions runtimeOptions = options.ingestRuntimeOptions();
-    return runtimeOptions != null && Boolean.TRUE.equals(runtimeOptions.ampsPersistOofAsRows());
-  }
-
-  private static IngestManagerImpl resolveIngestManagerImpl(Fabric.Session session) {
-    if (session == null || session.data() == null) {
-      return null;
+    if (configuredPath != null) {
+      return configuredPath;
     }
-    DataManager direct = session.data().direct();
-    IngestManager ingestManager = direct.ingest();
-    if (ingestManager instanceof IngestManagerImpl local) {
-      return local;
+    Path defaultPath =
+        Path.of("data", "lite", "duckdb-active", sanitizeFilename(binding.relationName()) + ".duckdb")
+            .toAbsolutePath()
+            .normalize();
+    try {
+      Path parent = defaultPath.getParent();
+      if (parent != null) {
+        Files.createDirectories(parent);
+      }
+    } catch (IOException ex) {
+      throw new IllegalStateException(
+          "Failed to initialize DUCKDB_ACTIVE database directory for " + binding.relationName(), ex);
     }
-    return null;
+    return defaultPath.toString();
+  }
+
+  static void ensureDuckDbActiveInitialized(
+      RowManagerImpl self,
+      DuckdbSession session,
+      String canonicalDatasetId,
+      String tableName,
+      DefinitionDataset.DuckdbBinding binding) {
+    if (!Boolean.TRUE.equals(binding.memory())) {
+      return;
+    }
+    String historyPath = RowManagerImpl.trimToNull(binding.parquetHistoryPath());
+    if (historyPath == null) {
+      return;
+    }
+    if (self.activeDatasetsInitializedInternal().contains(canonicalDatasetId)) {
+      return;
+    }
+    synchronized (self.activeDatasetsInitializedInternal()) {
+      if (self.activeDatasetsInitializedInternal().contains(canonicalDatasetId)) {
+        return;
+      }
+      Path root = RowManagerImpl.normalizePath(historyPath).toAbsolutePath().normalize();
+      if (Files.exists(root)) {
+        List<Path> historyFiles = listActiveHistoryFiles(root);
+        for (Path historyFile : historyFiles) {
+          replayDuckDbActiveHistoryFile(self, session, canonicalDatasetId, tableName, binding, historyFile);
+        }
+      }
+      self.activeDatasetsInitializedInternal().add(canonicalDatasetId);
+    }
+  }
+
+  static List<Path> listActiveHistoryFiles(Path root) {
+    if (root == null || !Files.exists(root)) {
+      return List.of();
+    }
+    try (var stream = Files.walk(root)) {
+      return stream
+          .filter(Files::isRegularFile)
+          .filter(path -> path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".parquet"))
+          .sorted(Comparator.comparing(path -> path.toAbsolutePath().normalize().toString()))
+          .toList();
+    } catch (IOException ex) {
+      throw new IllegalStateException("Failed to enumerate DUCKDB_ACTIVE history files under " + root, ex);
+    }
+  }
+
+  static void replayDuckDbActiveHistoryFile(
+      RowManagerImpl self,
+      DuckdbSession session,
+      String canonicalDatasetId,
+      String tableName,
+      DefinitionDataset.DuckdbBinding binding,
+      Path historyFile) {
+    String tempTableName = self.nextTempTableName("active_replay_");
+    String sqlPath = historyFile.toAbsolutePath().normalize().toString().replace('\\', '/');
+    boolean tempCreated = false;
+    RuntimeException failure = null;
+    try {
+      session.exec(
+          "create temp table "
+              + RowManagerImpl.quoteIdentifier(tempTableName)
+              + " as select * from read_parquet('"
+              + RowManagerImpl.escapeSqlLiteral(sqlPath)
+              + "')");
+      tempCreated = true;
+      List<RowManagerImpl.SqlColumn> replayColumns =
+          sortedSqlColumns(readTableColumns(session, tempTableName, "_fabric_op"));
+      if (replayColumns.isEmpty()) {
+        return;
+      }
+      List<String> primaryKey = normalizePrimaryKey(binding.primaryKey(), canonicalDatasetId);
+      ensureDuckDbActiveTable(
+          self,
+          session,
+          canonicalDatasetId,
+          tableName,
+          toAppendColumns(replayColumns),
+          binding);
+      DuckDbActiveMutation mutation = readReplayMutation(session, tempTableName);
+      applyDuckDbActiveMutation(
+          session,
+          canonicalDatasetId,
+          tableName,
+          tempTableName,
+          toAppendColumns(replayColumns),
+          primaryKey,
+          mutation);
+    } catch (RuntimeException ex) {
+      failure = ex;
+      throw ex;
+    } finally {
+      if (tempCreated) {
+        try {
+          session.exec("drop table if exists " + RowManagerImpl.quoteIdentifier(tempTableName));
+        } catch (RuntimeException cleanupEx) {
+          if (failure != null) {
+            failure.addSuppressed(cleanupEx);
+          } else {
+            throw cleanupEx;
+          }
+        }
+      }
+    }
+  }
+
+  static DuckDbActiveMutation readReplayMutation(
+      DuckdbSession session, String tempTableName) {
+    List<RowManagerImpl.SqlColumn> columns = readTableColumns(session, tempTableName);
+    boolean hasOp = columns.stream().anyMatch(column -> "_fabric_op".equalsIgnoreCase(column.name()));
+    if (!hasOp) {
+      return DuckDbActiveMutation.UPSERT;
+    }
+    String sql =
+        "select coalesce(max(cast("
+            + RowManagerImpl.quoteIdentifier("_fabric_op")
+            + " as varchar)),'UPSERT') from "
+            + RowManagerImpl.quoteIdentifier(tempTableName);
+    try (PreparedStatement statement = session.prepareStatement(sql)) {
+      boolean hasResult = statement.execute();
+      if (!hasResult) {
+        return DuckDbActiveMutation.UPSERT;
+      }
+      try (ResultSet resultSet = statement.getResultSet()) {
+        if (!resultSet.next()) {
+          return DuckDbActiveMutation.UPSERT;
+        }
+        String raw = RowManagerImpl.trimToNull(resultSet.getString(1));
+        if (raw == null) {
+          return DuckDbActiveMutation.UPSERT;
+        }
+        return DuckDbActiveMutation.valueOf(raw.toUpperCase(Locale.ROOT));
+      }
+    } catch (SQLException ex) {
+      throw new IllegalStateException("Failed to resolve DUCKDB_ACTIVE replay mutation", ex);
+    }
+  }
+
+  static List<String> normalizePrimaryKey(List<String> primaryKey, String canonicalDatasetId) {
+    if (primaryKey == null || primaryKey.isEmpty()) {
+      throw new IllegalStateException(
+          "DUCKDB_ACTIVE primary key is required for dataset " + canonicalDatasetId);
+    }
+    List<String> normalized = new ArrayList<>(primaryKey.size());
+    for (String key : primaryKey) {
+      String candidate = RowManagerImpl.trimToNull(key);
+      if (candidate != null && !normalized.contains(candidate)) {
+        normalized.add(candidate);
+      }
+    }
+    if (normalized.isEmpty()) {
+      throw new IllegalStateException(
+          "DUCKDB_ACTIVE primary key is required for dataset " + canonicalDatasetId);
+    }
+    return List.copyOf(normalized);
+  }
+
+  static List<RowManagerImpl.SqlColumn> sortedSqlColumns(List<RowManagerImpl.SqlColumn> columns) {
+    List<RowManagerImpl.SqlColumn> sorted = new ArrayList<>(columns);
+    sorted.sort(
+        Comparator.comparing(
+                (RowManagerImpl.SqlColumn column) -> column.name(), String.CASE_INSENSITIVE_ORDER)
+            .thenComparing(RowManagerImpl.SqlColumn::name));
+    return List.copyOf(sorted);
+  }
+
+  static List<RowManagerImpl.AppendColumn> toAppendColumns(
+      List<RowManagerImpl.SqlColumn> sqlColumns) {
+    List<RowManagerImpl.AppendColumn> result = new ArrayList<>(sqlColumns.size());
+    int index = 0;
+    for (RowManagerImpl.SqlColumn column : sqlColumns) {
+      Field field = new Field(column.name(), FieldType.nullable(new ArrowType.Utf8()), null);
+      result.add(new RowManagerImpl.AppendColumn(field, index++, column.duckdbType(), Types.VARCHAR));
+    }
+    return List.copyOf(result);
+  }
+
+  static void validatePrimaryKeyColumns(
+      List<String> primaryKey,
+      List<RowManagerImpl.AppendColumn> columns,
+      String canonicalDatasetId,
+      String tableName) {
+    List<String> names = columns.stream().map(column -> column.field().getName()).toList();
+    for (String key : primaryKey) {
+      if (!names.contains(key)) {
+        throw new IllegalStateException(
+            "DUCKDB_ACTIVE primary key field '"
+                + key
+                + "' is missing from payload for dataset "
+                + canonicalDatasetId
+                + " table="
+                + tableName);
+      }
+    }
+  }
+
+  static void ensureDuckDbActiveTable(
+      RowManagerImpl self,
+      DuckdbSession session,
+      String canonicalDatasetId,
+      String tableName,
+      List<RowManagerImpl.AppendColumn> columns,
+      DefinitionDataset.DuckdbBinding binding) {
+    boolean tableExists = tableExists(session, tableName);
+    if (!tableExists) {
+      if (Boolean.FALSE.equals(binding.createIfMissing())) {
+        throw new IllegalStateException(
+            "DUCKDB_ACTIVE table does not exist and createIfMissing=false for dataset "
+                + canonicalDatasetId
+                + " table="
+                + tableName);
+      }
+      String sql = RowManagerImplSql.buildCreateActiveTableSql(tableName, columns);
+      session.exec(sql);
+      return;
+    }
+    Map<String, String> existingTypes = readTableTypeMap(session, tableName);
+    for (RowManagerImpl.AppendColumn column : columns) {
+      String name = column.field().getName();
+      String existingType = existingTypes.get(name.toLowerCase(Locale.ROOT));
+      if (existingType == null) {
+        session.exec(
+            "alter table "
+                + RowManagerImpl.quoteIdentifier(tableName)
+                + " add column "
+                + RowManagerImpl.quoteIdentifier(name)
+                + " "
+                + column.duckdbType());
+        continue;
+      }
+      if (!normalizeDuckdbType(existingType).equals(normalizeDuckdbType(column.duckdbType()))) {
+        throw new IllegalStateException(
+            "DUCKDB_ACTIVE schema mismatch for dataset "
+                + canonicalDatasetId
+                + " table="
+                + tableName
+                + " column="
+                + name
+                + " expectedType="
+                + existingType
+                + " actualType="
+                + column.duckdbType());
+      }
+    }
+  }
+
+  static void applyDuckDbActiveMutation(
+      DuckdbSession session,
+      String canonicalDatasetId,
+      String tableName,
+      String tempTableName,
+      List<RowManagerImpl.AppendColumn> columns,
+      List<String> primaryKey,
+      DuckDbActiveMutation mutation) {
+    switch (mutation) {
+      case UPSERT -> {
+        boolean hasDeleteMark = tableHasColumn(session, tableName, RowManagerImpl.ACTIVE_DELETE_MARK_COLUMN);
+        boolean hasSequence = tableHasColumn(session, tempTableName, "__fabric_seq");
+        String sql =
+            RowManagerImplSql.buildDuckDbActiveMergeSql(
+                tableName,
+                tempTableName,
+                columns,
+                primaryKey,
+                hasDeleteMark,
+                hasSequence,
+                RowManagerImpl.ACTIVE_DELETE_MARK_COLUMN);
+        session.exec(sql);
+      }
+      case DELETE -> {
+        String sql = RowManagerImplSql.buildDuckDbActiveDeleteSql(tableName, tempTableName, primaryKey);
+        session.exec(sql);
+      }
+      case MARK_AS_DELETED -> {
+        if (!tableHasColumn(session, tableName, RowManagerImpl.ACTIVE_DELETE_MARK_COLUMN)) {
+          session.exec(
+              "alter table "
+                  + RowManagerImpl.quoteIdentifier(tableName)
+                  + " add column "
+                  + RowManagerImpl.quoteIdentifier(RowManagerImpl.ACTIVE_DELETE_MARK_COLUMN)
+                  + " BOOLEAN DEFAULT FALSE");
+        }
+        String sql =
+            RowManagerImplSql.buildDuckDbActiveMarkDeletedSql(
+                tableName, tempTableName, primaryKey, RowManagerImpl.ACTIVE_DELETE_MARK_COLUMN);
+        session.exec(sql);
+      }
+    }
+  }
+
+  static void writeDuckDbActiveHistory(
+      RowManagerImpl self,
+      DuckdbSession session,
+      String canonicalDatasetId,
+      String tableName,
+      String tempTableName,
+      List<RowManagerImpl.AppendColumn> columns,
+      DuckDbActiveMutation mutation,
+      DefinitionDataset.DuckdbBinding binding) {
+    String historyRootText = RowManagerImpl.trimToNull(binding.parquetHistoryPath());
+    if (historyRootText == null) {
+      return;
+    }
+    Path historyRoot = RowManagerImpl.normalizePath(historyRootText).toAbsolutePath().normalize();
+    Path writeRoot = historyRoot;
+    if (columns.stream().anyMatch(column -> column.field().getType() instanceof ArrowType.Date)) {
+      String partition = RowManagerImpl.PARTITION_DATE_FORMAT.format(LocalDate.now(ZoneOffset.UTC));
+      writeRoot = historyRoot.resolve("date=" + partition);
+    }
+    try {
+      Files.createDirectories(writeRoot);
+    } catch (IOException ex) {
+      throw new IllegalStateException(
+          "Failed to create DUCKDB_ACTIVE history directory for dataset "
+              + canonicalDatasetId
+              + ": "
+              + writeRoot,
+          ex);
+    }
+    long sequence = self.nextActiveHistoryFileSequence();
+    String fileName =
+        sanitizeFilename(tableName)
+            + "_"
+            + RowManagerImpl.FILE_TIMESTAMP_FORMAT.format(Instant.now())
+            + "_"
+            + String.format(Locale.ROOT, "%08d", sequence)
+            + ".parquet";
+    Path targetFile = writeRoot.resolve(fileName).toAbsolutePath().normalize();
+    String selectColumns =
+        columns.stream()
+            .map(column -> RowManagerImpl.quoteIdentifier(column.field().getName()))
+            .reduce((left, right) -> left + ", " + right)
+            .orElse("*");
+    String sql =
+        "copy (select "
+            + selectColumns
+            + ", '"
+            + mutation.name()
+            + "' as "
+            + RowManagerImpl.quoteIdentifier("_fabric_op")
+            + " from "
+            + RowManagerImpl.quoteIdentifier(tempTableName)
+            + ") to '"
+            + RowManagerImpl.escapeSqlLiteral(targetFile.toString().replace('\\', '/'))
+            + "' (format parquet, compression snappy)";
+    session.exec(sql);
+  }
+
+  static String sanitizeFilename(String value) {
+    String input = RowManagerImpl.trimToNull(value);
+    if (input == null) {
+      return "dataset";
+    }
+    StringBuilder builder = new StringBuilder(input.length());
+    for (int index = 0; index < input.length(); index++) {
+      char ch = input.charAt(index);
+      if (Character.isLetterOrDigit(ch) || ch == '-' || ch == '_' || ch == '.') {
+        builder.append(ch);
+      } else {
+        builder.append('_');
+      }
+    }
+    String normalized = RowManagerImpl.trimToNull(builder.toString());
+    return normalized == null ? "dataset" : normalized;
+  }
+
+  static void ensureDuckDbActiveChangeTable(DuckdbSession session, DatasetId datasetId) {
+    String sql =
+        "create table if not exists "
+            + DuckdbActiveChangeLog.quoteIdentifier(DuckdbActiveChangeLog.tableName(datasetId))
+            + " (seq BIGINT, ts TIMESTAMP, pk VARCHAR, op VARCHAR)";
+    session.exec(sql);
+  }
+
+  static long appendDuckDbActiveChangeLog(
+      DuckdbSession session,
+      DatasetId datasetId,
+      String tempTableName,
+      List<String> primaryKey,
+      DuckDbActiveMutation mutation) {
+    ensureDuckDbActiveChangeTable(session, datasetId);
+    String changeTable = DuckdbActiveChangeLog.quoteIdentifier(DuckdbActiveChangeLog.tableName(datasetId));
+    String pkExpr = DuckdbActiveChangeLog.primaryKeyTextExpression(primaryKey, "src");
+    String source =
+        "select __fabric_pk, max(__fabric_seq) as __fabric_ord from (select "
+            + pkExpr
+            + " as __fabric_pk, __fabric_seq from "
+            + RowManagerImpl.quoteIdentifier(tempTableName)
+            + " as src) as staged where __fabric_pk is not null group by __fabric_pk";
+    String sql =
+        "insert into "
+            + changeTable
+            + " (seq, ts, pk, op) select base.base_seq + row_number() over (order by source.__fabric_ord, source.__fabric_pk), current_timestamp, source.__fabric_pk, "
+            + DuckdbActiveChangeLog.quoteSqlString(mutation.name())
+            + " from ("
+            + source
+            + ") as source cross join (select coalesce(max(seq), 0) as base_seq from "
+            + changeTable
+            + ") as base";
+    session.exec(sql);
+    return queryDuckDbActiveChangeMaxSeq(session, datasetId, datasetId.toString());
+  }
+
+  static long queryDuckDbActiveChangeMaxSeq(
+      DuckdbSession session, DatasetId datasetId, String canonicalDatasetId) {
+    String sql =
+        "select coalesce(max(seq), 0) from "
+            + DuckdbActiveChangeLog.quoteIdentifier(DuckdbActiveChangeLog.tableName(datasetId));
+    try (PreparedStatement statement = session.prepareStatement(sql)) {
+      boolean hasResult = statement.execute();
+      if (!hasResult) {
+        return 0L;
+      }
+      try (ResultSet resultSet = statement.getResultSet()) {
+        if (!resultSet.next()) {
+          return 0L;
+        }
+        return Math.max(0L, resultSet.getLong(1));
+      }
+    } catch (SQLException ex) {
+      throw new IllegalStateException(
+          "Failed to query DUCKDB_ACTIVE change max seq for " + canonicalDatasetId, ex);
+    }
+  }
+
+  static long insertArrowRowsIntoActiveTemp(
+      RowManagerImpl self,
+      DuckdbSession session,
+      String insertSql,
+      List<RowManagerImpl.AppendColumn> columns,
+      VectorSchemaRoot root,
+      ArrowStreamReader reader,
+      String canonicalDatasetId) {
+    long insertedRows = 0L;
+    long sequence = 0L;
+    try (PreparedStatement statement = session.prepareStatement(insertSql)) {
+      while (reader.loadNextBatch()) {
+        int rowCount = root.getRowCount();
+        if (rowCount <= 0) {
+          continue;
+        }
+        for (int rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+          for (int index = 0; index < columns.size(); index++) {
+            RowManagerImpl.AppendColumn column = columns.get(index);
+            FieldVector vector = root.getVector(column.vectorIndex());
+            if (vector == null || vector.isNull(rowIndex)) {
+              statement.setNull(index + 1, column.jdbcNullType());
+              continue;
+            }
+            Object value =
+                RowManagerImpl.toJdbcValue(
+                    column.field().getType(), vector.getObject(rowIndex), column.field().getName());
+            if (value == null) {
+              statement.setNull(index + 1, column.jdbcNullType());
+            } else if (value instanceof byte[] bytes) {
+              statement.setBytes(index + 1, bytes);
+            } else if (value instanceof Timestamp timestamp) {
+              statement.setTimestamp(index + 1, timestamp);
+            } else {
+              statement.setObject(index + 1, value);
+            }
+          }
+          statement.setLong(columns.size() + 1, sequence++);
+          statement.addBatch();
+          insertedRows++;
+        }
+        statement.executeBatch();
+        statement.clearBatch();
+      }
+    } catch (SQLException | IOException ex) {
+      throw new IllegalStateException(
+          "Failed to append DUCKDB_ACTIVE rows for dataset " + canonicalDatasetId, ex);
+    }
+    return insertedRows;
+  }
+
+  static boolean tableExists(DuckdbSession session, String tableName) {
+    String sql =
+        "select count(*) from information_schema.tables where table_schema = current_schema() and lower(table_name) = lower('"
+            + RowManagerImpl.escapeSqlLiteral(tableName)
+            + "')";
+    try (PreparedStatement statement = session.prepareStatement(sql)) {
+      boolean hasResult = statement.execute();
+      if (!hasResult) {
+        return false;
+      }
+      try (ResultSet resultSet = statement.getResultSet()) {
+        if (!resultSet.next()) {
+          return false;
+        }
+        return resultSet.getLong(1) > 0L;
+      }
+    } catch (SQLException ex) {
+      throw new IllegalStateException("Failed to inspect table existence for " + tableName, ex);
+    }
+  }
+
+  static boolean tableHasColumn(DuckdbSession session, String tableName, String columnName) {
+    return readTableTypeMap(session, tableName).containsKey(columnName.toLowerCase(Locale.ROOT));
+  }
+
+  static Map<String, String> readTableTypeMap(DuckdbSession session, String tableName) {
+    Map<String, String> types = new LinkedHashMap<>();
+    for (RowManagerImpl.SqlColumn column : readTableColumns(session, tableName)) {
+      types.put(column.name().toLowerCase(Locale.ROOT), column.duckdbType());
+    }
+    return types;
+  }
+
+  static List<RowManagerImpl.SqlColumn> readTableColumns(DuckdbSession session, String tableName) {
+    return readTableColumns(session, tableName, null);
+  }
+
+  static List<RowManagerImpl.SqlColumn> readTableColumns(
+      DuckdbSession session, String tableName, String excludedColumnName) {
+    String excluded = RowManagerImpl.trimToNull(excludedColumnName);
+    String sql = "pragma table_info('" + RowManagerImpl.escapeSqlLiteral(tableName) + "')";
+    List<RowManagerImpl.SqlColumn> columns = new ArrayList<>();
+    try (PreparedStatement statement = session.prepareStatement(sql)) {
+      boolean hasResult = statement.execute();
+      if (!hasResult) {
+        return List.of();
+      }
+      try (ResultSet resultSet = statement.getResultSet()) {
+        while (resultSet.next()) {
+          String name = RowManagerImpl.trimToNull(resultSet.getString("name"));
+          String type = RowManagerImpl.trimToNull(resultSet.getString("type"));
+          if (name == null || type == null) {
+            continue;
+          }
+          if (excluded != null && excluded.equalsIgnoreCase(name)) {
+            continue;
+          }
+          columns.add(new RowManagerImpl.SqlColumn(name, type));
+        }
+        return List.copyOf(columns);
+      }
+    } catch (SQLException ex) {
+      throw new IllegalStateException("Failed to read DuckDB table columns for " + tableName, ex);
+    }
+  }
+
+  static String normalizeDuckdbType(String type) {
+    String normalized = RowManagerImpl.trimToNull(type);
+    if (normalized == null) {
+      return "";
+    }
+    return normalized.toUpperCase(Locale.ROOT).replace(" ", "");
+  }
+
+  static RowManagerImpl.ActiveDatasetBinding resolveActiveDatasetBinding(
+      RowManagerImpl self, DatasetId datasetId) {
+    DefinitionDataset definition = self.resolveDatasetDefinition(datasetId);
+    DefinitionDataset.DuckdbBinding binding = definition.binding() == null ? null : definition.binding().duckdb();
+    if (!self.isDuckDbActive(binding)) {
+      throw new IllegalStateException("Dataset is not DUCKDB_ACTIVE: " + datasetId);
+    }
+    String relationName =
+        RowManagerImpl.requireNonBlank(binding.relationName(), "Dataset DUCKDB relationName is required");
+    List<String> primaryKey = normalizePrimaryKey(binding.primaryKey(), datasetId.toString());
+    return new RowManagerImpl.ActiveDatasetBinding(
+        datasetId, datasetId.toString(), relationName, binding, primaryKey);
+  }
+
+  static <T> T withActiveDatasetSession(
+      RowManagerImpl self,
+      RowManagerImpl.ActiveDatasetBinding active,
+      Function<DuckdbSession, T> callback) {
+    Objects.requireNonNull(active, "active");
+    Objects.requireNonNull(callback, "callback");
+    if (Boolean.TRUE.equals(active.binding().memory())) {
+      synchronized (self.sharedSessionLockInternal()) {
+        DuckdbSession session = self.requireSharedSession();
+        ensureDuckDbActiveInitialized(
+            self, session, active.canonicalDatasetId(), active.relationName(), active.binding());
+        return callback.apply(session);
+      }
+    }
+    try (DuckdbSession session = openDuckDbActiveSession(self, active.binding())) {
+      return callback.apply(session);
+    }
   }
 }
-
-
-
-
-
-
