@@ -1,629 +1,632 @@
-package org.pronzato.fabric.api.catalog.semantics;
+package org.pronzato.fabric.api.control.security.kerberos;
 
-import org.pronzato.fabric.api.control.discovery.definitions.common.Semantic;
-
-import java.util.ArrayList;
-import java.util.EnumMap;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.PrivilegedAction;
+import java.security.PrivilegedActionException;
+import java.security.PrivilegedExceptionAction;
+import java.util.Base64;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
-import org.pronzato.fabric.api.control.discovery.definitions.Definition;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfig;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfigLayer;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngest;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngestSource;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionSchema;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionService;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStream;
+import java.util.Objects;
+import java.util.UUID;
+import javax.security.auth.Subject;
+import javax.security.auth.callback.Callback;
+import javax.security.auth.callback.CallbackHandler;
+import javax.security.auth.callback.UnsupportedCallbackException;
+import javax.security.auth.kerberos.KerberosPrincipal;
+import javax.security.auth.login.AppConfigurationEntry;
+import javax.security.auth.login.Configuration;
+import javax.security.auth.login.LoginContext;
+import javax.security.auth.login.LoginException;
+import org.ietf.jgss.GSSContext;
+import org.ietf.jgss.GSSCredential;
+import org.ietf.jgss.GSSException;
+import org.ietf.jgss.GSSManager;
+import org.ietf.jgss.GSSName;
+import org.ietf.jgss.Oid;
+import org.pronzato.fabric.api.util.Io;
 import org.pronzato.fabric.api.util.Strings;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-public final class SemanticCompletenessAuditor {
-  private SemanticCompletenessAuditor() {}
+public final class KerberosClient implements AutoCloseable {
+  private static final Logger LOGGER = LoggerFactory.getLogger(KerberosClient.class);
+  private static final String LOGIN_CONTEXT_PREFIX = "FabricKerberosClient";
+  private static final String JVM_KRB5_CONF = "java.security.krb5.conf";
+  private static final String JVM_KRB5_CONFIG = "sun.security.krb5.config";
+  private static final String JVM_USE_SUBJECT_CREDS_ONLY = "javax.security.auth.useSubjectCredsOnly";
+  private static final String JVM_KRB5_DEBUG = "sun.security.krb5.debug";
+  private static final Object JVM_KRB5_LOCK = new Object();
+  private static final Oid SPNEGO_OID = oid("1.3.6.1.5.5.2");
+  private static Path installedJvmKrb5Path;
+  private static String installedJvmKrb5Fingerprint;
 
-  public record AuditInput(String source, Definition definition) {}
+  private final KerberosConfig config;
+  private final String loginContextName =
+      LOGIN_CONTEXT_PREFIX + "-" + UUID.randomUUID().toString().replace("-", "");
 
-  public static SemanticAuditReport auditDefinitions(
-      Iterable<Definition> definitions, SemanticValidationPolicy policy) {
-    List<AuditInput> inputs = new ArrayList<>();
-    if (definitions != null) {
-      int index = 0;
-      for (Definition definition : definitions) {
-        inputs.add(new AuditInput("definition#" + index, definition));
-        index++;
-      }
-    }
-    return auditAssets(inputs, policy);
+  private Subject subject;
+  private LoginContext loginContext;
+  private Path resolvedKeytabPath;
+  private Path resolvedKrb5Path;
+  private Path materializedKeytabPath;
+  private Path materializedKrb5Path;
+  private boolean started;
+
+  public KerberosClient(KerberosConfig config) {
+    this.config = Objects.requireNonNull(config, "config");
+    this.config.validate();
   }
 
-  public static SemanticAuditReport auditAssets(
-      Iterable<AuditInput> inputs, SemanticValidationPolicy policy) {
-    SemanticValidationPolicy effectivePolicy =
-        policy == null ? SemanticValidationPolicy.fromTier("dev") : policy;
-    List<SemanticAssetAudit> assets = new ArrayList<>();
-    Map<String, Integer> countsByType = new LinkedHashMap<>();
-    Map<SemanticFindingSeverity, Integer> countsBySeverity =
-        new EnumMap<>(SemanticFindingSeverity.class);
-    countsBySeverity.put(SemanticFindingSeverity.ERROR, 0);
-    countsBySeverity.put(SemanticFindingSeverity.WARN, 0);
-    countsBySeverity.put(SemanticFindingSeverity.INFO, 0);
+  public KerberosConfig getConfig() {
+    return config;
+  }
 
-    int placeholderFindings = 0;
-    int totalFindings = 0;
-    int totalScore = 0;
-    boolean enforcementFailed = false;
+  public Path getResolvedKeytabPath() {
+    return resolvedKeytabPath;
+  }
 
-    List<AuditInput> normalizedInputs = new ArrayList<>();
-    if (inputs != null) {
-      for (AuditInput input : inputs) {
-        if (input != null && input.definition() != null) {
-          normalizedInputs.add(input);
-        }
-      }
+  public Path getResolvedKrb5Path() {
+    return resolvedKrb5Path;
+  }
+
+  public static void ensureJvmKrb5Configuration(
+      Path resolvedKrb5Path, boolean debug, String realmHint) {
+    try {
+      installJvmKrb5ForStart(resolvedKrb5Path, debug, realmHint);
+    } catch (Exception ex) {
+      throw new IllegalStateException(
+          "Failed to configure JVM Kerberos bootstrap for krb5.conf=" + resolvedKrb5Path, ex);
     }
-    Map<String, Semantic> configSemanticByKey = indexConfigSemantic(normalizedInputs);
+  }
 
-    for (AuditInput input : normalizedInputs) {
-      if (input == null || input.definition() == null) {
-        continue;
+  public synchronized KerberosClient start() {
+    if (started) {
+      return this;
+    }
+    if (!config.isEnabled()) {
+      started = true;
+      return this;
+    }
+    try {
+      resolvedKeytabPath = resolveKeytabPath(config);
+      resolvedKrb5Path = resolveKrb5Path(config.getKrb5ConfigSource());
+      installJvmKrb5ForStart(resolvedKrb5Path, config.isDebug(), config.getRealm());
+      login();
+      started = true;
+      return this;
+    } catch (Exception ex) {
+      close();
+      throw new IllegalStateException("Failed to start Kerberos context '" + config.getName() + "'", ex);
+    }
+  }
+
+  public synchronized Subject getSubject() {
+    ensureActive();
+    if (subject == null) {
+      throw new IllegalStateException("Kerberos Subject is not initialized");
+    }
+    return subject;
+  }
+
+  @SuppressWarnings("removal")
+  public <T> T doAs(PrivilegedExceptionAction<T> action) throws Exception {
+    Objects.requireNonNull(action, "action");
+    try {
+      return Subject.doAs(getSubject(), action);
+    } catch (PrivilegedActionException ex) {
+      throw ex.getException();
+    }
+  }
+
+  @SuppressWarnings("removal")
+  public void doAs(Runnable action) {
+    Objects.requireNonNull(action, "action");
+    Subject.doAs(
+        getSubject(),
+        (PrivilegedAction<Void>)
+            () -> {
+              action.run();
+              return null;
+            });
+  }
+
+  public String buildNegotiateHeader(String spn) {
+    return buildNegotiateHeader(spn, getSubject());
+  }
+
+  public String buildNegotiateHeaderForSpn(String spn) {
+    return buildNegotiateHeader(spn);
+  }
+
+  public String buildNegotiateHeaderForSpn(String spn, Subject subject) {
+    return buildNegotiateHeader(spn, subject);
+  }
+
+  public String buildNegotiateHeaderForHostHttp(String hostFqdn) {
+    return buildNegotiateHeader(KerberosSpn.httpSpnForHost(hostFqdn));
+  }
+
+  @SuppressWarnings("removal")
+  public String buildNegotiateHeader(String spn, Subject subject) {
+    ensureActive();
+    String target = require(spn, "spn");
+    try {
+      byte[] token = mintSpnegoTokenAsSubject(target, Objects.requireNonNull(subject, "subject"));
+      return "Negotiate " + Base64.getEncoder().encodeToString(token);
+    } catch (Exception ex) {
+      throw new IllegalStateException(
+          "Failed to build Negotiate header for SPN '" + target + "'", ex);
+    }
+  }
+
+  @SuppressWarnings("removal")
+  public byte[] mintSpnegoTokenAsSubject(String spn, Subject subject) throws Exception {
+    String target = require(spn, "spn");
+    Subject subjectForMint = Objects.requireNonNull(subject, "subject");
+    try {
+      return Subject.doAs(
+          subjectForMint,
+          (PrivilegedExceptionAction<byte[]>)
+              () -> createInitToken(target, config.isAllowSpnegoFallbackToKrb5()));
+    } catch (PrivilegedActionException ex) {
+      throw ex.getException();
+    }
+  }
+
+  public synchronized void reloadKrb5Config(KerberosKrb5Source source) {
+    ensureActive();
+    Path oldResolved = resolvedKrb5Path;
+    Path oldMaterialized = materializedKrb5Path;
+    LoginContext oldLogin = loginContext;
+    Subject oldSubject = subject;
+    try {
+      resolvedKrb5Path = resolveKrb5Path(Objects.requireNonNull(source, "source"));
+      installJvmKrb5ForReload(resolvedKrb5Path, config.isDebug(), config.getRealm());
+      login();
+      if (oldLogin != null) {
+        oldLogin.logout();
       }
-        Definition definition = input.definition();
-        String definitionType = targetedDefinitionType(definition);
-        if (definitionType == null) {
+      if (oldMaterialized != null && !oldMaterialized.equals(materializedKrb5Path)) {
+        Io.deleteIfExists(oldMaterialized);
+      }
+    } catch (Exception ex) {
+      resolvedKrb5Path = oldResolved;
+      subject = oldSubject;
+      loginContext = oldLogin;
+      restoreJvmKrb5AfterFailedReload(oldResolved, config.isDebug(), config.getRealm());
+      throw new IllegalStateException("Failed to reload krb5 source", ex);
+    }
+  }
+
+  public KerberosResult acceptSpnego(byte[] token) {
+    return acceptSpnego(token, null);
+  }
+
+  public KerberosResult acceptSpnego(byte[] token, String acceptorPrincipal) {
+    Objects.requireNonNull(token, "token");
+    if (token.length == 0) {
+      throw new IllegalArgumentException("token is required");
+    }
+    if (acceptorPrincipal != null) {
+      require(acceptorPrincipal, "acceptorPrincipal");
+    }
+    try {
+      return doAs(() -> acceptToken(token));
+    } catch (Exception ex) {
+      throw new IllegalStateException("Failed to accept SPNEGO token", ex);
+    }
+  }
+
+  public KerberosResult acceptSpnegoToken(byte[] token) {
+    return acceptSpnego(token);
+  }
+
+  public KerberosResult acceptSpnegoToken(byte[] token, String acceptorPrincipal) {
+    return acceptSpnego(token, acceptorPrincipal);
+  }
+
+  @SuppressWarnings("removal")
+  public KerberosResult acceptSpnegoTokenAsSubject(
+      byte[] token, String acceptorPrincipal, Subject acceptorSubject) {
+    Objects.requireNonNull(token, "token");
+    if (token.length == 0) {
+      throw new IllegalArgumentException("token is required");
+    }
+    require(acceptorPrincipal, "acceptorPrincipal");
+    Subject subjectForAccept = Objects.requireNonNull(acceptorSubject, "acceptorSubject");
+    try {
+      return Subject.doAs(
+          subjectForAccept,
+          (PrivilegedExceptionAction<KerberosResult>)
+              () -> {
+                GSSManager manager = GSSManager.getInstance();
+                GSSContext context = manager.createContext((GSSCredential) null);
+                try {
+                  byte[] response = context.acceptSecContext(token, 0, token.length);
+                  if (!context.isEstablished()) {
+                    throw new IllegalStateException("SPNEGO accept did not establish context");
+                  }
+                  String sourcePrincipal =
+                      context.getSrcName() == null ? null : context.getSrcName().toString();
+                  Subject delegated = delegatedSubject(context);
+                  return new KerberosResult(sourcePrincipal, true, response, delegated);
+                } finally {
+                  context.dispose();
+                }
+              });
+    } catch (PrivilegedActionException ex) {
+      throw new IllegalStateException("Failed to accept SPNEGO token", ex.getException());
+    }
+  }
+
+  public KerberosResult acceptSpnegoTokenAsSubject(
+      byte[] token,
+      String acceptorPrincipal,
+      Subject acceptorSubject,
+      String keytabPath,
+      String krb5Path) {
+    return acceptSpnegoTokenAsSubject(token, acceptorPrincipal, acceptorSubject);
+  }
+
+  @Override
+  public synchronized void close() {
+    started = false;
+    if (loginContext != null) {
+      try {
+        loginContext.logout();
+      } catch (LoginException ignore) {
+      }
+      loginContext = null;
+    }
+    subject = null;
+    resolvedKeytabPath = null;
+    resolvedKrb5Path = null;
+    Io.deleteIfExists(materializedKeytabPath);
+    Io.deleteIfExists(materializedKrb5Path);
+    materializedKeytabPath = null;
+    materializedKrb5Path = null;
+  }
+
+  private KerberosResult acceptToken(byte[] token) throws GSSException {
+    GSSManager manager = GSSManager.getInstance();
+    GSSContext ctx = manager.createContext((GSSCredential) null);
+    try {
+      byte[] response = ctx.acceptSecContext(token, 0, token.length);
+      String principal = ctx.getSrcName() == null ? null : ctx.getSrcName().toString();
+      Subject delegated = delegatedSubject(ctx);
+      return new KerberosResult(principal, ctx.isEstablished(), response, delegated);
+    } finally {
+      ctx.dispose();
+    }
+  }
+
+  private void ensureActive() {
+    if (!started) {
+      throw new IllegalStateException("Kerberos context is not started");
+    }
+    if (!config.isEnabled()) {
+      throw new IllegalStateException("Kerberos context is disabled");
+    }
+  }
+
+  private void login() throws LoginException {
+    LoginContext ctx =
+        new LoginContext(
+            loginContextName,
+            null,
+            NoPromptCallbackHandler.INSTANCE,
+            new LoginConfig(
+                config.getEffectivePrincipal(),
+                resolvedKeytabPath,
+                resolvedKrb5Path,
+                config.isDebug()));
+    ctx.login();
+    loginContext = ctx;
+    subject = Objects.requireNonNull(ctx.getSubject(), "subject");
+  }
+
+  private Path resolveKeytabPath(KerberosConfig cfg) throws Exception {
+    if (cfg.getKeytabPath() != null) {
+      if (!Files.isRegularFile(cfg.getKeytabPath())) {
+        throw new IllegalArgumentException("Kerberos keytab path does not exist: " + cfg.getKeytabPath());
+      }
+      return cfg.getKeytabPath();
+    }
+    byte[] bytes = cfg.getKeytabBytes();
+    if (bytes == null || bytes.length == 0) {
+      throw new IllegalArgumentException("Kerberos keytab bytes are required");
+    }
+    Path temp = Io.writeTempFile("fabric-kerberos-keytab-", ".keytab", bytes);
+    materializedKeytabPath = temp;
+    return temp;
+  }
+
+  private Path resolveKrb5Path(KerberosKrb5Source source) throws Exception {
+    KerberosKrb5Source value = source == null ? KerberosKrb5Source.DEFAULT : source;
+    if (value instanceof KerberosKrb5Source.FilePath filePath) {
+      Path path = filePath.getPath().toAbsolutePath().normalize();
+      if (!Files.isRegularFile(path)) {
+        throw new IllegalArgumentException("krb5 path does not exist: " + path);
+      }
+      materializedKrb5Path = null;
+      return path;
+    }
+    if (value instanceof KerberosKrb5Source.Bytes bytes) {
+      Path temp = Io.writeTempFile("fabric-krb5-", ".conf", bytes.getData());
+      materializedKrb5Path = temp;
+      return temp;
+    }
+    String resourcePath;
+    if (value instanceof KerberosKrb5Source.Classpath classpath) {
+      resourcePath = classpath.getResourcePath();
+    } else {
+      resourcePath = KerberosKrb5Source.DEFAULT_RESOURCE;
+    }
+    Path temp = materializeClasspathKrb5(resourcePath);
+    materializedKrb5Path = temp;
+    return temp;
+  }
+
+  private static void installJvmKrb5ForStart(Path resolvedKrb5Path, boolean debug, String realmHint)
+      throws Exception {
+    Path normalized = requireExistingPath(resolvedKrb5Path, "resolvedKrb5Path");
+    String fingerprint = sha256Hex(Files.readAllBytes(normalized));
+    synchronized (JVM_KRB5_LOCK) {
+      if (installedJvmKrb5Path != null
+          && !Objects.equals(installedJvmKrb5Fingerprint, fingerprint)) {
+        throw new IllegalStateException(
+            "Kerberos runtime requested krb5.conf "
+                + normalized
+                + " but JVM is already configured with "
+                + installedJvmKrb5Path
+                + ". The JDK uses a process-global krb5.conf; reuse the same krb5.conf for all Kerberos contexts or restart the process.");
+      }
+      applyJvmKrb5Properties(normalized, debug);
+      installedJvmKrb5Path = normalized;
+      installedJvmKrb5Fingerprint = fingerprint;
+      Krb5Diagnostic diagnostic = parseKrb5Diagnostic(normalized);
+      String realm = Strings.trimToNull(realmHint);
+      if (realm == null) {
+        realm = diagnostic.realm();
+      }
+      LOGGER.debug("[Kerberos] resolvedKrb5Path={} realm={} kdcHostPort={}", normalized, realm == null ? "<unknown>" : realm, diagnostic.kdcHostPort() == null ? "<unknown>" : diagnostic.kdcHostPort());
+    }
+  }
+
+  private static void installJvmKrb5ForReload(Path resolvedKrb5Path, boolean debug, String realmHint)
+      throws Exception {
+    Path normalized = requireExistingPath(resolvedKrb5Path, "resolvedKrb5Path");
+    String fingerprint = sha256Hex(Files.readAllBytes(normalized));
+    synchronized (JVM_KRB5_LOCK) {
+      applyJvmKrb5Properties(normalized, debug);
+      installedJvmKrb5Path = normalized;
+      installedJvmKrb5Fingerprint = fingerprint;
+      Krb5Diagnostic diagnostic = parseKrb5Diagnostic(normalized);
+      String realm = Strings.trimToNull(realmHint);
+      if (realm == null) {
+        realm = diagnostic.realm();
+      }
+      LOGGER.debug("[Kerberos] krb5 reload applied resolvedKrb5Path={} realm={} kdcHostPort={}", normalized, realm == null ? "<unknown>" : realm, diagnostic.kdcHostPort() == null ? "<unknown>" : diagnostic.kdcHostPort());
+    }
+  }
+
+  private static void restoreJvmKrb5AfterFailedReload(
+      Path resolvedKrb5Path, boolean debug, String realmHint) {
+    if (resolvedKrb5Path == null) {
+      return;
+    }
+    try {
+      installJvmKrb5ForReload(resolvedKrb5Path, debug, realmHint);
+    } catch (Exception ex) {
+      LOGGER.warn("[Kerberos] failed to restore JVM krb5 after reload failure", ex);
+    }
+  }
+
+  private static void applyJvmKrb5Properties(Path resolvedKrb5Path, boolean debug) {
+    String absolute = resolvedKrb5Path.toAbsolutePath().normalize().toString();
+    System.setProperty(JVM_KRB5_CONF, absolute);
+    System.setProperty(JVM_KRB5_CONFIG, absolute);
+    System.setProperty(JVM_USE_SUBJECT_CREDS_ONLY, "false");
+    String configuredDebug = System.getProperty(JVM_KRB5_DEBUG);
+    boolean externallyConfigured = configuredDebug != null;
+    boolean externallyEnabled = Boolean.parseBoolean(configuredDebug);
+    // JDK krb5 debug is intentionally opt-in and should only be enabled for troubleshooting.
+    if (debug || externallyEnabled) {
+      System.setProperty(JVM_KRB5_DEBUG, "true");
+    } else if (!externallyConfigured) {
+      System.clearProperty(JVM_KRB5_DEBUG);
+    }
+  }
+
+  private static Path materializeClasspathKrb5(String resourcePath) throws Exception {
+    byte[] data = Io.readClasspathBytes(resourcePath, KerberosConfig.class);
+    return Io.writeTempFile("fabric-kerberos-krb5-", ".conf", data);
+  }
+
+  private static String sha256Hex(byte[] data) throws Exception {
+    MessageDigest digest = MessageDigest.getInstance("SHA-256");
+    return HexFormat.of().formatHex(digest.digest(data == null ? new byte[0] : data));
+  }
+
+  private static Path requireExistingPath(Path value, String label) {
+    if (value == null) {
+      throw new IllegalArgumentException(label + " is required");
+    }
+    Path normalized = value.toAbsolutePath().normalize();
+    if (!Files.isRegularFile(normalized)) {
+      throw new IllegalArgumentException(label + " does not exist: " + normalized);
+    }
+    return normalized;
+  }
+
+  private static Krb5Diagnostic parseKrb5Diagnostic(Path path) {
+    String realm = null;
+    String kdc = null;
+    try {
+      List<String> lines = Files.readAllLines(path);
+      for (String line : lines) {
+        String trimmed = stripComment(line);
+        if (trimmed.isEmpty()) {
           continue;
         }
-        countsByType.merge(definitionType, 1, Integer::sum);
-        SemanticAssetAudit assetAudit =
-            auditAsset(
-                input.source(),
-                definitionType,
-                definition,
-                configSemanticByKey,
-                effectivePolicy);
-        assets.add(assetAudit);
-        totalScore += assetAudit.score();
-
-        for (SemanticAuditFinding finding : assetAudit.findings()) {
-          countsBySeverity.merge(finding.severity(), 1, Integer::sum);
-          totalFindings++;
-          if (finding.placeholder()) {
-            placeholderFindings++;
-          }
+        String lower = trimmed.toLowerCase(java.util.Locale.ROOT);
+        if (realm == null && lower.startsWith("default_realm")) {
+          realm = parseAssignmentValue(trimmed);
+          continue;
         }
-        if (effectivePolicy.enforcePlaceholderRejection()
-            && assetAudit.findings().stream().anyMatch(finding -> finding.severity() == SemanticFindingSeverity.ERROR)) {
-          enforcementFailed = true;
+        if (kdc == null && lower.startsWith("kdc")) {
+          kdc = parseAssignmentValue(trimmed);
         }
-    }
-
-    double completenessPercentage = assets.isEmpty() ? 100.0 : (double) totalScore / assets.size();
-    SemanticAuditSummary summary =
-        new SemanticAuditSummary(
-            assets.size(),
-            Map.copyOf(countsByType),
-            Map.copyOf(countsBySeverity),
-            placeholderFindings,
-            totalFindings,
-            roundToTwoDecimals(completenessPercentage));
-    return new SemanticAuditReport(effectivePolicy, summary, enforcementFailed, List.copyOf(assets));
-  }
-
-  private static SemanticAssetAudit auditAsset(
-      String source,
-      String definitionType,
-      Definition definition,
-      Map<String, Semantic> configSemanticByKey,
-      SemanticValidationPolicy policy) {
-    Semantic semantic = semantic(definition, configSemanticByKey);
-    String assetId = assetId(definitionType, definition);
-    List<SemanticAuditFinding> findings = new ArrayList<>();
-
-    if (semantic == null) {
-      findings.add(
-          new SemanticAuditFinding(
-              "SEM_REQUIRED_METADATA",
-              SemanticFindingSeverity.ERROR,
-              "semantic",
-              "semantic metadata is missing",
-              false));
-      return finalizeAssetAudit(source, assetId, definitionType, findings);
-    }
-
-    validateGlobalRequired(findings, semantic);
-    validateGlobalPlaceholders(findings, semantic, policy);
-    validateTypeSpecific(findings, definitionType, semantic);
-
-    return finalizeAssetAudit(source, assetId, definitionType, findings);
-  }
-
-  private static SemanticAssetAudit finalizeAssetAudit(
-      String source, String assetId, String definitionType, List<SemanticAuditFinding> findings) {
-    int score = calculateScore(findings);
-    int placeholderCount = 0;
-    for (SemanticAuditFinding finding : findings) {
-      if (finding.placeholder()) {
-        placeholderCount++;
-      }
-    }
-    SemanticCompletenessClass classification = classify(score, placeholderCount);
-    return new SemanticAssetAudit(
-        Strings.firstNonBlank(Strings.trimToNull(source), assetId),
-        assetId,
-        definitionType,
-        score,
-        classification,
-        placeholderCount,
-        List.copyOf(findings));
-  }
-
-  private static void validateGlobalRequired(List<SemanticAuditFinding> findings, Semantic semantic) {
-    requireText(findings, "SEM_REQUIRED_TITLE", "semantic.title", semantic.title());
-    requireText(findings, "SEM_REQUIRED_DESCRIPTION", "semantic.description", semantic.description());
-    requireText(findings, "SEM_REQUIRED_BUSINESS_MEANING", "semantic.businessMeaning", semantic.businessMeaning());
-    requireText(findings, "SEM_REQUIRED_DOMAIN", "semantic.domain", semantic.domain());
-    requireNonEmptyList(findings, "SEM_REQUIRED_TAGS", "semantic.tags", semantic.tags());
-
-    if (semantic.ownership() == null) {
-      findings.add(
-          new SemanticAuditFinding(
-              "SEM_REQUIRED_OWNERSHIP",
-              SemanticFindingSeverity.ERROR,
-              "semantic.ownership",
-              "semantic.ownership is required",
-              false));
-    } else {
-      requireText(findings, "SEM_REQUIRED_OWNER_ID", "semantic.ownership.ownerId", semantic.ownership().ownerId());
-    }
-
-    if (semantic.dataShape() == null || semantic.dataShape().type() == null) {
-      findings.add(
-          new SemanticAuditFinding(
-              "SEM_REQUIRED_DATASHAPE_TYPE",
-              SemanticFindingSeverity.ERROR,
-              "semantic.dataShape.type",
-              "semantic.dataShape.type is required",
-              false));
-    }
-    if (semantic.trust() == null || semantic.trust().certification() == null) {
-      findings.add(
-          new SemanticAuditFinding(
-              "SEM_REQUIRED_TRUST_CERTIFICATION",
-              SemanticFindingSeverity.ERROR,
-              "semantic.trust.certification",
-              "semantic.trust.certification is required",
-              false));
-    }
-    if (semantic.trust() == null || semantic.trust().qualityStatus() == null) {
-      findings.add(
-          new SemanticAuditFinding(
-              "SEM_REQUIRED_TRUST_QUALITY",
-              SemanticFindingSeverity.ERROR,
-              "semantic.trust.qualityStatus",
-              "semantic.trust.qualityStatus is required",
-              false));
-    }
-    if (semantic.toolHints() == null || semantic.toolHints().actionClass() == null) {
-      findings.add(
-          new SemanticAuditFinding(
-              "SEM_REQUIRED_ACTION_CLASS",
-              SemanticFindingSeverity.ERROR,
-              "semantic.toolHints.actionClass",
-              "semantic.toolHints.actionClass is required",
-              false));
-    }
-  }
-
-  private static void validateGlobalPlaceholders(
-      List<SemanticAuditFinding> findings, Semantic semantic, SemanticValidationPolicy policy) {
-    addPlaceholderIf(
-        findings,
-        policy,
-        "SEM_PLACEHOLDER_TITLE",
-        "semantic.title",
-        SemanticMetadataValidator.isPlaceholderText(semantic.title()));
-    addPlaceholderIf(
-        findings,
-        policy,
-        "SEM_PLACEHOLDER_DESCRIPTION",
-        "semantic.description",
-        SemanticMetadataValidator.isPlaceholderText(semantic.description()));
-    addPlaceholderIf(
-        findings,
-        policy,
-        "SEM_PLACEHOLDER_BUSINESS_MEANING",
-        "semantic.businessMeaning",
-        SemanticMetadataValidator.isPlaceholderText(semantic.businessMeaning()));
-    addPlaceholderIf(
-        findings,
-        policy,
-        "SEM_PLACEHOLDER_DOMAIN_DEFAULT",
-        "semantic.domain",
-        SemanticMetadataValidator.isDefaultDomain(semantic.domain()));
-    addPlaceholderIf(
-        findings,
-        policy,
-        "SEM_PLACEHOLDER_TAGS_DEFAULT",
-        "semantic.tags",
-        SemanticMetadataValidator.containsDefaultTag(semantic.tags()));
-    addPlaceholderIf(
-        findings,
-        policy,
-        "SEM_PLACEHOLDER_OWNER_DEFAULT",
-        "semantic.ownership.ownerId",
-        semantic.ownership() != null && SemanticMetadataValidator.isDefaultOwnerId(semantic.ownership().ownerId()));
-    addPlaceholderIf(
-        findings,
-        policy,
-        "SEM_PLACEHOLDER_TRUST_CERT_NONE",
-        "semantic.trust.certification",
-        semantic.trust() != null && semantic.trust().certification() == Semantic.Certification.NONE);
-    addPlaceholderIf(
-        findings,
-        policy,
-        "SEM_PLACEHOLDER_TRUST_QUALITY_UNKNOWN",
-        "semantic.trust.qualityStatus",
-        semantic.trust() != null && semantic.trust().qualityStatus() == Semantic.QualityStatus.UNKNOWN);
-    addPlaceholderIf(
-        findings,
-        policy,
-        "SEM_PLACEHOLDER_GRAIN",
-        "semantic.dataShape.grain",
-        semantic.dataShape() != null && SemanticMetadataValidator.isPlaceholderText(semantic.dataShape().grain()));
-    addPlaceholderIf(
-        findings,
-        policy,
-        "SEM_PLACEHOLDER_USAGE",
-        "semantic.usage",
-        hasPlaceholderUsage(semantic));
-  }
-
-  private static void validateTypeSpecific(
-      List<SemanticAuditFinding> findings, String definitionType, Semantic semantic) {
-    if ("DATASET".equals(definitionType) || "STREAM".equals(definitionType) || "SCHEMA".equals(definitionType)) {
-      if (semantic.dataShape() == null || isBlank(semantic.dataShape().grain())) {
-        findings.add(
-            new SemanticAuditFinding(
-                "SEM_WEAK_GRAIN",
-                SemanticFindingSeverity.WARN,
-                "semantic.dataShape.grain",
-                "grain should be explicitly defined",
-                false));
-      }
-      if (semantic.dataShape() == null || semantic.dataShape().keyFields().isEmpty()) {
-        findings.add(
-            new SemanticAuditFinding(
-                "SEM_WEAK_KEYS",
-                SemanticFindingSeverity.WARN,
-                "semantic.dataShape.keyFields",
-                "keyFields should include business keys",
-                false));
-      }
-      if (!hasSemanticFieldRichness(semantic)) {
-        findings.add(
-            new SemanticAuditFinding(
-                "SEM_WEAK_FIELD_RICHNESS",
-                SemanticFindingSeverity.WARN,
-                "semantic.dataShape",
-                "add dimension/measure/time fields or fieldRoles for better semantic coverage",
-                false));
-      }
-      if (!hasUsefulUsage(semantic)) {
-        findings.add(
-            new SemanticAuditFinding(
-                "SEM_WEAK_USAGE",
-                SemanticFindingSeverity.WARN,
-                "semantic.usage",
-                "add at least one useful example question or usage hint",
-                false));
-      }
-      return;
-    }
-
-    if ("CONFIG".equals(definitionType)) {
-      if (!hasUsefulUsage(semantic)) {
-        findings.add(
-            new SemanticAuditFinding(
-                "SEM_WEAK_CONFIG_USAGE",
-                SemanticFindingSeverity.WARN,
-                "semantic.usage",
-                "add at least one useful example question or usage hint for config semantics",
-                false));
-      }
-      return;
-    }
-
-    if ("SERVICE".equals(definitionType)) {
-      if (semantic.toolHints() == null || semantic.toolHints().readOnly() == null) {
-        findings.add(
-            new SemanticAuditFinding(
-                "SEM_REQUIRED_SERVICE_READ_ONLY",
-                SemanticFindingSeverity.ERROR,
-                "semantic.toolHints.readOnly",
-                "service semantic toolHints.readOnly is required",
-                false));
-      }
-      if (semantic.toolHints() == null || semantic.toolHints().idempotent() == null) {
-        findings.add(
-            new SemanticAuditFinding(
-                "SEM_REQUIRED_SERVICE_IDEMPOTENT",
-                SemanticFindingSeverity.ERROR,
-                "semantic.toolHints.idempotent",
-                "service semantic toolHints.idempotent is required",
-                false));
-      }
-      if (!hasUsefulUsage(semantic)) {
-        findings.add(
-            new SemanticAuditFinding(
-                "SEM_WEAK_SERVICE_USAGE",
-                SemanticFindingSeverity.WARN,
-                "semantic.usage",
-                "add at least one useful service example question or usage hint",
-                false));
-      }
-      return;
-    }
-
-    if ("INGEST".equals(definitionType) || "INGEST_SOURCE".equals(definitionType)) {
-      if (!hasUsefulUsage(semantic)) {
-        findings.add(
-            new SemanticAuditFinding(
-                "SEM_WEAK_INGEST_USAGE",
-                SemanticFindingSeverity.WARN,
-                "semantic.usage",
-                "add at least one useful usage hint for ingest operations",
-                false));
-      }
-    }
-  }
-
-  private static boolean hasSemanticFieldRichness(Semantic semantic) {
-    if (semantic == null || semantic.dataShape() == null) {
-      return false;
-    }
-    return !semantic.dataShape().dimensionFields().isEmpty()
-        || !semantic.dataShape().measureFields().isEmpty()
-        || !semantic.dataShape().timeFields().isEmpty()
-        || !semantic.dataShape().fieldRoles().isEmpty();
-  }
-
-  private static boolean hasUsefulUsage(Semantic semantic) {
-    if (semantic == null || semantic.usage() == null) {
-      return false;
-    }
-    return hasNonPlaceholderText(semantic.usage().exampleQuestions())
-        || hasNonPlaceholderText(semantic.usage().usageHints());
-  }
-
-  private static boolean hasNonPlaceholderText(List<String> values) {
-    if (values == null || values.isEmpty()) {
-      return false;
-    }
-    for (String value : values) {
-      String normalized = Strings.trimToNull(value);
-      if (normalized != null && !SemanticMetadataValidator.isPlaceholderText(normalized)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private static boolean hasPlaceholderUsage(Semantic semantic) {
-    if (semantic == null || semantic.usage() == null) {
-      return false;
-    }
-    return listHasPlaceholder(semantic.usage().exampleQuestions())
-        || listHasPlaceholder(semantic.usage().exampleQueries())
-        || listHasPlaceholder(semantic.usage().usageHints())
-        || listHasPlaceholder(semantic.usage().knownPitfalls());
-  }
-
-  private static boolean listHasPlaceholder(List<String> values) {
-    if (values == null || values.isEmpty()) {
-      return false;
-    }
-    for (String value : values) {
-      if (SemanticMetadataValidator.isPlaceholderText(value)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private static void addPlaceholderIf(
-      List<SemanticAuditFinding> findings,
-      SemanticValidationPolicy policy,
-      String code,
-      String field,
-      boolean condition) {
-    if (!condition) {
-      return;
-    }
-    findings.add(
-        new SemanticAuditFinding(
-            code,
-            policy.placeholderSeverity(),
-            field,
-            "placeholder/default semantic value detected: " + field,
-            true));
-  }
-
-  private static void requireText(
-      List<SemanticAuditFinding> findings, String code, String field, String value) {
-    if (isBlank(value)) {
-      findings.add(
-          new SemanticAuditFinding(
-              code,
-              SemanticFindingSeverity.ERROR,
-              field,
-              field + " is required",
-              false));
-    }
-  }
-
-  private static void requireNonEmptyList(
-      List<SemanticAuditFinding> findings, String code, String field, List<String> values) {
-    if (values == null || values.isEmpty()) {
-      findings.add(
-          new SemanticAuditFinding(
-              code,
-              SemanticFindingSeverity.ERROR,
-              field,
-              field + " must be non-empty",
-              false));
-    }
-  }
-
-  private static int calculateScore(List<SemanticAuditFinding> findings) {
-    int deductions = 0;
-    for (SemanticAuditFinding finding : findings) {
-      if (finding.severity() == SemanticFindingSeverity.ERROR) {
-        deductions += 20;
-      } else if (finding.severity() == SemanticFindingSeverity.WARN) {
-        deductions += 8;
-      } else if (finding.severity() == SemanticFindingSeverity.INFO) {
-        deductions += 2;
-      }
-    }
-    return Math.max(0, 100 - deductions);
-  }
-
-  private static SemanticCompletenessClass classify(int score, int placeholderCount) {
-    if (placeholderCount > 0) {
-      return SemanticCompletenessClass.PLACEHOLDER;
-    }
-    if (score >= 90) {
-      return SemanticCompletenessClass.STRONG;
-    }
-    if (score >= 75) {
-      return SemanticCompletenessClass.COMPLETE;
-    }
-    return SemanticCompletenessClass.WEAK;
-  }
-
-  private static String targetedDefinitionType(Definition definition) {
-    if (definition instanceof DefinitionDataset) {
-      return "DATASET";
-    }
-    if (definition instanceof DefinitionService) {
-      return "SERVICE";
-    }
-    if (definition instanceof DefinitionStream) {
-      return "STREAM";
-    }
-    if (definition instanceof DefinitionIngest) {
-      return "INGEST";
-    }
-    if (definition instanceof DefinitionIngestSource) {
-      return "INGEST_SOURCE";
-    }
-    if (definition instanceof DefinitionSchema) {
-      return "SCHEMA";
-    }
-    if (definition instanceof DefinitionConfigLayer) {
-      return "CONFIG";
-    }
-    return null;
-  }
-
-  private static Semantic semantic(
-      Definition definition, Map<String, Semantic> configSemanticByKey) {
-    if (definition instanceof DefinitionDataset dataset) {
-      return dataset.semantic();
-    }
-    if (definition instanceof DefinitionService service) {
-      return service.semantic();
-    }
-    if (definition instanceof DefinitionStream stream) {
-      return stream.semantic();
-    }
-    if (definition instanceof DefinitionIngest ingest) {
-      return ingest.semantic();
-    }
-    if (definition instanceof DefinitionIngestSource ingestSource) {
-      return ingestSource.semantic();
-    }
-    if (definition instanceof DefinitionSchema schema) {
-      return schema.semantic();
-    }
-    if (definition instanceof DefinitionConfigLayer config) {
-      String group =
-          Strings.trimToNull(
-              config == null || config.envelope() == null ? null : config.envelope().group());
-      String configSetId = normalizeConfigSetId(config == null ? null : config.configId());
-      if (group != null && configSetId != null && configSemanticByKey != null) {
-        Semantic fromMeta = configSemanticByKey.get(configSemanticKey(group, configSetId));
-        if (fromMeta != null) {
-          return fromMeta;
+        if (realm != null && kdc != null) {
+          break;
         }
       }
-      return null;
+    } catch (Exception ignore) {
     }
-    return null;
+    return new Krb5Diagnostic(Strings.trimToNull(realm), Strings.trimToNull(kdc));
   }
 
-  private static Map<String, Semantic> indexConfigSemantic(List<AuditInput> inputs) {
-    if (inputs == null || inputs.isEmpty()) {
-      return Map.of();
+  private static String stripComment(String line) {
+    if (line == null) {
+      return "";
     }
-    LinkedHashMap<String, Semantic> indexed = new LinkedHashMap<>();
-    for (AuditInput input : inputs) {
-      Definition definition = input == null ? null : input.definition();
-      if (!(definition instanceof DefinitionConfig configMeta)
-          || configMeta.semantic() == null) {
-        continue;
+    String value = line;
+    int hash = value.indexOf('#');
+    if (hash >= 0) {
+      value = value.substring(0, hash);
+    }
+    int semicolon = value.indexOf(';');
+    if (semicolon >= 0) {
+      value = value.substring(0, semicolon);
+    }
+    return value.trim();
+  }
+
+  private static String parseAssignmentValue(String line) {
+    if (line == null) {
+      return null;
+    }
+    int eq = line.indexOf('=');
+    if (eq < 0 || eq + 1 >= line.length()) {
+      return null;
+    }
+    return Strings.trimToNull(line.substring(eq + 1));
+  }
+
+  private record Krb5Diagnostic(String realm, String kdcHostPort) {}
+
+  private static byte[] createInitToken(String spn, boolean allowFallback) throws GSSException {
+    if (allowFallback) {
+      // SPNEGO-only by design to match standalone runtime behavior.
+      return createInitToken(spn);
+    }
+    return createInitToken(spn);
+  }
+
+  private static byte[] createInitToken(String spn) throws GSSException {
+    GSSManager manager = GSSManager.getInstance();
+    String normalized = require(spn, "spn");
+    GSSName server = manager.createName(normalized, GSSName.NT_USER_NAME);
+    GSSContext ctx = manager.createContext(server, SPNEGO_OID, null, GSSContext.DEFAULT_LIFETIME);
+    try {
+      ctx.requestMutualAuth(false);
+      ctx.requestCredDeleg(false);
+      ctx.requestConf(false);
+      ctx.requestInteg(true);
+      byte[] token = ctx.initSecContext(new byte[0], 0, 0);
+      if (token == null || token.length == 0) {
+        throw new IllegalStateException("SPNEGO init returned empty token");
       }
-      String group =
-          Strings.firstNonBlank(
-              Strings.trimToNull(configMeta.envelope() == null ? null : configMeta.envelope().group()),
-              Strings.trimToNull(configMeta.group()));
-      String configSetId = normalizeConfigSetId(configMeta.configId());
-      if (group == null || configSetId == null) {
-        continue;
+      return token;
+    } finally {
+      ctx.dispose();
+    }
+  }
+
+  private static Subject delegatedSubject(GSSContext ctx) throws GSSException {
+    GSSCredential credential = ctx.getDelegCred();
+    if (credential == null) {
+      return null;
+    }
+    Subject delegated = new Subject();
+    delegated.getPrivateCredentials().add(credential);
+    GSSName name = credential.getName();
+    if (name != null) {
+      delegated.getPrincipals().add(new KerberosPrincipal(name.toString()));
+    }
+    return delegated;
+  }
+
+  private static String require(String value, String label) {
+    String trimmed = Strings.trimToNull(value);
+    if (trimmed == null) {
+      throw new IllegalArgumentException(label + " is required");
+    }
+    return trimmed;
+  }
+
+  private static Oid oid(String value) {
+    try {
+      return new Oid(value);
+    } catch (GSSException ex) {
+      throw new ExceptionInInitializerError(ex);
+    }
+  }
+
+  private static final class NoPromptCallbackHandler implements CallbackHandler {
+    private static final NoPromptCallbackHandler INSTANCE = new NoPromptCallbackHandler();
+
+    @Override
+    public void handle(Callback[] callbacks) throws UnsupportedCallbackException {
+      if (callbacks != null && callbacks.length > 0) {
+        throw new UnsupportedCallbackException(
+            callbacks[0], "Kerberos interactive prompts are disabled");
       }
-      indexed.put(configSemanticKey(group, configSetId), configMeta.semantic());
     }
-    return indexed.isEmpty() ? Map.of() : Map.copyOf(indexed);
   }
 
-  private static String configSemanticKey(String group, String configSetId) {
-    return group + "|" + configSetId;
-  }
+  private static final class LoginConfig extends Configuration {
+    private final AppConfigurationEntry[] entries;
 
-  private static String normalizeConfigSetId(String value) {
-    String normalized = Strings.trimToNull(value);
-    if (normalized == null) {
-      return null;
+    private LoginConfig(String principal, Path keytabPath, Path krb5Path, boolean debug) {
+      this.entries =
+          new AppConfigurationEntry[] {
+            new AppConfigurationEntry(
+                "com.sun.security.auth.module.Krb5LoginModule",
+                AppConfigurationEntry.LoginModuleControlFlag.REQUIRED,
+                options(principal, keytabPath, krb5Path, debug))
+          };
     }
-    if (!normalized.startsWith("config:")) {
-      return normalized;
+
+    @Override
+    public AppConfigurationEntry[] getAppConfigurationEntry(String name) {
+      return entries;
     }
-    String payload = normalized.substring("config:".length());
-    String[] parts = payload.split("/");
-    if (parts.length < 2) {
-      return null;
+
+    private static Map<String, String> options(
+        String principal, Path keytabPath, Path krb5Path, boolean debug) {
+      Map<String, String> options = new LinkedHashMap<>();
+      options.put("refreshKrb5Config", "true");
+      options.put("isInitiator", "true");
+      options.put("doNotPrompt", "true");
+      options.put("renewTGT", "false");
+      options.put("useKeyTab", "true");
+      options.put("keyTab", keytabPath.toAbsolutePath().toString());
+      options.put("storeKey", "true");
+      options.put("useTicketCache", "false");
+      options.put("principal", principal);
+      options.put("debug", Boolean.toString(debug));
+      if (krb5Path != null) {
+        String path = krb5Path.toAbsolutePath().toString();
+        options.put("krb5Config", path);
+        options.put("krb5Conf", path);
+      }
+      return options;
     }
-    return Strings.trimToNull(parts[1]);
-  }
-
-  private static String assetId(String definitionType, Definition definition) {
-    String group =
-        Strings.firstNonBlank(
-            definition == null || definition.envelope() == null ? null : definition.envelope().group(),
-            "unknown");
-    String name =
-        Strings.firstNonBlank(
-            definition == null || definition.envelope() == null ? null : definition.envelope().name(),
-            "unknown");
-    return definitionType.toLowerCase(Locale.ROOT) + ":" + group + "/" + name;
-  }
-
-  private static boolean isBlank(String value) {
-    return Strings.trimToNull(value) == null;
-  }
-
-  private static double roundToTwoDecimals(double value) {
-    return Math.round(value * 100.0d) / 100.0d;
   }
 }
-
