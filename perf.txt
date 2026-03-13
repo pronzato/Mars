@@ -1,548 +1,584 @@
-package org.pronzato.fabric.api.configs.manager;
+package org.pronzato.fabric.api.control.security.sso.oidc;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import java.time.Instant;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
+import java.net.URI;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfigLayer;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
-import org.pronzato.fabric.api.configs.ConfigManager.ConfigSubscription;
-import org.pronzato.fabric.api.configs.ConfigManager.ConfigUpdate;
-import org.pronzato.fabric.api.configs.ConfigManager.ConfigUpdateListener;
-import org.pronzato.fabric.api.configs.audit.ConfigEventSubscribed;
-import org.pronzato.fabric.api.configs.audit.ConfigEventType;
-import org.pronzato.fabric.api.configs.audit.ConfigEventUnsubscribed;
-import org.pronzato.fabric.api.configs.audit.ConfigEventUpdateCallback;
-import org.pronzato.fabric.api.configs.ConfigManager.ConfigLineage;
-import org.pronzato.fabric.api.configs.model.ConfigResolved;
+import java.util.Set;
 import org.pronzato.fabric.api.util.Strings;
 
-final class ConfigManagerImplSubscription {
-  private ConfigManagerImplSubscription() {}
+/**
+ * Configuration for the OIDC SSO implementation.
+ *
+ * <p>Values can be loaded via system properties or environment variables. Required fields
+ * must be provided explicitly; no real secrets are hard-coded.
+ */
+@JsonDeserialize(builder = FabricOidcConfig.Builder.class)
+public final class FabricOidcConfig {
 
-  static ConfigSubscription subscribe(
-      ConfigManagerImpl manager, String configId, String layerId, ConfigUpdateListener listener) {
-    ConfigManagerImpl.Resolution resolved = manager.resolveId(configId, layerId);
-    return subscribeInternal(manager, resolved.group(), resolved.configId(), resolved.layerId(), listener);
+  public static final String DEFAULT_SCOPE = "openid profile email";
+  public static final String DEFAULT_USERNAME_CLAIM = "preferred_username";
+  public static final String DEFAULT_LOGIN_PATH = "/login";
+  public static final String DEFAULT_CALLBACK_PATH = "/oidc/callback";
+  public static final int DEFAULT_CLOCK_SKEW_SECONDS = 60;
+
+  private final String issuerBaseUrl;
+  private final String authorizationEndpoint;
+  private final String tokenEndpoint;
+  private final String jwksEndpoint;
+  private final String clientId;
+  private final String clientSecret;
+  private final String redirectUri;
+  private final String scope;
+  private final String usernameClaim;
+  private final List<String> groupClaims;
+  private final List<String> allowAnonPaths;
+  private final boolean httpsRequiredForSameSiteNone;
+  private final String loginPath;
+  private final String callbackPath;
+  private final int clockSkewSeconds;
+
+  private FabricOidcConfig(Builder builder) {
+    this.issuerBaseUrl = builder.issuerBaseUrl;
+    this.authorizationEndpoint = builder.authorizationEndpoint;
+    this.tokenEndpoint = builder.tokenEndpoint;
+    this.jwksEndpoint = builder.jwksEndpoint;
+    this.clientId = builder.clientId;
+    this.clientSecret = builder.clientSecret;
+    this.redirectUri = builder.redirectUri;
+    this.scope = builder.scope;
+    this.usernameClaim = builder.usernameClaim;
+    this.groupClaims = builder.groupClaims;
+    this.allowAnonPaths = builder.allowAnonPaths;
+    this.httpsRequiredForSameSiteNone = builder.httpsRequiredForSameSiteNone;
+    this.loginPath = builder.loginPath;
+    this.callbackPath = builder.callbackPath;
+    this.clockSkewSeconds = builder.clockSkewSeconds;
   }
 
-  static ConfigSubscription subscribeInternal(
-      ConfigManagerImpl manager,
-      String group,
-      String configId,
-      String layerId,
-      ConfigUpdateListener listener) {
-    manager.ensureOpen();
-    String requiredGroup = ConfigManagerImpl.required(group, "group");
-    String requiredconfigId = ConfigManagerImpl.required(configId, "configId");
-    String requiredLayerId = Strings.trimToNull(layerId);
-    ConfigUpdateListener requiredListener = Objects.requireNonNull(listener, "listener");
-    ConfigManagerImpl.AuditContext auditContext = manager.captureAuditContext();
-    String subscriptionId = "config-sub-" + ConfigManagerImpl.SUBSCRIPTION_ID.incrementAndGet();
+  public static Builder builder() {
+    return new Builder();
+  }
 
-    ConfigManagerImpl.SubscriptionImpl subscription =
-        new ConfigManagerImpl.SubscriptionImpl(
-            manager,
-            subscriptionId,
-            requiredGroup,
-            requiredconfigId,
-            requiredLayerId,
-            requiredListener,
-            auditContext);
+  public static FabricOidcConfig fromSystem() {
+    return Builder.fromSystem().build();
+  }
 
-    AutoCloseable cacheHandle =
-        manager.configView.onUpsert(
-            DefinitionType.CONFIG_LAYER,
-            (key, definition) -> {
-              if (subscription.closed.get()) {
-                return;
-              }
-              if (!(definition instanceof DefinitionConfigLayer config)) {
-                ConfigManagerImpl.LOGGER.debug(
-                    "[ConfigManager][Ignored] reason=definition-type type={} key={}",
-                    key == null ? null : key.type(),
-                    key);
-                return;
-              }
-              ConfigManagerImpl.ParsedLayerIdentity identity =
-                  manager.parseLayerIdentity(config, key == null ? null : key.group());
-              if (identity == null) {
-                ConfigManagerImpl.LOGGER.debug(
-                    "[ConfigManager][Ignored] reason=identity-parse key={}", key);
-                return;
-              }
-              if (!requiredGroup.equals(identity.group())
-                  || !requiredconfigId.equals(identity.configId())) {
-                ConfigManagerImpl.LOGGER.debug(
-                    "[ConfigManager][Ignored] reason=filter-mismatch key={} configId={} layerId={}",
-                    key,
-                    identity.configId(),
-                    identity.layerId());
-                return;
-              }
-              if (requiredLayerId != null) {
-                if (!layerAffectsTarget(
-                    manager,
-                    requiredGroup,
-                    requiredconfigId,
-                    requiredLayerId,
-                    identity.layerId())) {
-                  ConfigManagerImpl.LOGGER.debug(
-                      "[ConfigManager][Ignored] reason=layer-not-in-chain key={} changedLayerId={} targetLayerId={}",
-                      key,
-                      identity.layerId(),
-                      requiredLayerId);
-                  return;
-                }
-                ConfigManagerImpl.LayerEntry targetLayer =
-                    manager.requireLayer(requiredGroup, requiredconfigId, requiredLayerId);
-                emitResolvedWithReschedule(
-                    manager,
-                    subscription,
-                    targetLayer,
-                    Instant.now(),
-                    ConfigManagerImpl.CALLBACK_REASON_RESOLVED_CHAIN_CHANGE);
-                return;
-              }
-              emitWithReschedule(
-                  manager,
-                  subscription,
-                  config,
-                  identity,
-                  Instant.now(),
-                  ConfigManagerImpl.CALLBACK_REASON_UPSERT);
-            });
+  public String issuerBaseUrl() {
+    return issuerBaseUrl;
+  }
 
-    subscription.cacheHandle = cacheHandle;
-    manager.subscriptions.add(subscription);
+  public String authorizationEndpoint() {
+    return authorizationEndpoint;
+  }
 
-    List<ConfigManagerImpl.LayerEntry> initialLayers =
-        manager.sortLayers(manager.findConfigLayersOrEmpty(requiredGroup, requiredconfigId));
-    if (requiredLayerId != null) {
-      initialLayers =
-          initialLayers.stream()
-              .filter(entry -> requiredLayerId.equals(entry.identity().layerId()))
-              .toList();
+  public String tokenEndpoint() {
+    return tokenEndpoint;
+  }
+
+  public String jwksEndpoint() {
+    return jwksEndpoint;
+  }
+
+  public String clientId() {
+    return clientId;
+  }
+
+  public String clientSecret() {
+    return clientSecret;
+  }
+
+  public String redirectUri() {
+    return redirectUri;
+  }
+
+  public String scope() {
+    return scope;
+  }
+
+  public String usernameClaim() {
+    return usernameClaim;
+  }
+
+  public List<String> groupClaims() {
+    return groupClaims;
+  }
+
+  public List<String> allowAnonPaths() {
+    return allowAnonPaths;
+  }
+
+  public boolean httpsRequiredForSameSiteNone() {
+    return httpsRequiredForSameSiteNone;
+  }
+
+  public String loginPath() {
+    return loginPath;
+  }
+
+  public String callbackPath() {
+    return callbackPath;
+  }
+
+  public int clockSkewSeconds() {
+    return clockSkewSeconds;
+  }
+
+  public String authorizationUrl() {
+    return resolveEndpoint(issuerBaseUrl, authorizationEndpoint);
+  }
+
+  public String tokenUrl() {
+    return resolveEndpoint(issuerBaseUrl, tokenEndpoint);
+  }
+
+  public String discoveryUrl() {
+    String base = issuerBaseUrl == null ? null : issuerBaseUrl.trim();
+    if (Strings.isBlank(base)) {
+      return null;
     }
-    ConfigManagerImpl.LOGGER.info(
-        "[ConfigManager][Subscribe] group={} configId={} layerId={} initialLayers={}",
-        requiredGroup,
-        requiredconfigId,
-        requiredLayerId,
-        initialLayers.size());
-    Instant subscribedAt = Instant.now();
-    ConfigLineage subscribedLineage =
-        manager.resolveLineage(requiredGroup, requiredconfigId, requiredLayerId, subscribedAt);
-    JsonNode subscribedChangedPayload = null;
-    if (!initialLayers.isEmpty() && (requiredLayerId != null || initialLayers.size() == 1)) {
-      subscribedChangedPayload =
-          manager.deepCopy(manager.resolveDeclaredAt(initialLayers.getFirst().definition(), subscribedAt));
+    String normalized = trimTrailingSlash(base);
+    return normalized + "/.well-known/openid-configuration";
+  }
+
+  public static String resolveEndpoint(String base, String endpoint) {
+    if (Strings.isBlank(endpoint)) {
+      return null;
     }
-    manager.publishAudit(
-        new ConfigEventSubscribed(
-            manager.envelope(
-                ConfigEventType.CONFIG_SUBSCRIBED,
-                requiredGroup,
-                requiredconfigId,
-                requiredLayerId,
-                manager.schemaKey(initialLayers.isEmpty() ? null : initialLayers.getFirst().definition()),
-                auditContext,
-                subscribedAt),
-            subscription.subscriptionId,
-            requiredLayerId,
-            subscribedLineage,
-            subscribedChangedPayload));
-    for (ConfigManagerImpl.LayerEntry layer : initialLayers) {
-      if (requiredLayerId != null) {
-        emitResolvedWithReschedule(
-            manager, subscription, layer, Instant.now(), ConfigManagerImpl.CALLBACK_REASON_INITIAL);
-      } else {
-        emitWithReschedule(
-            manager,
-            subscription,
-            layer.definition(),
-            layer.identity(),
-            Instant.now(),
-            ConfigManagerImpl.CALLBACK_REASON_INITIAL);
+    String trimmed = endpoint.trim();
+    if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+      return trimmed;
+    }
+    if (Strings.isBlank(base)) {
+      return trimmed;
+    }
+    return join(base.trim(), trimmed);
+  }
+
+  static String join(String base, String endpoint) {
+    String normalizedBase = trimTrailingSlash(base == null ? "" : base.trim());
+    String normalizedEndpoint = endpoint == null ? "" : endpoint.trim();
+    if (normalizedEndpoint.startsWith("/")) {
+      return normalizedBase + normalizedEndpoint;
+    }
+    return normalizedBase + "/" + normalizedEndpoint;
+  }
+
+  static String trimTrailingSlash(String value) {
+    if (Strings.isBlank(value)) {
+      return value;
+    }
+    String trimmed = value.trim();
+    while (trimmed.endsWith("/") && trimmed.length() > 1) {
+      trimmed = trimmed.substring(0, trimmed.length() - 1);
+    }
+    return trimmed;
+  }
+
+  public static final class Builder {
+
+    private String issuerBaseUrl;
+    private String authorizationEndpoint;
+    private String tokenEndpoint;
+    private String jwksEndpoint;
+    private String clientId;
+    private String clientSecret;
+    private String redirectUri;
+    private String externalBaseUrl;
+    private String redirectPath = DEFAULT_CALLBACK_PATH;
+    private String scope = DEFAULT_SCOPE;
+    private String usernameClaim = DEFAULT_USERNAME_CLAIM;
+    private List<String> groupClaims = List.of();
+    private List<String> allowAnonPaths =
+        List.of(DEFAULT_LOGIN_PATH, DEFAULT_CALLBACK_PATH, "/health", "/favicon.ico");
+    private boolean httpsRequiredForSameSiteNone = true;
+    private String loginPath = DEFAULT_LOGIN_PATH;
+    private String callbackPath = DEFAULT_CALLBACK_PATH;
+    private int clockSkewSeconds = DEFAULT_CLOCK_SKEW_SECONDS;
+
+    private Builder() {
+    }
+
+    public static Builder fromSystem() {
+      Builder builder = new Builder();
+      String issuer = firstNonBlank(
+          System.getProperty("fabric.oidc.issuerBaseUrl"),
+          System.getProperty("fabric.oidc.issuer"),
+          System.getenv("FABRIC_OIDC_ISSUER_BASE_URL"),
+          System.getenv("FABRIC_OIDC_ISSUER"));
+      if (Strings.isNotBlank(issuer)) {
+        builder.withIssuerBaseUrl(issuer);
+      }
+      String authorizationEndpoint = firstNonBlank(
+          System.getProperty("fabric.oidc.authorizationEndpoint"),
+          System.getProperty("fabric.oidc.authEndpoint"),
+          System.getenv("FABRIC_OIDC_AUTHORIZATION_ENDPOINT"),
+          System.getenv("FABRIC_OIDC_AUTH_ENDPOINT"));
+      if (Strings.isNotBlank(authorizationEndpoint)) {
+        builder.withAuthorizationEndpoint(authorizationEndpoint);
+      }
+      String tokenEndpoint = firstNonBlank(
+          System.getProperty("fabric.oidc.tokenEndpoint"),
+          System.getenv("FABRIC_OIDC_TOKEN_ENDPOINT"));
+      if (Strings.isNotBlank(tokenEndpoint)) {
+        builder.withTokenEndpoint(tokenEndpoint);
+      }
+      String jwksEndpoint = firstNonBlank(
+          System.getProperty("fabric.oidc.jwksEndpoint"),
+          System.getenv("FABRIC_OIDC_JWKS_ENDPOINT"));
+      if (Strings.isNotBlank(jwksEndpoint)) {
+        builder.withJwksEndpoint(jwksEndpoint);
+      }
+      String clientId = firstNonBlank(
+          System.getProperty("fabric.oidc.clientId"),
+          System.getenv("FABRIC_OIDC_CLIENT_ID"));
+      if (Strings.isNotBlank(clientId)) {
+        builder.withClientId(clientId);
+      }
+      String clientSecret = firstNonBlank(
+          System.getProperty("fabric.oidc.clientSecret"),
+          System.getenv("FABRIC_OIDC_CLIENT_SECRET"));
+      if (Strings.isNotBlank(clientSecret)) {
+        builder.withClientSecret(clientSecret);
+      }
+      String redirectUri = firstNonBlank(
+          System.getProperty("fabric.oidc.redirectUri"),
+          System.getenv("FABRIC_OIDC_REDIRECT_URI"));
+      if (Strings.isNotBlank(redirectUri)) {
+        builder.withRedirectUri(redirectUri);
+      }
+      String externalBaseUrl = firstNonBlank(
+          System.getProperty("fabric.oidc.externalBaseUrl"),
+          System.getenv("FABRIC_OIDC_EXTERNAL_BASE_URL"));
+      if (Strings.isNotBlank(externalBaseUrl)) {
+        builder.withExternalBaseUrl(externalBaseUrl);
+      }
+      String redirectPath = firstNonBlank(
+          System.getProperty("fabric.oidc.redirectPath"),
+          System.getenv("FABRIC_OIDC_REDIRECT_PATH"));
+      if (Strings.isNotBlank(redirectPath)) {
+        builder.withRedirectPath(redirectPath);
+      }
+      String scope = firstNonBlank(
+          System.getProperty("fabric.oidc.scope"),
+          System.getenv("FABRIC_OIDC_SCOPE"));
+      if (Strings.isNotBlank(scope)) {
+        builder.withScope(scope);
+      }
+      String usernameClaim = firstNonBlank(
+          System.getProperty("fabric.oidc.usernameClaim"),
+          System.getenv("FABRIC_OIDC_USERNAME_CLAIM"));
+      if (Strings.isNotBlank(usernameClaim)) {
+        builder.withUsernameClaim(usernameClaim);
+      }
+      String groupClaims = firstNonBlank(
+          System.getProperty("fabric.oidc.groupClaims"),
+          System.getenv("FABRIC_OIDC_GROUP_CLAIMS"));
+      if (Strings.isNotBlank(groupClaims)) {
+        builder.withGroupClaims(parseList(groupClaims));
+      }
+      String allowAnonPaths = firstNonBlank(
+          System.getProperty("fabric.oidc.allowAnonPaths"),
+          System.getenv("FABRIC_OIDC_ALLOW_ANON_PATHS"));
+      if (Strings.isNotBlank(allowAnonPaths)) {
+        builder.withAllowAnonPaths(parseList(allowAnonPaths));
+      }
+      String loginPath = firstNonBlank(
+          System.getProperty("fabric.oidc.loginPath"),
+          System.getenv("FABRIC_OIDC_LOGIN_PATH"));
+      if (Strings.isNotBlank(loginPath)) {
+        builder.withLoginPath(loginPath);
+      }
+      String callbackPath = firstNonBlank(
+          System.getProperty("fabric.oidc.callbackPath"),
+          System.getenv("FABRIC_OIDC_CALLBACK_PATH"));
+      if (Strings.isNotBlank(callbackPath)) {
+        builder.withCallbackPath(callbackPath);
+      }
+      String httpsRequired = firstNonBlank(
+          System.getProperty("fabric.oidc.httpsRequiredForSameSiteNone"),
+          System.getenv("FABRIC_OIDC_HTTPS_REQUIRED_FOR_SAMESITE_NONE"));
+      if (Strings.isNotBlank(httpsRequired)) {
+        builder.withHttpsRequiredForSameSiteNone(parseBoolean(httpsRequired, true));
+      }
+      String clockSkew = firstNonBlank(
+          System.getProperty("fabric.oidc.clockSkewSeconds"),
+          System.getenv("FABRIC_OIDC_CLOCK_SKEW_SECONDS"));
+      if (Strings.isNotBlank(clockSkew)) {
+        builder.withClockSkewSeconds(parseInt(clockSkew, DEFAULT_CLOCK_SKEW_SECONDS));
+      }
+      return builder;
+    }
+
+    @JsonProperty("issuerBaseUrl")
+    public Builder withIssuerBaseUrl(String issuerBaseUrl) {
+      this.issuerBaseUrl = normalizeBaseUrl(issuerBaseUrl);
+      return this;
+    }
+
+    @JsonProperty("authorizationEndpoint")
+    public Builder withAuthorizationEndpoint(String authorizationEndpoint) {
+      this.authorizationEndpoint = trimToNull(authorizationEndpoint);
+      return this;
+    }
+
+    @JsonProperty("tokenEndpoint")
+    public Builder withTokenEndpoint(String tokenEndpoint) {
+      this.tokenEndpoint = trimToNull(tokenEndpoint);
+      return this;
+    }
+
+    @JsonProperty("jwksEndpoint")
+    public Builder withJwksEndpoint(String jwksEndpoint) {
+      this.jwksEndpoint = trimToNull(jwksEndpoint);
+      return this;
+    }
+
+    @JsonProperty("clientId")
+    public Builder withClientId(String clientId) {
+      this.clientId = trimToNull(clientId);
+      return this;
+    }
+
+    @JsonProperty("clientSecret")
+    public Builder withClientSecret(String clientSecret) {
+      this.clientSecret = trimToNull(clientSecret);
+      return this;
+    }
+
+    @JsonProperty("redirectUri")
+    public Builder withRedirectUri(String redirectUri) {
+      this.redirectUri = trimToNull(redirectUri);
+      return this;
+    }
+
+    @JsonProperty("externalBaseUrl")
+    public Builder withExternalBaseUrl(String externalBaseUrl) {
+      this.externalBaseUrl = trimToNull(externalBaseUrl);
+      return this;
+    }
+
+    @JsonProperty("redirectPath")
+    public Builder withRedirectPath(String redirectPath) {
+      this.redirectPath = trimToNull(redirectPath);
+      return this;
+    }
+
+    @JsonProperty("scope")
+    public Builder withScope(String scope) {
+      this.scope = trimToNull(scope);
+      return this;
+    }
+
+    @JsonProperty("usernameClaim")
+    public Builder withUsernameClaim(String usernameClaim) {
+      this.usernameClaim = trimToNull(usernameClaim);
+      return this;
+    }
+
+    @JsonProperty("groupClaims")
+    public Builder withGroupClaims(List<String> groupClaims) {
+      this.groupClaims = normalizeList(groupClaims);
+      return this;
+    }
+
+    @JsonProperty("allowAnonPaths")
+    public Builder withAllowAnonPaths(List<String> allowAnonPaths) {
+      this.allowAnonPaths = normalizeList(allowAnonPaths);
+      return this;
+    }
+
+    @JsonProperty("httpsRequiredForSameSiteNone")
+    public Builder withHttpsRequiredForSameSiteNone(boolean httpsRequiredForSameSiteNone) {
+      this.httpsRequiredForSameSiteNone = httpsRequiredForSameSiteNone;
+      return this;
+    }
+
+    @JsonProperty("loginPath")
+    public Builder withLoginPath(String loginPath) {
+      this.loginPath = normalizePath(loginPath, DEFAULT_LOGIN_PATH);
+      return this;
+    }
+
+    @JsonProperty("callbackPath")
+    public Builder withCallbackPath(String callbackPath) {
+      this.callbackPath = normalizePath(callbackPath, DEFAULT_CALLBACK_PATH);
+      return this;
+    }
+
+    @JsonProperty("clockSkewSeconds")
+    public Builder withClockSkewSeconds(int clockSkewSeconds) {
+      this.clockSkewSeconds = Math.max(0, clockSkewSeconds);
+      return this;
+    }
+
+    public FabricOidcConfig build() {
+      if (Strings.isBlank(redirectUri)) {
+        if (Strings.isNotBlank(externalBaseUrl)) {
+          String path = Strings.isBlank(redirectPath) ? DEFAULT_CALLBACK_PATH : redirectPath.trim();
+          redirectUri = join(externalBaseUrl, path);
+        }
+      }
+      if (Strings.isNotBlank(loginPath)) {
+        loginPath = normalizePath(loginPath, DEFAULT_LOGIN_PATH);
+      }
+      if (Strings.isNotBlank(callbackPath)) {
+        callbackPath = normalizePath(callbackPath, DEFAULT_CALLBACK_PATH);
+      }
+      allowAnonPaths = normalizeAllowlist(allowAnonPaths, loginPath, callbackPath);
+      scope = Strings.isBlank(scope) ? DEFAULT_SCOPE : scope;
+      usernameClaim = Strings.isBlank(usernameClaim) ? DEFAULT_USERNAME_CLAIM : usernameClaim;
+      validateRequired();
+      URI.create(redirectUri);
+      return new FabricOidcConfig(this);
+    }
+
+    private void validateRequired() {
+      List<String> missing = new ArrayList<>();
+      if (Strings.isBlank(issuerBaseUrl)) {
+        missing.add("issuerBaseUrl");
+      }
+      if (Strings.isBlank(authorizationEndpoint)) {
+        missing.add("authorizationEndpoint");
+      }
+      if (Strings.isBlank(tokenEndpoint)) {
+        missing.add("tokenEndpoint");
+      }
+      if (Strings.isBlank(clientId)) {
+        missing.add("clientId");
+      }
+      if (Strings.isBlank(clientSecret)) {
+        missing.add("clientSecret");
+      }
+      if (Strings.isBlank(redirectUri)) {
+        missing.add("redirectUri");
+      }
+      if (!missing.isEmpty()) {
+        throw new IllegalStateException(
+            "OIDC config missing required values: " + String.join(", ", missing));
       }
     }
-    return subscription;
   }
 
-  static void emitWithReschedule(
-      ConfigManagerImpl manager,
-      ConfigManagerImpl.SubscriptionImpl subscription,
-      DefinitionConfigLayer config,
-      ConfigManagerImpl.ParsedLayerIdentity identity,
-      Instant asOfUtc,
-      String callbackReason) {
-    emitIfChanged(manager, subscription, config, identity, asOfUtc, callbackReason);
-    scheduleTransitions(manager, subscription, config, identity);
+  private static String normalizeBaseUrl(String base) {
+    if (Strings.isBlank(base)) {
+      return null;
+    }
+    return trimTrailingSlash(base.trim());
   }
 
-  static void emitResolvedWithReschedule(
-      ConfigManagerImpl manager,
-      ConfigManagerImpl.SubscriptionImpl subscription,
-      ConfigManagerImpl.LayerEntry targetLayer,
-      Instant asOfUtc,
-      String callbackReason) {
-    if (targetLayer == null) {
-      return;
+  private static String normalizePath(String value, String fallback) {
+    String trimmed = trimToNull(value);
+    if (trimmed == null) {
+      return fallback;
     }
-    emitIfChanged(
-        manager, subscription, targetLayer.definition(), targetLayer.identity(), asOfUtc, callbackReason);
-    scheduleResolvedTransitions(
-        manager, subscription, targetLayer, asOfUtc == null ? Instant.now() : asOfUtc);
+    if (!trimmed.startsWith("/")) {
+      return "/" + trimmed;
+    }
+    return trimmed;
   }
 
-  static void emitIfChanged(
-      ConfigManagerImpl manager,
-      ConfigManagerImpl.SubscriptionImpl subscription,
-      DefinitionConfigLayer config,
-      ConfigManagerImpl.ParsedLayerIdentity identity,
-      Instant asOfUtc,
-      String callbackReason) {
-    if (subscription.closed.get()) {
-      return;
+  private static List<String> normalizeAllowlist(
+      List<String> allowlist, String loginPath, String callbackPath) {
+    Set<String> merged = new LinkedHashSet<>();
+    if (allowlist != null) {
+      merged.addAll(allowlist);
     }
-    try {
-      ConfigManagerImpl.UpdateSnapshot snapshot = manager.toUpdateSnapshotAt(config, identity, asOfUtc);
-      ConfigUpdate update = snapshot.update();
-      String dedupeKey = dedupeKey(update);
-      String last = subscription.lastSeenByLayer.put(identity.layerId(), dedupeKey);
-      if (Objects.equals(last, dedupeKey)) {
-        return;
-      }
-      dispatch(manager, subscription, snapshot, callbackReason, last, dedupeKey);
-    } catch (Exception ex) {
-      ConfigManagerImpl.LOGGER.warn(
-          "[ConfigManager][EmitIgnored] group={} configId={} layerId={} message={}",
-          identity.group(),
-          identity.configId(),
-          identity.layerId(),
-          ex.getMessage(),
-          ex);
+    if (Strings.isNotBlank(loginPath)) {
+      merged.add(loginPath);
     }
-  }
-
-  static void scheduleTransitions(
-      ConfigManagerImpl manager,
-      ConfigManagerImpl.SubscriptionImpl subscription,
-      DefinitionConfigLayer config,
-      ConfigManagerImpl.ParsedLayerIdentity identity) {
-    if (subscription.closed.get()) {
-      return;
+    if (Strings.isNotBlank(callbackPath)) {
+      merged.add(callbackPath);
     }
-    Instant now = Instant.now();
-    List<Instant> transitions = transitionTimesAfter(config, now);
-    subscription.cancelScheduled(identity.layerId());
-    if (transitions.isEmpty()) {
-      return;
+    if (merged.isEmpty()) {
+      merged.add(DEFAULT_LOGIN_PATH);
+      merged.add(DEFAULT_CALLBACK_PATH);
+      merged.add("/health");
+      merged.add("/favicon.ico");
     }
-    for (Instant transition : transitions) {
-      long delayMillis = Math.max(0L, transition.toEpochMilli() - now.toEpochMilli());
-      try {
-        ScheduledFuture<?> future =
-            manager.scheduleExecutor.schedule(
-                () -> onScheduledTransition(manager, subscription, identity, transition),
-                delayMillis,
-                TimeUnit.MILLISECONDS);
-        subscription.addScheduled(identity.layerId(), future);
-      } catch (RejectedExecutionException ignore) {
-        // Session/client is closing; ignore.
+    List<String> normalized = new ArrayList<>();
+    for (String entry : merged) {
+      String trimmed = trimToNull(entry);
+      if (trimmed != null) {
+        normalized.add(trimmed.startsWith("/") ? trimmed : "/" + trimmed);
       }
     }
+    return List.copyOf(normalized);
   }
 
-  static void scheduleResolvedTransitions(
-      ConfigManagerImpl manager,
-      ConfigManagerImpl.SubscriptionImpl subscription,
-      ConfigManagerImpl.LayerEntry targetLayer,
-      Instant now) {
-    if (subscription.closed.get() || targetLayer == null) {
-      return;
+  private static List<String> normalizeList(List<String> values) {
+    if (values == null || values.isEmpty()) {
+      return List.of();
     }
-    ConfigManagerImpl.ParsedLayerIdentity identity = targetLayer.identity();
-    List<Instant> transitions = transitionTimesAfterResolvedChain(manager, targetLayer, now);
-    subscription.cancelScheduled(identity.layerId());
-    if (transitions.isEmpty()) {
-      return;
-    }
-    for (Instant transition : transitions) {
-      long delayMillis = Math.max(0L, transition.toEpochMilli() - now.toEpochMilli());
-      try {
-        ScheduledFuture<?> future =
-            manager.scheduleExecutor.schedule(
-                () -> onScheduledTransition(manager, subscription, identity, transition),
-                delayMillis,
-                TimeUnit.MILLISECONDS);
-        subscription.addScheduled(identity.layerId(), future);
-      } catch (RejectedExecutionException ignore) {
-        // Session/client is closing; ignore.
+    List<String> normalized = new ArrayList<>();
+    for (String value : values) {
+      String trimmed = trimToNull(value);
+      if (trimmed != null) {
+        normalized.add(trimmed);
       }
     }
+    return List.copyOf(normalized);
   }
 
-  static void onScheduledTransition(
-      ConfigManagerImpl manager,
-      ConfigManagerImpl.SubscriptionImpl subscription,
-      ConfigManagerImpl.ParsedLayerIdentity identity,
-      Instant transitionUtc) {
-    if (subscription.closed.get() || manager.closed.get()) {
-      return;
+  private static List<String> parseList(String value) {
+    if (Strings.isBlank(value)) {
+      return List.of();
     }
-    try {
-      ConfigManagerImpl.LayerEntry layer =
-          manager.requireLayer(identity.group(), identity.configId(), identity.layerId());
-      emitIfChanged(
-          manager,
-          subscription,
-          layer.definition(),
-          layer.identity(),
-          transitionUtc,
-          ConfigManagerImpl.CALLBACK_REASON_SCHEDULED);
-    } catch (IllegalArgumentException ignored) {
-      // Config/layer disappeared between scheduling and execution; ignore.
-    } finally {
-      subscription.pruneScheduled(identity.layerId());
+    String[] parts = value.split("[,;]");
+    List<String> normalized = new ArrayList<>();
+    for (String part : parts) {
+      String trimmed = trimToNull(part);
+      if (trimmed != null) {
+        normalized.add(trimmed);
+      }
     }
+    return List.copyOf(normalized);
   }
 
-  static void dispatch(
-      ConfigManagerImpl manager,
-      ConfigManagerImpl.SubscriptionImpl subscription,
-      ConfigManagerImpl.UpdateSnapshot snapshot,
-      String callbackReason,
-      String previousHash,
-      String newHash) {
-    ConfigUpdate update = snapshot.update();
-    if (subscription.closed.get() || manager.closed.get()) {
-      return;
+  private static String trimToNull(String value) {
+    if (value == null) {
+      return null;
     }
-    try {
-      manager.callbackExecutor.execute(
-          () -> {
-            if (subscription.closed.get() || manager.closed.get()) {
-              return;
-            }
-            try {
-              manager.publishAudit(
-                  new ConfigEventUpdateCallback(
-                      manager.envelope(
-                          ConfigEventType.CONFIG_UPDATE_CALLBACK,
-                          update.group(),
-                          update.configName(),
-                          update.layerId(),
-                          update.schemaKey(),
-                          subscription.auditContext,
-                          Instant.now()),
-                      subscription.subscriptionId,
-                      callbackReason,
-                      previousHash,
-                      newHash,
-                      update.configId(),
-                      update.effectiveConfigId(),
-                      update.updatedTimeUtc(),
-                      snapshot.lineage(),
-                      snapshot.changedPayload()));
-              subscription.callbackCount.incrementAndGet();
-              subscription.listener.onUpdate(update);
-            } catch (Exception ex) {
-              ConfigManagerImpl.LOGGER.warn(
-                  "[ConfigManager][CallbackFailed] group={} configId={} layerId={} message={}",
-                  update.group(),
-                  update.configName(),
-                  update.layerId(),
-                  ex.getMessage(),
-                  ex);
-            }
-          });
-    } catch (RejectedExecutionException ignore) {
-      // Session/client is closing; ignore.
-    }
+    String trimmed = value.trim();
+    return trimmed.isEmpty() ? null : trimmed;
   }
 
-  static boolean layerAffectsTarget(
-      ConfigManagerImpl manager,
-      String group,
-      String configId,
-      String targetLayerId,
-      String changedLayerId) {
-    if (targetLayerId == null || changedLayerId == null) {
-      return false;
+  private static String firstNonBlank(String... values) {
+    if (values == null) {
+      return null;
     }
-    if (targetLayerId.equals(changedLayerId)) {
+    for (String value : values) {
+      if (Strings.isNotBlank(value)) {
+        return value.trim();
+      }
+    }
+    return null;
+  }
+
+  private static boolean parseBoolean(String raw, boolean fallback) {
+    if (Strings.isBlank(raw)) {
+      return fallback;
+    }
+    String trimmed = raw.trim();
+    if ("true".equalsIgnoreCase(trimmed) || "1".equals(trimmed) || "yes".equalsIgnoreCase(trimmed)) {
       return true;
     }
-    try {
-      if (manager.resolver == null) {
-        return false;
-      }
-      ConfigResolved resolved = manager.resolver.resolve(group, configId, targetLayerId, Instant.now());
-      ConfigLineage lineage = resolved == null ? null : resolved.lineage();
-      List<String> resolvedLayers = lineage == null ? List.of() : lineage.resolvedLayers();
-      return resolvedLayers.contains(changedLayerId);
-    } catch (RuntimeException ex) {
-      ConfigManagerImpl.LOGGER.debug(
-          "[ConfigManager][ChainIgnored] group={} configId={} targetLayerId={} changedLayerId={} message={}",
-          group,
-          configId,
-          targetLayerId,
-          changedLayerId,
-          ex.getMessage());
+    if ("false".equalsIgnoreCase(trimmed) || "0".equals(trimmed) || "no".equalsIgnoreCase(trimmed)) {
       return false;
     }
+    return fallback;
   }
 
-  static List<Instant> transitionTimesAfterResolvedChain(
-      ConfigManagerImpl manager, ConfigManagerImpl.LayerEntry targetLayer, Instant now) {
-    if (targetLayer == null) {
-      return List.of();
+  private static int parseInt(String raw, int fallback) {
+    if (Strings.isBlank(raw)) {
+      return fallback;
     }
-    if (manager.resolver == null) {
-      return transitionTimesAfter(targetLayer.definition(), now);
+    try {
+      return Integer.parseInt(raw.trim());
+    } catch (NumberFormatException ex) {
+      return fallback;
     }
-    ConfigResolved resolved =
-        manager.resolver.resolve(
-            targetLayer.identity().group(),
-            targetLayer.identity().configId(),
-            targetLayer.identity().layerId(),
-            now);
-    List<String> resolvedLayers =
-        resolved == null || resolved.lineage() == null || resolved.lineage().resolvedLayers() == null
-            ? List.of()
-            : resolved.lineage().resolvedLayers();
-    if (resolvedLayers.isEmpty()) {
-      return List.of();
-    }
-    Map<String, ConfigManagerImpl.LayerEntry> byLayerId = new LinkedHashMap<>();
-    for (ConfigManagerImpl.LayerEntry entry :
-        manager.findConfigLayers(targetLayer.identity().group(), targetLayer.identity().configId())) {
-      byLayerId.put(entry.identity().layerId(), entry);
-    }
-    List<Instant> times = new ArrayList<>();
-    for (String layerId : resolvedLayers) {
-      ConfigManagerImpl.LayerEntry entry = byLayerId.get(layerId);
-      if (entry == null) {
-        continue;
-      }
-      times.addAll(transitionTimesAfter(entry.definition(), now));
-    }
-    if (times.isEmpty()) {
-      return List.of();
-    }
-    times.sort(Instant::compareTo);
-    List<Instant> distinct = new ArrayList<>(times.size());
-    Instant last = null;
-    for (Instant time : times) {
-      if (!Objects.equals(last, time)) {
-        distinct.add(time);
-        last = time;
-      }
-    }
-    return List.copyOf(distinct);
-  }
-
-  static List<Instant> transitionTimesAfter(DefinitionConfigLayer definition, Instant now) {
-    DefinitionConfigLayer payload =
-        definition == null  ? null : definition;
-    List<DefinitionConfigLayer.Effective> effectiveEntries = payload == null ? null : payload.effective();
-    if (effectiveEntries == null || effectiveEntries.isEmpty()) {
-      return List.of();
-    }
-    List<Instant> times = new ArrayList<>();
-    for (DefinitionConfigLayer.Effective entry : effectiveEntries) {
-      if (entry == null) {
-        continue;
-      }
-      String effectiveTimeUtc = Strings.trimToNull(entry.effectiveTimeUtc());
-      if (effectiveTimeUtc != null) {
-        try {
-          Instant effectiveAt = Instant.parse(effectiveTimeUtc);
-          if (effectiveAt.isAfter(now)) {
-            times.add(effectiveAt);
-          }
-        } catch (Exception ex) {
-          ConfigManagerImpl.LOGGER.debug(
-              "[ConfigManager][ScheduleIgnored] reason=invalid-effectiveTimeUtc value={}",
-              effectiveTimeUtc);
-        }
-      }
-      String expiresAtUtc = Strings.trimToNull(entry.expiresAtUtc());
-      if (expiresAtUtc != null) {
-        try {
-          Instant expiresAt = Instant.parse(expiresAtUtc);
-          if (expiresAt.isAfter(now)) {
-            times.add(expiresAt);
-          }
-        } catch (Exception ex) {
-          ConfigManagerImpl.LOGGER.debug(
-              "[ConfigManager][ScheduleIgnored] reason=invalid-expiresAtUtc value={}",
-              expiresAtUtc);
-        }
-      }
-    }
-    if (times.isEmpty()) {
-      return List.of();
-    }
-    times.sort(Instant::compareTo);
-    List<Instant> distinct = new ArrayList<>(times.size());
-    Instant last = null;
-    for (Instant time : times) {
-      if (!Objects.equals(last, time)) {
-        distinct.add(time);
-        last = time;
-      }
-    }
-    return List.copyOf(distinct);
-  }
-
-  static String dedupeKey(ConfigUpdate update) {
-    JsonNode declared = update.declared();
-    return declared == null ? "" : ConfigManagerImplAudit.hashJson(ConfigManagerImpl.HASH_MAPPER, declared);
-  }
-
-  static void closeSubscription(ConfigManagerImpl.SubscriptionImpl subscription) {
-    if (!subscription.closed.compareAndSet(false, true)) {
-      return;
-    }
-    ConfigManagerImpl manager = subscription.manager;
-    manager.subscriptions.remove(subscription);
-    AutoCloseable handle = subscription.cacheHandle;
-    subscription.cacheHandle = null;
-    if (handle != null) {
-      try {
-        handle.close();
-      } catch (Exception ignore) {
-      }
-    }
-    for (String layer : subscription.scheduledByLayer.keySet()) {
-      subscription.cancelScheduled(layer);
-    }
-    manager.publishAudit(
-        new ConfigEventUnsubscribed(
-            manager.envelope(
-                ConfigEventType.CONFIG_UNSUBSCRIBED,
-                subscription.group,
-                subscription.configId,
-                subscription.layerId,
-                null,
-                subscription.auditContext,
-                Instant.now()),
-            subscription.subscriptionId));
-    ConfigManagerImpl.LOGGER.info(
-        "[ConfigManager][Unsubscribe] subscriptionId={} group={} configId={} layerId={} callbacks={}",
-        subscription.subscriptionId,
-        subscription.group,
-        subscription.configId,
-        subscription.layerId,
-        subscription.callbackCount.get());
   }
 }
-
