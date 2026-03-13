@@ -1,1302 +1,1207 @@
-package org.pronzato.fabric.api.control.session;
+package org.pronzato.fabric.api.configs.workflow;
 
-import org.pronzato.fabric.api.access.AccessManager;
-import org.pronzato.fabric.api.access.manager.AccessManagerImpl;
-import org.pronzato.fabric.api.util.CloseSupport;
-import java.net.InetAddress;
-import java.net.UnknownHostException;
-import java.nio.file.Path;
-import java.time.Duration;
-import java.util.Arrays;
-import java.util.Collections;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Consumer;
-import org.pronzato.fabric.api.Fabric;
-import org.pronzato.fabric.api.catalog.CatalogManager;
-import org.pronzato.fabric.api.connections.manager.ConnectionManagerImpl;
-import org.pronzato.fabric.api.connections.ConnectionManager;
-import org.pronzato.fabric.api.connectors.amps.AmpsConfig;
-import org.pronzato.fabric.api.control.ControlConnection;
-import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
-import org.pronzato.fabric.api.control.discovery.cache.DiscoveryTopics;
-import org.pronzato.fabric.api.control.discovery.DeleteManager;
-import org.pronzato.fabric.api.control.discovery.DiscoveryManager;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionApp;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvironment;
+import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
+import org.pronzato.fabric.api.control.discovery.definitions.Definition;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfigLayer;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfigChange;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionSchema;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
-import org.pronzato.fabric.api.data.checkpoints.CheckpointStore;
-import org.pronzato.fabric.api.data.checkpoints.CheckpointStores;
-import org.pronzato.fabric.api.data.DataManagers;
-import org.pronzato.fabric.api.data.DataOptions;
-import org.pronzato.fabric.api.data.manager.DataPlanesImpl;
-import org.pronzato.fabric.api.control.entitlements.core.data.DataEntitlements;
-import org.pronzato.fabric.api.control.entitlements.manager.EntitlementsManagerImpl;
-import org.pronzato.fabric.api.schemas.SchemaManager;
-import org.pronzato.fabric.api.control.status.app.AppStatusCache;
-import org.pronzato.fabric.api.control.status.app.AppStatusPublisher;
-import org.pronzato.fabric.api.control.status.data.DataStatusCache;
-import org.pronzato.fabric.api.control.status.service.ServiceStatusCache;
-import org.pronzato.fabric.api.control.entitlements.core.services.ServiceEntitlements;
-import org.pronzato.fabric.api.configs.ConfigManager;
-import org.pronzato.fabric.api.configs.manager.ConfigManagerImpl;
-import org.pronzato.fabric.api.configs.workflow.ConfigAdminService;
-import org.pronzato.fabric.api.recovery.RecoveryManager;
-import org.pronzato.fabric.api.recovery.manager.DiscoveryCacheRecoveryResult;
-import org.pronzato.fabric.api.recovery.manager.DiscoveryCacheSnapshotManifest;
-import org.pronzato.fabric.api.recovery.manager.DiscoveryCacheSnapshotService;
-import org.pronzato.fabric.api.recovery.manager.RecoveryManagerImpl;
-import org.pronzato.fabric.api.control.security.SecurityManager;
-import org.pronzato.fabric.api.control.security.manager.SecurityManagerImpl;
-import org.pronzato.fabric.api.services.ServiceManager;
-import org.pronzato.fabric.api.services.common.ServiceInstanceResolver;
-import org.pronzato.fabric.api.control.security.secrets.SessionSecrets;
-import org.pronzato.fabric.api.streams.StreamManager;
-import org.pronzato.fabric.api.streams.manager.StreamManagerImpl;
-import org.pronzato.fabric.api.telemetry.manager.FabricOtelEnablement;
-import org.pronzato.fabric.api.telemetry.OtelManager;
-import org.pronzato.fabric.api.telemetry.manager.OtelManagerImpl;
-import org.pronzato.fabric.api.telemetry.manager.OtelManagerNoop;
 import org.pronzato.fabric.api.util.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public final class SessionImpl implements Fabric.Session {
-  private static final Logger LOGGER = LoggerFactory.getLogger(SessionImpl.class);
-  private static final String UNKNOWN = "UNKNOWN";
-  private static final String DEFAULT_KERBEROS_REALM = "FABRIC.TEST.REALM";
-  private static final int DEFAULT_DUPLICATE_INSTANCE_CHECK_ATTEMPTS = 6;
-  private static final long DEFAULT_DUPLICATE_INSTANCE_CHECK_DELAY_MILLIS = 3_000L;
-  private static final Duration DEFAULT_DUPLICATE_HEARTBEAT_GRACE = Duration.ofSeconds(12);
-  private static final long DEFAULT_SERVICE_HEARTBEAT_CADENCE_SECONDS = 10L;
-  private static final long DEFAULT_SERVICE_STATUS_CADENCE_SECONDS = 30L;
-  private static final long DEFAULT_DATA_STATUS_CADENCE_SECONDS = 30L;
-  private static final int STATUS_SCHEDULER_THREADS = 2;
-  private static final AtomicInteger STATUS_SCHEDULER_THREAD_ID = new AtomicInteger(0);
+public final class ConfigWorkflowService implements ConfigAdminService.Workflow {
+  private static final Logger LOGGER = LoggerFactory.getLogger(ConfigWorkflowService.class);
+  private static final int AUDIT_MAX = 100;
+  private static final int HISTORY_MAX = ConfigHistoryUtil.DEFAULT_HISTORY_LIMIT;
+  private static final String SCHEMA_FORMAT = "FABRIC_SCHEMA_CONFIG";
 
-  private final SessionConfig cfg;
-  private final String sessionId = UUID.randomUUID().toString();
-  private final Object lifecycleLock = new Object();
-  private final AtomicBoolean started = new AtomicBoolean(false);
-  private final AtomicBoolean closed = new AtomicBoolean(false);
-  private final AtomicBoolean shutdownHookRegistered = new AtomicBoolean(false);
-  private final Thread shutdownHook;
-  private final ConnectionManagerImpl connectionManager;
-  private final SecurityManager securityManager;
+  private final Store store;
 
-  private volatile String group;
-  private volatile String appName;
-  private volatile String instance;
-  private volatile String env = UNKNOWN;
-  private volatile String region = UNKNOWN;
-  private volatile String site = UNKNOWN;
-  private volatile boolean configCacheAdmin;
-  private volatile List<String> normalizedDiscoveryUrls = List.of();
-  private volatile List<String> discoveryUris = List.of();
-  private volatile ControlConnection controlPlaneConnection;
-  private volatile String runtimePlacementHost;
-  private volatile DiscoveryManager discoveryManager;
-  private volatile DeleteManager deleteManager;
-  private volatile DefinitionEnvironment environmentDefinition;
-  private volatile DefinitionApp appDefinition;
-  private volatile AppStatusPublisher statusPublisher;
-  private volatile SessionVmArgs kerberosPropertyScope;
-  private volatile SessionContext sessionContext;
-  private volatile ScheduledExecutorService statusScheduler;
-  private volatile Path checkpointPath;
-  private volatile CheckpointStore checkpointStore;
-  private volatile DiscoveryCacheRecoveryResult discoveryRecoveryStatus =
-      DiscoveryCacheRecoveryResult.notStarted();
-  private final DiscoveryCacheSnapshotService discoverySnapshotService =
-      new DiscoveryCacheSnapshotService();
-  private final RecoveryManager recoveryManager;
-
-  private volatile ServiceManager serviceManager;
-  private final AccessManagerImpl accessManager;
-  private volatile DataManagers dataPlanes;
-  private volatile ConfigManagerImpl configsCore;
-  private volatile SchemaManager schemaRegistryManager;
-  private volatile StreamManagerImpl streamManager;
-  private volatile CatalogManager assetCatalogService;
-  private volatile ServiceEntitlements serviceEntitlements;
-  private volatile DataEntitlements dataEntitlements;
-  private volatile EntitlementsManagerImpl entitlementsManager;
-  private volatile OtelManager otelManager;
-  private final boolean serviceEntitlementsLogDecisions;
-  private final boolean grpcRoutingLogSelections;
-  private final String statusUserTag;
-
-  public SessionImpl(SessionConfig config) {
-    this.cfg = Objects.requireNonNull(config, "config");
-    this.group = Strings.trimToNull(config.group());
-    this.appName = Strings.trimToNull(config.appName());
-    this.instance = SessionBootstrap.resolveInstanceName(config.instance());
-    this.normalizedDiscoveryUrls = SessionBootstrap.normalizeDiscoveryUrls(config.discoveryUrls());
-    this.shutdownHook = new Thread(this::closeQuietlyFromShutdownHook, "fabric-session-" + sessionId);
-    this.serviceEntitlementsLogDecisions = config.entitlementsDecisionLogging();
-    this.grpcRoutingLogSelections = config.grpcRoutingLogSelections();
-    this.statusUserTag = config.statusUserTag();
-    this.connectionManager =
-        new ConnectionManagerImpl(
-            this::discoveryCache, () -> group, () -> sessionContext, cfg, this::decryptS3Credential);
-    this.securityManager =
-        new SecurityManagerImpl(this::discoveryCache, () -> group, connectionManager::evictS3Connection);
-    this.accessManager =
-        new AccessManagerImpl(
-            this, () -> entitlementsManager, this::discoveryCache, this::serviceStatusCache);
-    this.recoveryManager =
-        new RecoveryManagerImpl(
-            this::dumpConfiguredRecoverySnapshot, this::currentDiscoveryRecoveryStatus);
-    refreshSessionViews();
-  }
-
-
-  @Override
-  public SessionContext context() {
-    return sessionContext;
+  public ConfigWorkflowService(Store store) {
+    this.store = Objects.requireNonNull(store, "store");
   }
 
   @Override
-  public ServiceManager services() {
-    return serviceManager;
+  public DefinitionConfigChange workflow(String group, String configId, String layerId, int auditLimit) {
+    String requiredGroup = required(group, "group");
+    String requiredconfigId = required(configId, "configId");
+    String requiredLayerId = required(layerId, "layerId");
+
+    DefinitionConfigLayer published = published(requiredGroup, requiredconfigId, requiredLayerId);
+    DefinitionConfigChange change = loadChange(requiredGroup, requiredconfigId, requiredLayerId);
+    if (change == null) {
+      return emptyChange(requiredGroup, requiredconfigId, requiredLayerId, published);
+    }
+    return clampAudit(change, auditLimit);
   }
 
   @Override
-  public AccessManager access() {
-    return accessManager;
-  }
-
-  public ServiceEntitlements serviceEntitlements() {
-    return serviceEntitlements;
-  }
-
-  @Override
-  public DataManagers data() {
-    return dataPlanes;
+  public JsonNode draft(String group, String configId, String layerId) {
+    DefinitionConfigChange change = requiredChange(group, configId, layerId);
+    JsonNode draft = change.draftDeclared();
+    if (draft == null || !draft.isObject()) {
+      throw new WorkflowDraftNotFoundException("draft not found");
+    }
+    return draft.deepCopy();
   }
 
   @Override
-  public ConfigManager configs() {
-    return configsCore;
+  public DefinitionConfigChange propose(
+      String group,
+      String configId,
+      String layerId,
+      JsonNode declaredPayload,
+      DefinitionConfigChange.ChangeMode mode,
+      Instant effectiveAt,
+      Instant expiresAt,
+      String comment,
+      String subject) {
+    String requiredGroup = required(group, "group");
+    String requiredconfigId = required(configId, "configId");
+    String requiredLayerId = required(layerId, "layerId");
+    String resolvedSubject = resolveSubject(subject);
+    JsonNode draft = requireObject(declaredPayload, "declaredPayload").deepCopy();
+
+    DefinitionConfigLayer published = published(requiredGroup, requiredconfigId, requiredLayerId);
+    validateDraft(requiredGroup, published, draft);
+
+    DefinitionConfigChange existing = loadChange(requiredGroup, requiredconfigId, requiredLayerId);
+    DefinitionConfigChange.ChangeState from = stateOf(existing);
+    DefinitionConfigChange.ChangeMode resolvedMode =
+        mode == null ? DefinitionConfigChange.ChangeMode.IMMEDIATE : mode;
+    Window window = validateWindow(resolvedMode, effectiveAt, expiresAt, Instant.now());
+    String now = Instant.now().toString();
+    String normalizedComment = Strings.trimToNull(comment);
+    String baseCreatedAt = now;
+    String baseCreatedBy = resolvedSubject;
+    String previousPublishedConfigId = existing == null ? null : Strings.trimToNull(existing.lastPublishedConfigId());
+
+    DefinitionConfigChange.ChangeEntry nextEntry =
+        new DefinitionConfigChange.ChangeEntry(
+            UUID.randomUUID().toString(),
+            DefinitionConfigChange.ChangeState.PROPOSED,
+            resolvedMode,
+            window.effectiveAtUtc(),
+            window.expiresAtUtc(),
+            draft,
+            Strings.trimToNull(published.configId()),
+            Strings.trimToNull(published.effectiveConfigId()),
+            previousPublishedConfigId,
+            baseCreatedAt,
+            baseCreatedBy,
+            now,
+            resolvedSubject,
+            normalizedComment,
+            null,
+            appendAudit(
+                activeAudit(existing),
+                now,
+                resolvedSubject,
+                DefinitionConfigChange.DecisionAction.PROPOSE,
+                normalizedComment,
+                from,
+                DefinitionConfigChange.ChangeState.PROPOSED,
+                null));
+
+    DefinitionConfigChange next =
+        new DefinitionConfigChange(
+            nextEnvelope(existing, requiredGroup, requiredconfigId, requiredLayerId, now, resolvedSubject),
+            requiredGroup,
+            requiredconfigId,
+            requiredLayerId,
+            schemaKey(published),
+            nextEntry.state(),
+            nextEntry.mode(),
+            nextEntry.effectiveAtUtc(),
+            nextEntry.expiresAtUtc(),
+            nextEntry.draftDeclared(),
+            nextEntry.baseConfigId(),
+            nextEntry.baseEffectiveConfigId(),
+            nextEntry.lastPublishedConfigId(),
+            nextEntry.createdTimeUtc(),
+            nextEntry.createdBySubject(),
+            nextEntry.updatedTimeUtc(),
+            nextEntry.updatedBySubject(),
+            nextEntry.rationale(),
+            nextEntry.decisionMessage(),
+            nextEntry.audit(),
+            prependEntry(existing, nextEntry));
+    upsertChange(next);
+    LOGGER.info("[ConfigWorkflow][Propose] group={} configId={} layerId={} mode={} effectiveAt={} expiresAt={} subject={}", requiredGroup, requiredconfigId, requiredLayerId, resolvedMode, window.effectiveAtUtc() == null ? "IMMEDIATE" : window.effectiveAtUtc(), window.expiresAtUtc() == null ? "NEVER" : window.expiresAtUtc(), resolvedSubject);
+    return next;
   }
 
   @Override
-  public SchemaManager schemas() {
-    return schemaRegistryManager;
-  }
-
-  @Override
-  public StreamManager streams() {
-    return streamManager;
-  }
-
-  public DeleteManager deletes() {
-    return deleteManager;
-  }
-
-  @Override
-  public ConnectionManager connections() {
-    return connectionManager;
-  }
-
-  @Override
-  public CatalogManager catalog() {
-    return assetCatalogService;
-  }
-
-  @Override
-  public SecurityManager security() {
-    return securityManager;
-  }
-
-  public boolean grpcRoutingLogSelections() {
-    return grpcRoutingLogSelections;
-  }
-
-  public String statusUserTag() {
-    return statusUserTag;
-  }
-
-  Path checkpointPath() {
-    return checkpointPath;
-  }
-
-  Path configuredCheckpointPath() {
-    return cfg.checkpointPath();
-  }
-
-  public DefinitionApp appDefinition() {
-    return appDefinition;
-  }
-
-  @Override
-  public OtelManager telemetry() {
-    return otelManager;
-  }
-  
-  @Override
-  public void start() throws Exception {
-    synchronized (lifecycleLock) {
-      if (closed.get()) {
-        throw new IllegalStateException("Session is closed");
-      }
-      if (started.get()) {
-        return;
-      }
-
-      long startupStartNanos = System.nanoTime();
-      LOGGER.info(
-          "[Session][StartupTiming] phase=start group={} app={} instance={} recoveryEnabled={}",
-          cfg.group(),
-          cfg.appName(),
-          cfg.instance(),
-          cfg.discoveryCacheRecoveryEnabled());
-
-      long phaseStartNanos = System.nanoTime();
-      SessionBootstrap.BootstrapResult result = bootstrapWithRecoveryFallback();
-      LOGGER.info(
-          "[Session][StartupTiming] phase=bootstrap elapsedMs={} mode={}",
-          elapsedMillis(phaseStartNanos),
-          discoveryRecoveryStatus.recoveryUsed() ? "recovered" : "live");
-
-      phaseStartNanos = System.nanoTime();
-      this.kerberosPropertyScope = result.kerberosPropertyScope();
-      this.group = result.group();
-      this.appName = result.appName();
-      this.instance = result.instance();
-      this.normalizedDiscoveryUrls = result.discoveryUrls();
-      this.env = result.environment();
-      this.region = result.region();
-      this.site = result.site();
-      this.configCacheAdmin = result.configCacheAdmin();
-      this.discoveryUris = result.discoveryUris();
-      this.controlPlaneConnection = result.controlPlaneConnection();
-      this.runtimePlacementHost = resolveHostname();
-      this.environmentDefinition = result.environmentDefinition();
-      this.appDefinition = result.appDefinition();
-      this.otelManager = createOtelManager(result.environmentDefinition(), result.appDefinition());
-      LOGGER.info(
-          "[Session][StartupTiming] phase=bootstrap-assign elapsedMs={}",
-          elapsedMillis(phaseStartNanos));
-
-      phaseStartNanos = System.nanoTime();
-      Path configuredCheckpointPath = cfg.checkpointPath();
-      if (configuredCheckpointPath != null) {
-        Path resolvedCheckpointPath = configuredCheckpointPath.toAbsolutePath().normalize();
-        this.checkpointPath = resolvedCheckpointPath;
-        this.checkpointStore = CheckpointStores.local(resolvedCheckpointPath);
-        LOGGER.info("[Checkpoint] usingConfiguredPath path={}", resolvedCheckpointPath);
-      } else {
-        this.checkpointPath = null;
-        this.checkpointStore =
-            CheckpointStores.noOp(
-                "checkpointPath not configured for session "
-                    + Strings.firstNonBlank(group, "<group>")
-                    + "/"
-                    + Strings.firstNonBlank(appName, "<app>"));
-        LOGGER.info("[Checkpoint] disabled (no checkpointPath configured)");
-      }
-      LOGGER.info(
-          "[Session][StartupTiming] phase=checkpoint elapsedMs={}",
-          elapsedMillis(phaseStartNanos));
-
-      phaseStartNanos = System.nanoTime();
-      SessionImplManagers.StartedManagers startedManagers =
-          SessionImplManagers.initialize(
-              this,
-              cfg,
-              result,
-              sessionId,
-              checkpointStore,
-              connectionManager,
-              serviceEntitlementsLogDecisions,
-              LOGGER);
-      DiscoveryCache cache = startedManagers.discoveryCache();
-      LOGGER.info(
-          "[Session][StartupTiming] phase=managers.initialize elapsedMs={}",
-          elapsedMillis(phaseStartNanos));
-
-      phaseStartNanos = System.nanoTime();
-      this.discoveryManager = startedManagers.discoveryManager();
-      this.deleteManager = startedManagers.deleteManager();
-      this.entitlementsManager = startedManagers.entitlementsManager();
-      this.serviceEntitlements = startedManagers.serviceEntitlements();
-      this.dataEntitlements = startedManagers.dataEntitlements();
-      this.serviceManager = startedManagers.serviceManager();
-      this.schemaRegistryManager = startedManagers.schemaRegistryManager();
-      this.streamManager = startedManagers.streamManager();
-      this.dataPlanes = startedManagers.dataPlanes();
-      this.assetCatalogService = startedManagers.assetCatalogService();
-      this.configsCore = startedManagers.configsCore();
-      LOGGER.info(
-          "[Session][StartupTiming] phase=managers.publish elapsedMs={}",
-          elapsedMillis(phaseStartNanos));
-
-      phaseStartNanos = System.nanoTime();
-      registerShutdownHook();
-      this.started.set(true);
-      refreshSessionViews();
-      LOGGER.info(
-          "[Session][StartupTiming] phase=session-mark-started elapsedMs={}",
-          elapsedMillis(phaseStartNanos));
-
-      phaseStartNanos = System.nanoTime();
-      SessionImplLifecycle.runDuplicateInstanceCheck(
-          LOGGER,
-          controlPlaneConnection,
-          appDefinition,
-          cfg,
-          group,
-          appName,
-          instance,
-          DEFAULT_DUPLICATE_HEARTBEAT_GRACE,
-          DEFAULT_DUPLICATE_INSTANCE_CHECK_ATTEMPTS,
-          DEFAULT_DUPLICATE_INSTANCE_CHECK_DELAY_MILLIS);
-      LOGGER.info(
-          "[Session][StartupTiming] phase=duplicate-instance-check elapsedMs={}",
-          elapsedMillis(phaseStartNanos));
-
-      phaseStartNanos = System.nanoTime();
-      startStatusPublisher();
-      LOGGER.info(
-          "[Session][StartupTiming] phase=status-publisher-start elapsedMs={}",
-          elapsedMillis(phaseStartNanos));
-
-      phaseStartNanos = System.nanoTime();
-      refreshSessionViews();
-      LOGGER.info(
-          "[Session][StartupTiming] phase=session-refresh-final elapsedMs={}",
-          elapsedMillis(phaseStartNanos));
-
-      if (discoveryRecoveryStatus.recoveryUsed()) {
-        LOGGER.info(
-            "[Session][DiscoveryRecovery] startup=recovered sessionId={} app={}/{} instance={} snapshotPath={} definitions={}",
-            sessionId,
+  public DefinitionConfigChange approve(
+      String group, String configId, String layerId, String comment, String subject) {
+    DefinitionConfigChange approved =
+        adminTransition(
+            "APPROVE",
             group,
-            appName,
-            instance,
-            discoveryRecoveryStatus.snapshotPath(),
-            discoveryRecoveryStatus.definitionCount());
+            configId,
+            layerId,
+            comment,
+            subject,
+            List.of(
+                DefinitionConfigChange.ChangeState.PROPOSED,
+                DefinitionConfigChange.ChangeState.DRAFT),
+            DefinitionConfigChange.ChangeState.APPROVED,
+            DefinitionConfigChange.DecisionAction.APPROVE);
+    LOGGER.info("[ConfigWorkflow][Approve] group={} configId={} layerId={} effectiveAt={} expiresAt={} subject={}", approved.group(), approved.configId(), approved.layerId(), Strings.trimToNull(approved.effectiveAtUtc()) == null ? "IMMEDIATE" : approved.effectiveAtUtc(), Strings.trimToNull(approved.expiresAtUtc()) == null ? "NEVER" : approved.expiresAtUtc(), resolveSubject(subject));
+    return approved;
+  }
+
+  @Override
+  public DefinitionConfigChange reject(
+      String group, String configId, String layerId, String comment, String subject) {
+    return adminTransition(
+        "REJECT",
+        group,
+        configId,
+        layerId,
+        comment,
+        subject,
+        List.of(
+            DefinitionConfigChange.ChangeState.PROPOSED,
+            DefinitionConfigChange.ChangeState.DRAFT,
+            DefinitionConfigChange.ChangeState.APPROVED),
+        DefinitionConfigChange.ChangeState.REJECTED,
+        DefinitionConfigChange.DecisionAction.REJECT);
+  }
+
+  @Override
+  public DefinitionConfigChange cancel(
+      String group, String configId, String layerId, String comment, String subject) {
+    String requiredGroup = required(group, "group");
+    String requiredconfigId = required(configId, "configId");
+    String requiredLayerId = required(layerId, "layerId");
+    String resolvedSubject = resolveSubject(subject);
+
+    DefinitionConfigChange existing =
+        requiredChange(requiredGroup, requiredconfigId, requiredLayerId);
+    DefinitionConfigChange.ChangeState existingState = stateOf(existing);
+    boolean scheduledPending = isScheduledPending(existing);
+    if (!List.of(
+                DefinitionConfigChange.ChangeState.PROPOSED,
+                DefinitionConfigChange.ChangeState.DRAFT,
+                DefinitionConfigChange.ChangeState.APPROVED)
+            .contains(existingState)
+        && !scheduledPending) {
+      throw new WorkflowStateException(
+          "cancel requires PROPOSED, DRAFT, APPROVED, or a pending scheduled publish");
+    }
+    if (scheduledPending) {
+      cancelScheduledEffective(requiredGroup, requiredconfigId, requiredLayerId, existing);
+    }
+
+    String now = Instant.now().toString();
+    String normalizedComment = Strings.trimToNull(comment);
+    DefinitionConfigChange.ChangeEntry currentEntry = activeEntry(existing);
+    DefinitionConfigChange.ChangeEntry nextEntry =
+        new DefinitionConfigChange.ChangeEntry(
+            currentEntry == null ? UUID.randomUUID().toString() : currentEntry.changeId(),
+            DefinitionConfigChange.ChangeState.NONE,
+            scheduledPending
+                ? DefinitionConfigChange.ChangeMode.SCHEDULED
+                : DefinitionConfigChange.ChangeMode.IMMEDIATE,
+            null,
+            null,
+            scheduledPending ? deepCopy(existing.draftDeclared()) : null,
+            existing.baseConfigId(),
+            existing.baseEffectiveConfigId(),
+            existing.lastPublishedConfigId(),
+            existing.createdTimeUtc(),
+            existing.createdBySubject(),
+            now,
+            resolvedSubject,
+            existing.rationale(),
+            normalizedComment,
+            appendAudit(
+                activeAudit(existing),
+                now,
+                resolvedSubject,
+                DefinitionConfigChange.DecisionAction.CANCEL,
+                normalizedComment,
+                existingState,
+                DefinitionConfigChange.ChangeState.NONE,
+                null));
+    DefinitionConfigChange next =
+        new DefinitionConfigChange(
+            nextEnvelope(existing, requiredGroup, requiredconfigId, requiredLayerId, now, resolvedSubject),
+            requiredGroup,
+            requiredconfigId,
+            requiredLayerId,
+            existing.schemaKey(),
+            nextEntry.state(),
+            nextEntry.mode(),
+            nextEntry.effectiveAtUtc(),
+            nextEntry.expiresAtUtc(),
+            nextEntry.draftDeclared(),
+            nextEntry.baseConfigId(),
+            nextEntry.baseEffectiveConfigId(),
+            nextEntry.lastPublishedConfigId(),
+            nextEntry.createdTimeUtc(),
+            nextEntry.createdBySubject(),
+            nextEntry.updatedTimeUtc(),
+            nextEntry.updatedBySubject(),
+            nextEntry.rationale(),
+            nextEntry.decisionMessage(),
+            nextEntry.audit(),
+            replaceEntry(existing, nextEntry));
+    upsertChange(next);
+    return next;
+  }
+
+  @Override
+  public DefinitionConfigLayer publish(
+      String group,
+      String configId,
+      String layerId,
+      DefinitionConfigChange.ChangeMode modeOverride,
+      Instant effectiveAtOverride,
+      Instant expiresAtOverride,
+      String comment,
+      String subject) {
+    String requiredGroup = required(group, "group");
+    String requiredconfigId = required(configId, "configId");
+    String requiredLayerId = required(layerId, "layerId");
+    String resolvedSubject = resolveSubject(subject);
+
+    DefinitionConfigChange change = requiredChange(requiredGroup, requiredconfigId, requiredLayerId);
+    DefinitionConfigChange.ChangeState changeState = stateOf(change);
+    if (changeState != DefinitionConfigChange.ChangeState.APPROVED) {
+      throw new WorkflowStateException("publish requires APPROVED state");
+    }
+
+    JsonNode draft = requireObject(change.draftDeclared(), "draftDeclared");
+    DefinitionConfigLayer current = published(requiredGroup, requiredconfigId, requiredLayerId);
+    validatePublish(requiredGroup, current, draft);
+
+    DefinitionConfigChange.ChangeMode publishMode =
+        modeOverride == null ? modeOf(change) : modeOverride;
+    Instant publishedAt = Instant.now();
+    Instant configuredEffectiveAt = parseInstantOrNull(change.effectiveAtUtc(), "effectiveAtUtc");
+    Instant configuredExpiresAt = parseInstantOrNull(change.expiresAtUtc(), "expiresAtUtc");
+    Instant publishEffectiveAt;
+    Instant publishExpiresAt;
+    if (publishMode == DefinitionConfigChange.ChangeMode.SCHEDULED) {
+      publishEffectiveAt = effectiveAtOverride == null ? configuredEffectiveAt : effectiveAtOverride;
+      if (publishEffectiveAt == null) {
+        throw new IllegalArgumentException("effectiveAt is required for SCHEDULED publish");
+      }
+      publishExpiresAt = expiresAtOverride == null ? configuredExpiresAt : expiresAtOverride;
+      validateWindow(DefinitionConfigChange.ChangeMode.SCHEDULED, publishEffectiveAt, publishExpiresAt, publishedAt);
+    } else {
+      if (effectiveAtOverride != null) {
+        throw new IllegalArgumentException("effectiveAt must be null for IMMEDIATE publish");
+      }
+      publishEffectiveAt = null;
+      publishExpiresAt = expiresAtOverride == null ? configuredExpiresAt : expiresAtOverride;
+      validateWindow(DefinitionConfigChange.ChangeMode.IMMEDIATE, null, publishExpiresAt, publishedAt);
+    }
+
+    DefinitionConfigLayer updated =
+        publishDefinition(
+            current, draft.deepCopy(), publishMode, publishEffectiveAt, publishExpiresAt, publishedAt, resolvedSubject);
+    store.upsert(updated);
+    DefinitionConfigLayer persisted = published(requiredGroup, requiredconfigId, requiredLayerId);
+
+    String now = publishedAt.toString();
+    String publishEffectiveAtUtc = publishEffectiveAt == null ? null : publishEffectiveAt.toString();
+    String publishExpiresAtUtc = publishExpiresAt == null ? null : publishExpiresAt.toString();
+    String clearedEffectiveAtUtc =
+        publishMode == DefinitionConfigChange.ChangeMode.SCHEDULED
+            ? publishEffectiveAtUtc
+            : publishExpiresAt == null ? null : now;
+    String normalizedComment = Strings.trimToNull(comment);
+    DefinitionConfigChange.ChangeEntry activeEntry = activeEntry(change);
+    DefinitionConfigChange.ChangeEntry clearedEntry =
+        new DefinitionConfigChange.ChangeEntry(
+            activeEntry == null ? UUID.randomUUID().toString() : activeEntry.changeId(),
+            DefinitionConfigChange.ChangeState.NONE,
+            publishMode == DefinitionConfigChange.ChangeMode.SCHEDULED
+                ? DefinitionConfigChange.ChangeMode.SCHEDULED
+                : DefinitionConfigChange.ChangeMode.IMMEDIATE,
+            clearedEffectiveAtUtc,
+            publishExpiresAtUtc,
+            publishMode == DefinitionConfigChange.ChangeMode.SCHEDULED ? draft.deepCopy() : null,
+            change.baseConfigId(),
+            change.baseEffectiveConfigId(),
+            Strings.trimToNull(persisted.configId()),
+            change.createdTimeUtc(),
+            change.createdBySubject(),
+            now,
+            resolvedSubject,
+            change.rationale(),
+            normalizedComment,
+            appendAudit(
+                activeAudit(change),
+                now,
+                resolvedSubject,
+                DefinitionConfigChange.DecisionAction.PUBLISH,
+                normalizedComment,
+                changeState,
+                DefinitionConfigChange.ChangeState.NONE,
+                Strings.trimToNull(persisted.configId())));
+    DefinitionConfigChange cleared =
+        new DefinitionConfigChange(
+            nextEnvelope(change, requiredGroup, requiredconfigId, requiredLayerId, now, resolvedSubject),
+            requiredGroup,
+            requiredconfigId,
+            requiredLayerId,
+            change.schemaKey(),
+            clearedEntry.state(),
+            clearedEntry.mode(),
+            clearedEntry.effectiveAtUtc(),
+            clearedEntry.expiresAtUtc(),
+            clearedEntry.draftDeclared(),
+            clearedEntry.baseConfigId(),
+            clearedEntry.baseEffectiveConfigId(),
+            clearedEntry.lastPublishedConfigId(),
+            clearedEntry.createdTimeUtc(),
+            clearedEntry.createdBySubject(),
+            clearedEntry.updatedTimeUtc(),
+            clearedEntry.updatedBySubject(),
+            clearedEntry.rationale(),
+            clearedEntry.decisionMessage(),
+            clearedEntry.audit(),
+            replaceEntry(change, clearedEntry));
+    upsertChange(cleared);
+    LOGGER.info("[ConfigWorkflow][Publish] group={} configId={} layerId={} mode={} effectiveAt={} expiresAt={} subject={}", requiredGroup, requiredconfigId, requiredLayerId, publishMode, publishMode == DefinitionConfigChange.ChangeMode.IMMEDIATE ? "IMMEDIATE" : publishEffectiveAtUtc, publishExpiresAtUtc == null ? "NEVER" : publishExpiresAtUtc, resolvedSubject);
+    return persisted;
+  }
+
+  private void cancelScheduledEffective(
+      String group, String configId, String layerId, DefinitionConfigChange existing) {
+    String effectiveAtUtc = Strings.trimToNull(existing == null ? null : existing.effectiveAtUtc());
+    if (effectiveAtUtc == null) {
+      throw new WorkflowStateException("pending scheduled publish effectiveAt is missing");
+    }
+    Instant effectiveAt;
+    try {
+      effectiveAt = Instant.parse(effectiveAtUtc);
+    } catch (Exception ex) {
+      throw new WorkflowStateException("pending scheduled publish effectiveAt is invalid");
+    }
+    if (!effectiveAt.isAfter(Instant.now())) {
+      throw new WorkflowStateException("scheduled publish is already effective");
+    }
+
+    DefinitionConfigLayer current = published(group, configId, layerId);
+    DefinitionConfigLayer payload = ConfigPayload(current);
+    List<DefinitionConfigLayer.Effective> baseline = payload.effective();
+    if (baseline == null || baseline.isEmpty()) {
+      throw new WorkflowStateException("scheduled publish entry not found");
+    }
+    List<DefinitionConfigLayer.Effective> rewritten = new ArrayList<>();
+    boolean removed = false;
+    for (DefinitionConfigLayer.Effective entry : baseline) {
+      if (entry == null) {
+        continue;
+      }
+      if (effectiveAtUtc.equals(entry.effectiveTimeUtc())) {
+        removed = true;
+        continue;
+      }
+      rewritten.add(entry);
+    }
+    if (!removed) {
+      throw new WorkflowStateException("scheduled publish entry not found");
+    }
+    DefinitionConfigLayer rewrittenPayload =
+        new DefinitionConfigLayer(
+            current.envelope(),
+            payload.resourceId(),
+            payload.parentId(),
+            payload.shortName(),
+            payload.configType(),
+            payload.schemaKey(),
+            payload.displayName(),
+            deepCopy(payload.declared()),
+            List.copyOf(rewritten),
+            payload.history(),
+            current.configId(),
+            current.effectiveConfigId());
+    DefinitionConfigLayer updated = rewrittenPayload;
+    store.upsert(updated);
+  }
+
+  private DefinitionConfigChange adminTransition(
+      String action,
+      String group,
+      String configId,
+      String layerId,
+      String comment,
+      String subject,
+      List<DefinitionConfigChange.ChangeState> fromStates,
+      DefinitionConfigChange.ChangeState toState,
+      DefinitionConfigChange.DecisionAction decisionAction) {
+    String requiredGroup = required(group, "group");
+    String requiredconfigId = required(configId, "configId");
+    String requiredLayerId = required(layerId, "layerId");
+    String resolvedSubject = resolveSubject(subject);
+
+    DefinitionConfigChange existing =
+        requiredChange(requiredGroup, requiredconfigId, requiredLayerId);
+    DefinitionConfigChange.ChangeState fromState = stateOf(existing);
+    if (!fromStates.contains(fromState)) {
+      throw new WorkflowStateException(action + " not allowed from " + fromState);
+    }
+
+    String now = Instant.now().toString();
+    String normalizedComment = Strings.trimToNull(comment);
+    DefinitionConfigChange.ChangeEntry currentEntry = activeEntry(existing);
+    DefinitionConfigChange.ChangeEntry nextEntry =
+        new DefinitionConfigChange.ChangeEntry(
+            currentEntry == null ? UUID.randomUUID().toString() : currentEntry.changeId(),
+            toState,
+            modeOf(existing),
+            existing.effectiveAtUtc(),
+            existing.expiresAtUtc(),
+            existing.draftDeclared(),
+            existing.baseConfigId(),
+            existing.baseEffectiveConfigId(),
+            existing.lastPublishedConfigId(),
+            existing.createdTimeUtc(),
+            existing.createdBySubject(),
+            now,
+            resolvedSubject,
+            existing.rationale(),
+            normalizedComment,
+            appendAudit(
+                activeAudit(existing),
+                now,
+                resolvedSubject,
+                decisionAction,
+                normalizedComment,
+                fromState,
+                toState,
+                null));
+    DefinitionConfigChange next =
+        new DefinitionConfigChange(
+            nextEnvelope(existing, requiredGroup, requiredconfigId, requiredLayerId, now, resolvedSubject),
+            requiredGroup,
+            requiredconfigId,
+            requiredLayerId,
+            existing.schemaKey(),
+            nextEntry.state(),
+            nextEntry.mode(),
+            nextEntry.effectiveAtUtc(),
+            nextEntry.expiresAtUtc(),
+            nextEntry.draftDeclared(),
+            nextEntry.baseConfigId(),
+            nextEntry.baseEffectiveConfigId(),
+            nextEntry.lastPublishedConfigId(),
+            nextEntry.createdTimeUtc(),
+            nextEntry.createdBySubject(),
+            nextEntry.updatedTimeUtc(),
+            nextEntry.updatedBySubject(),
+            nextEntry.rationale(),
+            nextEntry.decisionMessage(),
+            nextEntry.audit(),
+            replaceEntry(existing, nextEntry));
+    upsertChange(next);
+    return next;
+  }
+
+  private DefinitionConfigLayer publishDefinition(
+      DefinitionConfigLayer current,
+      JsonNode draft,
+      DefinitionConfigChange.ChangeMode mode,
+      Instant effectiveAt,
+      Instant expiresAt,
+      Instant publishedAt,
+      String subject) {
+    DefinitionConfigLayer payload = ConfigPayload(current);
+    Instant snapshotEffectiveAt = mode == DefinitionConfigChange.ChangeMode.IMMEDIATE ? publishedAt : effectiveAt;
+    DefinitionConfigLayer.History currentSnapshot =
+        ConfigHistoryUtil.snapshotFromCurrent(current, mode.name(), snapshotEffectiveAt, subject);
+    List<DefinitionConfigLayer.History> rewrittenHistory =
+        ConfigHistoryUtil.appendSnapshot(payload.history(), currentSnapshot, HISTORY_MAX);
+
+    DefinitionConfigLayer rewrittenPayload;
+    if (mode == DefinitionConfigChange.ChangeMode.SCHEDULED) {
+      List<DefinitionConfigLayer.Effective> effective =
+          upsertScheduledEffective(payload.effective(), effectiveAt, expiresAt, draft);
+      rewrittenPayload =
+          new DefinitionConfigLayer(
+              current.envelope(),
+              payload.resourceId(),
+              payload.parentId(),
+              payload.shortName(),
+              payload.configType(),
+              payload.schemaKey(),
+              payload.displayName(),
+              deepCopy(payload.declared()),
+              effective,
+              rewrittenHistory,
+              current.configId(),
+              current.effectiveConfigId());
+    } else {
+      if (expiresAt != null) {
+        List<DefinitionConfigLayer.Effective> effective =
+            upsertScheduledEffective(payload.effective(), publishedAt, expiresAt, draft);
+        rewrittenPayload =
+            new DefinitionConfigLayer(
+                current.envelope(),
+                payload.resourceId(),
+                payload.parentId(),
+                payload.shortName(),
+                payload.configType(),
+                payload.schemaKey(),
+                payload.displayName(),
+                deepCopy(payload.declared()),
+                effective,
+                rewrittenHistory,
+                current.configId(),
+                current.effectiveConfigId());
       } else {
-        LOGGER.info(
-            "[Session][DiscoveryRecovery] startup=live sessionId={} app={}/{} instance={} endpoints={} definitions={}",
-            sessionId,
-            group,
-            appName,
-            instance,
-            discoveryUris,
-            cache == null ? 0 : cache.size());
+        rewrittenPayload =
+            new DefinitionConfigLayer(
+                current.envelope(),
+                payload.resourceId(),
+                payload.parentId(),
+                payload.shortName(),
+                payload.configType(),
+                payload.schemaKey(),
+                payload.displayName(),
+                draft,
+                ConfigHistoryUtil.copyEffective(payload.effective()),
+                rewrittenHistory,
+                current.configId(),
+                current.effectiveConfigId());
       }
-      LOGGER.info(
-          "[Session][StartupTiming] phase=complete sessionId={} totalElapsedMs={} mode={}",
-          sessionId,
-          elapsedMillis(startupStartNanos),
-          discoveryRecoveryStatus.recoveryUsed() ? "recovered" : "live");
-      LOGGER.debug("L0 bootstrap complete sessionId={} app={}/{} instance={} env={} region={} site={} endpoints={} configCount={}", sessionId, group, appName, instance, env, region, site, discoveryUris, cache == null ? 0 : cache.size());
     }
+    return rewrittenPayload;
   }
 
-  @Override
-  public boolean started() {
-    return started.get();
-  }
-
-  @Override
-  public RecoveryManager recovery() {
-    return recoveryManager;
-  }
-
-  @Override
-  public void stop() {
-    synchronized (lifecycleLock) {
-      if (!started.get()
-          && controlPlaneConnection == null
-          && discoveryManager == null
-          && statusScheduler == null
-          && configsCore == null
-          && dataPlanes == null) {
-        return;
+  private static List<DefinitionConfigLayer.Effective> upsertScheduledEffective(
+      List<DefinitionConfigLayer.Effective> baseline,
+      Instant effectiveAt,
+      Instant expiresAt,
+      JsonNode declaredPayload) {
+    if (effectiveAt == null) {
+      throw new IllegalArgumentException("effectiveAt is required for SCHEDULED publish");
+    }
+    String effectiveUtc = effectiveAt.toString();
+    String expiresUtc = expiresAt == null ? null : expiresAt.toString();
+    List<DefinitionConfigLayer.Effective> rewritten = new ArrayList<>();
+    if (baseline != null) {
+      for (DefinitionConfigLayer.Effective entry : baseline) {
+        if (entry == null) {
+          continue;
+        }
+        if (!effectiveUtc.equals(entry.effectiveTimeUtc())) {
+          rewritten.add(entry);
+        }
       }
-      SessionImplShutdown.stopManagedServices(serviceManager, LOGGER);
-      serviceManager = null;
-      CloseSupport.closeQuietly(dataPlanes instanceof AutoCloseable closeable ? closeable : null);
-      dataPlanes = null;
-      CloseSupport.closeQuietly(streamManager);
-      streamManager = null;
-      assetCatalogService = null;
-      CloseSupport.closeQuietly(configsCore);
-      configsCore = null;
-      CloseSupport.closeQuietly(connectionManager);
-      schemaRegistryManager = null;
-      CloseSupport.closeQuietly(statusPublisher);
-      statusPublisher = null;
-      CloseSupport.closeQuietly(entitlementsManager);
-      entitlementsManager = null;
-      CloseSupport.closeQuietly(accessManager);
-      serviceEntitlements = null;
-      dataEntitlements = null;
-      CloseSupport.closeQuietly(deleteManager);
-      deleteManager = null;
-      CloseSupport.closeQuietly(otelManager);
-      otelManager = null;
-      CloseSupport.closeQuietly(discoveryManager);
-      discoveryManager = null;
-      SessionImplShutdown.closeControlConnection(controlPlaneConnection);
-      controlPlaneConnection = null;
-      runtimePlacementHost = null;
-      environmentDefinition = null;
-      appDefinition = null;
-      configCacheAdmin = false;
-      discoveryUris = List.of();
-      discoveryRecoveryStatus = DiscoveryCacheRecoveryResult.notStarted();
-      started.set(false);
-      closeStatusScheduler();
-      refreshSessionViews();
     }
+    rewritten.add(new DefinitionConfigLayer.Effective(effectiveUtc, expiresUtc, declaredPayload.deepCopy()));
+    rewritten.sort(Comparator.comparing(entry -> Instant.parse(entry.effectiveTimeUtc())));
+    return List.copyOf(rewritten);
   }
 
-  @Override
-  public void close() {
-    synchronized (lifecycleLock) {
-      if (!closed.compareAndSet(false, true)) {
-        return;
+  private void validateDraft(String group, DefinitionConfigLayer published, JsonNode draftDeclared) {
+    if (draftDeclared == null || !draftDeclared.isObject()) {
+      throw new IllegalArgumentException("declaredPayload must be a JSON object");
+    }
+    resolveSchema(group, schemaKey(published));
+  }
+
+  private void validatePublish(String group, DefinitionConfigLayer published, JsonNode draftDeclared) {
+    DefinitionSchema schema = resolveSchema(group, schemaKey(published));
+    ObjectNode draft = requireObject(draftDeclared, "draftDeclared");
+    for (String key : ConfigSchemaRequiredKeys.explicitRequiredKeys(schema)) {
+      if (!draft.has(key)) {
+        draft.set(key, DiscoveryCodec.mapper().nullNode());
       }
-      unregisterShutdownHook();
-      stop();
-      CloseSupport.closeQuietly(kerberosPropertyScope);
-      kerberosPropertyScope = null;
     }
   }
 
-  public InternalAccess internal() {
-    if (cfg.type() != SessionType.PLATFORM) {
-      throw new IllegalStateException("internal access denied");
+  private DefinitionSchema resolveSchema(String group, String schemaKey) {
+    Definition definition = store.get(DefinitionType.SCHEMA, group, schemaKey);
+    if (!(definition instanceof DefinitionSchema schema)) {
+      throw new IllegalStateException("schema not found for group=" + group + " key=" + schemaKey);
     }
-    return new InternalAccess();
-  }
-
-  public DiscoveryCache discoveryCache() {
-    synchronized (lifecycleLock) {
-      DiscoveryManager manager = discoveryManager;
-      return manager == null ? null : manager.discoveryCache();
+    if (schema.schemaType() != DefinitionSchema.SchemaType.CONFIG) {
+      throw new IllegalStateException("schemaType must be CONFIG");
     }
-  }
-
-  public AppStatusCache appStatusCache() {
-    synchronized (lifecycleLock) {
-      DiscoveryManager manager = discoveryManager;
-      return manager == null ? null : manager.appStatusCache();
-    }
-  }
-
-  public ServiceStatusCache serviceStatusCache() {
-    synchronized (lifecycleLock) {
-      DiscoveryManager manager = discoveryManager;
-      return manager == null ? null : manager.serviceStatusCache();
-    }
-  }
-
-  public DataStatusCache dataStatusCache() {
-    synchronized (lifecycleLock) {
-      DiscoveryManager manager = discoveryManager;
-      return manager == null ? null : manager.dataStatusCache();
-    }
-  }
-
-  public DefinitionEnvironment environmentDefinition() {
-    return environmentDefinition;
-  }
-
-  public long serviceHeartbeatCadenceSeconds() {
-    DefinitionEnvironment.Cadence configuredCadence =
-        environmentDefinition == null ? null : environmentDefinition.cadence();
-    Integer configured =
-        configuredCadence == null ? null : configuredCadence.serviceHeartbeatSeconds();
-    return resolveCadenceSeconds(configured, DEFAULT_SERVICE_HEARTBEAT_CADENCE_SECONDS);
-  }
-
-  public long serviceStatusCadenceSeconds() {
-    DefinitionEnvironment.Cadence configuredCadence =
-        environmentDefinition == null ? null : environmentDefinition.cadence();
-    Integer configured = configuredCadence == null ? null : configuredCadence.serviceStatusSeconds();
-    return resolveCadenceSeconds(configured, DEFAULT_SERVICE_STATUS_CADENCE_SECONDS);
-  }
-
-  public long dataStatusCadenceSeconds() {
-    DefinitionEnvironment.Cadence configuredCadence =
-        environmentDefinition == null ? null : environmentDefinition.cadence();
-    Integer configured = configuredCadence == null ? null : configuredCadence.dataStatusSeconds();
-    return resolveCadenceSeconds(configured, DEFAULT_DATA_STATUS_CADENCE_SECONDS);
-  }
-
-  public String kerberosPrincipal() {
-    return cfg.kerberosPrincipal();
-  }
-
-  public Path kerberosKeytab() {
-    return cfg.kerberosKeytab();
-  }
-
-  public Path trustCert() {
-    return cfg.trustCert();
-  }
-
-  public Path serviceTlsCertChain() {
-    return cfg.serviceTlsCertChain();
-  }
-
-  public Path serviceTlsPrivateKey() {
-    return cfg.serviceTlsPrivateKey();
-  }
-
-  public ControlConnection controlPlaneConnection() {
-    return controlPlaneConnection;
-  }
-
-  public ScheduledExecutorService statusScheduler() {
-    synchronized (lifecycleLock) {
-      if (statusScheduler == null || statusScheduler.isShutdown()) {
-        statusScheduler =
-            Executors.newScheduledThreadPool(
-                STATUS_SCHEDULER_THREADS,
-                runnable -> {
-                  Thread thread =
-                      new Thread(
-                          runnable,
-                          "fabric-status-" + STATUS_SCHEDULER_THREAD_ID.incrementAndGet());
-                  thread.setDaemon(true);
-                  return thread;
-                });
-      }
-      return statusScheduler;
-    }
-  }
-
-  public String runtimePlacementHost() {
-    String configured = Strings.trimToNull(runtimePlacementHost);
-    return configured == null ? resolveHostname() : configured;
-  }
-
-  public final class InternalAccess {
-    public ControlConnection controlPlaneConnection() {
-      return controlPlaneConnection;
-    }
-
-    public DiscoveryCache discoveryCache() {
-      return SessionImpl.this.discoveryCache();
-    }
-
-    public AppStatusCache statusCache() {
-      return SessionImpl.this.appStatusCache();
-    }
-
-    public AppStatusCache appStatusCache() {
-      return SessionImpl.this.appStatusCache();
-    }
-
-    public ServiceStatusCache serviceStatusCache() {
-      return SessionImpl.this.serviceStatusCache();
-    }
-
-    public DataStatusCache dataStatusCache() {
-      return SessionImpl.this.dataStatusCache();
-    }
-
-    public ConfigAdminService configAdminService() {
-      ConfigAdminService service = configsCore;
-      if (service == null) {
-        throw new IllegalStateException("Config manager is not available");
-      }
-      return service;
-    }
-  }
-
-  String decryptS3Credential(String alias, String encryptedValue) {
-    SessionSecrets secrets = cfg.sessionSecrets();
-    if (secrets == null) {
+    if (!SCHEMA_FORMAT.equals(schema.format())) {
       throw new IllegalStateException(
-          "S3 credentials are encrypted but no KEK was provided (alias="
-              + Strings.firstNonBlank(alias, SessionSecrets.DEFAULT_KEK_ALIAS)
-              + ")");
+          "schema format must be " + SCHEMA_FORMAT + " but was " + schema.format());
     }
-    return secrets.decrypt(alias, encryptedValue);
+    return schema;
   }
 
-  public ServiceInstanceResolver serviceInstanceResolver() {
-    DataManagers manager = dataPlanes;
-    if (manager instanceof DataPlanesImpl impl) {
-      ServiceInstanceResolver resolver = impl.serviceInstanceResolverIfInitialized();
-      if (resolver != null) {
-        return resolver;
+  private DefinitionConfigLayer published(String group, String configId, String layerId) {
+    Definition definition = store.get(DefinitionType.CONFIG_LAYER, group, configLayerDefinitionName(configId, layerId));
+    if (definition instanceof DefinitionConfigLayer config) {
+      return config;
+    }
+    throw new ConfigNotFoundException("config layer not found: " + configId + "/" + layerId);
+  }
+
+  private DefinitionConfigChange requiredChange(String group, String configId, String layerId) {
+    String requiredGroup = required(group, "group");
+    String requiredconfigId = required(configId, "configId");
+    String requiredLayerId = required(layerId, "layerId");
+    DefinitionConfigChange change = loadChange(requiredGroup, requiredconfigId, requiredLayerId);
+    if (change == null) {
+      throw new WorkflowDraftNotFoundException("workflow change not found");
+    }
+    return change;
+  }
+
+  private DefinitionConfigChange loadChange(String group, String configId, String layerId) {
+    Definition definition = store.get(DefinitionType.CONFIG_CHANGE, group, changeName(configId, layerId));
+    if (!(definition instanceof DefinitionConfigChange change)) {
+      return null;
+    }
+    return normalizeChange(change);
+  }
+
+  private void upsertChange(DefinitionConfigChange change) {
+    DefinitionConfigChange normalized = normalizeChange(change);
+    if (normalized == null || normalized.envelope() == null) {
+      throw new IllegalArgumentException("change envelope is required");
+    }
+    String expectedName = changeName(normalized.configId(), normalized.layerId());
+    if (!expectedName.equals(normalized.envelope().name())) {
+      throw new IllegalArgumentException("CONFIG_CHANGE name must be " + expectedName);
+    }
+    if (!Objects.equals(normalized.group(), normalized.envelope().group())) {
+      throw new IllegalArgumentException("CONFIG_CHANGE group mismatch");
+    }
+    store.upsert(normalized);
+  }
+
+  private DefinitionConfigChange emptyChange(
+      String group, String configId, String layerId, DefinitionConfigLayer published) {
+    String now = Instant.now().toString();
+    return new DefinitionConfigChange(
+        new DefinitionEnvelope(
+            group,
+            DefinitionType.CONFIG_CHANGE,
+            changeName(configId, layerId),
+            null,
+            true,
+            "ACTIVE",
+            now,
+            resolveSubject(null),
+            now,
+            resolveSubject(null)),
+        group,
+        configId,
+        layerId,
+        schemaKey(published),
+        DefinitionConfigChange.ChangeState.NONE,
+        DefinitionConfigChange.ChangeMode.IMMEDIATE,
+        null,
+        null,
+        null,
+        Strings.trimToNull(published.configId()),
+        Strings.trimToNull(published.effectiveConfigId()),
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        List.of());
+  }
+
+  private DefinitionConfigChange clampAudit(DefinitionConfigChange change, int limitRaw) {
+    int limit = limitRaw <= 0 ? 20 : Math.min(limitRaw, AUDIT_MAX);
+    List<DefinitionConfigChange.AuditEntry> audit =
+        change.audit() == null ? List.of() : change.audit();
+    if (audit.size() <= limit) {
+      return change;
+    }
+    DefinitionConfigChange.ChangeEntry activeEntry = activeEntry(change);
+    List<DefinitionConfigChange.ChangeEntry> changes = change.changes();
+    if (activeEntry != null && changes != null && !changes.isEmpty()) {
+      DefinitionConfigChange.ChangeEntry clampedEntry =
+          new DefinitionConfigChange.ChangeEntry(
+              activeEntry.changeId(),
+              activeEntry.state(),
+              activeEntry.mode(),
+              activeEntry.effectiveAtUtc(),
+              activeEntry.expiresAtUtc(),
+              activeEntry.draftDeclared(),
+              activeEntry.baseConfigId(),
+              activeEntry.baseEffectiveConfigId(),
+              activeEntry.lastPublishedConfigId(),
+              activeEntry.createdTimeUtc(),
+              activeEntry.createdBySubject(),
+              activeEntry.updatedTimeUtc(),
+              activeEntry.updatedBySubject(),
+              activeEntry.rationale(),
+              activeEntry.decisionMessage(),
+              List.copyOf(audit.subList(0, limit)));
+      changes = replaceEntry(change, clampedEntry);
+    }
+    return new DefinitionConfigChange(
+        change.envelope(),
+        change.group(),
+        change.configId(),
+        change.layerId(),
+        change.schemaKey(),
+        change.state(),
+        change.mode(),
+        change.effectiveAtUtc(),
+        change.expiresAtUtc(),
+        change.draftDeclared(),
+        change.baseConfigId(),
+        change.baseEffectiveConfigId(),
+        change.lastPublishedConfigId(),
+        change.createdTimeUtc(),
+        change.createdBySubject(),
+        change.updatedTimeUtc(),
+        change.updatedBySubject(),
+        change.rationale(),
+        change.decisionMessage(),
+        List.copyOf(audit.subList(0, limit)),
+        changes == null ? List.of() : changes);
+  }
+
+  private DefinitionEnvelope nextEnvelope(
+      DefinitionConfigChange existing,
+      String group,
+      String configId,
+      String layerId,
+      String now,
+      String subject) {
+    DefinitionEnvelope previous = existing == null ? null : existing.envelope();
+    String uuid = Strings.trimToNull(previous == null ? null : previous.uuid());
+    return new DefinitionEnvelope(
+        group,
+        DefinitionType.CONFIG_CHANGE,
+        changeName(configId, layerId),
+        uuid == null ? UUID.randomUUID().toString() : uuid,
+        true,
+        "ACTIVE",
+        previous == null ? now : previous.createdTimeUtc(),
+        previous == null ? subject : previous.createdBy(),
+        now,
+        subject);
+  }
+
+  private static List<DefinitionConfigChange.AuditEntry> appendAudit(
+      List<DefinitionConfigChange.AuditEntry> existing,
+      String timeUtc,
+      String subject,
+      DefinitionConfigChange.DecisionAction action,
+      String message,
+      DefinitionConfigChange.ChangeState from,
+      DefinitionConfigChange.ChangeState to,
+      String targetConfigId) {
+    List<DefinitionConfigChange.AuditEntry> audit = new ArrayList<>();
+    audit.add(
+        new DefinitionConfigChange.AuditEntry(
+            timeUtc,
+            subject,
+            action,
+            message,
+            (from == null ? DefinitionConfigChange.ChangeState.NONE : from).name(),
+            (to == null ? DefinitionConfigChange.ChangeState.NONE : to).name(),
+            targetConfigId));
+    if (existing != null) {
+      for (DefinitionConfigChange.AuditEntry entry : existing) {
+        if (entry != null) {
+          audit.add(entry);
+        }
+        if (audit.size() >= AUDIT_MAX) {
+          break;
+        }
       }
     }
-    throw new IllegalStateException("ServiceInstanceResolver is not initialized");
+    return List.copyOf(audit);
   }
 
-  public ServiceInstanceResolver serviceInstanceResolverIfInitialized() {
-    DataManagers manager = dataPlanes;
-    if (manager instanceof DataPlanesImpl impl) {
-      return impl.serviceInstanceResolverIfInitialized();
+  private static DefinitionConfigChange normalizeChange(DefinitionConfigChange change) {
+    if (change == null) {
+      return null;
+    }
+    List<DefinitionConfigChange.ChangeEntry> normalizedEntries = normalizedEntries(change.changes());
+    if (normalizedEntries.isEmpty()) {
+      if (!hasLegacyEntryPayload(change)) {
+        return new DefinitionConfigChange(
+            change.envelope(),
+            change.group(),
+            change.configId(),
+            change.layerId(),
+            change.schemaKey(),
+            change.state(),
+            change.mode(),
+            change.effectiveAtUtc(),
+            change.expiresAtUtc(),
+            change.draftDeclared(),
+            change.baseConfigId(),
+            change.baseEffectiveConfigId(),
+            change.lastPublishedConfigId(),
+            change.createdTimeUtc(),
+            change.createdBySubject(),
+            change.updatedTimeUtc(),
+            change.updatedBySubject(),
+            change.rationale(),
+            change.decisionMessage(),
+            change.audit(),
+            List.of());
+      }
+      DefinitionConfigChange.ChangeEntry legacy = legacyEntry(change);
+      return projectChange(change, legacy, List.of(legacy));
+    }
+    DefinitionConfigChange.ChangeEntry latest = firstEntry(normalizedEntries);
+    return projectChange(change, latest, normalizedEntries);
+  }
+
+  private static DefinitionConfigChange.ChangeEntry activeEntry(DefinitionConfigChange change) {
+    if (change == null) {
+      return null;
+    }
+    DefinitionConfigChange.ChangeEntry latest = firstEntry(change.changes());
+    if (latest != null) {
+      return latest;
+    }
+    return hasLegacyEntryPayload(change) ? legacyEntry(change) : null;
+  }
+
+  private static List<DefinitionConfigChange.AuditEntry> activeAudit(DefinitionConfigChange change) {
+    DefinitionConfigChange.ChangeEntry entry = activeEntry(change);
+    if (entry != null && entry.audit() != null) {
+      return entry.audit();
+    }
+    return change == null ? List.of() : change.audit();
+  }
+
+  private static List<DefinitionConfigChange.ChangeEntry> prependEntry(
+      DefinitionConfigChange existing, DefinitionConfigChange.ChangeEntry nextEntry) {
+    List<DefinitionConfigChange.ChangeEntry> entries = new ArrayList<>();
+    if (nextEntry != null) {
+      entries.add(nextEntry);
+    }
+    for (DefinitionConfigChange.ChangeEntry entry : normalizedEntries(existing == null ? null : existing.changes())) {
+      if (entry != null) {
+        entries.add(entry);
+      }
+    }
+    return entries.isEmpty() ? List.of() : List.copyOf(entries);
+  }
+
+  private static List<DefinitionConfigChange.ChangeEntry> replaceEntry(
+      DefinitionConfigChange existing, DefinitionConfigChange.ChangeEntry replacement) {
+    if (replacement == null) {
+      return normalizedEntries(existing == null ? null : existing.changes());
+    }
+    List<DefinitionConfigChange.ChangeEntry> entries =
+        new ArrayList<>(normalizedEntries(existing == null ? null : existing.changes()));
+    String replacementId = Strings.trimToNull(replacement.changeId());
+    int replaceIndex = -1;
+    if (replacementId != null) {
+      for (int i = 0; i < entries.size(); i++) {
+        DefinitionConfigChange.ChangeEntry current = entries.get(i);
+        if (current != null && Objects.equals(replacementId, Strings.trimToNull(current.changeId()))) {
+          replaceIndex = i;
+          break;
+        }
+      }
+    }
+    if (replaceIndex < 0 && !entries.isEmpty()) {
+      replaceIndex = 0;
+    }
+    if (replaceIndex < 0) {
+      entries.add(replacement);
+    } else {
+      entries.set(replaceIndex, replacement);
+    }
+    return List.copyOf(entries);
+  }
+
+  private static DefinitionConfigChange projectChange(
+      DefinitionConfigChange base,
+      DefinitionConfigChange.ChangeEntry latest,
+      List<DefinitionConfigChange.ChangeEntry> entries) {
+    if (base == null) {
+      return null;
+    }
+    List<DefinitionConfigChange.ChangeEntry> normalizedEntries = normalizedEntries(entries);
+    if (latest == null) {
+      return new DefinitionConfigChange(
+          base.envelope(),
+          base.group(),
+          base.configId(),
+          base.layerId(),
+          base.schemaKey(),
+          base.state(),
+          base.mode(),
+          base.effectiveAtUtc(),
+          base.expiresAtUtc(),
+          base.draftDeclared(),
+          base.baseConfigId(),
+          base.baseEffectiveConfigId(),
+          base.lastPublishedConfigId(),
+          base.createdTimeUtc(),
+          base.createdBySubject(),
+          base.updatedTimeUtc(),
+          base.updatedBySubject(),
+          base.rationale(),
+          base.decisionMessage(),
+          base.audit(),
+          normalizedEntries);
+    }
+    return new DefinitionConfigChange(
+        base.envelope(),
+        base.group(),
+        base.configId(),
+        base.layerId(),
+        base.schemaKey(),
+        latest.state(),
+        latest.mode(),
+        latest.effectiveAtUtc(),
+        latest.expiresAtUtc(),
+        latest.draftDeclared(),
+        latest.baseConfigId(),
+        latest.baseEffectiveConfigId(),
+        latest.lastPublishedConfigId(),
+        latest.createdTimeUtc(),
+        latest.createdBySubject(),
+        latest.updatedTimeUtc(),
+        latest.updatedBySubject(),
+        latest.rationale(),
+        latest.decisionMessage(),
+        latest.audit(),
+        normalizedEntries);
+  }
+
+  private static DefinitionConfigChange.ChangeEntry legacyEntry(DefinitionConfigChange change) {
+    String fallbackId = Strings.trimToNull(change == null ? null : change.updatedTimeUtc());
+    return new DefinitionConfigChange.ChangeEntry(
+        fallbackId == null ? UUID.randomUUID().toString() : fallbackId,
+        change == null || change.state() == null ? DefinitionConfigChange.ChangeState.NONE : change.state(),
+        change == null || change.mode() == null ? DefinitionConfigChange.ChangeMode.IMMEDIATE : change.mode(),
+        change == null ? null : change.effectiveAtUtc(),
+        change == null ? null : change.expiresAtUtc(),
+        change == null ? null : change.draftDeclared(),
+        change == null ? null : change.baseConfigId(),
+        change == null ? null : change.baseEffectiveConfigId(),
+        change == null ? null : change.lastPublishedConfigId(),
+        change == null ? null : change.createdTimeUtc(),
+        change == null ? null : change.createdBySubject(),
+        change == null ? null : change.updatedTimeUtc(),
+        change == null ? null : change.updatedBySubject(),
+        change == null ? null : change.rationale(),
+        change == null ? null : change.decisionMessage(),
+        change == null ? List.of() : change.audit());
+  }
+
+  private static boolean hasLegacyEntryPayload(DefinitionConfigChange change) {
+    if (change == null) {
+      return false;
+    }
+    if (change.state() != null && change.state() != DefinitionConfigChange.ChangeState.NONE) {
+      return true;
+    }
+    if (change.draftDeclared() != null) {
+      return true;
+    }
+    if (change.audit() != null && !change.audit().isEmpty()) {
+      return true;
+    }
+    if (Strings.trimToNull(change.createdTimeUtc()) != null || Strings.trimToNull(change.createdBySubject()) != null) {
+      return true;
+    }
+    if (Strings.trimToNull(change.updatedTimeUtc()) != null || Strings.trimToNull(change.updatedBySubject()) != null) {
+      return true;
+    }
+    if (Strings.trimToNull(change.effectiveAtUtc()) != null || Strings.trimToNull(change.expiresAtUtc()) != null) {
+      return true;
+    }
+    if (Strings.trimToNull(change.rationale()) != null || Strings.trimToNull(change.decisionMessage()) != null) {
+      return true;
+    }
+    return Strings.trimToNull(change.lastPublishedConfigId()) != null;
+  }
+
+  private static DefinitionConfigChange.ChangeEntry firstEntry(
+      List<DefinitionConfigChange.ChangeEntry> entries) {
+    if (entries == null || entries.isEmpty()) {
+      return null;
+    }
+    for (DefinitionConfigChange.ChangeEntry entry : entries) {
+      if (entry != null) {
+        return entry;
+      }
     }
     return null;
   }
 
-  private void dumpConfiguredRecoverySnapshot() {
-    Path configuredPath = cfg.discoveryCacheRecoveryPath();
-    if (configuredPath == null) {
-      throw new IllegalStateException(
-          "Discovery cache recovery path is not configured; set withRecoveryPath(...)");
+  private static List<DefinitionConfigChange.ChangeEntry> normalizedEntries(
+      List<DefinitionConfigChange.ChangeEntry> entries) {
+    if (entries == null || entries.isEmpty()) {
+      return List.of();
     }
-    dumpRecoverySnapshot(configuredPath);
-  }
-
-  private void dumpRecoverySnapshot(Path path) {
-    DiscoveryCache cache = discoveryCache();
-    if (cache == null) {
-      throw new IllegalStateException("DiscoveryCache is not initialized");
+    List<DefinitionConfigChange.ChangeEntry> copy = new ArrayList<>();
+    for (DefinitionConfigChange.ChangeEntry entry : entries) {
+      if (entry != null) {
+        copy.add(entry);
+      }
     }
-    DiscoveryCacheSnapshotManifest manifest =
-        discoverySnapshotService.dump(
-            cache,
-            Objects.requireNonNull(path, "path"),
-            new DiscoveryCacheSnapshotService.SnapshotMetadata(sessionId, group, appName, instance));
-    LOGGER.info(
-        "[Session][DiscoveryRecovery][Dump] path={} createdTimeUtc={} definitions={}",
-        path.toAbsolutePath().normalize(),
-        manifest.createdTimeUtc(),
-        manifest.definitionCount());
+    return copy.isEmpty() ? List.of() : List.copyOf(copy);
   }
 
-  private DiscoveryCacheRecoveryResult currentDiscoveryRecoveryStatus() {
-    return discoveryRecoveryStatus;
+  private static Window validateWindow(
+      DefinitionConfigChange.ChangeMode mode, Instant effectiveAt, Instant expiresAt, Instant now) {
+    DefinitionConfigChange.ChangeMode resolvedMode =
+        mode == null ? DefinitionConfigChange.ChangeMode.IMMEDIATE : mode;
+    Instant referenceNow = now == null ? Instant.now() : now;
+    if (resolvedMode == DefinitionConfigChange.ChangeMode.SCHEDULED) {
+      if (effectiveAt == null) {
+        throw new IllegalArgumentException("effectiveAt is required for SCHEDULED mode");
+      }
+      if (expiresAt != null && !expiresAt.isAfter(effectiveAt)) {
+        throw new IllegalArgumentException("expiresAt must be after effectiveAt for SCHEDULED mode");
+      }
+      return new Window(effectiveAt.toString(), expiresAt == null ? null : expiresAt.toString());
+    }
+    if (effectiveAt != null) {
+      throw new IllegalArgumentException("effectiveAt must be null for IMMEDIATE mode");
+    }
+    if (expiresAt != null && !expiresAt.isAfter(referenceNow)) {
+      throw new IllegalArgumentException("expiresAt must be after now for IMMEDIATE mode");
+    }
+    return new Window(null, expiresAt == null ? null : expiresAt.toString());
   }
 
-  private SessionBootstrap.BootstrapResult bootstrapWithRecoveryFallback() throws Exception {
-    LOGGER.info(
-        "[Session][DiscoveryRecovery] config enabled={} path={} ttl={}",
-        cfg.discoveryCacheRecoveryEnabled(),
-        cfg.discoveryCacheRecoveryPath(),
-        cfg.discoveryCacheRecoveryTtl());
-    LOGGER.info(
-        "[Session][DiscoveryRecovery] live-bootstrap-start app={}/{} instance={} discoveryUrls={}",
-        cfg.group(),
-        cfg.appName(),
-        cfg.instance(),
-        cfg.discoveryUrls());
+  private static Instant parseInstantOrNull(String value, String field) {
+    String normalized = Strings.trimToNull(value);
+    if (normalized == null) {
+      return null;
+    }
     try {
-      SessionBootstrap.BootstrapResult liveResult =
-          SessionBootstrap.bootstrap(cfg, sessionId, kerberosPropertyScope);
-      discoveryRecoveryStatus =
-          DiscoveryCacheRecoveryResult.live(
-              cfg.discoveryCacheRecoveryEnabled(), "live DiscoveryCache bootstrap succeeded");
-      LOGGER.info(
-          "[Session][DiscoveryRecovery] live-bootstrap-succeeded app={}/{} instance={}",
-          cfg.group(),
-          cfg.appName(),
-          cfg.instance());
-      return liveResult;
-    } catch (Exception liveFailure) {
-      LOGGER.warn(
-          "[Session][DiscoveryRecovery] live-bootstrap-failed app={}/{} instance={} message={}",
-          cfg.group(),
-          cfg.appName(),
-          cfg.instance(),
-          Strings.firstNonBlank(liveFailure.getMessage(), liveFailure.getClass().getSimpleName()));
-      return recoverBootstrapOrThrow(liveFailure);
+      return Instant.parse(normalized);
+    } catch (Exception ex) {
+      throw new IllegalArgumentException(field + " must be an ISO-8601 UTC instant", ex);
     }
   }
 
-  private SessionBootstrap.BootstrapResult recoverBootstrapOrThrow(Exception liveFailure)
-      throws Exception {
-    if (!cfg.discoveryCacheRecoveryEnabled()) {
-      LOGGER.info("[Session][DiscoveryRecovery] recovery-disabled; startup will fail if live bootstrap fails");
-      discoveryRecoveryStatus =
-          DiscoveryCacheRecoveryResult.failed(
-              false,
-              null,
-              null,
-              null,
-              null,
-              "Recovery disabled and live bootstrap failed");
-      throw liveFailure;
-    }
+  private static DefinitionConfigChange.ChangeState stateOf(DefinitionConfigChange change) {
+    DefinitionConfigChange.ChangeState state = change == null ? null : change.state();
+    return state == null ? DefinitionConfigChange.ChangeState.NONE : state;
+  }
 
-    Path snapshotPath = cfg.discoveryCacheRecoveryPath();
-    Duration snapshotTtl = cfg.discoveryCacheRecoveryTtl();
-    if (snapshotPath == null) {
-      discoveryRecoveryStatus =
-          DiscoveryCacheRecoveryResult.failed(
-              true,
-              null,
-              null,
-              null,
-              snapshotTtl,
-              "Recovery enabled but snapshot path is not configured");
-      IllegalStateException error =
-          new IllegalStateException(
-              "DiscoveryCache recovery is enabled but no snapshot path is configured");
-      error.addSuppressed(liveFailure);
-      throw error;
-    }
+  private static DefinitionConfigChange.ChangeMode modeOf(DefinitionConfigChange change) {
+    DefinitionConfigChange.ChangeMode mode = change == null ? null : change.mode();
+    return mode == null ? DefinitionConfigChange.ChangeMode.IMMEDIATE : mode;
+  }
 
-    LOGGER.info(
-        "[Session][DiscoveryRecovery] recovery-attempt-enabled=true path={} ttl={}",
-        snapshotPath.toAbsolutePath().normalize(),
-        snapshotTtl);
-    DiscoveryCache probeCache = null;
-    DiscoveryCache runtimeCache = null;
-    boolean published = false;
+  private static boolean isScheduledPending(DefinitionConfigChange change) {
+    if (change == null || modeOf(change) != DefinitionConfigChange.ChangeMode.SCHEDULED) {
+      return false;
+    }
+    String effectiveAtUtc = Strings.trimToNull(change.effectiveAtUtc());
+    if (effectiveAtUtc == null) {
+      return false;
+    }
     try {
-      DiscoveryCacheSnapshotService.LoadedSnapshot loaded =
-          discoverySnapshotService.load(snapshotPath, snapshotTtl);
-      String sessionGroup = Strings.trimToNull(cfg.group());
-      probeCache =
-          DiscoveryCache.recoveredSnapshotCache(
-              sessionGroup, true, cfg.verbose(), loaded.definitions());
-      SessionBootstrap.BootstrapResult recoveredResult =
-          SessionBootstrap.bootstrapFromRecoveredSnapshot(
-              cfg, sessionId, kerberosPropertyScope, probeCache);
-      runtimeCache = probeCache;
-      if (!recoveredResult.configCacheAdmin()) {
-        runtimeCache =
-            DiscoveryCache.recoveredSnapshotCache(
-                recoveredResult.group(), false, cfg.verbose(), loaded.definitions());
-        probeCache.close();
-        probeCache = null;
+      Instant effectiveAt = Instant.parse(effectiveAtUtc);
+      Instant now = Instant.now();
+      Instant expiresAt = parseInstantOrNull(change.expiresAtUtc(), "expiresAtUtc");
+      if (expiresAt != null && !expiresAt.isAfter(effectiveAt)) {
+        return false;
       }
-      publishDiscoveryManager(
-          DiscoveryManager.recoveredSnapshot(
-              runtimeCache, recoveredResult.group(), this::defaultCatalogSubject, () -> null));
-      published = true;
-      discoveryRecoveryStatus =
-          DiscoveryCacheRecoveryResult.recovered(
-              loaded.snapshotPath(),
-              loaded.createdTimeUtc(),
-              loaded.age(),
-              loaded.ttl(),
-              loaded.manifest().definitionCount(),
-              "Recovered DiscoveryCache from disk snapshot");
-      LOGGER.info(
-          "[Session][DiscoveryRecovery] recovery-accepted path={} createdTimeUtc={} age={} ttl={} definitions={}",
-          loaded.snapshotPath(),
-          loaded.createdTimeUtc(),
-          loaded.age(),
-          loaded.ttl(),
-          loaded.manifest().definitionCount());
-      return recoveredResult;
-    } catch (Exception recoveryFailure) {
-      CloseSupport.closeQuietly(probeCache);
-      if (!published) {
-        CloseSupport.closeQuietly(runtimeCache);
+      if (expiresAt != null && !now.isBefore(expiresAt)) {
+        return false;
       }
-      discoveryRecoveryStatus =
-          DiscoveryCacheRecoveryResult.failed(
-              true,
-              snapshotPath,
-              null,
-              null,
-              snapshotTtl,
-              Strings.firstNonBlank(
-                  recoveryFailure.getMessage(), recoveryFailure.getClass().getSimpleName()));
-      LOGGER.error(
-          "[Session][DiscoveryRecovery] recovery-rejected path={} ttl={} reason={}",
-          snapshotPath.toAbsolutePath().normalize(),
-          snapshotTtl,
-          Strings.firstNonBlank(
-              recoveryFailure.getMessage(), recoveryFailure.getClass().getSimpleName()));
-      IllegalStateException startupFailure =
-          new IllegalStateException(
-              "Live bootstrap failed and DiscoveryCache recovery failed: "
-                  + Strings.firstNonBlank(
-                      recoveryFailure.getMessage(),
-                      recoveryFailure.getClass().getSimpleName()),
-              recoveryFailure);
-      startupFailure.addSuppressed(liveFailure);
-      throw startupFailure;
+      return effectiveAt.isAfter(now);
+    } catch (Exception ignored) {
+      return false;
     }
   }
 
-  OtelManager createOtelManager(
-      DefinitionEnvironment environment, DefinitionApp app) {
-    if (!FabricOtelEnablement.isEnvironmentOtelEnabled(environment)
-        || !FabricOtelEnablement.isAppOtelEnabled(app)) {
-      return OtelManagerNoop.instance();
-    }
-    String defaultServiceName =
-        Strings.firstNonBlank(
-            app == null || app.envelope() == null ? null : app.envelope().name(),
-            appName,
-            "fabric-lite");
-    return OtelManagerImpl.create(environment, app, defaultServiceName);
+  private static String schemaKey(DefinitionConfigLayer config) {
+    DefinitionConfigLayer payload =
+        config == null  ? null : config;
+    return Strings.trimToNull(payload == null ? null : payload.schemaKey());
   }
 
-  private void refreshSessionViews() {
-    DiscoveryCache cache = discoveryCache();
-    SessionContext context =
-        new SessionContext(
-            cfg.type(),
-            group,
-            appName,
-            instance,
-            env,
-            region,
-            site,
-            sessionId,
-            normalizedDiscoveryUrls,
-            discoveryUris,
-            configCacheAdmin,
-            cache != null && cache.recovered(),
-            cache == null ? 0 : cache.size(),
-            statusPublisher == null ? 0 : statusPublisher.publishIntervalSeconds(),
-            statusPublisher == null ? null : statusPublisher.intervalSource(),
-            statusPublisher != null && statusPublisher.started(),
-            statusPublisher == null ? null : statusPublisher.lastPublishedPayload(),
-            statusPublisher == null ? 0L : statusPublisher.lastPublishedEpochMs(),
-            statusPublisher == null ? 0L : statusPublisher.publishCount());
-    this.sessionContext = context;
+  private static DefinitionConfigLayer ConfigPayload(DefinitionConfigLayer definition) {
+    if (definition == null) {
+      throw new IllegalStateException("config payload is required");
+    }
+    return definition;
   }
 
-  private void startStatusPublisher() {
-    DiscoveryCache cache = discoveryCache();
-    if (controlPlaneConnection == null || cache == null || !cache.recovered()) {
-      return;
+  private static String required(String value, String field) {
+    String normalized = Strings.trimToNull(value);
+    if (normalized == null) {
+      throw new IllegalArgumentException(field + " is required");
     }
-    AppStatusPublisher publisher =
-        new AppStatusPublisher(
-            controlPlaneConnection,
-            sessionContext,
-            appDefinition,
-            statusUserTag,
-            otelManager.enabled(),
-            statusScheduler(),
-            (publishEpochMs, status, payload) -> {
-              synchronized (lifecycleLock) {
-                if (!started.get() || statusPublisher == null) {
-                  return;
-                }
-                refreshSessionViews();
-              }
-            });
-    statusPublisher = publisher;
-    publisher.start();
+    return normalized;
   }
 
-  public record SessionConfig(
-      String group,
-      String appName,
-      List<String> discoveryUrls,
-      String instance,
-      String kerberosUsername,
-      String kerberosPrincipal,
-      Path kerberosKeytab,
-      Path trustCert,
-      Path serviceTlsCertChain,
-      Path serviceTlsPrivateKey,
-      SessionType type,
-      boolean verbose,
-      Integer duplicateInstanceCheckAttempts,
-      Duration duplicateInstanceCheckDelay,
-      DataOptions dataOptions,
-      boolean entitlementsDecisionLogging,
-      boolean grpcRoutingLogSelections,
-      String statusUserTag,
-      Path checkpointPath,
-      boolean discoveryCacheRecoveryEnabled,
-      Path discoveryCacheRecoveryPath,
-      Duration discoveryCacheRecoveryTtl,
-      SessionSecrets sessionSecrets) {
-    public SessionConfig(
-        String group,
-        String appName,
-        List<String> discoveryUrls,
-        String instance,
-        String kerberosUsername,
-        String kerberosPrincipal,
-        Path kerberosKeytab,
-        Path trustCert,
-        Path serviceTlsCertChain,
-        Path serviceTlsPrivateKey,
-        SessionType type,
-        boolean verbose,
-        Integer duplicateInstanceCheckAttempts,
-        Duration duplicateInstanceCheckDelay,
-        DataOptions dataOptions,
-        boolean entitlementsDecisionLogging,
-        boolean grpcRoutingLogSelections,
-        String statusUserTag,
-        Path checkpointPath,
-        boolean discoveryCacheRecoveryEnabled,
-        Path discoveryCacheRecoveryPath,
-        Duration discoveryCacheRecoveryTtl) {
-      this(
-          group,
-          appName,
-          discoveryUrls,
-          instance,
-          kerberosUsername,
-          kerberosPrincipal,
-          kerberosKeytab,
-          trustCert,
-          serviceTlsCertChain,
-          serviceTlsPrivateKey,
-          type,
-          verbose,
-          duplicateInstanceCheckAttempts,
-          duplicateInstanceCheckDelay,
-          dataOptions,
-          entitlementsDecisionLogging,
-          grpcRoutingLogSelections,
-          statusUserTag,
-          checkpointPath,
-          discoveryCacheRecoveryEnabled,
-          discoveryCacheRecoveryPath,
-          discoveryCacheRecoveryTtl,
-          SessionSecrets.empty());
+  private static ObjectNode requireObject(JsonNode node, String field) {
+    if (node == null || !node.isObject()) {
+      throw new IllegalArgumentException(field + " must be a JSON object");
     }
+    return (ObjectNode) node;
+  }
 
-    public SessionConfig {
-      discoveryUrls = discoveryUrls == null ? Collections.emptyList() : List.copyOf(discoveryUrls);
-      type = type == null ? SessionType.CLIENT : type;
-      duplicateInstanceCheckAttempts =
-          duplicateInstanceCheckAttempts != null && duplicateInstanceCheckAttempts > 0
-              ? duplicateInstanceCheckAttempts
-              : null;
-      duplicateInstanceCheckDelay =
-          duplicateInstanceCheckDelay != null
-                  && !duplicateInstanceCheckDelay.isNegative()
-                  && !duplicateInstanceCheckDelay.isZero()
-              ? duplicateInstanceCheckDelay
-              : null;
-      dataOptions = dataOptions == null ? DataOptions.builder().build() : dataOptions;
-      statusUserTag = Strings.trimToNull(statusUserTag);
-      checkpointPath = checkpointPath == null ? null : checkpointPath.normalize();
-      discoveryCacheRecoveryPath =
-          discoveryCacheRecoveryPath == null ? null : discoveryCacheRecoveryPath.normalize();
-      discoveryCacheRecoveryTtl =
-          discoveryCacheRecoveryTtl == null || discoveryCacheRecoveryTtl.isNegative()
-              ? null
-              : discoveryCacheRecoveryTtl;
-      trustCert = trustCert == null ? null : trustCert.normalize();
-      serviceTlsCertChain =
-          serviceTlsCertChain == null ? null : serviceTlsCertChain.normalize();
-      serviceTlsPrivateKey =
-          serviceTlsPrivateKey == null ? null : serviceTlsPrivateKey.normalize();
-      sessionSecrets = sessionSecrets == null ? SessionSecrets.empty() : sessionSecrets;
+  private static String configLayerDefinitionName(String configId, String layerId) {
+    return "config__" + configId + "__" + layerId;
+  }
+
+  private static String changeName(String configId, String layerId) {
+    return "config_change__" + configId + "__" + layerId;
+  }
+
+  private static String resolveSubject(String subject) {
+    String normalized = Strings.trimToNull(subject);
+    return normalized == null ? "service:config-client" : normalized;
+  }
+
+  private static JsonNode deepCopy(JsonNode node) {
+    return node == null ? null : node.deepCopy();
+  }
+
+  private record Window(String effectiveAtUtc, String expiresAtUtc) {}
+
+  public interface Store {
+    List<DefinitionConfigLayer> listConfigLayers(String group);
+
+    Definition get(DefinitionType type, String group, String name);
+
+    void upsert(Definition definition);
+  }
+
+  public static final class WorkflowDraftNotFoundException extends RuntimeException {
+    public WorkflowDraftNotFoundException(String message) {
+      super(message);
     }
   }
 
-  void deleteDefinition(DefinitionType type, String definitionGroup, String definitionName) {
-    DiscoveryCache cache = discoveryCache();
-    if (cache == null) {
-      throw new IllegalStateException("DiscoveryCache is not initialized");
-    }
-    cache.delete(type, definitionGroup, definitionName);
-  }
-
-  void publishDiscoveryManager(DiscoveryManager manager) {
-    this.discoveryManager = manager;
-  }
-
-  DiscoveryManager publishedDiscoveryManager() {
-    return discoveryManager;
-  }
-
-  void publishDeleteManager(DeleteManager manager) {
-    this.deleteManager = manager;
-  }
-
-  void publishSchemaRegistryManager(SchemaManager manager) {
-    this.schemaRegistryManager = manager;
-  }
-
-  void publishServiceEntitlements(ServiceEntitlements entitlements) {
-    this.serviceEntitlements = entitlements;
-  }
-
-  void publishDataEntitlements(DataEntitlements entitlements) {
-    this.dataEntitlements = entitlements;
-  }
-
-
-
-  public static final class Builder {
-    private String group;
-    private String appName;
-    private List<String> discoveryUrls = List.of();
-    private String instance;
-    private String kerberosUsername;
-    private String kerberosPrincipal;
-    private Path kerberosKeytab;
-    private Path trustCert;
-    private Path serviceTlsCertChain;
-    private Path serviceTlsPrivateKey;
-    private SessionType type = SessionType.CLIENT;
-    private boolean verbose;
-    private Integer duplicateInstanceCheckAttempts;
-    private Duration duplicateInstanceCheckDelay;
-    private DataOptions dataOptions = DataOptions.builder().build();
-    private boolean entitlementsDecisionLogging;
-    private boolean grpcRoutingLogSelections;
-    private String statusUserTag;
-    private Path checkpointPath;
-    private boolean discoveryCacheRecoveryEnabled;
-    private Path discoveryCacheRecoveryPath;
-    private Duration discoveryCacheRecoveryTtl;
-    private final SessionSecrets.Builder sessionSecrets = SessionSecrets.builder();
-
-    public Builder withGroup(String value) {
-      group = Strings.trimToNull(value);
-      return this;
-    }
-
-    public Builder withName(String value) {
-      appName = Strings.trimToNull(value);
-      return this;
-    }
-
-    public Builder withDiscoveryUrls(String value) {
-      discoveryUrls = AmpsConfig.parseDiscoveryUrls(value == null ? List.of() : List.of(value));
-      return this;
-    }
-
-    public Builder withDiscoveryUrls(String... values) {
-      discoveryUrls =
-          AmpsConfig.parseDiscoveryUrls(values == null ? List.of() : Arrays.asList(values));
-      return this;
-    }
-
-    public Builder withDiscoveryUrls(List<String> values) {
-      discoveryUrls = AmpsConfig.parseDiscoveryUrls(values);
-      return this;
-    }
-
-    public Builder withInstance(String value) {
-      instance = Strings.trimToNull(value);
-      return this;
-    }
-
-    public Builder withKerberosUsername(String value) {
-      if (Strings.isBlank(value)) {
-        throw new IllegalArgumentException("Kerberos username is required");
-      }
-      kerberosUsername = value.trim();
-      return this;
-    }
-
-    public Builder withKerberosPrincipal(String value) {
-      kerberosPrincipal = Strings.trimToNull(value);
-      return this;
-    }
-
-    public Builder withKerberosKeytab(Path value) {
-      kerberosKeytab = value;
-      return this;
-    }
-
-    public Builder withTlsTrustCert(Path value) {
-      trustCert = value;
-      return this;
-    }
-
-    public Builder withTlsCertChain(Path value) {
-      serviceTlsCertChain = value;
-      return this;
-    }
-
-    public Builder withTlsPrivateKey(Path value) {
-      serviceTlsPrivateKey = value;
-      return this;
-    }
-
-    public Builder withType(SessionType value) {
-      type = value == null ? SessionType.CLIENT : value;
-      return this;
-    }
-
-    public Builder withVerbose(boolean value) {
-      verbose = value;
-      return this;
-    }
-
-    public Builder withDiscoveryVerbose(boolean value) {
-      verbose = value;
-      return this;
-    }
-
-    public Builder withVerbos(boolean value) {
-      return withVerbose(value);
-    }
-
-    public Builder withDuplicateInstanceCheckAttempts(int value) {
-      if (value <= 0) {
-        throw new IllegalArgumentException("duplicate instance check attempts must be > 0");
-      }
-      duplicateInstanceCheckAttempts = value;
-      return this;
-    }
-
-    public Builder withDuplicateInstanceCheckDelay(Duration value) {
-      if (value == null || value.isNegative() || value.isZero()) {
-        throw new IllegalArgumentException("duplicate instance check delay must be > 0");
-      }
-      duplicateInstanceCheckDelay = value;
-      return this;
-    }
-
-    public Builder withDataOptions(DataOptions options) {
-      dataOptions = options == null ? DataOptions.builder().build() : options;
-      return this;
-    }
-
-    public Builder withEntitlementsDecisionLogging(boolean value) {
-      entitlementsDecisionLogging = value;
-      return this;
-    }
-
-    public Builder withGrpcRoutingLogging(boolean value) {
-      grpcRoutingLogSelections = value;
-      return this;
-    }
-
-    public Builder withStatusUserTag(String value) {
-      statusUserTag = Strings.trimToNull(value);
-      return this;
-    }
-
-    public Builder withCheckpointPath(Path value) {
-      checkpointPath = Objects.requireNonNull(value, "checkpointPath");
-      return this;
-    }
-
-    public Builder withRecoveryEnabled(boolean enabled) {
-      discoveryCacheRecoveryEnabled = enabled;
-      return this;
-    }
-
-    public Builder withRecoveryPath(Path path) {
-      discoveryCacheRecoveryPath = Objects.requireNonNull(path, "path");
-      return this;
-    }
-
-    public Builder withRecoveryTtl(Duration ttl) {
-      if (ttl != null && ttl.isNegative()) {
-        throw new IllegalArgumentException("discovery cache recovery TTL must be >= 0");
-      }
-      discoveryCacheRecoveryTtl = ttl;
-      return this;
-    }
-
-    public Builder withSecrets(Consumer<SessionSecrets.Builder> customizer) {
-      Objects.requireNonNull(customizer, "customizer");
-      customizer.accept(sessionSecrets);
-      return this;
-    }
-
-    public Builder withKekFile(String alias, Path kekFile) {
-      sessionSecrets.withClientKekFile(alias, kekFile);
-      return this;
-    }
-
-    public Builder withKekFile(Path kekFile) {
-      sessionSecrets.withClientKekFile(kekFile);
-      return this;
-    }
-
-    public Fabric.Session build() {
-      String principal = Strings.trimToNull(kerberosPrincipal);
-      if (principal == null && Strings.isNotBlank(kerberosUsername)) {
-        principal = kerberosUsername.trim() + "@" + DEFAULT_KERBEROS_REALM;
-      }
-      return new SessionImpl(
-          new SessionConfig(
-              group,
-              appName,
-              discoveryUrls,
-              instance,
-              Strings.trimToNull(kerberosUsername),
-              principal,
-              kerberosKeytab,
-              trustCert,
-              serviceTlsCertChain,
-              serviceTlsPrivateKey,
-              type == null ? SessionType.CLIENT : type,
-              verbose,
-              duplicateInstanceCheckAttempts,
-              duplicateInstanceCheckDelay,
-              dataOptions,
-              entitlementsDecisionLogging,
-              grpcRoutingLogSelections,
-              statusUserTag,
-              checkpointPath,
-              discoveryCacheRecoveryEnabled,
-              discoveryCacheRecoveryPath,
-              discoveryCacheRecoveryTtl,
-              sessionSecrets.build()));
+  public static final class WorkflowStateException extends IllegalStateException {
+    public WorkflowStateException(String message) {
+      super(message);
     }
   }
 
-  private void closeStatusScheduler() {
-    ScheduledExecutorService scheduler = statusScheduler;
-    statusScheduler = null;
-    SessionImplShutdown.closeStatusScheduler(scheduler);
-  }
-
-  private static String resolveHostname() {
-    try {
-      return InetAddress.getLocalHost().getHostName();
-    } catch (UnknownHostException ex) {
-      return "localhost";
+  public static final class ConfigNotFoundException extends RuntimeException {
+    public ConfigNotFoundException(String message) {
+      super(message);
     }
-  }
-
-  private void registerShutdownHook() {
-    SessionImplShutdown.registerShutdownHook(shutdownHookRegistered, shutdownHook);
-  }
-
-  private void unregisterShutdownHook() {
-    SessionImplShutdown.unregisterShutdownHook(shutdownHookRegistered, shutdownHook);
-  }
-
-  private void closeQuietlyFromShutdownHook() {
-    SessionImplShutdown.closeQuietlyFromShutdownHook(this::close);
-  }
-
-  String defaultCatalogSubject() {
-    String resolvedGroup = Strings.trimToNull(group);
-    String resolvedApp = Strings.trimToNull(appName);
-    if (resolvedGroup == null || resolvedApp == null) {
-      return "app:catalog/system";
-    }
-    return "app:" + resolvedGroup + "/" + resolvedApp;
-  }
-
-  private static long elapsedMillis(long startNanos) {
-    return Math.max(0L, (System.nanoTime() - startNanos) / 1_000_000L);
-  }
-
-  private static long resolveCadenceSeconds(Integer configuredSeconds, long defaultSeconds) {
-    if (configuredSeconds != null && configuredSeconds > 0) {
-      return configuredSeconds.longValue();
-    }
-    return defaultSeconds;
   }
 }
-
-
-
-
-
-
-
-
-
-
-
 
 
 
