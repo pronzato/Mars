@@ -1,584 +1,551 @@
-package org.pronzato.fabric.api.control.security.sso.oidc;
+package org.pronzato.fabric.api.data.parquet;
 
-import com.fasterxml.jackson.annotation.JsonProperty;
-import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
-import java.net.URI;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.time.Instant;
 import java.util.ArrayList;
-import java.util.LinkedHashSet;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Set;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import org.pronzato.fabric.api.Fabric;
+import org.pronzato.fabric.api.connectors.s3.S3Connection;
+import org.pronzato.fabric.api.data.checkpoints.CheckpointKey;
+import org.pronzato.fabric.api.data.checkpoints.CheckpointRecord;
+import org.pronzato.fabric.api.data.checkpoints.CheckpointStore;
+import org.pronzato.fabric.api.data.checkpoints.CheckpointStores;
+import org.pronzato.fabric.api.data.checkpoints.CheckpointType;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
+import org.pronzato.fabric.api.data.ParquetManager;
+import org.pronzato.fabric.api.data.RowManager;
+import org.pronzato.fabric.api.data.dataset.DatasetId;
+import org.pronzato.fabric.api.data.duckdb.DuckdbSession;
+import org.pronzato.fabric.api.data.manager.RowManagerImpl;
+import org.pronzato.fabric.api.control.entitlements.core.data.DataWriteAuthorization;
 import org.pronzato.fabric.api.util.Strings;
 
-/**
- * Configuration for the OIDC SSO implementation.
- *
- * <p>Values can be loaded via system properties or environment variables. Required fields
- * must be provided explicitly; no real secrets are hard-coded.
- */
-@JsonDeserialize(builder = FabricOidcConfig.Builder.class)
-public final class FabricOidcConfig {
+public final class ParquetManagerImpl implements ParquetManager {
+  private static final Pattern PARTITION_PATTERN = Pattern.compile("(^|/)date=([0-9]{8})(/|$)");
+  private static final String DEFAULT_PARQUET_GLOB = "**/*.parquet";
 
-  public static final String DEFAULT_SCOPE = "openid profile email";
-  public static final String DEFAULT_USERNAME_CLAIM = "preferred_username";
-  public static final String DEFAULT_LOGIN_PATH = "/login";
-  public static final String DEFAULT_CALLBACK_PATH = "/oidc/callback";
-  public static final int DEFAULT_CLOCK_SKEW_SECONDS = 60;
+  private final RowManagerImpl rowManager;
+  private final DiscoveryCache DiscoveryCache;
+  private final Fabric.Session session;
+  private final String group;
+  private final CheckpointStore checkpointStore;
+  private final ParquetCompactionPlanner compactionPlanner;
+  private final ParquetRetentionPlanner retentionPlanner;
 
-  private final String issuerBaseUrl;
-  private final String authorizationEndpoint;
-  private final String tokenEndpoint;
-  private final String jwksEndpoint;
-  private final String clientId;
-  private final String clientSecret;
-  private final String redirectUri;
-  private final String scope;
-  private final String usernameClaim;
-  private final List<String> groupClaims;
-  private final List<String> allowAnonPaths;
-  private final boolean httpsRequiredForSameSiteNone;
-  private final String loginPath;
-  private final String callbackPath;
-  private final int clockSkewSeconds;
-
-  private FabricOidcConfig(Builder builder) {
-    this.issuerBaseUrl = builder.issuerBaseUrl;
-    this.authorizationEndpoint = builder.authorizationEndpoint;
-    this.tokenEndpoint = builder.tokenEndpoint;
-    this.jwksEndpoint = builder.jwksEndpoint;
-    this.clientId = builder.clientId;
-    this.clientSecret = builder.clientSecret;
-    this.redirectUri = builder.redirectUri;
-    this.scope = builder.scope;
-    this.usernameClaim = builder.usernameClaim;
-    this.groupClaims = builder.groupClaims;
-    this.allowAnonPaths = builder.allowAnonPaths;
-    this.httpsRequiredForSameSiteNone = builder.httpsRequiredForSameSiteNone;
-    this.loginPath = builder.loginPath;
-    this.callbackPath = builder.callbackPath;
-    this.clockSkewSeconds = builder.clockSkewSeconds;
+  public ParquetManagerImpl(
+      RowManager manager, DiscoveryCache DiscoveryCache, String group, Fabric.Session session) {
+    this(
+        manager,
+        DiscoveryCache,
+        group,
+        session,
+        CheckpointStores.failFast(
+            "ParquetManager checkpoint store is not configured. Configure session with withCheckpointPath(...)"));
   }
 
-  public static Builder builder() {
-    return new Builder();
+  public ParquetManagerImpl(
+      RowManager manager,
+      DiscoveryCache DiscoveryCache,
+      String group,
+      Fabric.Session session,
+      CheckpointStore checkpointStore) {
+    this(
+        manager,
+        DiscoveryCache,
+        group,
+        session,
+        checkpointStore,
+        new ParquetCompactionPlanner(),
+        new ParquetRetentionPlanner());
   }
 
-  public static FabricOidcConfig fromSystem() {
-    return Builder.fromSystem().build();
-  }
-
-  public String issuerBaseUrl() {
-    return issuerBaseUrl;
-  }
-
-  public String authorizationEndpoint() {
-    return authorizationEndpoint;
-  }
-
-  public String tokenEndpoint() {
-    return tokenEndpoint;
-  }
-
-  public String jwksEndpoint() {
-    return jwksEndpoint;
-  }
-
-  public String clientId() {
-    return clientId;
-  }
-
-  public String clientSecret() {
-    return clientSecret;
-  }
-
-  public String redirectUri() {
-    return redirectUri;
-  }
-
-  public String scope() {
-    return scope;
-  }
-
-  public String usernameClaim() {
-    return usernameClaim;
-  }
-
-  public List<String> groupClaims() {
-    return groupClaims;
-  }
-
-  public List<String> allowAnonPaths() {
-    return allowAnonPaths;
-  }
-
-  public boolean httpsRequiredForSameSiteNone() {
-    return httpsRequiredForSameSiteNone;
-  }
-
-  public String loginPath() {
-    return loginPath;
-  }
-
-  public String callbackPath() {
-    return callbackPath;
-  }
-
-  public int clockSkewSeconds() {
-    return clockSkewSeconds;
-  }
-
-  public String authorizationUrl() {
-    return resolveEndpoint(issuerBaseUrl, authorizationEndpoint);
-  }
-
-  public String tokenUrl() {
-    return resolveEndpoint(issuerBaseUrl, tokenEndpoint);
-  }
-
-  public String discoveryUrl() {
-    String base = issuerBaseUrl == null ? null : issuerBaseUrl.trim();
-    if (Strings.isBlank(base)) {
-      return null;
+  ParquetManagerImpl(
+      RowManager manager,
+      DiscoveryCache DiscoveryCache,
+      String group,
+      Fabric.Session session,
+      CheckpointStore checkpointStore,
+      ParquetCompactionPlanner compactionPlanner,
+      ParquetRetentionPlanner retentionPlanner) {
+    if (!(manager instanceof RowManagerImpl localManager)) {
+      throw new IllegalStateException(
+          "Parquet maintenance requires DIRECT mode local RowManager implementation");
     }
-    String normalized = trimTrailingSlash(base);
-    return normalized + "/.well-known/openid-configuration";
+    this.rowManager = localManager;
+    this.DiscoveryCache = Objects.requireNonNull(DiscoveryCache, "DiscoveryCache");
+    this.group = Strings.requireNonBlank(group, "group");
+    this.session = session;
+    this.checkpointStore = Objects.requireNonNull(checkpointStore, "checkpointStore");
+    this.compactionPlanner = Objects.requireNonNull(compactionPlanner, "compactionPlanner");
+    this.retentionPlanner = Objects.requireNonNull(retentionPlanner, "retentionPlanner");
   }
 
-  public static String resolveEndpoint(String base, String endpoint) {
-    if (Strings.isBlank(endpoint)) {
-      return null;
-    }
-    String trimmed = endpoint.trim();
-    if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
-      return trimmed;
-    }
-    if (Strings.isBlank(base)) {
-      return trimmed;
-    }
-    return join(base.trim(), trimmed);
+  @Override
+  public ParquetMaintenanceResult compactDataset(String datasetId, ParquetCompactionOptions options) {
+    return compact(datasetId, null, options, "compact-dataset");
   }
 
-  static String join(String base, String endpoint) {
-    String normalizedBase = trimTrailingSlash(base == null ? "" : base.trim());
-    String normalizedEndpoint = endpoint == null ? "" : endpoint.trim();
-    if (normalizedEndpoint.startsWith("/")) {
-      return normalizedBase + normalizedEndpoint;
-    }
-    return normalizedBase + "/" + normalizedEndpoint;
+  @Override
+  public ParquetMaintenanceResult compactPartition(
+      String datasetId, String partitionSpec, ParquetCompactionOptions options) {
+    String normalized = Strings.requireNonBlank(partitionSpec, "partitionSpec");
+    return compact(datasetId, normalized, options, "compact-partition");
   }
 
-  static String trimTrailingSlash(String value) {
-    if (Strings.isBlank(value)) {
-      return value;
-    }
-    String trimmed = value.trim();
-    while (trimmed.endsWith("/") && trimmed.length() > 1) {
-      trimmed = trimmed.substring(0, trimmed.length() - 1);
-    }
-    return trimmed;
-  }
+  @Override
+  public ParquetMaintenanceResult applyRetention(String datasetId, ParquetRetentionPolicy policy) {
+    long started = System.currentTimeMillis();
+    DatasetContext context = resolveDataset(datasetId);
+    DataWriteAuthorization.requireWrite(
+        rowManager.dataEntitlementsForSqlPlanning(),
+        rowManager.effectiveIdentityForSqlPlanning(),
+        context.datasetId().toString(),
+        "PARQUET_RETENTION",
+        null);
+    List<String> warnings = new ArrayList<>();
+    List<String> files = listParquetFiles(context);
+    S3Connection s3Connection = context.s3() ? resolveS3Connection(context) : null;
+    Map<String, List<String>> filesByPartition = partitionToFiles(files);
+    List<String> partitions = new ArrayList<>(filesByPartition.keySet());
+    partitions.sort(String.CASE_INSENSITIVE_ORDER.thenComparing(Comparator.naturalOrder()));
+    List<String> partitionsToDelete = retentionPlanner.partitionsToDelete(partitions, policy);
 
-  public static final class Builder {
-
-    private String issuerBaseUrl;
-    private String authorizationEndpoint;
-    private String tokenEndpoint;
-    private String jwksEndpoint;
-    private String clientId;
-    private String clientSecret;
-    private String redirectUri;
-    private String externalBaseUrl;
-    private String redirectPath = DEFAULT_CALLBACK_PATH;
-    private String scope = DEFAULT_SCOPE;
-    private String usernameClaim = DEFAULT_USERNAME_CLAIM;
-    private List<String> groupClaims = List.of();
-    private List<String> allowAnonPaths =
-        List.of(DEFAULT_LOGIN_PATH, DEFAULT_CALLBACK_PATH, "/health", "/favicon.ico");
-    private boolean httpsRequiredForSameSiteNone = true;
-    private String loginPath = DEFAULT_LOGIN_PATH;
-    private String callbackPath = DEFAULT_CALLBACK_PATH;
-    private int clockSkewSeconds = DEFAULT_CLOCK_SKEW_SECONDS;
-
-    private Builder() {
-    }
-
-    public static Builder fromSystem() {
-      Builder builder = new Builder();
-      String issuer = firstNonBlank(
-          System.getProperty("fabric.oidc.issuerBaseUrl"),
-          System.getProperty("fabric.oidc.issuer"),
-          System.getenv("FABRIC_OIDC_ISSUER_BASE_URL"),
-          System.getenv("FABRIC_OIDC_ISSUER"));
-      if (Strings.isNotBlank(issuer)) {
-        builder.withIssuerBaseUrl(issuer);
+    int deleted = 0;
+    long bytes = 0L;
+    for (String partition : partitionsToDelete) {
+      List<String> partitionFiles = filesByPartition.getOrDefault(partition, List.of());
+      for (String file : partitionFiles) {
+        bytes += context.s3() ? s3FileSize(s3Connection, file, warnings) : localFileSize(file);
       }
-      String authorizationEndpoint = firstNonBlank(
-          System.getProperty("fabric.oidc.authorizationEndpoint"),
-          System.getProperty("fabric.oidc.authEndpoint"),
-          System.getenv("FABRIC_OIDC_AUTHORIZATION_ENDPOINT"),
-          System.getenv("FABRIC_OIDC_AUTH_ENDPOINT"));
-      if (Strings.isNotBlank(authorizationEndpoint)) {
-        builder.withAuthorizationEndpoint(authorizationEndpoint);
-      }
-      String tokenEndpoint = firstNonBlank(
-          System.getProperty("fabric.oidc.tokenEndpoint"),
-          System.getenv("FABRIC_OIDC_TOKEN_ENDPOINT"));
-      if (Strings.isNotBlank(tokenEndpoint)) {
-        builder.withTokenEndpoint(tokenEndpoint);
-      }
-      String jwksEndpoint = firstNonBlank(
-          System.getProperty("fabric.oidc.jwksEndpoint"),
-          System.getenv("FABRIC_OIDC_JWKS_ENDPOINT"));
-      if (Strings.isNotBlank(jwksEndpoint)) {
-        builder.withJwksEndpoint(jwksEndpoint);
-      }
-      String clientId = firstNonBlank(
-          System.getProperty("fabric.oidc.clientId"),
-          System.getenv("FABRIC_OIDC_CLIENT_ID"));
-      if (Strings.isNotBlank(clientId)) {
-        builder.withClientId(clientId);
-      }
-      String clientSecret = firstNonBlank(
-          System.getProperty("fabric.oidc.clientSecret"),
-          System.getenv("FABRIC_OIDC_CLIENT_SECRET"));
-      if (Strings.isNotBlank(clientSecret)) {
-        builder.withClientSecret(clientSecret);
-      }
-      String redirectUri = firstNonBlank(
-          System.getProperty("fabric.oidc.redirectUri"),
-          System.getenv("FABRIC_OIDC_REDIRECT_URI"));
-      if (Strings.isNotBlank(redirectUri)) {
-        builder.withRedirectUri(redirectUri);
-      }
-      String externalBaseUrl = firstNonBlank(
-          System.getProperty("fabric.oidc.externalBaseUrl"),
-          System.getenv("FABRIC_OIDC_EXTERNAL_BASE_URL"));
-      if (Strings.isNotBlank(externalBaseUrl)) {
-        builder.withExternalBaseUrl(externalBaseUrl);
-      }
-      String redirectPath = firstNonBlank(
-          System.getProperty("fabric.oidc.redirectPath"),
-          System.getenv("FABRIC_OIDC_REDIRECT_PATH"));
-      if (Strings.isNotBlank(redirectPath)) {
-        builder.withRedirectPath(redirectPath);
-      }
-      String scope = firstNonBlank(
-          System.getProperty("fabric.oidc.scope"),
-          System.getenv("FABRIC_OIDC_SCOPE"));
-      if (Strings.isNotBlank(scope)) {
-        builder.withScope(scope);
-      }
-      String usernameClaim = firstNonBlank(
-          System.getProperty("fabric.oidc.usernameClaim"),
-          System.getenv("FABRIC_OIDC_USERNAME_CLAIM"));
-      if (Strings.isNotBlank(usernameClaim)) {
-        builder.withUsernameClaim(usernameClaim);
-      }
-      String groupClaims = firstNonBlank(
-          System.getProperty("fabric.oidc.groupClaims"),
-          System.getenv("FABRIC_OIDC_GROUP_CLAIMS"));
-      if (Strings.isNotBlank(groupClaims)) {
-        builder.withGroupClaims(parseList(groupClaims));
-      }
-      String allowAnonPaths = firstNonBlank(
-          System.getProperty("fabric.oidc.allowAnonPaths"),
-          System.getenv("FABRIC_OIDC_ALLOW_ANON_PATHS"));
-      if (Strings.isNotBlank(allowAnonPaths)) {
-        builder.withAllowAnonPaths(parseList(allowAnonPaths));
-      }
-      String loginPath = firstNonBlank(
-          System.getProperty("fabric.oidc.loginPath"),
-          System.getenv("FABRIC_OIDC_LOGIN_PATH"));
-      if (Strings.isNotBlank(loginPath)) {
-        builder.withLoginPath(loginPath);
-      }
-      String callbackPath = firstNonBlank(
-          System.getProperty("fabric.oidc.callbackPath"),
-          System.getenv("FABRIC_OIDC_CALLBACK_PATH"));
-      if (Strings.isNotBlank(callbackPath)) {
-        builder.withCallbackPath(callbackPath);
-      }
-      String httpsRequired = firstNonBlank(
-          System.getProperty("fabric.oidc.httpsRequiredForSameSiteNone"),
-          System.getenv("FABRIC_OIDC_HTTPS_REQUIRED_FOR_SAMESITE_NONE"));
-      if (Strings.isNotBlank(httpsRequired)) {
-        builder.withHttpsRequiredForSameSiteNone(parseBoolean(httpsRequired, true));
-      }
-      String clockSkew = firstNonBlank(
-          System.getProperty("fabric.oidc.clockSkewSeconds"),
-          System.getenv("FABRIC_OIDC_CLOCK_SKEW_SECONDS"));
-      if (Strings.isNotBlank(clockSkew)) {
-        builder.withClockSkewSeconds(parseInt(clockSkew, DEFAULT_CLOCK_SKEW_SECONDS));
-      }
-      return builder;
-    }
-
-    @JsonProperty("issuerBaseUrl")
-    public Builder withIssuerBaseUrl(String issuerBaseUrl) {
-      this.issuerBaseUrl = normalizeBaseUrl(issuerBaseUrl);
-      return this;
-    }
-
-    @JsonProperty("authorizationEndpoint")
-    public Builder withAuthorizationEndpoint(String authorizationEndpoint) {
-      this.authorizationEndpoint = trimToNull(authorizationEndpoint);
-      return this;
-    }
-
-    @JsonProperty("tokenEndpoint")
-    public Builder withTokenEndpoint(String tokenEndpoint) {
-      this.tokenEndpoint = trimToNull(tokenEndpoint);
-      return this;
-    }
-
-    @JsonProperty("jwksEndpoint")
-    public Builder withJwksEndpoint(String jwksEndpoint) {
-      this.jwksEndpoint = trimToNull(jwksEndpoint);
-      return this;
-    }
-
-    @JsonProperty("clientId")
-    public Builder withClientId(String clientId) {
-      this.clientId = trimToNull(clientId);
-      return this;
-    }
-
-    @JsonProperty("clientSecret")
-    public Builder withClientSecret(String clientSecret) {
-      this.clientSecret = trimToNull(clientSecret);
-      return this;
-    }
-
-    @JsonProperty("redirectUri")
-    public Builder withRedirectUri(String redirectUri) {
-      this.redirectUri = trimToNull(redirectUri);
-      return this;
-    }
-
-    @JsonProperty("externalBaseUrl")
-    public Builder withExternalBaseUrl(String externalBaseUrl) {
-      this.externalBaseUrl = trimToNull(externalBaseUrl);
-      return this;
-    }
-
-    @JsonProperty("redirectPath")
-    public Builder withRedirectPath(String redirectPath) {
-      this.redirectPath = trimToNull(redirectPath);
-      return this;
-    }
-
-    @JsonProperty("scope")
-    public Builder withScope(String scope) {
-      this.scope = trimToNull(scope);
-      return this;
-    }
-
-    @JsonProperty("usernameClaim")
-    public Builder withUsernameClaim(String usernameClaim) {
-      this.usernameClaim = trimToNull(usernameClaim);
-      return this;
-    }
-
-    @JsonProperty("groupClaims")
-    public Builder withGroupClaims(List<String> groupClaims) {
-      this.groupClaims = normalizeList(groupClaims);
-      return this;
-    }
-
-    @JsonProperty("allowAnonPaths")
-    public Builder withAllowAnonPaths(List<String> allowAnonPaths) {
-      this.allowAnonPaths = normalizeList(allowAnonPaths);
-      return this;
-    }
-
-    @JsonProperty("httpsRequiredForSameSiteNone")
-    public Builder withHttpsRequiredForSameSiteNone(boolean httpsRequiredForSameSiteNone) {
-      this.httpsRequiredForSameSiteNone = httpsRequiredForSameSiteNone;
-      return this;
-    }
-
-    @JsonProperty("loginPath")
-    public Builder withLoginPath(String loginPath) {
-      this.loginPath = normalizePath(loginPath, DEFAULT_LOGIN_PATH);
-      return this;
-    }
-
-    @JsonProperty("callbackPath")
-    public Builder withCallbackPath(String callbackPath) {
-      this.callbackPath = normalizePath(callbackPath, DEFAULT_CALLBACK_PATH);
-      return this;
-    }
-
-    @JsonProperty("clockSkewSeconds")
-    public Builder withClockSkewSeconds(int clockSkewSeconds) {
-      this.clockSkewSeconds = Math.max(0, clockSkewSeconds);
-      return this;
-    }
-
-    public FabricOidcConfig build() {
-      if (Strings.isBlank(redirectUri)) {
-        if (Strings.isNotBlank(externalBaseUrl)) {
-          String path = Strings.isBlank(redirectPath) ? DEFAULT_CALLBACK_PATH : redirectPath.trim();
-          redirectUri = join(externalBaseUrl, path);
+      if (!policy.dryRun()) {
+        if (context.s3()) {
+          deleted += deleteS3Files(s3Connection, partitionFiles, warnings);
+        } else {
+          for (String file : partitionFiles) {
+            if (deleteLocalFile(file)) {
+              deleted++;
+            }
+          }
         }
       }
-      if (Strings.isNotBlank(loginPath)) {
-        loginPath = normalizePath(loginPath, DEFAULT_LOGIN_PATH);
-      }
-      if (Strings.isNotBlank(callbackPath)) {
-        callbackPath = normalizePath(callbackPath, DEFAULT_CALLBACK_PATH);
-      }
-      allowAnonPaths = normalizeAllowlist(allowAnonPaths, loginPath, callbackPath);
-      scope = Strings.isBlank(scope) ? DEFAULT_SCOPE : scope;
-      usernameClaim = Strings.isBlank(usernameClaim) ? DEFAULT_USERNAME_CLAIM : usernameClaim;
-      validateRequired();
-      URI.create(redirectUri);
-      return new FabricOidcConfig(this);
     }
-
-    private void validateRequired() {
-      List<String> missing = new ArrayList<>();
-      if (Strings.isBlank(issuerBaseUrl)) {
-        missing.add("issuerBaseUrl");
-      }
-      if (Strings.isBlank(authorizationEndpoint)) {
-        missing.add("authorizationEndpoint");
-      }
-      if (Strings.isBlank(tokenEndpoint)) {
-        missing.add("tokenEndpoint");
-      }
-      if (Strings.isBlank(clientId)) {
-        missing.add("clientId");
-      }
-      if (Strings.isBlank(clientSecret)) {
-        missing.add("clientSecret");
-      }
-      if (Strings.isBlank(redirectUri)) {
-        missing.add("redirectUri");
-      }
-      if (!missing.isEmpty()) {
-        throw new IllegalStateException(
-            "OIDC config missing required values: " + String.join(", ", missing));
-      }
-    }
+    long durationMs = Math.max(0L, System.currentTimeMillis() - started);
+    writeCheckpoint(
+        context.datasetId().toString(),
+        "retention",
+        Map.of(
+            "partitionsDeleted", Integer.toString(partitionsToDelete.size()),
+            "filesDeleted", Integer.toString(deleted),
+            "bytes", Long.toString(Math.max(0L, bytes)),
+            "durationMs", Long.toString(durationMs)));
+    return new ParquetMaintenanceResult(
+        0L,
+        bytes,
+        files.size(),
+        0,
+        deleted,
+        durationMs,
+        List.copyOf(warnings));
   }
 
-  private static String normalizeBaseUrl(String base) {
-    if (Strings.isBlank(base)) {
-      return null;
-    }
-    return trimTrailingSlash(base.trim());
+  @Override
+  public ParquetMaintenanceResult optimizeDataset(String datasetId, ParquetCompactionOptions options) {
+    ParquetMaintenanceResult compactResult = compact(datasetId, null, options, "optimize");
+    writeCheckpoint(
+        DatasetId.parse(datasetId).toString(),
+        "optimize",
+        Map.of(
+            "filesRead", Integer.toString(compactResult.filesRead()),
+            "filesWritten", Integer.toString(compactResult.filesWritten()),
+            "durationMs", Long.toString(compactResult.durationMs())));
+    return compactResult;
   }
 
-  private static String normalizePath(String value, String fallback) {
-    String trimmed = trimToNull(value);
-    if (trimmed == null) {
-      return fallback;
-    }
-    if (!trimmed.startsWith("/")) {
-      return "/" + trimmed;
-    }
-    return trimmed;
-  }
+  private ParquetMaintenanceResult compact(
+      String datasetId,
+      String partitionSpec,
+      ParquetCompactionOptions options,
+      String checkpointScope) {
+    long started = System.currentTimeMillis();
+    DatasetContext context = resolveDataset(datasetId);
+    DataWriteAuthorization.requireWrite(
+        rowManager.dataEntitlementsForSqlPlanning(),
+        rowManager.effectiveIdentityForSqlPlanning(),
+        context.datasetId().toString(),
+        "PARQUET_COMPACT",
+        null);
+    List<String> allFiles = listParquetFiles(context);
+    List<String> filtered = filterPartition(allFiles, partitionSpec);
+    ParquetCompactionOptions resolved =
+        options == null ? ParquetCompactionOptions.defaults() : options;
+    List<List<String>> groups = compactionPlanner.plan(filtered, resolved);
+    List<String> warnings = new ArrayList<>();
+    S3Connection s3Connection = context.s3() ? resolveS3Connection(context) : null;
 
-  private static List<String> normalizeAllowlist(
-      List<String> allowlist, String loginPath, String callbackPath) {
-    Set<String> merged = new LinkedHashSet<>();
-    if (allowlist != null) {
-      merged.addAll(allowlist);
-    }
-    if (Strings.isNotBlank(loginPath)) {
-      merged.add(loginPath);
-    }
-    if (Strings.isNotBlank(callbackPath)) {
-      merged.add(callbackPath);
-    }
-    if (merged.isEmpty()) {
-      merged.add(DEFAULT_LOGIN_PATH);
-      merged.add(DEFAULT_CALLBACK_PATH);
-      merged.add("/health");
-      merged.add("/favicon.ico");
-    }
-    List<String> normalized = new ArrayList<>();
-    for (String entry : merged) {
-      String trimmed = trimToNull(entry);
-      if (trimmed != null) {
-        normalized.add(trimmed.startsWith("/") ? trimmed : "/" + trimmed);
+    long rows = 0L;
+    long bytes = 0L;
+    int filesRead = 0;
+    int filesWritten = 0;
+    int filesDeleted = 0;
+
+    for (int index = 0; index < groups.size(); index++) {
+      List<String> groupFiles = groups.get(index);
+      if (groupFiles.size() < resolved.minFilesPerGroup()) {
+        continue;
+      }
+      filesRead += groupFiles.size();
+      for (String file : groupFiles) {
+        bytes += context.s3() ? s3FileSize(s3Connection, file, warnings) : localFileSize(file);
+      }
+      rows += countRows(groupFiles, context);
+
+      String outputFile = outputFilePath(context, groupFiles, index);
+      if (!resolved.dryRun()) {
+        writeCompactedFile(groupFiles, outputFile, context);
+      }
+      filesWritten++;
+      if (!resolved.dryRun()) {
+        if (context.s3()) {
+          filesDeleted += deleteS3Files(s3Connection, groupFiles, warnings);
+        } else {
+          for (String source : groupFiles) {
+            if (deleteLocalFile(source)) {
+              filesDeleted++;
+            }
+          }
+        }
       }
     }
-    return List.copyOf(normalized);
+
+    long durationMs = Math.max(0L, System.currentTimeMillis() - started);
+    writeCheckpoint(
+        context.datasetId().toString(),
+        checkpointScope,
+        Map.of(
+            "groups", Integer.toString(groups.size()),
+            "filesRead", Integer.toString(filesRead),
+            "filesWritten", Integer.toString(filesWritten),
+            "filesDeleted", Integer.toString(filesDeleted),
+            "durationMs", Long.toString(durationMs)));
+    return new ParquetMaintenanceResult(
+        rows, bytes, filesRead, filesWritten, filesDeleted, durationMs, List.copyOf(warnings));
   }
 
-  private static List<String> normalizeList(List<String> values) {
-    if (values == null || values.isEmpty()) {
-      return List.of();
-    }
-    List<String> normalized = new ArrayList<>();
-    for (String value : values) {
-      String trimmed = trimToNull(value);
-      if (trimmed != null) {
-        normalized.add(trimmed);
-      }
-    }
-    return List.copyOf(normalized);
-  }
-
-  private static List<String> parseList(String value) {
-    if (Strings.isBlank(value)) {
-      return List.of();
-    }
-    String[] parts = value.split("[,;]");
-    List<String> normalized = new ArrayList<>();
-    for (String part : parts) {
-      String trimmed = trimToNull(part);
-      if (trimmed != null) {
-        normalized.add(trimmed);
-      }
-    }
-    return List.copyOf(normalized);
-  }
-
-  private static String trimToNull(String value) {
-    if (value == null) {
-      return null;
-    }
-    String trimmed = value.trim();
-    return trimmed.isEmpty() ? null : trimmed;
-  }
-
-  private static String firstNonBlank(String... values) {
-    if (values == null) {
-      return null;
-    }
-    for (String value : values) {
-      if (Strings.isNotBlank(value)) {
-        return value.trim();
-      }
-    }
-    return null;
-  }
-
-  private static boolean parseBoolean(String raw, boolean fallback) {
-    if (Strings.isBlank(raw)) {
-      return fallback;
-    }
-    String trimmed = raw.trim();
-    if ("true".equalsIgnoreCase(trimmed) || "1".equals(trimmed) || "yes".equalsIgnoreCase(trimmed)) {
-      return true;
-    }
-    if ("false".equalsIgnoreCase(trimmed) || "0".equals(trimmed) || "no".equalsIgnoreCase(trimmed)) {
-      return false;
-    }
-    return fallback;
-  }
-
-  private static int parseInt(String raw, int fallback) {
-    if (Strings.isBlank(raw)) {
-      return fallback;
+  private int deleteS3Files(S3Connection connection, List<String> files, List<String> warnings) {
+    if (connection == null || Strings.isEmpty(files)) {
+      return 0;
     }
     try {
-      return Integer.parseInt(raw.trim());
-    } catch (NumberFormatException ex) {
-      return fallback;
+      var result = connection.admin().deleteObjects(files);
+      for (String failedKey : result.failedKeys()) {
+        warnings.add("S3 delete failed for file=" + failedKey);
+      }
+      return result.deletedCount();
+    } catch (Exception ex) {
+      warnings.add("S3 delete failed for " + files.size() + " file(s): " + ex.getMessage());
+      return 0;
     }
   }
+
+  private long s3FileSize(S3Connection connection, String file, List<String> warnings) {
+    if (connection == null || Strings.isBlank(file)) {
+      return 0L;
+    }
+    try {
+      return Math.max(0L, connection.admin().headObject(file).sizeBytes());
+    } catch (Exception ex) {
+      warnings.add("S3 headObject failed for file=" + file + " error=" + ex.getMessage());
+      return 0L;
+    }
+  }
+
+  private S3Connection resolveS3Connection(DatasetContext context) {
+    if (!context.s3()) {
+      return null;
+    }
+    if (session == null) {
+      throw new IllegalStateException("S3 parquet maintenance requires a session");
+    }
+    String connectionName =
+        Strings.requireNonBlank(
+            context.connectionName(),
+            "dataset.parquet.connectionName is required for s3 dataset " + context.datasetId());
+    return session.connections().s3(connectionName);
+  }
+
+  private long countRows(List<String> files, DatasetContext context) {
+    if (files.isEmpty()) {
+      return 0L;
+    }
+    return rowManager.withDuckdbSession(
+        session -> {
+          configureS3IfNeeded(session, context);
+          String sql =
+              "select count(*) from read_parquet(" + parquetArraySql(files) + ", hive_partitioning=true)";
+          try (java.sql.Statement statement = session.createStatement();
+              ResultSet result = statement.executeQuery(sql)) {
+            return result.next() ? result.getLong(1) : 0L;
+          } catch (SQLException ex) {
+            throw new IllegalStateException("Failed to count parquet rows: " + ex.getMessage(), ex);
+          }
+        });
+  }
+
+  private void writeCompactedFile(List<String> files, String outputFile, DatasetContext context) {
+    rowManager.withDuckdbSession(
+        session -> {
+          configureS3IfNeeded(session, context);
+          if (!context.s3()) {
+            Path outputPath = Path.of(outputFile).toAbsolutePath().normalize();
+            Path parent = outputPath.getParent();
+            if (parent != null) {
+              try {
+                Files.createDirectories(parent);
+              } catch (Exception ex) {
+                throw new IllegalStateException("Failed to create output directory: " + parent, ex);
+              }
+            }
+          }
+          String sql =
+              "copy (select * from read_parquet("
+                  + parquetArraySql(files)
+                  + ", hive_partitioning=true)) to '"
+                  + escapeSql(outputFile)
+                  + "' (format parquet, compression snappy)";
+          session.exec(sql);
+        });
+  }
+
+  private List<String> listParquetFiles(DatasetContext context) {
+    if (!context.s3()) {
+      return listLocalParquetFiles(context.rootUri(), context.glob());
+    }
+    return rowManager.withDuckdbSession(
+        session -> {
+          configureS3IfNeeded(session, context);
+          String sql =
+              "select file from glob('"
+                  + escapeSql(appendGlob(normalizeUri(context.rootUri()), context.glob()))
+                  + "') order by file";
+          List<String> files = new ArrayList<>();
+          try (java.sql.Statement statement = session.createStatement();
+              ResultSet result = statement.executeQuery(sql)) {
+            while (result.next()) {
+              String file = Strings.trimToNull(result.getString(1));
+              if (file != null && file.toLowerCase(Locale.ROOT).endsWith(".parquet")) {
+                files.add(file);
+              }
+            }
+          } catch (SQLException ex) {
+            throw new IllegalStateException("Failed to list parquet files from s3: " + ex.getMessage(), ex);
+          }
+          files.sort(String.CASE_INSENSITIVE_ORDER.thenComparing(Comparator.naturalOrder()));
+          return List.copyOf(files);
+        });
+  }
+
+  private List<String> listLocalParquetFiles(String rootUri, String glob) {
+    try {
+      Path root = Path.of(rootUri).toAbsolutePath().normalize();
+      if (!Files.exists(root)) {
+        return List.of();
+      }
+      List<String> files = new ArrayList<>();
+      try (java.util.stream.Stream<Path> stream = Files.walk(root)) {
+        stream
+            .filter(Files::isRegularFile)
+            .filter(path -> path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".parquet"))
+            .forEach(path -> files.add(path.toString().replace('\\', '/')));
+      }
+      files.sort(String.CASE_INSENSITIVE_ORDER.thenComparing(Comparator.naturalOrder()));
+      return List.copyOf(files);
+    } catch (Exception ex) {
+      throw new IllegalStateException("Failed to list local parquet files: root=" + rootUri, ex);
+    }
+  }
+
+  private List<String> filterPartition(List<String> files, String partitionSpec) {
+    if (partitionSpec == null) {
+      return files;
+    }
+    String needle = "/" + partitionSpec + "/";
+    List<String> filtered = new ArrayList<>();
+    for (String file : files) {
+      String normalized = file.replace('\\', '/');
+      if (normalized.contains(needle)) {
+        filtered.add(normalized);
+      }
+    }
+    filtered.sort(String.CASE_INSENSITIVE_ORDER.thenComparing(Comparator.naturalOrder()));
+    return List.copyOf(filtered);
+  }
+
+  private String outputFilePath(DatasetContext context, List<String> sourceFiles, int groupIndex) {
+    String root = normalizeUri(context.rootUri());
+    String signature =
+        Integer.toHexString(
+            Objects.hash(sourceFiles.get(0), sourceFiles.get(sourceFiles.size() - 1), sourceFiles.size()));
+    String name = String.format(Locale.ROOT, "compact_%03d_%s.parquet", groupIndex + 1, signature);
+    return appendPath(root, "_compact/" + name);
+  }
+
+  private Map<String, List<String>> partitionToFiles(List<String> files) {
+    LinkedHashMap<String, List<String>> grouped = new LinkedHashMap<>();
+    for (String file : files) {
+      Matcher matcher = PARTITION_PATTERN.matcher(file.replace('\\', '/'));
+      if (!matcher.find()) {
+        continue;
+      }
+      String partition = "date=" + matcher.group(2);
+      grouped.computeIfAbsent(partition, ignored -> new ArrayList<>()).add(file);
+    }
+    LinkedHashMap<String, List<String>> ordered = new LinkedHashMap<>();
+    List<String> partitions = new ArrayList<>(grouped.keySet());
+    partitions.sort(String.CASE_INSENSITIVE_ORDER.thenComparing(Comparator.naturalOrder()));
+    for (String partition : partitions) {
+      List<String> partitionFiles = new ArrayList<>(grouped.get(partition));
+      partitionFiles.sort(String.CASE_INSENSITIVE_ORDER.thenComparing(Comparator.naturalOrder()));
+      ordered.put(partition, List.copyOf(partitionFiles));
+    }
+    return Map.copyOf(ordered);
+  }
+
+  private DatasetContext resolveDataset(String datasetIdValue) {
+    DatasetId datasetId = DatasetId.parse(Strings.requireNonBlank(datasetIdValue, "datasetId"));
+    DefinitionDataset definition = resolveDefinition(datasetId);
+    DefinitionDataset.ParquetBinding parquet =
+        Optional.ofNullable(definition.binding())
+            .map(DefinitionDataset.Binding::parquet)
+            .orElseThrow(() -> new IllegalStateException("Dataset is not parquet: " + datasetId));
+    String uri = Strings.requireNonBlank(parquet.uri(), "dataset.parquet.uri");
+    return new DatasetContext(
+        datasetId,
+        uri,
+        normalizeGlob(parquet.glob()),
+        isS3Uri(uri),
+        Strings.trimToNull(parquet.connectionName()));
+  }
+
+  private DefinitionDataset resolveDefinition(DatasetId datasetId) {
+    for (DefinitionDataset candidate : DiscoveryCache.list(DefinitionDataset.class, datasetId.group())) {
+      if (candidate == null || candidate.envelope() == null) {
+        continue;
+      }
+      DefinitionEnvelope envelope = candidate.envelope();
+      if (!datasetId.group().equals(envelope.group())) {
+        continue;
+      }
+      if (!datasetId.namespace().equals(candidate.namespace())) {
+        continue;
+      }
+      if (envelope.name() == null || !envelope.name().equals(datasetId.namespace() + "/" + datasetId.name())) {
+        continue;
+      }
+      return candidate;
+    }
+    throw new IllegalStateException("Dataset definition not found: " + datasetId);
+  }
+
+  private void configureS3IfNeeded(DuckdbSession sessionHandle, DatasetContext context) {
+    if (!context.s3()) {
+      return;
+    }
+    resolveS3Connection(context).admin().configureDuckdbSession(sessionHandle);
+  }
+
+  private void writeCheckpoint(String datasetId, String scope, Map<String, String> payload) {
+    checkpointStore.save(
+        CheckpointRecord.of(
+            new CheckpointKey(group, CheckpointType.PARQUET_MAINT, datasetId, scope),
+            payload == null ? Map.of("updatedUtc", Instant.now().toString()) : payload));
+  }
+
+  private static String parquetArraySql(List<String> files) {
+    List<String> quoted = new ArrayList<>(files.size());
+    for (String file : files) {
+      quoted.add("'" + escapeSql(file) + "'");
+    }
+    return "[" + String.join(", ", quoted) + "]";
+  }
+
+  private static boolean deleteLocalFile(String file) {
+    try {
+      return Files.deleteIfExists(Path.of(file));
+    } catch (Exception ex) {
+      throw new IllegalStateException("Failed to delete local parquet file: " + file, ex);
+    }
+  }
+
+  private static long localFileSize(String file) {
+    if (file == null || isS3Uri(file)) {
+      return 0L;
+    }
+    try {
+      Path path = Path.of(file);
+      if (!Files.exists(path)) {
+        return 0L;
+      }
+      return Files.size(path);
+    } catch (Exception ex) {
+      return 0L;
+    }
+  }
+
+  private static String normalizeGlob(String value) {
+    return Strings.firstNonBlank(Strings.trimToNull(value), DEFAULT_PARQUET_GLOB);
+  }
+
+  private static String appendGlob(String base, String glob) {
+    return appendPath(base, glob.startsWith("/") ? glob.substring(1) : glob);
+  }
+
+  private static String appendPath(String base, String suffix) {
+    String normalizedBase = normalizeUri(base);
+    String normalizedSuffix = Strings.requireNonBlank(suffix, "suffix").replace('\\', '/');
+    if (normalizedBase.endsWith("/")) {
+      return normalizedBase + normalizedSuffix;
+    }
+    return normalizedBase + "/" + normalizedSuffix;
+  }
+
+  private static String normalizeUri(String value) {
+    return Strings.requireNonBlank(value, "value").replace('\\', '/');
+  }
+
+  private static boolean isS3Uri(String value) {
+    return value != null
+        && (value.regionMatches(true, 0, "s3://", 0, "s3://".length())
+            || value.regionMatches(true, 0, "s3a://", 0, "s3a://".length()));
+  }
+
+  private static String escapeSql(String value) {
+    return value.replace("'", "''");
+  }
+
+  private record DatasetContext(
+      DatasetId datasetId,
+      String rootUri,
+      String glob,
+      boolean s3,
+      String connectionName) {}
 }
+
+
+
+
+
+
+
