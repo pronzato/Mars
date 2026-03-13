@@ -1,551 +1,535 @@
-package org.pronzato.fabric.api.data.parquet;
+package org.pronzato.fabric.api.control.entitlements.provider;
 
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.time.Instant;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import org.pronzato.fabric.api.Fabric;
-import org.pronzato.fabric.api.connectors.s3.S3Connection;
-import org.pronzato.fabric.api.data.checkpoints.CheckpointKey;
-import org.pronzato.fabric.api.data.checkpoints.CheckpointRecord;
-import org.pronzato.fabric.api.data.checkpoints.CheckpointStore;
-import org.pronzato.fabric.api.data.checkpoints.CheckpointStores;
-import org.pronzato.fabric.api.data.checkpoints.CheckpointType;
+import java.util.Set;
+import org.pronzato.fabric.api.control.discovery.CanonicalIds;
 import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEntitlement;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
-import org.pronzato.fabric.api.data.ParquetManager;
-import org.pronzato.fabric.api.data.RowManager;
-import org.pronzato.fabric.api.data.dataset.DatasetId;
-import org.pronzato.fabric.api.data.duckdb.DuckdbSession;
-import org.pronzato.fabric.api.data.manager.RowManagerImpl;
-import org.pronzato.fabric.api.control.entitlements.core.data.DataWriteAuthorization;
-import org.pronzato.fabric.api.util.Strings;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvironment;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionService;
+import org.pronzato.fabric.api.control.discovery.definitions.common.EntitlementsProvider;
+import org.pronzato.fabric.api.control.entitlements.core.EntitlementsScopeType;
+import org.pronzato.fabric.api.control.entitlements.core.data.DataEntitlements;
+import org.pronzato.fabric.api.control.entitlements.core.services.ServiceEntitlements;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-public final class ParquetManagerImpl implements ParquetManager {
-  private static final Pattern PARTITION_PATTERN = Pattern.compile("(^|/)date=([0-9]{8})(/|$)");
-  private static final String DEFAULT_PARQUET_GLOB = "**/*.parquet";
+public final class EntitlementProviderSelector {
+  private static final Logger LOGGER = LoggerFactory.getLogger(EntitlementProviderSelector.class);
+  private static final String PLATFORM_GROUP = "platform";
+  private static final String ENVIRONMENT_NAME = "environment";
+  private static final String KEY_SUBJECT_PROVIDER = "entitlements.subjectProvider";
+  private static final String KEY_PROVIDER = "entitlements.provider";
 
-  private final RowManagerImpl rowManager;
   private final DiscoveryCache DiscoveryCache;
-  private final Fabric.Session session;
-  private final String group;
-  private final CheckpointStore checkpointStore;
-  private final ParquetCompactionPlanner compactionPlanner;
-  private final ParquetRetentionPlanner retentionPlanner;
+  private final EntitlementProviderRegistry registry;
+  private final String configuredEnvironmentDefaultProviderId;
 
-  public ParquetManagerImpl(
-      RowManager manager, DiscoveryCache DiscoveryCache, String group, Fabric.Session session) {
-    this(
-        manager,
-        DiscoveryCache,
-        group,
-        session,
-        CheckpointStores.failFast(
-            "ParquetManager checkpoint store is not configured. Configure session with withCheckpointPath(...)"));
+  public EntitlementProviderSelector(DiscoveryCache DiscoveryCache, EntitlementProviderRegistry registry) {
+    this(DiscoveryCache, registry, null);
   }
 
-  public ParquetManagerImpl(
-      RowManager manager,
+  public EntitlementProviderSelector(
       DiscoveryCache DiscoveryCache,
-      String group,
-      Fabric.Session session,
-      CheckpointStore checkpointStore) {
-    this(
-        manager,
-        DiscoveryCache,
-        group,
-        session,
-        checkpointStore,
-        new ParquetCompactionPlanner(),
-        new ParquetRetentionPlanner());
-  }
-
-  ParquetManagerImpl(
-      RowManager manager,
-      DiscoveryCache DiscoveryCache,
-      String group,
-      Fabric.Session session,
-      CheckpointStore checkpointStore,
-      ParquetCompactionPlanner compactionPlanner,
-      ParquetRetentionPlanner retentionPlanner) {
-    if (!(manager instanceof RowManagerImpl localManager)) {
-      throw new IllegalStateException(
-          "Parquet maintenance requires DIRECT mode local RowManager implementation");
-    }
-    this.rowManager = localManager;
+      EntitlementProviderRegistry registry,
+      String configuredEnvironmentDefaultProviderId) {
     this.DiscoveryCache = Objects.requireNonNull(DiscoveryCache, "DiscoveryCache");
-    this.group = Strings.requireNonBlank(group, "group");
-    this.session = session;
-    this.checkpointStore = Objects.requireNonNull(checkpointStore, "checkpointStore");
-    this.compactionPlanner = Objects.requireNonNull(compactionPlanner, "compactionPlanner");
-    this.retentionPlanner = Objects.requireNonNull(retentionPlanner, "retentionPlanner");
+    this.registry = Objects.requireNonNull(registry, "registry");
+    this.configuredEnvironmentDefaultProviderId = trimToNull(configuredEnvironmentDefaultProviderId);
   }
 
-  @Override
-  public ParquetMaintenanceResult compactDataset(String datasetId, ParquetCompactionOptions options) {
-    return compact(datasetId, null, options, "compact-dataset");
-  }
+  public Selection select(EntitlementsScopeType scopeType, String resourceId) {
+    EntitlementsScopeType normalizedScopeType = Objects.requireNonNull(scopeType, "scopeType");
+    String normalizedResourceId = canonicalResourceId(normalizedScopeType, resourceId);
 
-  @Override
-  public ParquetMaintenanceResult compactPartition(
-      String datasetId, String partitionSpec, ParquetCompactionOptions options) {
-    String normalized = Strings.requireNonBlank(partitionSpec, "partitionSpec");
-    return compact(datasetId, normalized, options, "compact-partition");
-  }
+    ProviderChoice resourceProvider = resourceProviderChoice(normalizedScopeType, normalizedResourceId);
+    ProviderChoice namespaceProvider = namespaceProviderChoice(normalizedScopeType, normalizedResourceId);
+    ProviderChoice environmentProvider = environmentProviderChoice();
+    ProviderChoice configured = firstNonNull(resourceProvider, namespaceProvider, environmentProvider);
 
-  @Override
-  public ParquetMaintenanceResult applyRetention(String datasetId, ParquetRetentionPolicy policy) {
-    long started = System.currentTimeMillis();
-    DatasetContext context = resolveDataset(datasetId);
-    DataWriteAuthorization.requireWrite(
-        rowManager.dataEntitlementsForSqlPlanning(),
-        rowManager.effectiveIdentityForSqlPlanning(),
-        context.datasetId().toString(),
-        "PARQUET_RETENTION",
-        null);
-    List<String> warnings = new ArrayList<>();
-    List<String> files = listParquetFiles(context);
-    S3Connection s3Connection = context.s3() ? resolveS3Connection(context) : null;
-    Map<String, List<String>> filesByPartition = partitionToFiles(files);
-    List<String> partitions = new ArrayList<>(filesByPartition.keySet());
-    partitions.sort(String.CASE_INSENSITIVE_ORDER.thenComparing(Comparator.naturalOrder()));
-    List<String> partitionsToDelete = retentionPlanner.partitionsToDelete(partitions, policy);
-
-    int deleted = 0;
-    long bytes = 0L;
-    for (String partition : partitionsToDelete) {
-      List<String> partitionFiles = filesByPartition.getOrDefault(partition, List.of());
-      for (String file : partitionFiles) {
-        bytes += context.s3() ? s3FileSize(s3Connection, file, warnings) : localFileSize(file);
+    String defaultProvider = defaultProviderForTrace();
+    Selection selected;
+    if (configured != null) {
+      selected = explicitSelection(configured, normalizedScopeType, normalizedResourceId);
+    } else {
+      EntitlementSubjectProvider provider = registry.defaultProvider();
+      if (provider == null) {
+        throw new IllegalStateException("No default entitlement subject provider is registered");
       }
-      if (!policy.dryRun()) {
-        if (context.s3()) {
-          deleted += deleteS3Files(s3Connection, partitionFiles, warnings);
-        } else {
-          for (String file : partitionFiles) {
-            if (deleteLocalFile(file)) {
-              deleted++;
-            }
-          }
-        }
-      }
-    }
-    long durationMs = Math.max(0L, System.currentTimeMillis() - started);
-    writeCheckpoint(
-        context.datasetId().toString(),
-        "retention",
-        Map.of(
-            "partitionsDeleted", Integer.toString(partitionsToDelete.size()),
-            "filesDeleted", Integer.toString(deleted),
-            "bytes", Long.toString(Math.max(0L, bytes)),
-            "durationMs", Long.toString(durationMs)));
-    return new ParquetMaintenanceResult(
-        0L,
-        bytes,
-        files.size(),
-        0,
-        deleted,
-        durationMs,
-        List.copyOf(warnings));
-  }
-
-  @Override
-  public ParquetMaintenanceResult optimizeDataset(String datasetId, ParquetCompactionOptions options) {
-    ParquetMaintenanceResult compactResult = compact(datasetId, null, options, "optimize");
-    writeCheckpoint(
-        DatasetId.parse(datasetId).toString(),
-        "optimize",
-        Map.of(
-            "filesRead", Integer.toString(compactResult.filesRead()),
-            "filesWritten", Integer.toString(compactResult.filesWritten()),
-            "durationMs", Long.toString(compactResult.durationMs())));
-    return compactResult;
-  }
-
-  private ParquetMaintenanceResult compact(
-      String datasetId,
-      String partitionSpec,
-      ParquetCompactionOptions options,
-      String checkpointScope) {
-    long started = System.currentTimeMillis();
-    DatasetContext context = resolveDataset(datasetId);
-    DataWriteAuthorization.requireWrite(
-        rowManager.dataEntitlementsForSqlPlanning(),
-        rowManager.effectiveIdentityForSqlPlanning(),
-        context.datasetId().toString(),
-        "PARQUET_COMPACT",
-        null);
-    List<String> allFiles = listParquetFiles(context);
-    List<String> filtered = filterPartition(allFiles, partitionSpec);
-    ParquetCompactionOptions resolved =
-        options == null ? ParquetCompactionOptions.defaults() : options;
-    List<List<String>> groups = compactionPlanner.plan(filtered, resolved);
-    List<String> warnings = new ArrayList<>();
-    S3Connection s3Connection = context.s3() ? resolveS3Connection(context) : null;
-
-    long rows = 0L;
-    long bytes = 0L;
-    int filesRead = 0;
-    int filesWritten = 0;
-    int filesDeleted = 0;
-
-    for (int index = 0; index < groups.size(); index++) {
-      List<String> groupFiles = groups.get(index);
-      if (groupFiles.size() < resolved.minFilesPerGroup()) {
-        continue;
-      }
-      filesRead += groupFiles.size();
-      for (String file : groupFiles) {
-        bytes += context.s3() ? s3FileSize(s3Connection, file, warnings) : localFileSize(file);
-      }
-      rows += countRows(groupFiles, context);
-
-      String outputFile = outputFilePath(context, groupFiles, index);
-      if (!resolved.dryRun()) {
-        writeCompactedFile(groupFiles, outputFile, context);
-      }
-      filesWritten++;
-      if (!resolved.dryRun()) {
-        if (context.s3()) {
-          filesDeleted += deleteS3Files(s3Connection, groupFiles, warnings);
-        } else {
-          for (String source : groupFiles) {
-            if (deleteLocalFile(source)) {
-              filesDeleted++;
-            }
-          }
-        }
-      }
+      selected =
+          new Selection(defaultProviderId(provider), provider, SelectionSource.REGISTRY_DEFAULT, false);
     }
 
-    long durationMs = Math.max(0L, System.currentTimeMillis() - started);
-    writeCheckpoint(
-        context.datasetId().toString(),
-        checkpointScope,
-        Map.of(
-            "groups", Integer.toString(groups.size()),
-            "filesRead", Integer.toString(filesRead),
-            "filesWritten", Integer.toString(filesWritten),
-            "filesDeleted", Integer.toString(filesDeleted),
-            "durationMs", Long.toString(durationMs)));
-    return new ParquetMaintenanceResult(
-        rows, bytes, filesRead, filesWritten, filesDeleted, durationMs, List.copyOf(warnings));
+    if (LOGGER.isDebugEnabled()) {
+      LOGGER.debug(
+          "[Entitlements][ProviderTrace] resource={} resourceProvider={} namespaceProvider={} environmentProvider={} defaultProvider={} selectedProvider={}",
+          normalizedResourceId,
+          providerId(resourceProvider),
+          providerId(namespaceProvider),
+          providerId(environmentProvider),
+          defaultProvider,
+          selected.providerId());
+      LOGGER.debug(
+          "[Entitlements][ProviderSelected] resource={} provider={} source={}",
+          normalizedResourceId,
+          selectedProviderForLog(selected, defaultProvider),
+          sourceLabel(selected.source()));
+    }
+
+    return selected;
   }
 
-  private int deleteS3Files(S3Connection connection, List<String> files, List<String> warnings) {
-    if (connection == null || Strings.isEmpty(files)) {
-      return 0;
+  private Selection explicitSelection(
+      ProviderChoice configured, EntitlementsScopeType scopeType, String resourceId) {
+    EntitlementSubjectProvider provider = registry.provider(configured.providerId());
+    if (provider == null) {
+      throw new IllegalStateException(
+          "Unknown entitlement subject provider '"
+              + configured.providerId()
+              + "' configured at "
+              + configured.source()
+              + " scopeType="
+              + scopeType.name()
+              + " resourceId="
+              + resourceId);
     }
-    try {
-      var result = connection.admin().deleteObjects(files);
-      for (String failedKey : result.failedKeys()) {
-        warnings.add("S3 delete failed for file=" + failedKey);
-      }
-      return result.deletedCount();
-    } catch (Exception ex) {
-      warnings.add("S3 delete failed for " + files.size() + " file(s): " + ex.getMessage());
-      return 0;
-    }
+    return new Selection(configured.providerId(), provider, configured.source(), true);
   }
 
-  private long s3FileSize(S3Connection connection, String file, List<String> warnings) {
-    if (connection == null || Strings.isBlank(file)) {
-      return 0L;
+  private ProviderChoice resourceProviderChoice(EntitlementsScopeType scopeType, String resourceId) {
+    String fromDefinition = resourceDefinitionProviderId(scopeType, resourceId);
+    if (fromDefinition != null) {
+      return new ProviderChoice(fromDefinition, SelectionSource.RESOURCE);
     }
-    try {
-      return Math.max(0L, connection.admin().headObject(file).sizeBytes());
-    } catch (Exception ex) {
-      warnings.add("S3 headObject failed for file=" + file + " error=" + ex.getMessage());
-      return 0L;
+
+    String fromEntitlements = entitlementsScopeProviderId(scopeType, resourceId);
+    if (fromEntitlements != null) {
+      return new ProviderChoice(fromEntitlements, SelectionSource.RESOURCE);
     }
+    return null;
   }
 
-  private S3Connection resolveS3Connection(DatasetContext context) {
-    if (!context.s3()) {
+  private ProviderChoice namespaceProviderChoice(EntitlementsScopeType scopeType, String resourceId) {
+    String namespaceId = namespaceResourceId(scopeType, resourceId);
+    if (namespaceId == null) {
       return null;
     }
-    if (session == null) {
-      throw new IllegalStateException("S3 parquet maintenance requires a session");
+    String fromEntitlements = entitlementsScopeProviderId(EntitlementsScopeType.NAMESPACE, namespaceId);
+    if (fromEntitlements == null) {
+      return null;
     }
-    String connectionName =
-        Strings.requireNonBlank(
-            context.connectionName(),
-            "dataset.parquet.connectionName is required for s3 dataset " + context.datasetId());
-    return session.connections().s3(connectionName);
+    return new ProviderChoice(fromEntitlements, SelectionSource.NAMESPACE);
   }
 
-  private long countRows(List<String> files, DatasetContext context) {
-    if (files.isEmpty()) {
-      return 0L;
+  private ProviderChoice environmentProviderChoice() {
+    String configured = trimToNull(configuredEnvironmentDefaultProviderId);
+    if (configured != null) {
+      return new ProviderChoice(configured, SelectionSource.ENVIRONMENT);
     }
-    return rowManager.withDuckdbSession(
-        session -> {
-          configureS3IfNeeded(session, context);
-          String sql =
-              "select count(*) from read_parquet(" + parquetArraySql(files) + ", hive_partitioning=true)";
-          try (java.sql.Statement statement = session.createStatement();
-              ResultSet result = statement.executeQuery(sql)) {
-            return result.next() ? result.getLong(1) : 0L;
-          } catch (SQLException ex) {
-            throw new IllegalStateException("Failed to count parquet rows: " + ex.getMessage(), ex);
-          }
-        });
-  }
 
-  private void writeCompactedFile(List<String> files, String outputFile, DatasetContext context) {
-    rowManager.withDuckdbSession(
-        session -> {
-          configureS3IfNeeded(session, context);
-          if (!context.s3()) {
-            Path outputPath = Path.of(outputFile).toAbsolutePath().normalize();
-            Path parent = outputPath.getParent();
-            if (parent != null) {
-              try {
-                Files.createDirectories(parent);
-              } catch (Exception ex) {
-                throw new IllegalStateException("Failed to create output directory: " + parent, ex);
-              }
-            }
-          }
-          String sql =
-              "copy (select * from read_parquet("
-                  + parquetArraySql(files)
-                  + ", hive_partitioning=true)) to '"
-                  + escapeSql(outputFile)
-                  + "' (format parquet, compression snappy)";
-          session.exec(sql);
-        });
-  }
-
-  private List<String> listParquetFiles(DatasetContext context) {
-    if (!context.s3()) {
-      return listLocalParquetFiles(context.rootUri(), context.glob());
+    DefinitionEnvironment environment = findEnvironmentDefinition();
+    if (environment == null) {
+      return null;
     }
-    return rowManager.withDuckdbSession(
-        session -> {
-          configureS3IfNeeded(session, context);
-          String sql =
-              "select file from glob('"
-                  + escapeSql(appendGlob(normalizeUri(context.rootUri()), context.glob()))
-                  + "') order by file";
-          List<String> files = new ArrayList<>();
-          try (java.sql.Statement statement = session.createStatement();
-              ResultSet result = statement.executeQuery(sql)) {
-            while (result.next()) {
-              String file = Strings.trimToNull(result.getString(1));
-              if (file != null && file.toLowerCase(Locale.ROOT).endsWith(".parquet")) {
-                files.add(file);
-              }
-            }
-          } catch (SQLException ex) {
-            throw new IllegalStateException("Failed to list parquet files from s3: " + ex.getMessage(), ex);
-          }
-          files.sort(String.CASE_INSENSITIVE_ORDER.thenComparing(Comparator.naturalOrder()));
-          return List.copyOf(files);
-        });
+    String value = providerIdFromEnvironment(environment.entitlements());
+    if (value == null) {
+      return null;
+    }
+    return new ProviderChoice(value, SelectionSource.ENVIRONMENT);
   }
 
-  private List<String> listLocalParquetFiles(String rootUri, String glob) {
+  private String resourceDefinitionProviderId(EntitlementsScopeType scopeType, String resourceId) {
+    CanonicalIds.ParsedId parsed = CanonicalIds.parse(resourceId);
+    if (scopeType == EntitlementsScopeType.SERVICE && parsed.isService()) {
+      DefinitionService definition = findServiceDefinition(parsed.group(), parsed.name());
+      return providerIdFromService(definition);
+    }
+    if (scopeType == EntitlementsScopeType.DATASET && parsed.isDataset()) {
+      DefinitionDataset definition = findDatasetDefinition(parsed.group(), parsed.namespace(), parsed.name());
+      return providerIdFromDataset(definition);
+    }
+    return null;
+  }
+
+  private String providerIdFromService(DefinitionService definition) {
+    if (definition == null) {
+      return null;
+    }
+    String typed = providerIdFromTypedConfig(definition.entitlements());
+    if (typed != null) {
+      return typed;
+    }
+    return providerIdFromObject(definition);
+  }
+
+  private String providerIdFromDataset(DefinitionDataset definition) {
+    if (definition == null) {
+      return null;
+    }
+    String typed = providerIdFromTypedConfig(definition.entitlements());
+    if (typed != null) {
+      return typed;
+    }
+    return providerIdFromObject(definition);
+  }
+
+  private String providerIdFromEnvironment(DefinitionEnvironment.Entitlements entitlements) {
+    if (entitlements == null) {
+      return null;
+    }
+    String typed = trimToNull(entitlements.defaultProviderId());
+    if (typed != null) {
+      return typed;
+    }
+    return providerIdFromObject(entitlements);
+  }
+
+  private DefinitionService findServiceDefinition(String group, String name) {
+    List<DefinitionService> services = DiscoveryCache.list(DefinitionService.class, group);
+    if (services == null || services.isEmpty()) {
+      return null;
+    }
+    for (DefinitionService service : services) {
+      DefinitionEnvelope envelope = service == null ? null : service.envelope();
+      if (envelope != null && Objects.equals(name, envelope.name())) {
+        return service;
+      }
+    }
+    return null;
+  }
+
+  private DefinitionDataset findDatasetDefinition(String group, String namespace, String name) {
+    List<DefinitionDataset> datasets = DiscoveryCache.list(DefinitionDataset.class, group);
+    if (datasets == null || datasets.isEmpty()) {
+      return null;
+    }
+    String canonicalName = trimToNull(namespace) == null ? null : namespace + "/" + name;
+    for (DefinitionDataset dataset : datasets) {
+      DefinitionEnvelope envelope = dataset == null ? null : dataset.envelope();
+      if (envelope == null) {
+        continue;
+      }
+      if (Objects.equals(name, envelope.name()) || Objects.equals(canonicalName, envelope.name())) {
+        return dataset;
+      }
+    }
+    return null;
+  }
+
+  private DefinitionEnvironment findEnvironmentDefinition() {
+    List<DefinitionEnvironment> environments = DiscoveryCache.list(DefinitionEnvironment.class, PLATFORM_GROUP);
+    if (environments == null || environments.isEmpty()) {
+      return null;
+    }
+    for (DefinitionEnvironment environment : environments) {
+      DefinitionEnvelope envelope = environment == null ? null : environment.envelope();
+      if (envelope != null && Objects.equals(ENVIRONMENT_NAME, envelope.name())) {
+        return environment;
+      }
+    }
+    return null;
+  }
+
+  private String entitlementsScopeProviderId(EntitlementsScopeType scopeType, String scopeId) {
+    List<DefinitionEntitlement> definitions = DiscoveryCache.list(DefinitionEntitlement.class);
+    if (definitions == null || definitions.isEmpty()) {
+      return null;
+    }
+
+    LinkedHashSet<String> matches = new LinkedHashSet<>();
+    for (DefinitionEntitlement definition : definitions) {
+      if (definition == null || !enabled(definition.envelope() == null ? null : definition.envelope().enabled())) {
+        continue;
+      }
+      String canonicalScopeId = canonicalScopeId(scopeType, definition.scopeId());
+      if (!scopeId.equals(canonicalScopeId)) {
+        continue;
+      }
+      String configured = providerIdFromEntitlement(definition);
+      if (configured != null) {
+        matches.add(configured);
+      }
+    }
+
+    if (matches.isEmpty()) {
+      return null;
+    }
+    if (matches.size() == 1) {
+      return matches.iterator().next();
+    }
+    List<String> values = new ArrayList<>(matches);
+    values.sort(String.CASE_INSENSITIVE_ORDER);
+    throw new IllegalStateException(
+        "Conflicting entitlement subject provider configuration for scopeType="
+            + scopeType.name()
+            + " scopeId="
+            + scopeId
+            + " providers="
+            + values);
+  }
+
+  private String providerIdFromEntitlement(DefinitionEntitlement definition) {
+    if (definition == null) {
+      return null;
+    }
+    String fromLabels = providerIdFromMap(definition.labels());
+    if (fromLabels != null) {
+      return fromLabels;
+    }
+    if (definition.policies() == null || definition.policies().isEmpty()) {
+      return null;
+    }
+    LinkedHashSet<String> matches = new LinkedHashSet<>();
+    for (DefinitionEntitlement.PolicyDocument policy : definition.policies()) {
+      if (policy == null) {
+        continue;
+      }
+      String fromMetadata = providerIdFromMap(policy.metadata());
+      if (fromMetadata != null) {
+        matches.add(fromMetadata);
+      }
+    }
+    if (matches.isEmpty()) {
+      return null;
+    }
+    if (matches.size() == 1) {
+      return matches.iterator().next();
+    }
+    List<String> values = new ArrayList<>(matches);
+    values.sort(String.CASE_INSENSITIVE_ORDER);
+    throw new IllegalStateException(
+        "Conflicting policy metadata entitlement subject provider configuration providers="
+            + values);
+  }
+
+  private static String providerIdFromTypedConfig(EntitlementsProvider config) {
+    if (config == null) {
+      return null;
+    }
+    return trimToNull(config.providerId());
+  }
+
+  private String providerIdFromObject(Object object) {
+    if (object == null) {
+      return null;
+    }
+
+    String fromAccessor = providerIdFromAccessor(object, "subjectProvider");
+    if (fromAccessor != null) {
+      return fromAccessor;
+    }
+
+    fromAccessor = providerIdFromAccessor(object, "provider");
+    if (fromAccessor != null) {
+      return fromAccessor;
+    }
+
+    Object labels = valueFromAccessor(object, "labels");
+    if (labels instanceof Map<?, ?> map) {
+      return providerIdFromMap(castStringMap(map));
+    }
+
+    Object metadata = valueFromAccessor(object, "metadata");
+    if (metadata instanceof Map<?, ?> map) {
+      return providerIdFromMap(castStringMap(map));
+    }
+    return null;
+  }
+
+  private static String providerIdFromAccessor(Object object, String accessor) {
+    Object value = valueFromAccessor(object, accessor);
+    if (!(value instanceof String stringValue)) {
+      return null;
+    }
+    return trimToNull(stringValue);
+  }
+
+  private static Object valueFromAccessor(Object object, String accessor) {
+    if (object == null || accessor == null || accessor.isBlank()) {
+      return null;
+    }
     try {
-      Path root = Path.of(rootUri).toAbsolutePath().normalize();
-      if (!Files.exists(root)) {
-        return List.of();
-      }
-      List<String> files = new ArrayList<>();
-      try (java.util.stream.Stream<Path> stream = Files.walk(root)) {
-        stream
-            .filter(Files::isRegularFile)
-            .filter(path -> path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".parquet"))
-            .forEach(path -> files.add(path.toString().replace('\\', '/')));
-      }
-      files.sort(String.CASE_INSENSITIVE_ORDER.thenComparing(Comparator.naturalOrder()));
-      return List.copyOf(files);
-    } catch (Exception ex) {
-      throw new IllegalStateException("Failed to list local parquet files: root=" + rootUri, ex);
+      Method method = object.getClass().getMethod(accessor);
+      return method.invoke(object);
+    } catch (Exception ignored) {
+      return null;
     }
   }
 
-  private List<String> filterPartition(List<String> files, String partitionSpec) {
-    if (partitionSpec == null) {
-      return files;
+  private static Map<String, String> castStringMap(Map<?, ?> value) {
+    if (value == null || value.isEmpty()) {
+      return Map.of();
     }
-    String needle = "/" + partitionSpec + "/";
-    List<String> filtered = new ArrayList<>();
-    for (String file : files) {
-      String normalized = file.replace('\\', '/');
-      if (normalized.contains(needle)) {
-        filtered.add(normalized);
-      }
-    }
-    filtered.sort(String.CASE_INSENSITIVE_ORDER.thenComparing(Comparator.naturalOrder()));
-    return List.copyOf(filtered);
-  }
-
-  private String outputFilePath(DatasetContext context, List<String> sourceFiles, int groupIndex) {
-    String root = normalizeUri(context.rootUri());
-    String signature =
-        Integer.toHexString(
-            Objects.hash(sourceFiles.get(0), sourceFiles.get(sourceFiles.size() - 1), sourceFiles.size()));
-    String name = String.format(Locale.ROOT, "compact_%03d_%s.parquet", groupIndex + 1, signature);
-    return appendPath(root, "_compact/" + name);
-  }
-
-  private Map<String, List<String>> partitionToFiles(List<String> files) {
-    LinkedHashMap<String, List<String>> grouped = new LinkedHashMap<>();
-    for (String file : files) {
-      Matcher matcher = PARTITION_PATTERN.matcher(file.replace('\\', '/'));
-      if (!matcher.find()) {
+    java.util.LinkedHashMap<String, String> casted = new java.util.LinkedHashMap<>();
+    for (Map.Entry<?, ?> entry : value.entrySet()) {
+      Object key = entry.getKey();
+      Object raw = entry.getValue();
+      if (!(key instanceof String keyString) || !(raw instanceof String valueString)) {
         continue;
       }
-      String partition = "date=" + matcher.group(2);
-      grouped.computeIfAbsent(partition, ignored -> new ArrayList<>()).add(file);
+      casted.put(keyString, valueString);
     }
-    LinkedHashMap<String, List<String>> ordered = new LinkedHashMap<>();
-    List<String> partitions = new ArrayList<>(grouped.keySet());
-    partitions.sort(String.CASE_INSENSITIVE_ORDER.thenComparing(Comparator.naturalOrder()));
-    for (String partition : partitions) {
-      List<String> partitionFiles = new ArrayList<>(grouped.get(partition));
-      partitionFiles.sort(String.CASE_INSENSITIVE_ORDER.thenComparing(Comparator.naturalOrder()));
-      ordered.put(partition, List.copyOf(partitionFiles));
-    }
-    return Map.copyOf(ordered);
+    return casted.isEmpty() ? Map.of() : Map.copyOf(casted);
   }
 
-  private DatasetContext resolveDataset(String datasetIdValue) {
-    DatasetId datasetId = DatasetId.parse(Strings.requireNonBlank(datasetIdValue, "datasetId"));
-    DefinitionDataset definition = resolveDefinition(datasetId);
-    DefinitionDataset.ParquetBinding parquet =
-        Optional.ofNullable(definition.binding())
-            .map(DefinitionDataset.Binding::parquet)
-            .orElseThrow(() -> new IllegalStateException("Dataset is not parquet: " + datasetId));
-    String uri = Strings.requireNonBlank(parquet.uri(), "dataset.parquet.uri");
-    return new DatasetContext(
-        datasetId,
-        uri,
-        normalizeGlob(parquet.glob()),
-        isS3Uri(uri),
-        Strings.trimToNull(parquet.connectionName()));
+  private static String providerIdFromMap(Map<String, String> values) {
+    if (values == null || values.isEmpty()) {
+      return null;
+    }
+    String fromSubjectProvider = trimToNull(values.get(KEY_SUBJECT_PROVIDER));
+    if (fromSubjectProvider != null) {
+      return fromSubjectProvider;
+    }
+    return trimToNull(values.get(KEY_PROVIDER));
   }
 
-  private DefinitionDataset resolveDefinition(DatasetId datasetId) {
-    for (DefinitionDataset candidate : DiscoveryCache.list(DefinitionDataset.class, datasetId.group())) {
-      if (candidate == null || candidate.envelope() == null) {
-        continue;
+  private static String canonicalResourceId(EntitlementsScopeType scopeType, String resourceId) {
+    if (scopeType == EntitlementsScopeType.DATASET) {
+      return DataEntitlements.requireDatasetResourceId(resourceId);
+    }
+    if (scopeType == EntitlementsScopeType.SERVICE) {
+      return ServiceEntitlements.requireAssetResourceId(resourceId);
+    }
+    if (scopeType == EntitlementsScopeType.NAMESPACE) {
+      CanonicalIds.ParsedId parsed = CanonicalIds.parse(resourceId);
+      if (!parsed.isNamespace()) {
+        throw new IllegalArgumentException("resourceId must be canonical namespace:<group>/<namespace>");
       }
-      DefinitionEnvelope envelope = candidate.envelope();
-      if (!datasetId.group().equals(envelope.group())) {
-        continue;
-      }
-      if (!datasetId.namespace().equals(candidate.namespace())) {
-        continue;
-      }
-      if (envelope.name() == null || !envelope.name().equals(datasetId.namespace() + "/" + datasetId.name())) {
-        continue;
-      }
-      return candidate;
+      return parsed.canonical();
     }
-    throw new IllegalStateException("Dataset definition not found: " + datasetId);
+    return requireTrimmed(resourceId, "resourceId");
   }
 
-  private void configureS3IfNeeded(DuckdbSession sessionHandle, DatasetContext context) {
-    if (!context.s3()) {
-      return;
-    }
-    resolveS3Connection(context).admin().configureDuckdbSession(sessionHandle);
-  }
-
-  private void writeCheckpoint(String datasetId, String scope, Map<String, String> payload) {
-    checkpointStore.save(
-        CheckpointRecord.of(
-            new CheckpointKey(group, CheckpointType.PARQUET_MAINT, datasetId, scope),
-            payload == null ? Map.of("updatedUtc", Instant.now().toString()) : payload));
-  }
-
-  private static String parquetArraySql(List<String> files) {
-    List<String> quoted = new ArrayList<>(files.size());
-    for (String file : files) {
-      quoted.add("'" + escapeSql(file) + "'");
-    }
-    return "[" + String.join(", ", quoted) + "]";
-  }
-
-  private static boolean deleteLocalFile(String file) {
-    try {
-      return Files.deleteIfExists(Path.of(file));
-    } catch (Exception ex) {
-      throw new IllegalStateException("Failed to delete local parquet file: " + file, ex);
-    }
-  }
-
-  private static long localFileSize(String file) {
-    if (file == null || isS3Uri(file)) {
-      return 0L;
+  private static String canonicalScopeId(EntitlementsScopeType scopeType, String scopeId) {
+    if (scopeId == null) {
+      return null;
     }
     try {
-      Path path = Path.of(file);
-      if (!Files.exists(path)) {
-        return 0L;
+      if (scopeType == EntitlementsScopeType.DATASET) {
+        return DataEntitlements.requireDatasetResourceId(scopeId);
       }
-      return Files.size(path);
-    } catch (Exception ex) {
-      return 0L;
+      if (scopeType == EntitlementsScopeType.SERVICE) {
+        return ServiceEntitlements.requireAssetResourceId(scopeId);
+      }
+      if (scopeType == EntitlementsScopeType.NAMESPACE) {
+        CanonicalIds.ParsedId parsed = CanonicalIds.parse(scopeId);
+        return parsed.isNamespace() ? parsed.canonical() : null;
+      }
+      return trimToNull(scopeId);
+    } catch (RuntimeException ex) {
+      return null;
     }
   }
 
-  private static String normalizeGlob(String value) {
-    return Strings.firstNonBlank(Strings.trimToNull(value), DEFAULT_PARQUET_GLOB);
-  }
-
-  private static String appendGlob(String base, String glob) {
-    return appendPath(base, glob.startsWith("/") ? glob.substring(1) : glob);
-  }
-
-  private static String appendPath(String base, String suffix) {
-    String normalizedBase = normalizeUri(base);
-    String normalizedSuffix = Strings.requireNonBlank(suffix, "suffix").replace('\\', '/');
-    if (normalizedBase.endsWith("/")) {
-      return normalizedBase + normalizedSuffix;
+  private static String namespaceResourceId(EntitlementsScopeType scopeType, String resourceId) {
+    if (scopeType == EntitlementsScopeType.NAMESPACE) {
+      return canonicalScopeId(EntitlementsScopeType.NAMESPACE, resourceId);
     }
-    return normalizedBase + "/" + normalizedSuffix;
+    CanonicalIds.ParsedId parsed = CanonicalIds.parse(resourceId);
+    if (scopeType == EntitlementsScopeType.DATASET && parsed.isDataset()) {
+      return "namespace:" + parsed.group() + "/" + parsed.namespace();
+    }
+    return null;
   }
 
-  private static String normalizeUri(String value) {
-    return Strings.requireNonBlank(value, "value").replace('\\', '/');
+  private static boolean enabled(Boolean value) {
+    return value == null || value.booleanValue();
   }
 
-  private static boolean isS3Uri(String value) {
-    return value != null
-        && (value.regionMatches(true, 0, "s3://", 0, "s3://".length())
-            || value.regionMatches(true, 0, "s3a://", 0, "s3a://".length()));
+  private static String requireTrimmed(String value, String name) {
+    String normalized = trimToNull(value);
+    if (normalized == null) {
+      throw new IllegalArgumentException(name + " is required");
+    }
+    return normalized;
   }
 
-  private static String escapeSql(String value) {
-    return value.replace("'", "''");
+  private static <T> T firstNonNull(T first, T second, T third) {
+    if (first != null) {
+      return first;
+    }
+    if (second != null) {
+      return second;
+    }
+    return third;
   }
 
-  private record DatasetContext(
-      DatasetId datasetId,
-      String rootUri,
-      String glob,
-      boolean s3,
-      String connectionName) {}
+  private static String providerId(ProviderChoice choice) {
+    return choice == null ? null : choice.providerId();
+  }
+
+  private String defaultProviderForTrace() {
+    if (registry instanceof DefaultEntitlementProviderRegistry defaultRegistry) {
+      return defaultRegistry.defaultProviderIdHint();
+    }
+    return "default";
+  }
+
+  private static String sourceLabel(SelectionSource source) {
+    if (source == SelectionSource.REGISTRY_DEFAULT) {
+      return "default";
+    }
+    return source.name().toLowerCase(java.util.Locale.ROOT);
+  }
+
+  private static String selectedProviderForLog(Selection selected, String defaultProviderId) {
+    if (selected == null) {
+      return null;
+    }
+    if (selected.source() == SelectionSource.REGISTRY_DEFAULT
+        && Objects.equals("default", selected.providerId())) {
+      return defaultProviderId;
+    }
+    return selected.providerId();
+  }
+
+  private String defaultProviderId(EntitlementSubjectProvider provider) {
+    EntitlementSubjectProvider platformProvider =
+        registry.provider(DefaultEntitlementProviderRegistry.PLATFORM_MODEL_PROVIDER_ID);
+    if (platformProvider != null && platformProvider == provider) {
+      return DefaultEntitlementProviderRegistry.PLATFORM_MODEL_PROVIDER_ID;
+    }
+    return "default";
+  }
+
+  private static String trimToNull(String value) {
+    if (value == null) {
+      return null;
+    }
+    String normalized = value.trim();
+    return normalized.isEmpty() ? null : normalized;
+  }
+
+  public record Selection(
+      String providerId,
+      EntitlementSubjectProvider provider,
+      SelectionSource source,
+      boolean explicit) {
+    public Selection {
+      providerId = trimToNull(providerId);
+      provider = Objects.requireNonNull(provider, "provider");
+      source = Objects.requireNonNull(source, "source");
+    }
+  }
+
+  public enum SelectionSource {
+    RESOURCE,
+    NAMESPACE,
+    ENVIRONMENT,
+    REGISTRY_DEFAULT
+  }
+
+  private record ProviderChoice(String providerId, SelectionSource source) {
+    private ProviderChoice {
+      providerId = requireTrimmed(providerId, "providerId");
+      source = Objects.requireNonNull(source, "source");
+    }
+  }
 }
-
-
-
-
-
-
-
