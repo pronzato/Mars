@@ -1,763 +1,779 @@
-package org.pronzato.fabric.api.services.manager;
+package org.pronzato.fabric.api.configs.manager;
 
-import io.grpc.BindableService;
-import io.grpc.ManagedChannel;
-import io.opentelemetry.api.common.Attributes;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.UUID;
-import java.util.concurrent.atomic.AtomicInteger;
-import org.apache.arrow.flight.FlightProducer;
-import org.pronzato.fabric.api.control.ControlConnection;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionService;
-import org.pronzato.fabric.api.control.status.service.ServiceHbCache;
-import org.pronzato.fabric.api.control.status.service.ServiceStatusPublisher;
-import org.pronzato.fabric.api.data.TabularManager;
-import org.pronzato.fabric.api.data.catalog.DuckdbCatalogImpl;
-import org.pronzato.fabric.api.data.dataset.DatasetId;
-import org.pronzato.fabric.api.data.manager.TabularManagerImpl;
-import org.pronzato.fabric.api.control.entitlements.core.services.ServiceEntitlements;
-import org.pronzato.fabric.api.control.security.kerberos.KerberosSpn;
-import org.pronzato.fabric.api.services.ServiceRunOptions;
-import org.pronzato.fabric.api.services.common.ServiceInstanceResolver;
-import org.pronzato.fabric.api.services.common.routing.ServiceRoutingMode;
-import org.pronzato.fabric.api.services.flight.FlightSqlRequestHeadersMiddleware;
-import org.pronzato.fabric.api.services.flight.FlightSqlServiceProducer;
-import org.pronzato.fabric.api.services.flight.FlightSqlServiceRuntime;
-import org.pronzato.fabric.api.services.flight.ingest.FlightIngestProducer;
-import org.pronzato.fabric.api.services.flight.ingest.FlightIngestServiceRuntime;
-import org.pronzato.fabric.api.services.grpc.GrpcClientRuntime;
-import org.pronzato.fabric.api.services.grpc.GrpcServiceRuntime;
-import org.pronzato.fabric.api.telemetry.OtelManager;
-import org.pronzato.fabric.api.telemetry.manager.FabricArrowFlightOtel;
-import org.pronzato.fabric.api.telemetry.manager.FabricOtelAttributes;
-import org.pronzato.fabric.api.telemetry.manager.FabricOtelEnablement;
-import org.pronzato.fabric.api.telemetry.manager.FabricOtelSupport;
-import org.pronzato.fabric.api.telemetry.manager.OtelManagerNoop;
+import org.pronzato.fabric.api.control.discovery.CanonicalIds;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
+import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfigLayer;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
+import org.pronzato.fabric.api.configs.model.ConfigLayerLink;
+import org.pronzato.fabric.api.configs.ConfigManager.ConfigLineage;
+import org.pronzato.fabric.api.configs.model.ConfigSummary;
+import org.pronzato.fabric.api.configs.model.ConfigResolved;
 import org.pronzato.fabric.api.util.Strings;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-final class ServiceManagerImplBootstrap {
+public final class ConfigResolver {
+  private static final Logger LOGGER = LoggerFactory.getLogger(ConfigResolver.class);
+  private static final String LAYER_BASE = "base";
+  private static final String HASH_VERSION = "v1";
+  private static final ObjectMapper HASH_MAPPER =
+      DiscoveryCodec.mapper().copy().configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
 
-  private ServiceManagerImplBootstrap() {}
+  private final DiscoveryCache discoveryCache;
 
-  static ServiceManagerImpl.RunningGrpcServer startGrpcServer(
-      ServiceManagerImpl manager,
-      DefinitionService def,
-      BindableService svc,
-      ServiceRunOptions options)
-      throws Exception {
-    Objects.requireNonNull(def, "def");
-    Objects.requireNonNull(svc, "svc");
-    String serviceName = ServiceManagerImpl.resolveServiceName(def);
-    String serviceId = ServiceManagerImpl.serviceId(def);
-    DefinitionService.Grpc grpc = manager.requireGrpc(def, serviceName);
-    manager.requireGrpcRoutingMode(def, "server");
-    options = options == null ? ServiceRunOptions.defaults() : options;
-
-    int bindPort = manager.resolveBindPort(grpc, options);
-    String bindHost = manager.resolveBindHost(grpc, options);
-    String advertiseHost = manager.resolveAdvertiseHost(grpc, options);
-    int advertisePort = manager.resolveAdvertisePort(grpc, options, bindPort);
-    boolean tlsEnabled = ServiceManagerImpl.tlsEnabled(grpc);
-    boolean kerberosEnabled = ServiceManagerImpl.kerberosEnabled(grpc);
-    String instanceId = resolveInstanceId(options, advertiseHost, advertisePort);
-
-    GrpcServiceRuntime.Config cfg = new GrpcServiceRuntime.Config();
-    cfg.bindHost = bindHost;
-    cfg.bindPort = bindPort;
-    cfg.advertiseHost = advertiseHost;
-    cfg.advertisePort = advertisePort;
-    cfg.portFailback = Boolean.TRUE.equals(grpc.portFailback());
-    cfg.tlsEnabled = tlsEnabled;
-    cfg.certChainPem =
-        ServiceManagerImpl.toFile(
-            ServiceManagerImpl.firstNonNull(
-                options.tlsCertChain(), manager.session().serviceTlsCertChain()));
-    cfg.privateKeyPem =
-        ServiceManagerImpl.toFile(
-            ServiceManagerImpl.firstNonNull(
-                options.tlsPrivateKey(), manager.session().serviceTlsPrivateKey()));
-    cfg.kerberosEnabled = kerberosEnabled;
-    cfg.kerberosSpn = grpc.kerberos() == null ? null : grpc.kerberos().spn();
-    cfg.kerberosPrincipal = manager.sessionKerberosPrincipal();
-    cfg.kerberosKeytab = manager.sessionKerberosKeytab();
-    cfg.kerberosRealm = KerberosSpn.extractRealm(cfg.kerberosPrincipal);
-
-    authorizeStart(
-        manager,
-        serviceId,
-        resolveServerStartSubject(manager, grpc),
-        ServiceEntitlements.Transport.GRPC);
-    GrpcServiceRuntime runtime =
-        GrpcServiceRuntime.start(cfg, svc, manager.buildServerInterceptors(def, serviceId, grpc, options));
-    ServiceStatusPublisher publisher =
-        createGrpcStatusPublisher(
-            manager,
-            serviceName,
-            instanceId,
-            advertiseHost,
-            advertisePort,
-            bindHost,
-            bindPort,
-            grpc,
-            tlsEnabled,
-            options);
-    try {
-      publisher.start();
-    } catch (Exception ex) {
-      runtime.close();
-      throw ex;
-    }
-    manager
-        .logger()
-        .info(
-            "[ServiceManager][gRPC][server-start] serviceId={} bind={}:{} advertise={}:{} instanceId={} tlsEnabled={} kerberosEnabled={} identityMode={}",
-            serviceId,
-            bindHost,
-            runtime.port(),
-            advertiseHost,
-            advertisePort,
-            instanceId,
-            tlsEnabled,
-            kerberosEnabled,
-            ServiceManagerImpl.resolveGrpcIdentityMode(grpc));
-    return new ServiceManagerImpl.RunningGrpcServer(serviceId, instanceId, runtime, publisher);
+  public ConfigResolver(DiscoveryCache discoveryCache) {
+    this.discoveryCache = Objects.requireNonNull(discoveryCache, "discoveryCache");
   }
 
-  static ServiceManagerImpl.RunningArrowFlightSqlServer startArrowFlightSqlServerInternal(
-      ServiceManagerImpl manager,
-      DefinitionService def,
-      ServiceRunOptions options,
-      Object implementation)
-      throws Exception {
-    Objects.requireNonNull(def, "def");
-    String serviceName = ServiceManagerImpl.resolveServiceName(def);
-    String serviceId = ServiceManagerImpl.serviceId(def);
-    DefinitionService.Arrow arrow = manager.requireArrowFlightSql(def, serviceName);
-    manager.requireArrowRoutingMode(def, "server");
-    options = options == null ? ServiceRunOptions.defaults() : options;
-
-    int bindPort = manager.resolveBindPort(arrow, options);
-    String bindHost = manager.resolveBindHost(arrow, options);
-    String advertiseHost = manager.resolveAdvertiseHost(arrow, options);
-    int advertisePort = manager.resolveAdvertisePort(arrow, options, bindPort);
-    boolean tlsEnabled = ServiceManagerImpl.tlsEnabled(arrow);
-    boolean kerberosEnabled = ServiceManagerImpl.kerberosEnabled(arrow);
-    String instanceId = resolveInstanceId(options, advertiseHost, advertisePort);
-
-    AtomicInteger portRef = new AtomicInteger(advertisePort);
-    FlightSqlServiceProducer producer =
-        toFlightSqlProducer(
-            manager, implementation, serviceId, advertiseHost, portRef::get, tlsEnabled, options);
-    FlightProducer runtimeProducer =
-        maybeInstrumentArrowServerProducer(
-            manager,
-            def,
-            producer,
-            "arrow-flight-sql",
-            FabricOtelEnablement.isArrowFlightSqlServerTracingEnabled(def));
-    FlightSqlServiceRuntime.Config cfg = new FlightSqlServiceRuntime.Config();
-    cfg.bindHost = bindHost;
-    cfg.bindPort = bindPort;
-    cfg.advertiseHost = advertiseHost;
-    cfg.advertisePort = advertisePort;
-    cfg.portFailback = Boolean.TRUE.equals(arrow.portFailback());
-    cfg.tlsEnabled = tlsEnabled;
-    cfg.certChainPem =
-        ServiceManagerImpl.toFile(
-            ServiceManagerImpl.firstNonNull(
-                options.tlsCertChain(), manager.session().serviceTlsCertChain()));
-    cfg.privateKeyPem =
-        ServiceManagerImpl.toFile(
-            ServiceManagerImpl.firstNonNull(
-                options.tlsPrivateKey(), manager.session().serviceTlsPrivateKey()));
-    cfg.kerberosEnabled = kerberosEnabled;
-    cfg.kerberosSpn = arrow.kerberos() == null ? null : arrow.kerberos().spn();
-    cfg.kerberosPrincipal = manager.sessionKerberosPrincipal();
-    cfg.kerberosKeytab = manager.sessionKerberosKeytab();
-    cfg.kerberosRealm = KerberosSpn.extractRealm(cfg.kerberosPrincipal);
-    cfg.middlewares =
-        ServiceManagerImpl.mergeFlightMiddlewares(
-            options,
-            Map.of(
-                FlightSqlRequestHeadersMiddleware.KEY, FlightSqlRequestHeadersMiddleware.factory()));
-
-    authorizeStart(
-        manager,
-        serviceId,
-        resolveServerStartSubject(manager, arrow),
-        ServiceEntitlements.Transport.ARROW_FLIGHT_SQL);
-
-    FlightSqlServiceRuntime runtime = FlightSqlServiceRuntime.start(cfg, runtimeProducer);
-    int boundPort = runtime.port();
-    portRef.set(boundPort);
-    ServiceStatusPublisher publisher =
-        createArrowStatusPublisher(
-            manager,
-            serviceName,
-            instanceId,
-            advertiseHost,
-            advertisePort,
-            bindHost,
-            boundPort,
-            arrow,
-            tlsEnabled,
-            options);
-    try {
-      publisher.start();
-    } catch (Exception ex) {
-      runtime.close();
-      throw ex;
-    }
-    manager
-        .logger()
-        .info(
-            "[ServiceManager][FlightSQL][server-start] serviceId={} bind={}:{} advertise={}:{} instanceId={} tlsEnabled={} kerberosEnabled={}",
-            serviceId,
-            bindHost,
-            runtime.port(),
-            advertiseHost,
-            advertisePort,
-            instanceId,
-            tlsEnabled,
-            kerberosEnabled);
-    return new ServiceManagerImpl.RunningArrowFlightSqlServer(serviceId, instanceId, runtime, publisher);
-  }
-
-  static ServiceManagerImpl.RunningArrowFlightIngestServer startArrowFlightIngestServerInternal(
-      ServiceManagerImpl manager,
-      DefinitionService def,
-      ServiceRunOptions options,
-      Object implementation)
-      throws Exception {
-    Objects.requireNonNull(def, "def");
-    String serviceName = ServiceManagerImpl.resolveServiceName(def);
-    String serviceId = ServiceManagerImpl.serviceId(def);
-    DefinitionService.Arrow arrow = manager.requireArrowFlightIngest(def, serviceName);
-    manager.requireArrowRoutingMode(def, "server");
-    options = options == null ? ServiceRunOptions.defaults() : options;
-
-    int bindPort = manager.resolveBindPort(arrow, options);
-    String bindHost = manager.resolveBindHost(arrow, options);
-    String advertiseHost = manager.resolveAdvertiseHost(arrow, options);
-    int advertisePort = manager.resolveAdvertisePort(arrow, options, bindPort);
-    boolean tlsEnabled = ServiceManagerImpl.tlsEnabled(arrow);
-    boolean kerberosEnabled = ServiceManagerImpl.kerberosEnabled(arrow);
-    String instanceId = resolveInstanceId(options, advertiseHost, advertisePort);
-
-    FlightIngestProducer producer = toFlightIngestProducer(manager, implementation, serviceId);
-    FlightProducer runtimeProducer =
-        maybeInstrumentArrowServerProducer(
-            manager,
-            def,
-            producer,
-            "arrow-flight",
-            FabricOtelEnablement.isArrowFlightServerTracingEnabled(def));
-    FlightIngestServiceRuntime.Config cfg = new FlightIngestServiceRuntime.Config();
-    cfg.bindHost = bindHost;
-    cfg.bindPort = bindPort;
-    cfg.advertiseHost = advertiseHost;
-    cfg.advertisePort = advertisePort;
-    cfg.portFailback = Boolean.TRUE.equals(arrow.portFailback());
-    cfg.tlsEnabled = tlsEnabled;
-    cfg.certChainPem =
-        ServiceManagerImpl.toFile(
-            ServiceManagerImpl.firstNonNull(
-                options.tlsCertChain(), manager.session().serviceTlsCertChain()));
-    cfg.privateKeyPem =
-        ServiceManagerImpl.toFile(
-            ServiceManagerImpl.firstNonNull(
-                options.tlsPrivateKey(), manager.session().serviceTlsPrivateKey()));
-    cfg.kerberosEnabled = kerberosEnabled;
-    cfg.kerberosSpn = arrow.kerberos() == null ? null : arrow.kerberos().spn();
-    cfg.kerberosPrincipal = manager.sessionKerberosPrincipal();
-    cfg.kerberosKeytab = manager.sessionKerberosKeytab();
-    cfg.kerberosRealm = KerberosSpn.extractRealm(cfg.kerberosPrincipal);
-    cfg.middlewares =
-        ServiceManagerImpl.mergeFlightMiddlewares(
-            options,
-            Map.of(
-                FlightSqlRequestHeadersMiddleware.KEY, FlightSqlRequestHeadersMiddleware.factory()));
-
-    authorizeStart(
-        manager,
-        serviceId,
-        resolveServerStartSubject(manager, arrow),
-        ServiceEntitlements.Transport.ARROW_FLIGHT_INGEST);
-
-    FlightIngestServiceRuntime runtime = FlightIngestServiceRuntime.start(cfg, runtimeProducer);
-    int boundPort = runtime.port();
-    ServiceStatusPublisher publisher =
-        createArrowStatusPublisher(
-            manager,
-            serviceName,
-            instanceId,
-            advertiseHost,
-            advertisePort,
-            bindHost,
-            boundPort,
-            arrow,
-            tlsEnabled,
-            options);
-    try {
-      publisher.start();
-    } catch (Exception ex) {
-      runtime.close();
-      throw ex;
-    }
-    manager
-        .logger()
-        .info(
-            "[ServiceManager][FlightIngest][server-start] serviceId={} bind={}:{} advertise={}:{} instanceId={} tlsEnabled={} kerberosEnabled={}",
-            serviceId,
-            bindHost,
-            runtime.port(),
-            advertiseHost,
-            advertisePort,
-            instanceId,
-            tlsEnabled,
-            kerberosEnabled);
-    return new ServiceManagerImpl.RunningArrowFlightIngestServer(serviceId, instanceId, runtime, publisher);
-  }
-
-  static ManagedChannel createGrpcChannel(
-      ServiceManagerImpl manager, DefinitionService def, ServiceRunOptions options) throws Exception {
-    Objects.requireNonNull(def, "def");
-    String serviceName = ServiceManagerImpl.resolveServiceName(def);
-    String serviceId = ServiceManagerImpl.serviceId(def);
-    String group = manager.resolveGroup(def);
-    DefinitionService.Grpc grpc = manager.requireGrpc(def, serviceName);
-    ServiceRoutingMode routingMode = manager.requireGrpcRoutingMode(def, "client");
-    options = options == null ? ServiceRunOptions.defaults() : options;
-
-    ServiceInstanceResolver instanceResolver = manager.session().serviceInstanceResolverIfInitialized();
-    GrpcClientRuntime.RoutingConfig cfg = new GrpcClientRuntime.RoutingConfig();
-    cfg.serviceId = serviceId;
-    if (instanceResolver != null) {
-      cfg.instanceResolver = instanceResolver;
-      cfg.serviceGroup = ServiceManagerImpl.requireValue(group, "group");
-      cfg.serviceName = ServiceManagerImpl.requireValue(serviceName, "serviceName");
-      cfg.closeInstanceResolverOnCleanup = false;
-    } else {
-      cfg.statusCache = createRoutingStatusCache(manager, group, serviceName, serviceId);
-    }
-    cfg.tlsEnabled = ServiceManagerImpl.tlsEnabled(grpc);
-    cfg.trustCertPem =
-        ServiceManagerImpl.toFile(
-            ServiceManagerImpl.firstNonNull(
-                options.tlsTrustCert(), options.clientTrustCert(), manager.session().trustCert()));
-    cfg.kerberosEnabled = ServiceManagerImpl.kerberosEnabled(grpc);
-    cfg.kerberosSpn = grpc.kerberos() == null ? null : grpc.kerberos().spn();
-    cfg.kerberosPrincipal = manager.sessionKerberosPrincipal();
-    cfg.kerberosKeytab = manager.sessionKerberosKeytab();
-    cfg.kerberosRealm = KerberosSpn.extractRealm(cfg.kerberosPrincipal);
-    cfg.kerberosRequireTls = true;
-    cfg.logRoutingSelections = manager.session().grpcRoutingLogSelections();
-    cfg.routingMode = routingMode;
-    cfg.defaultEffectiveSubject = manager.sessionKerberosPrincipal();
-    cfg.callerAppSubject = manager.sessionAppSubject();
-    cfg.routingKey = options.routingKey();
-
-    ManagedChannel channel =
-        GrpcClientRuntime.createRoutingChannel(
-            cfg, manager.buildClientInterceptors(def, serviceId, options));
-    manager
-        .logger()
-        .info(
-            "[ServiceManager][gRPC][client-routing] serviceId={} group={} service={} mode={} tlsEnabled={} kerberosEnabled={} routingKeyConfigured={}",
-            serviceId,
-            group,
-            serviceName,
-            routingMode,
-            cfg.tlsEnabled,
-            cfg.kerberosEnabled,
-            Strings.isNotBlank(cfg.routingKey));
-    return channel;
-  }
-
-  static ServiceHbCache createRoutingStatusCache(
-      ServiceManagerImpl manager, String group, String serviceName, String serviceId) throws Exception {
-    ControlConnection control = manager.session().controlPlaneConnection();
-    if (control == null) {
-      throw new IllegalStateException(
-          "Session control-plane client is not initialized for service: " + serviceId);
-    }
-    ServiceHbCache cache =
-        new ServiceHbCache(
-            control,
-            ServiceManagerImpl.requireValue(group, "group"),
-            ServiceManagerImpl.requireValue(serviceName, "serviceName"),
-            new ServiceHbCache.Config(),
-            manager.session().statusScheduler());
-    boolean success = false;
-    try {
-      cache.start();
-      success = true;
-      return cache;
-    } finally {
-      if (!success) {
-        cache.close();
-      }
-    }
-  }
-
-  static FlightSqlServiceProducer toFlightSqlProducer(
-      ServiceManagerImpl manager,
-      Object implementation,
-      String serviceResourceId,
-      String advertiseHost,
-      java.util.function.IntSupplier portSupplier,
-      boolean tlsEnabled,
-      ServiceRunOptions options) {
-    List<String> datasetAllowlist =
-        normalizeDatasetAllowlist(options == null ? null : options.datasetIds());
-    Set<DatasetId> allowedDatasets = parseDatasetAllowlist(datasetAllowlist);
-    if (implementation == null) {
-      TabularManager tabularManager =
-          resolveFlightSqlTabularManager(manager, serviceResourceId, datasetAllowlist);
-      return new FlightSqlServiceProducer(
-          tabularManager,
-          manager.entitlements(),
-          serviceResourceId,
-          manager.session().discoveryCache(),
-          resolveRuntimeEnvironment(manager),
-          advertiseHost,
-          portSupplier,
-          tlsEnabled,
-          manager.checkpointStore(),
-          allowedDatasets);
-    }
-    if (implementation instanceof FlightSqlServiceProducer producer) {
-      return producer;
-    }
-    throw new IllegalArgumentException(
-        "Service implementation must be "
-            + FlightSqlServiceProducer.class.getName()
-            + " for Arrow Flight SQL services: "
-            + implementation.getClass().getName());
-  }
-
-  static TabularManager resolveFlightSqlTabularManager(
-      ServiceManagerImpl manager, String serviceResourceId, List<String> datasetAllowlist) {
-    TabularManager directTabular = manager.session().data().direct().tabular();
-    if (datasetAllowlist == null || datasetAllowlist.isEmpty()) {
-      return directTabular;
-    }
-    if (!(directTabular instanceof TabularManagerImpl localTabularManager)) {
-      manager
-          .logger()
-          .warn(
-              "[ServiceManager][FlightSQL][dataset-scope-ignored] serviceId={} reason=direct-tabular-not-local datasetIds={}",
-              serviceResourceId,
-              datasetAllowlist);
-      return directTabular;
-    }
-    String group = manager.resolveGroupName();
-    if (group == null) {
-      throw new IllegalStateException(
-          "Session group is required when ServiceRunOptions.datasetIds is configured");
-    }
-    DuckdbCatalogImpl scopedCatalog =
-        new DuckdbCatalogImpl(manager.session().discoveryCache(), localTabularManager.rowManager(), group);
-    TabularManagerImpl scopedTabularManager =
-        new TabularManagerImpl(localTabularManager.rowManager(), scopedCatalog);
-    scopedTabularManager.installDatasets(datasetAllowlist);
-    manager
-        .logger()
-        .info(
-            "[ServiceManager][FlightSQL][dataset-scope] serviceId={} datasetCount={} datasetIds={}",
-            serviceResourceId,
-            datasetAllowlist.size(),
-            datasetAllowlist);
-    return scopedTabularManager;
-  }
-
-  static List<String> normalizeDatasetAllowlist(List<String> datasetIds) {
-    if (datasetIds == null || datasetIds.isEmpty()) {
+  public List<ConfigSummary> list(String group) {
+    String normalizedGroup = required(group, "group");
+    List<LayerEntry> allEntries = groupEntries(normalizedGroup);
+    if (Strings.isEmpty(allEntries)) {
       return List.of();
     }
-    LinkedHashSet<String> normalized = new LinkedHashSet<>();
-    for (String value : datasetIds) {
-      String trimmed = Strings.trimToNull(value);
-      if (trimmed != null) {
-        normalized.add(trimmed);
+    Map<String, LayerEntry> allByResourceId = indexByResourceId(allEntries);
+    Map<String, List<LayerEntry>> byConfigId = new LinkedHashMap<>();
+    for (LayerEntry entry : allEntries) {
+      byConfigId.computeIfAbsent(entry.identity().configId(), ignored -> new ArrayList<>()).add(entry);
+    }
+
+    List<String> configIds = new ArrayList<>(byConfigId.keySet());
+    configIds.sort(String::compareTo);
+    List<ConfigSummary> summaries = new ArrayList<>(configIds.size());
+    for (String configId : configIds) {
+      ConfigIndex index =
+          configIndex(normalizedGroup, configId, byConfigId.get(configId), allByResourceId, false);
+      List<String> sortedLayerIds = new ArrayList<>(index.byLayerId().keySet());
+      sortedLayerIds.sort(String::compareTo);
+      for (String layerId : sortedLayerIds) {
+        resolveChain(index, layerId);
+      }
+
+      String latestUpdated = null;
+      for (LayerEntry entry : index.scopedLayers()) {
+        latestUpdated = maxUpdatedUtc(latestUpdated, updatedUtc(entry.layer()));
+      }
+      summaries.add(
+          new ConfigSummary(
+              configId, sortedLayerIds.size(), List.copyOf(sortedLayerIds), latestUpdated));
+    }
+    return List.copyOf(summaries);
+  }
+
+  public List<ConfigLayerLink> listLayers(String group, String configId) {
+    String normalizedGroup = required(group, "group");
+    String normalizedConfigId = required(configId, "configId");
+    ConfigIndex index = loadConfigIndex(normalizedGroup, normalizedConfigId, false);
+
+    List<String> sortedLayerIds = new ArrayList<>(index.byLayerId().keySet());
+    sortedLayerIds.sort(String::compareTo);
+    for (String layerId : sortedLayerIds) {
+      resolveChain(index, layerId);
+    }
+
+    List<ConfigLayerLink> links = new ArrayList<>(index.scopedLayers().size());
+    for (LayerEntry entry : index.scopedLayers()) {
+      String parentLayerId =
+          parseParentLayerId(
+              normalizedConfigId,
+              entry.identity().layerId(),
+              parentId(entry.layer()),
+              entry.identity().resourceId());
+      links.add(new ConfigLayerLink(entry.identity().layerId(), parentLayerId, layerShortName(entry.layer())));
+    }
+    links.sort(
+        Comparator.comparing(ConfigLayerLink::parentLayerId, Comparator.nullsFirst(String::compareTo))
+            .thenComparing(ConfigLayerLink::layerId));
+    return List.copyOf(links);
+  }
+
+  public ConfigResolved resolve(String group, String configId, String layerIdOrNull) {
+    return resolve(group, configId, layerIdOrNull, null);
+  }
+
+  public ConfigResolved resolve(String group, String configId, String layerIdOrNull, Instant asOfOrNull) {
+    String normalizedGroup = required(group, "group");
+    String normalizedConfigId = required(configId, "configId");
+    String targetLayerId = required(layerIdOrNull, "layer");
+    Instant asOf = asOfOrNull == null ? Instant.now() : asOfOrNull;
+
+    ConfigIndex index = loadConfigIndex(normalizedGroup, normalizedConfigId, true);
+    Chain chain = resolveChain(index, targetLayerId);
+
+    JsonNode merged = DiscoveryCodec.mapper().createObjectNode();
+    Map<String, String> sources = new LinkedHashMap<>();
+    List<ResolvedNode> resolvedNodes = new ArrayList<>(chain.entries().size());
+    String latestUpdated = null;
+    int activeChanges = 0;
+    int expiredChanges = 0;
+
+    for (LayerEntry layerEntry : chain.entries()) {
+      String layerId = layerEntry.identity().layerId();
+      DeclaredSelection declaredSelection = declaredPayload(layerEntry.layer(), asOf, layerId);
+      activeChanges += declaredSelection.activeChanges();
+      expiredChanges += declaredSelection.expiredChanges();
+      String payloadHash = hashJson(declaredSelection.declared());
+      resolvedNodes.add(new ResolvedNode(layerEntry, payloadHash));
+      latestUpdated = maxUpdatedUtc(latestUpdated, updatedUtc(layerEntry.layer()));
+      merged = merge(merged, declaredSelection.declared(), "", layerId, sources);
+    }
+
+    String payloadHash =
+        resolvedNodes.isEmpty() ? hashJson(DiscoveryCodec.mapper().createObjectNode()) : resolvedNodes.getLast().payloadHash();
+    ConfigLineage lineage = buildLineage(resolvedNodes, payloadHash, hashResolvedTree(resolvedNodes));
+
+    LOGGER.debug("[Config][ResolveAt] group={} configId={} layerId={} at={} activeChanges={} expiredChanges={} chainDepth={} hash={}", normalizedGroup, normalizedConfigId, targetLayerId, asOf, activeChanges, expiredChanges, lineage.chainDepth(), lineage.effectiveTreeHash());
+
+    return new ConfigResolved(
+        normalizedConfigId,
+        targetLayerId,
+        merged,
+        latestUpdated,
+        Collections.unmodifiableMap(new LinkedHashMap<>(sources)),
+        lineage);
+  }
+
+  private ConfigLineage buildLineage(
+      List<ResolvedNode> resolvedNodes, String payloadHash, String effectiveTreeHash) {
+    if (resolvedNodes == null || resolvedNodes.isEmpty()) {
+      return new ConfigLineage(
+          null,
+          0,
+          true,
+          List.of(),
+          List.of(),
+          payloadHash,
+          effectiveTreeHash,
+          HASH_VERSION);
+    }
+    List<String> resolvedNodeIds = new ArrayList<>(resolvedNodes.size());
+    List<String> resolvedLayers = new ArrayList<>(resolvedNodes.size());
+    for (ResolvedNode node : resolvedNodes) {
+      resolvedNodeIds.add(nodeId(node.entry()));
+      resolvedLayers.add(node.entry().identity().layerId());
+    }
+    String baseConfigId = resolvedNodeIds.getFirst();
+    return new ConfigLineage(
+        baseConfigId,
+        resolvedNodes.size(),
+        true,
+        List.copyOf(resolvedNodeIds),
+        List.copyOf(resolvedLayers),
+        payloadHash,
+        effectiveTreeHash,
+        HASH_VERSION);
+  }
+
+  private static String nodeId(LayerEntry entry) {
+    String configId = Strings.trimToNull(entry == null || entry.layer() == null ? null : entry.layer().configId());
+    return configId == null ? entry.identity().resourceId() : configId;
+  }
+
+  private static String hashResolvedTree(List<ResolvedNode> resolvedNodes) {
+    ObjectNode root = HASH_MAPPER.createObjectNode();
+    root.put("version", HASH_VERSION);
+    ArrayNode nodes = root.putArray("nodes");
+    if (resolvedNodes != null) {
+      for (ResolvedNode node : resolvedNodes) {
+        if (node == null) {
+          continue;
+        }
+        ObjectNode row = nodes.addObject();
+        LayerEntry entry = node.entry();
+        row.put("resourceId", entry.identity().resourceId());
+        row.put("layerId", entry.identity().layerId());
+        String configId = Strings.trimToNull(entry.layer() == null ? null : entry.layer().configId());
+        if (configId != null) {
+          row.put("configId", configId);
+        }
+        row.put("payloadHash", node.payloadHash());
       }
     }
-    return normalized.isEmpty() ? List.of() : List.copyOf(normalized);
+    return hashJson(root);
   }
 
-  static Set<DatasetId> parseDatasetAllowlist(List<String> datasetIds) {
-    if (datasetIds == null || datasetIds.isEmpty()) {
-      return Set.of();
-    }
-    LinkedHashSet<DatasetId> parsed = new LinkedHashSet<>();
-    for (String value : datasetIds) {
-      parsed.add(DatasetId.parse(Strings.requireNonBlank(value, "datasetIds entry")));
-    }
-    return parsed.isEmpty() ? Set.of() : Set.copyOf(parsed);
-  }
-
-  static FlightIngestProducer toFlightIngestProducer(
-      ServiceManagerImpl manager, Object implementation, String serviceResourceId) {
-    if (implementation == null) {
-      return new FlightIngestProducer(
-          manager.session().data().direct().ingest(),
-          manager.entitlements(),
-          serviceResourceId,
-          manager.session().discoveryCache(),
-          resolveRuntimeEnvironment(manager));
-    }
-    if (implementation instanceof FlightIngestProducer producer) {
-      return producer;
-    }
-    throw new IllegalArgumentException(
-        "Service implementation must be "
-            + FlightIngestProducer.class.getName()
-            + " for Arrow Flight ingest services: "
-            + implementation.getClass().getName());
-  }
-
-  static void authorizeStart(ServiceManagerImpl manager, String serviceId, String subject) {
-    authorizeStart(manager, serviceId, subject, ServiceEntitlements.Transport.GRPC);
-  }
-
-  static void authorizeStart(
-      ServiceManagerImpl manager,
-      String serviceId,
-      String subject,
-      ServiceEntitlements.Transport transport) {
-    ServiceEntitlements.Decision decision =
-        manager
-            .entitlements()
-            .authorize(
-                new ServiceEntitlements.Identity(subject, null),
-                new ServiceEntitlements.Request(
-                    transport,
-                    ServiceEntitlements.Action.START,
-                    serviceId,
-                    ServiceManagerImpl.startOperationName(transport),
-                    null,
-                    null,
-                    Map.of(),
-                    Map.of()));
-    if (decision == null || !decision.allowed()) {
-      throw new IllegalArgumentException(ServiceManagerImpl.decisionReason(decision));
+  private static String hashJson(JsonNode node) {
+    try {
+      JsonNode canonical = canonicalize(node);
+      byte[] payload = HASH_MAPPER.writeValueAsBytes(canonical);
+      MessageDigest digest = MessageDigest.getInstance("SHA-256");
+      byte[] bytes = digest.digest(payload);
+      StringBuilder out = new StringBuilder(bytes.length * 2);
+      for (byte value : bytes) {
+        out.append(String.format("%02x", value & 0xff));
+      }
+      return out.toString();
+    } catch (Exception ex) {
+      throw new IllegalStateException("failed to hash config payload", ex);
     }
   }
 
-  static String resolveServerStartSubject(ServiceManagerImpl manager, DefinitionService.Grpc grpc) {
-    String appSubject = manager.sessionAppSubject();
-    if (appSubject != null) {
-      return appSubject;
+  private static JsonNode canonicalize(JsonNode node) {
+    if (node == null || node.isMissingNode()) {
+      return HASH_MAPPER.nullNode();
     }
-    String kerberosPrincipal = manager.sessionKerberosPrincipal();
-    String serviceSpn = grpc == null || grpc.kerberos() == null ? null : grpc.kerberos().spn();
-    return ServiceManagerImpl.firstNonBlank(kerberosPrincipal, serviceSpn);
+    if (node.isObject()) {
+      ObjectNode sorted = HASH_MAPPER.createObjectNode();
+      List<String> keys = new ArrayList<>();
+      node.fieldNames().forEachRemaining(keys::add);
+      keys.sort(String::compareTo);
+      for (String key : keys) {
+        sorted.set(key, canonicalize(node.get(key)));
+      }
+      return sorted;
+    }
+    if (node.isArray()) {
+      ArrayNode array = HASH_MAPPER.createArrayNode();
+      for (JsonNode child : node) {
+        array.add(canonicalize(child));
+      }
+      return array;
+    }
+    return node.deepCopy();
   }
 
-  static String resolveServerStartSubject(ServiceManagerImpl manager, DefinitionService.Arrow arrow) {
-    String appSubject = manager.sessionAppSubject();
-    if (appSubject != null) {
-      return appSubject;
-    }
-    String kerberosPrincipal = manager.sessionKerberosPrincipal();
-    String serviceSpn = arrow == null || arrow.kerberos() == null ? null : arrow.kerberos().spn();
-    return ServiceManagerImpl.firstNonBlank(kerberosPrincipal, serviceSpn);
-  }
-
-  static FlightProducer maybeInstrumentArrowServerProducer(
-      ServiceManagerImpl manager,
-      DefinitionService service,
-      FlightProducer producer,
-      String transport,
-      boolean transportEnabled) {
-    if (!transportEnabled) {
-      return producer;
-    }
-    OtelManager otelManager = sessionOtelManager(manager);
-    if (!otelManager.enabled()) {
-      return producer;
-    }
-    return FabricArrowFlightOtel.instrumentServer(
-        otelManager,
-        producer,
-        manager.resolveGroup(service),
-        manager.currentAppName(),
-        ServiceManagerImpl.resolveServiceName(service),
-        transport);
-  }
-
-  static OtelManager sessionOtelManager(ServiceManagerImpl manager) {
-    OtelManager otelManager = manager.session().telemetry();
-    return otelManager == null ? OtelManagerNoop.instance() : otelManager;
-  }
-
-  static String resolveRuntimeEnvironment(ServiceManagerImpl manager) {
-    return manager.session().context() == null
-        ? null
-        : Strings.trimToNull(manager.session().context().getEnv());
-  }
-
-  static ServiceStatusPublisher createGrpcStatusPublisher(
-      ServiceManagerImpl manager,
-      String serviceName,
-      String instanceId,
-      String advertiseHost,
-      int advertisePort,
-      String bindHost,
-      int bindPort,
-      DefinitionService.Grpc grpc,
-      boolean tlsEnabled,
-      ServiceRunOptions options) {
-    ControlConnection control = manager.session().controlPlaneConnection();
-    if (control == null) {
-      throw new IllegalStateException("Session control-plane client is not initialized");
-    }
-    String group = ServiceManagerImpl.requireValue(manager.resolveGroupName(), "group");
-    String region =
-        manager.session().context() == null
-            ? null
-            : Strings.trimToNull(manager.session().context().getRegion());
-    Map<String, String> attrs = new java.util.HashMap<>();
-    attrs.put("bindHost", bindHost);
-    attrs.put("bindPort", Integer.toString(bindPort));
-    attrs.put("tlsEnabled", Boolean.toString(tlsEnabled));
-    attrs.put("kerberosEnabled", Boolean.toString(ServiceManagerImpl.kerberosEnabled(grpc)));
-    addDataResources(attrs, options);
-    if (grpc.tls() != null) {
-      String tlsTermination = Strings.trimToNull(grpc.tls().termination());
-      if (tlsTermination != null) {
-        attrs.put("tlsTermination", tlsTermination);
+  private ConfigIndex loadConfigIndex(String group, String configId, boolean strictMissingParent) {
+    List<LayerEntry> allEntries = groupEntries(group);
+    Map<String, LayerEntry> allByResourceId = indexByResourceId(allEntries);
+    List<LayerEntry> scoped = new ArrayList<>();
+    for (LayerEntry entry : allEntries) {
+      if (configId.equals(entry.identity().configId())) {
+        scoped.add(entry);
       }
     }
-    if (grpc.kerberos() != null) {
-      String kerberosSpn = Strings.trimToNull(grpc.kerberos().spn());
-      if (kerberosSpn != null) {
-        attrs.put("kerberosSpn", kerberosSpn);
+    return configIndex(group, configId, scoped, allByResourceId, strictMissingParent);
+  }
+
+  private static ConfigIndex configIndex(
+      String group,
+      String configId,
+      List<LayerEntry> scoped,
+      Map<String, LayerEntry> allByResourceId,
+      boolean strictMissingParent) {
+    if (Strings.isEmpty(scoped)) {
+      throw new IllegalArgumentException("config not found: " + configId);
+    }
+    requireSingleBaseLayer(scoped, configId);
+
+    Map<String, LayerEntry> byLayerId = new LinkedHashMap<>();
+    Map<String, LayerEntry> byResourceId = new LinkedHashMap<>();
+    for (LayerEntry entry : scoped) {
+      String layerId = entry.identity().layerId();
+      LayerEntry existingLayer = byLayerId.putIfAbsent(layerId, entry);
+      if (existingLayer != null) {
+        throw chainLayerInvalid(configId, layerId, existingLayer.identity().layerId());
+      }
+      LayerEntry existingResource = byResourceId.putIfAbsent(entry.identity().resourceId(), entry);
+      if (existingResource != null) {
+        throw chainLayerInvalid(configId, layerId, existingResource.identity().layerId());
       }
     }
-    return new ServiceStatusPublisher(
-        control,
+    return new ConfigIndex(
         group,
-        ServiceManagerImpl.requireValue(serviceName, "serviceName"),
-        ServiceManagerImpl.requireValue(instanceId, "instanceId"),
-        advertiseHost,
-        advertisePort,
-        region,
-        manager.resolvedServiceHeartbeatSeconds(),
-        manager.resolvedServiceStatusSeconds(),
-        manager.resolvedServiceHeartbeatTtlSeconds(),
-        tlsEnabled,
-        null,
-        null,
-        null,
-        manager.session().context() == null
-            ? null
-            : manager.session().context().getAppName(),
-        manager.session().context() == null
-            ? null
-            : manager.session().context().getInstance(),
-        group,
-        attrs,
-        manager.session().statusScheduler());
+        configId,
+        List.copyOf(scoped),
+        Map.copyOf(byLayerId),
+        Map.copyOf(byResourceId),
+        allByResourceId == null ? Map.of() : Map.copyOf(allByResourceId),
+        strictMissingParent);
   }
 
-  static ServiceStatusPublisher createArrowStatusPublisher(
-      ServiceManagerImpl manager,
-      String serviceName,
-      String instanceId,
-      String advertiseHost,
-      int advertisePort,
-      String bindHost,
-      int bindPort,
-      DefinitionService.Arrow arrow,
-      boolean tlsEnabled,
-      ServiceRunOptions options) {
-    ControlConnection control = manager.session().controlPlaneConnection();
-    if (control == null) {
-      throw new IllegalStateException("Session control-plane client is not initialized");
+  private List<LayerEntry> groupEntries(String group) {
+    List<DefinitionConfigLayer> layers = discoveryCache.list(DefinitionConfigLayer.class, group);
+    if (Strings.isEmpty(layers)) {
+      return List.of();
     }
-    String group = ServiceManagerImpl.requireValue(manager.resolveGroupName(), "group");
-    String region =
-        manager.session().context() == null
-            ? null
-            : Strings.trimToNull(manager.session().context().getRegion());
-    Map<String, String> attrs = new java.util.HashMap<>();
-    attrs.put("bindHost", bindHost);
-    attrs.put("bindPort", Integer.toString(bindPort));
-    attrs.put("tlsEnabled", Boolean.toString(tlsEnabled));
-    attrs.put("kerberosEnabled", Boolean.toString(ServiceManagerImpl.kerberosEnabled(arrow)));
-    addDataResources(attrs, options);
-    if (arrow.tls() != null) {
-      String tlsTermination = Strings.trimToNull(arrow.tls().termination());
-      if (tlsTermination != null) {
-        attrs.put("tlsTermination", tlsTermination);
+    List<LayerEntry> entries = new ArrayList<>(layers.size());
+    for (DefinitionConfigLayer layer : layers) {
+      LayerIdentity identity = parseLayerIdentity(layer, group);
+      entries.add(new LayerEntry(layer, identity));
+    }
+    return List.copyOf(entries);
+  }
+
+  private static Map<String, LayerEntry> indexByResourceId(List<LayerEntry> allEntries) {
+    Map<String, LayerEntry> byResourceId = new LinkedHashMap<>();
+    if (allEntries == null) {
+      return byResourceId;
+    }
+    for (LayerEntry entry : allEntries) {
+      if (entry == null) {
+        continue;
+      }
+      LayerEntry existing = byResourceId.putIfAbsent(entry.identity().resourceId(), entry);
+      if (existing != null) {
+        throw new IllegalStateException("duplicate config resourceId: " + entry.identity().resourceId());
       }
     }
-    if (arrow.kerberos() != null) {
-      String kerberosSpn = Strings.trimToNull(arrow.kerberos().spn());
-      if (kerberosSpn != null) {
-        attrs.put("kerberosSpn", kerberosSpn);
+    return byResourceId;
+  }
+
+  private Chain resolveChain(ConfigIndex index, String targetLayerId) {
+    LayerEntry current = index.byLayerId().get(targetLayerId);
+    if (current == null) {
+      throw new IllegalArgumentException(
+          "layer not found for config " + index.configId() + ": " + required(targetLayerId, "layer"));
+    }
+
+    List<LayerEntry> chain = new ArrayList<>();
+    Set<String> visitedResourceIds = new LinkedHashSet<>();
+    List<String> path = new ArrayList<>();
+
+    while (current != null) {
+      String resourceId = current.identity().resourceId();
+      String layerId = current.identity().layerId();
+      if (!visitedResourceIds.add(resourceId)) {
+        path.add(layerId);
+        throw chainCycle(index.configId(), path);
       }
+      path.add(layerId);
+      chain.add(current);
+
+      String parentId = parentId(current.layer());
+      if (LAYER_BASE.equals(layerId) && parentId != null) {
+        throw chainLayerInvalid(index.configId(), layerId, parentLayerName(parentId));
+      }
+      if (parentId == null) {
+        break;
+      }
+
+      CanonicalIds.ParsedId parentParsed = parseParentCanonical(index.configId(), layerId, parentId);
+      if (!Objects.equals(index.group(), parentParsed.group())
+          || !Objects.equals(index.configId(), parentParsed.namespace())) {
+        throw chainBaseMismatch(index.configId(), parentId);
+      }
+
+      LayerEntry parent = index.byResourceId().get(parentId);
+      if (parent == null) {
+        LayerEntry crossConfig = index.allByResourceId().get(parentId);
+        if (crossConfig != null || index.strictMissingParent()) {
+          if (crossConfig != null) {
+            throw chainBaseMismatch(index.configId(), parentId);
+          }
+          throw chainParentMissing(index.configId(), parentId);
+        }
+        throw chainParentMissing(index.configId(), parentId);
+      }
+      if (Objects.equals(layerId, parent.identity().layerId())) {
+        throw chainLayerInvalid(index.configId(), layerId, parent.identity().layerId());
+      }
+      current = parent;
     }
-    return new ServiceStatusPublisher(
-        control,
-        group,
-        ServiceManagerImpl.requireValue(serviceName, "serviceName"),
-        ServiceManagerImpl.requireValue(instanceId, "instanceId"),
-        advertiseHost,
-        advertisePort,
-        region,
-        manager.resolvedServiceHeartbeatSeconds(),
-        manager.resolvedServiceStatusSeconds(),
-        manager.resolvedServiceHeartbeatTtlSeconds(),
-        tlsEnabled,
-        null,
-        null,
-        null,
-        manager.session().context() == null
-            ? null
-            : manager.session().context().getAppName(),
-        manager.session().context() == null
-            ? null
-            : manager.session().context().getInstance(),
-        group,
-        attrs,
-        manager.session().statusScheduler());
+
+    Collections.reverse(chain);
+    if (chain.isEmpty()) {
+      throw chainBaseMissing(index.configId());
+    }
+
+    LayerEntry base = chain.getFirst();
+    if (!LAYER_BASE.equals(base.identity().layerId())) {
+      throw chainBaseMissing(index.configId());
+    }
+    validateBaseCompatibility(index.configId(), base, chain.getLast());
+    validateLayerProgression(index.configId(), chain);
+    return new Chain(List.copyOf(chain));
   }
 
-  static String resolveInstanceId(
-      ServiceRunOptions options, String advertiseHost, int advertisePort) {
-    String optionInstance = options == null ? null : Strings.trimToNull(options.instanceName());
-    if (optionInstance != null) {
-      return optionInstance;
+  private static void validateBaseCompatibility(String configId, LayerEntry base, LayerEntry leaf) {
+    DefinitionConfigLayer basePayload = configPayload(base.layer(), base.identity().layerId());
+    DefinitionConfigLayer leafPayload = configPayload(leaf.layer(), leaf.identity().layerId());
+    String baseConfigType = Strings.trimToNull(basePayload.configType());
+    String leafConfigType = Strings.trimToNull(leafPayload.configType());
+    String baseSchemaKey = Strings.trimToNull(basePayload.schemaKey());
+    String leafSchemaKey = Strings.trimToNull(leafPayload.schemaKey());
+    if (!Objects.equals(baseConfigType, leafConfigType)
+        || !Objects.equals(baseSchemaKey, leafSchemaKey)) {
+      throw chainBaseMismatch(configId, base.identity().resourceId());
     }
-    String host = Strings.trimToNull(advertiseHost);
-    if (host == null) {
-      host = "host";
-    }
-    return "svc-" + host.replace('.', '-') + "-" + advertisePort;
   }
 
-  private static void addDataResources(Map<String, String> attrs, ServiceRunOptions options) {
-    if (attrs == null || options == null || Strings.isEmpty(options.datasetIds())) {
+  private static void validateLayerProgression(String configId, List<LayerEntry> chain) {
+    if (chain == null || chain.size() <= 1) {
       return;
     }
-    LinkedHashSet<String> normalized = new LinkedHashSet<>();
-    for (String value : options.datasetIds()) {
-      String datasetId = Strings.trimToNull(value);
-      if (datasetId != null) {
-        normalized.add(datasetId);
+    for (int i = 1; i < chain.size(); i++) {
+      LayerEntry parent = chain.get(i - 1);
+      LayerEntry child = chain.get(i);
+      String expectedParentId = parent.identity().resourceId();
+      String actualParentId = parentId(child.layer());
+      if (!Objects.equals(expectedParentId, actualParentId)) {
+        throw chainLayerInvalid(configId, child.identity().layerId(), parent.identity().layerId());
       }
     }
-    if (normalized.isEmpty()) {
-      return;
-    }
-    attrs.put("datasetIds", String.join(",", normalized));
-    attrs.put("datasetCount", Integer.toString(normalized.size()));
   }
+
+  private static CanonicalIds.ParsedId parseParentCanonical(
+      String configId, String layerId, String parentId) {
+    try {
+      CanonicalIds.ParsedId parent = CanonicalIds.parse(parentId);
+      if (!"config".equals(parent.type())) {
+        throw chainBaseMismatch(configId, parentId);
+      }
+      return parent;
+    } catch (IllegalStateException ex) {
+      throw ex;
+    } catch (RuntimeException ex) {
+      throw chainLayerInvalid(configId, layerId, parentId);
+    }
+  }
+
+  private static String parentLayerName(String parentId) {
+    String normalized = Strings.trimToNull(parentId);
+    if (normalized == null) {
+      return null;
+    }
+    try {
+      CanonicalIds.ParsedId parsed = CanonicalIds.parse(normalized);
+      return Strings.trimToNull(parsed.name());
+    } catch (RuntimeException ignore) {
+      return normalized;
+    }
+  }
+
+  private static IllegalStateException chainParentMissing(String configId, String parentId) {
+    return new IllegalStateException(
+        "CONFIG_CHAIN_PARENT_MISSING configId=" + safe(configId) + " parentId=" + safe(parentId));
+  }
+
+  private static IllegalStateException chainCycle(String configId, List<String> path) {
+    List<String> resolvedPath = path == null ? List.of() : List.copyOf(path);
+    return new IllegalStateException(
+        "CONFIG_CHAIN_CYCLE configId=" + safe(configId) + " path=" + resolvedPath);
+  }
+
+  private static IllegalStateException chainBaseMissing(String configId) {
+    return new IllegalStateException("CONFIG_CHAIN_BASE_MISSING configId=" + safe(configId));
+  }
+
+  private static IllegalStateException chainBaseMismatch(String configId, String baseId) {
+    return new IllegalStateException(
+        "CONFIG_CHAIN_BASE_MISMATCH configId=" + safe(configId) + " baseId=" + safe(baseId));
+  }
+
+  private static IllegalStateException chainLayerInvalid(
+      String configId, String layer, String parentLayer) {
+    return new IllegalStateException(
+        "CONFIG_CHAIN_LAYER_INVALID configId="
+            + safe(configId)
+            + " layer="
+            + safe(layer)
+            + " parentLayer="
+            + safe(parentLayer));
+  }
+
+  private static String safe(String value) {
+    String normalized = Strings.trimToNull(value);
+    return normalized == null ? "<n/a>" : normalized;
+  }
+
+  private static String required(String value, String field) {
+    String normalized = Strings.trimToNull(value);
+    if (normalized == null) {
+      throw new IllegalArgumentException(field + " is required");
+    }
+    return normalized;
+  }
+
+  private static LayerIdentity parseLayerIdentity(DefinitionConfigLayer layer, String expectedGroup) {
+    String resourceId = layerResourceId(layer);
+    if (resourceId == null) {
+      throw new IllegalStateException("config resourceId is required");
+    }
+    CanonicalIds.ParsedId parsed = CanonicalIds.parse(resourceId);
+    if (!"config".equals(parsed.type())) {
+      throw new IllegalStateException("config resourceId must be config");
+    }
+    if (!Objects.equals(expectedGroup, parsed.group())) {
+      throw new IllegalStateException(
+          "config resourceId group mismatch: expected " + expectedGroup + " but got " + parsed.group());
+    }
+    if (parsed.namespace() == null || parsed.name() == null) {
+      throw new IllegalStateException("config resourceId is incomplete: " + resourceId);
+    }
+    return new LayerIdentity(resourceId, parsed.namespace(), parsed.name());
+  }
+
+  private static void requireSingleBaseLayer(List<LayerEntry> layers, String configId) {
+    int baseCount = 0;
+    for (LayerEntry entry : layers) {
+      if (LAYER_BASE.equals(entry.identity().layerId())) {
+        baseCount++;
+      }
+    }
+    if (baseCount != 1) {
+      throw new IllegalStateException("config " + configId + " must define exactly one base layer");
+    }
+  }
+
+  private static String parseParentLayerId(
+      String configId, String layerId, String parentId, String layerResourceId) {
+    if (parentId == null) {
+      return null;
+    }
+    try {
+      CanonicalIds.ParsedId parent = CanonicalIds.parse(parentId);
+      if (!"config".equals(parent.type())) {
+        throw chainLayerInvalid(configId, layerId, parentId);
+      }
+      if (!Objects.equals(parent.namespace(), configId)) {
+        throw chainBaseMismatch(configId, parentId);
+      }
+      return parent.name();
+    } catch (IllegalStateException ex) {
+      throw ex;
+    } catch (RuntimeException ex) {
+      throw new IllegalStateException(
+          "invalid parentId for layer "
+              + safe(layerId)
+              + " resourceId="
+              + safe(layerResourceId)
+              + " parentId="
+              + safe(parentId),
+          ex);
+    }
+  }
+
+  private static String layerResourceId(DefinitionConfigLayer layer) {
+    if (layer == null) {
+      return null;
+    }
+    return Strings.trimToNull(layer.resourceId());
+  }
+
+  private static String parentId(DefinitionConfigLayer layer) {
+    if (layer == null) {
+      return null;
+    }
+    return Strings.trimToNull(layer.parentId());
+  }
+
+  private static String layerShortName(DefinitionConfigLayer layer) {
+    if (layer == null) {
+      return null;
+    }
+    return Strings.trimToNull(layer.shortName());
+  }
+
+  private static DefinitionConfigLayer configPayload(DefinitionConfigLayer layer, String layerId) {
+    if (layer == null) {
+      throw new IllegalStateException("config payload is required for layer " + safe(layerId));
+    }
+    return layer;
+  }
+
+  private static JsonNode declaredPayload(DefinitionConfigLayer layer) {
+    DefinitionConfigLayer payload = configPayload(layer, "<unknown>");
+    JsonNode declared = payload.declared();
+    if (declared == null || declared.isNull() || declared.isMissingNode()) {
+      throw new IllegalStateException("declared payload is required");
+    }
+    requireObject(declared, "declared payload", "<unknown>");
+    return declared;
+  }
+
+  private static DeclaredSelection declaredPayload(DefinitionConfigLayer layer, Instant asOf, String layerId) {
+    JsonNode baseDeclared = declaredPayload(layer);
+    requireObject(baseDeclared, "base declared", layerId);
+    if (layer == null) {
+      return new DeclaredSelection(baseDeclared, 0, 0);
+    }
+    List<DefinitionConfigLayer.Effective> schedule = layer.effective();
+    if (Strings.isEmpty(schedule)) {
+      return new DeclaredSelection(baseDeclared, 0, 0);
+    }
+    DefinitionConfigLayer.Effective winner = null;
+    Instant winnerInstant = null;
+    int activeChanges = 0;
+    int expiredChanges = 0;
+    for (DefinitionConfigLayer.Effective entry : schedule) {
+      if (entry == null) {
+        throw new IllegalArgumentException("effective entry is required for layer " + layerId);
+      }
+      String effectiveTimeUtc = entry.effectiveTimeUtc();
+      if (effectiveTimeUtc == null) {
+        throw new IllegalArgumentException("effectiveTimeUtc is required for layer " + layerId);
+      }
+      Instant effectiveInstant;
+      try {
+        effectiveInstant = Instant.parse(effectiveTimeUtc);
+      } catch (Exception ex) {
+        throw new IllegalArgumentException(
+            "invalid effectiveTimeUtc for layer " + layerId + ": " + effectiveTimeUtc, ex);
+      }
+      JsonNode declared = entry.declared();
+      if (declared == null || declared.isNull() || declared.isMissingNode()) {
+        throw new IllegalArgumentException("effective declared is required for layer " + layerId);
+      }
+      requireObject(declared, "effective declared", layerId);
+      Instant expiresAt = parseExpiresAtUtc(entry.expiresAtUtc(), layerId);
+      if (expiresAt != null && !expiresAt.isAfter(effectiveInstant)) {
+        expiredChanges++;
+        continue;
+      }
+      if (expiresAt != null && !asOf.isBefore(expiresAt)) {
+        expiredChanges++;
+        continue;
+      }
+      if (!effectiveInstant.isAfter(asOf)) {
+        activeChanges++;
+      }
+      if (!effectiveInstant.isAfter(asOf)
+          && (winnerInstant == null
+              || effectiveInstant.isAfter(winnerInstant)
+              || effectiveInstant.equals(winnerInstant))) {
+        winner = entry;
+        winnerInstant = effectiveInstant;
+      }
+    }
+    return new DeclaredSelection(
+        winner == null ? baseDeclared : winner.declared(), activeChanges, expiredChanges);
+  }
+
+  private static Instant parseExpiresAtUtc(String expiresAtUtc, String layerId) {
+    String normalized = Strings.trimToNull(expiresAtUtc);
+    if (normalized == null) {
+      return null;
+    }
+    try {
+      return Instant.parse(normalized);
+    } catch (Exception ex) {
+      throw new IllegalArgumentException(
+          "invalid expiresAtUtc for layer " + layerId + ": " + expiresAtUtc, ex);
+    }
+  }
+
+  private static void requireObject(JsonNode value, String label, String layerId) {
+    if (value == null || !value.isObject()) {
+      throw new IllegalArgumentException(label + " must be a JSON object for layer " + layerId);
+    }
+  }
+
+  private static String updatedUtc(DefinitionConfigLayer layer) {
+    DefinitionEnvelope envelope = layer == null ? null : layer.envelope();
+    return envelope == null ? null : Strings.trimToNull(envelope.updatedTimeUtc());
+  }
+
+  private static String maxUpdatedUtc(String left, String right) {
+    if (Strings.trimToNull(left) == null) {
+      return Strings.trimToNull(right);
+    }
+    if (Strings.trimToNull(right) == null) {
+      return Strings.trimToNull(left);
+    }
+    long leftEpoch = parseEpochMillis(left);
+    long rightEpoch = parseEpochMillis(right);
+    if (rightEpoch > leftEpoch) {
+      return right;
+    }
+    if (rightEpoch < leftEpoch) {
+      return left;
+    }
+    return Comparator.nullsLast(String::compareTo).compare(right, left) > 0 ? right : left;
+  }
+
+  private static long parseEpochMillis(String value) {
+    String normalized = Strings.trimToNull(value);
+    if (normalized == null) {
+      return 0L;
+    }
+    try {
+      return Instant.parse(normalized).toEpochMilli();
+    } catch (Exception ignore) {
+      return 0L;
+    }
+  }
+
+  private static JsonNode merge(
+      JsonNode base,
+      JsonNode override,
+      String path,
+      String sourceLayerId,
+      Map<String, String> sources) {
+    if (override == null || override.isNull() || override.isMissingNode()) {
+      return copy(base);
+    }
+    if (base == null || base.isNull() || base.isMissingNode()) {
+      if (Strings.trimToNull(path) != null) {
+        sources.put(path, sourceLayerId);
+      }
+      return copy(override);
+    }
+    if (base.isObject() && override.isObject()) {
+      ObjectNode merged = ((ObjectNode) base).deepCopy();
+      override
+          .fields()
+          .forEachRemaining(
+              entry -> {
+                String field = entry.getKey();
+                JsonNode overrideValue = entry.getValue();
+                JsonNode baseValue = merged.get(field);
+                String childPath = appendPath(path, field);
+                if (baseValue != null
+                    && baseValue.isObject()
+                    && overrideValue != null
+                    && overrideValue.isObject()) {
+                  sources.put(childPath, sourceLayerId);
+                  merged.set(field, merge(baseValue, overrideValue, childPath, sourceLayerId, sources));
+                } else {
+                  merged.set(field, copy(overrideValue));
+                  sources.put(childPath, sourceLayerId);
+                }
+              });
+      return merged;
+    }
+    if (Strings.trimToNull(path) != null) {
+      sources.put(path, sourceLayerId);
+    }
+    return copy(override);
+  }
+
+  private static String appendPath(String path, String field) {
+    String normalizedField = Strings.trimToEmpty(field);
+    if (Strings.trimToNull(path) == null) {
+      return normalizedField;
+    }
+    return path + "." + normalizedField;
+  }
+
+  private static JsonNode copy(JsonNode node) {
+    return node == null ? null : node.deepCopy();
+  }
+
+  private record LayerIdentity(String resourceId, String configId, String layerId) {}
+
+  private record LayerEntry(DefinitionConfigLayer layer, LayerIdentity identity) {}
+
+  private record DeclaredSelection(JsonNode declared, int activeChanges, int expiredChanges) {}
+
+  private record ResolvedNode(LayerEntry entry, String payloadHash) {}
+
+  private record Chain(List<LayerEntry> entries) {}
+
+  private record ConfigIndex(
+      String group,
+      String configId,
+      List<LayerEntry> scopedLayers,
+      Map<String, LayerEntry> byLayerId,
+      Map<String, LayerEntry> byResourceId,
+      Map<String, LayerEntry> allByResourceId,
+      boolean strictMissingParent) {}
 }
 
