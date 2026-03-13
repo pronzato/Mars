@@ -1,469 +1,440 @@
-package org.pronzato.fabric.api.control.entitlements.simple.data;
+package org.pronzato.fabric.api.control.security.identity;
 
-import java.util.List;
-import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
-import java.util.Locale;
+import java.util.Optional;
+import java.util.function.Supplier;
 import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
-import org.pronzato.fabric.api.control.discovery.CanonicalIds;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEntitlement;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
-import org.pronzato.fabric.api.control.entitlements.core.EntitlementsAction;
-import org.pronzato.fabric.api.control.entitlements.core.EntitlementObligations;
-import org.pronzato.fabric.api.control.entitlements.core.EntitlementsScopeType;
-import org.pronzato.fabric.api.control.entitlements.core.data.DataEntitlements;
-import org.pronzato.fabric.api.control.entitlements.provider.DefaultEntitlementProviderRegistry;
-import org.pronzato.fabric.api.control.entitlements.provider.EntitlementProviderRegistry;
-import org.pronzato.fabric.api.control.entitlements.provider.EntitlementSubjectCandidates;
-import org.pronzato.fabric.api.control.entitlements.provider.EntitlementProviderSelector;
-import org.pronzato.fabric.api.control.entitlements.provider.EntitlementSubjectProvider;
-import org.pronzato.fabric.api.control.entitlements.provider.ResolveRequest;
-import org.pronzato.fabric.api.control.entitlements.provider.SubjectContext;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionApp;
+import org.pronzato.fabric.api.control.security.UserContext;
+import org.pronzato.fabric.api.control.security.UserPrincipal;
+import org.pronzato.fabric.api.control.security.headers.FabricRequestHeaders;
+import org.pronzato.fabric.api.util.Strings;
 
-public final class DataEntitlementsSimple implements DataEntitlements {
-  private static final Logger LOGGER = LoggerFactory.getLogger(DataEntitlementsSimple.class);
+public final class RequestIdentityResolver {
+  private static final String USER_PREFIX = "user:";
+  private static final String APP_PREFIX = "app:";
 
-  // Canonical, deterministic action strings derived from the shared enum.
-  // (Works for any enum-based EntitlementsAction.)
-  private static final String READ_ACTION =
-      EntitlementsAction.READ.name().toLowerCase(Locale.ROOT);
-  private static final String WRITE_ACTION =
-      EntitlementsAction.WRITE.name().toLowerCase(Locale.ROOT);
+  private RequestIdentityResolver() {}
 
-  private final DiscoveryCache DiscoveryCache;
-  private final String sessionGroup;
-  private final EntitlementProviderSelector providerSelector;
+  public static RequestIdentity resolve(
+      FabricRequestHeaders headers, DiscoveryCache DiscoveryCache, String runtimeEnvironment) {
+    Objects.requireNonNull(headers, "headers");
 
-  public DataEntitlementsSimple(DiscoveryCache DiscoveryCache, String sessionGroup) {
-    this(
-        DiscoveryCache,
-        sessionGroup,
-        new DefaultEntitlementProviderRegistry(DiscoveryCache));
+    String rawObo = Strings.trimToNull(headers.oboUser());
+    CallerAppIdentity requestCallerApp = normalizeCallerApp(headers.callerApp());
+    String authenticatedSubject =
+        normalizeAuthenticatedPrincipal(headers.authenticatedPrincipal(), requestCallerApp, rawObo);
+
+    if (authenticatedSubject == null) {
+      throw failure(
+          Code.UNAUTHENTICATED,
+          OboDenyRule.OBO_PRESENT_BUT_NOT_AUTHENTICATED,
+          requestCallerApp,
+          rawObo);
+    }
+
+    String normalizedObo = null;
+    String effectiveUserSubject = authenticatedSubject;
+    CallerAppIdentity resolvedCallerApp = mergeCallerAppForContext(requestCallerApp, authenticatedSubject);
+    if (rawObo != null) {
+      if (!requestCallerApp.isPresent()) {
+        throw failure(
+            Code.PERMISSION_DENIED,
+            OboDenyRule.OBO_CALLER_APP_HEADERS_REQUIRED,
+            requestCallerApp,
+            rawObo);
+      }
+      resolvedCallerApp = requestCallerApp;
+      DefinitionApp callerDefinition = requireCallerAppDefinition(DiscoveryCache, resolvedCallerApp, rawObo);
+      Config config = Config.from(callerDefinition, runtimeEnvironment, headers.requestMetadata().env());
+
+      if (!config.delegatedUserEnabled()) {
+        throw failure(
+            Code.PERMISSION_DENIED, OboDenyRule.OBO_DISABLED_FOR_APP, resolvedCallerApp, rawObo);
+      }
+
+      normalizedObo =
+          normalizeOboUser(
+              rawObo,
+              false,
+              true,
+              resolvedCallerApp,
+              rawObo);
+      effectiveUserSubject = normalizedObo;
+    }
+
+    return new RequestIdentity(
+        effectiveUserSubject,
+        callerAppSubject(resolvedCallerApp),
+        headers.requestMetadata().requestId(),
+        headers.requestMetadata().traceId(),
+        normalizedObo);
   }
 
-  public DataEntitlementsSimple(
-      DiscoveryCache DiscoveryCache, String sessionGroup, EntitlementSubjectProvider provider) {
-    this(DiscoveryCache, sessionGroup, new DefaultEntitlementProviderRegistry(provider));
-  }
-
-  public DataEntitlementsSimple(
-      DiscoveryCache DiscoveryCache, String sessionGroup, EntitlementProviderRegistry providerRegistry) {
-    this(
-        DiscoveryCache,
-        sessionGroup,
-        providerRegistry,
-        new EntitlementProviderSelector(DiscoveryCache, providerRegistry));
-  }
-
-  public DataEntitlementsSimple(
-      DiscoveryCache DiscoveryCache,
-      String sessionGroup,
-      EntitlementProviderRegistry providerRegistry,
-      EntitlementProviderSelector providerSelector) {
-    this.DiscoveryCache = Objects.requireNonNull(DiscoveryCache, "DiscoveryCache");
-    this.sessionGroup = sessionGroup;
-    Objects.requireNonNull(providerRegistry, "providerRegistry");
-    this.providerSelector = Objects.requireNonNull(providerSelector, "providerSelector");
-  }
-
-  @Override
-  public Decision authorizeRead(Identity identity, String datasetCanonicalId) {
-    return authorize(identity, datasetCanonicalId, READ_ACTION);
-  }
-
-  @Override
-  public Decision authorizeWrite(Identity identity, String datasetCanonicalId) {
-    return authorize(identity, datasetCanonicalId, WRITE_ACTION);
-  }
-
-  private Decision authorize(Identity identity, String datasetCanonicalId, String requestedAction) {
-    String datasetId = DataEntitlements.requireDatasetResourceId(datasetCanonicalId);
-    String datasetGroup = CanonicalIds.parse(datasetId).group();
-    String namespaceId = namespaceResourceId(datasetId);
-
-    String subject = DataEntitlements.subject(identity);
-
-    // Direct subject match only (exact). No normalization here.
-    Set<String> subjectCandidates = directSubjectCandidates(subject);
-
-    SubjectContext subjectContext;
+  public static <T> T callAsRequestIdentity(RequestIdentity identity, Supplier<T> action) {
+    Objects.requireNonNull(identity, "identity");
+    Objects.requireNonNull(action, "action");
+    UserPrincipal previousUser = UserContext.get().orElse(null);
+    CallerAppContext.ContextValue previousCallerApp = CallerAppContext.get().orElse(null);
+    UserContext.set(new UserPrincipal(identity.effectiveUserSubject(), Map.of()));
+    CallerAppContext.set(identity);
     try {
-      EntitlementProviderSelector.Selection selectedProvider =
-          providerSelector.select(EntitlementsScopeType.DATASET, datasetId);
-      subjectContext =
-          selectedProvider.provider().resolve(
-              new ResolveRequest(
-                  identity.subject(),
-                  identity.delegatedSubject(),
-                  EntitlementsScopeType.DATASET.name(),
-                  datasetId,
-                  Map.of()));
-    } catch (RuntimeException ex) {
-      return new Decision(false, "DENIED SUBJECT_PROVIDER_UNAVAILABLE: " + safeReason(ex), null);
+      return action.get();
+    } finally {
+      if (previousUser == null) {
+        UserContext.clear();
+      } else {
+        UserContext.set(previousUser);
+      }
+      if (previousCallerApp == null) {
+        CallerAppContext.clear();
+      } else {
+        CallerAppContext.set(previousCallerApp);
+      }
     }
-    Set<String> membershipCandidates =
-        EntitlementSubjectCandidates.membershipSubjectCandidates(subjectContext.subjectId());
-    Set<String> groups = subjectContext.effectiveGroups();
-
-    List<DefinitionEntitlement> entitlements = DiscoveryCache.list(DefinitionEntitlement.class);
-
-    // 1) Dataset scope is authoritative if present.
-    ScopeEvaluation datasetScope =
-        evaluateScope(
-            entitlements, datasetId, subjectCandidates, groups, requestedAction, true, datasetGroup);
-    if (datasetScope.exists()) {
-      if (datasetScope.deny()) {
-        boolean namespacePolicyExists = scopeExists(entitlements, namespaceId, false, datasetGroup);
-        logDeny(
-            subject,
-            membershipCandidates.size(),
-            datasetId,
-            true,
-            namespacePolicyExists,
-            "explicit_deny");
-        return new Decision(false, "DENY matched rules", null);
-      }
-      if (datasetScope.allow()) {
-        return new Decision(true, "ALLOW matched rules", null, datasetScope.obligations());
-      }
-      boolean namespacePolicyExists = scopeExists(entitlements, namespaceId, false, datasetGroup);
-      logDeny(
-          subject,
-          membershipCandidates.size(),
-          datasetId,
-          true,
-          namespacePolicyExists,
-          "no_matching_binding");
-      return new Decision(false, "DENIED no matching policy", null);
-    }
-
-    // 2) Namespace scope fallback only if dataset scope does not exist.
-    ScopeEvaluation namespaceScope =
-        evaluateScope(
-            entitlements, namespaceId, subjectCandidates, groups, requestedAction, false, datasetGroup);
-    if (namespaceScope.exists()) {
-      if (namespaceScope.deny()) {
-        logDeny(subject, membershipCandidates.size(), datasetId, false, true, "explicit_deny");
-        return new Decision(false, "DENY matched rules", null);
-      }
-      if (namespaceScope.allow()) {
-        return new Decision(true, "ALLOW matched rules", null, namespaceScope.obligations());
-      }
-      logDeny(subject, membershipCandidates.size(), datasetId, false, true, "no_matching_binding");
-      return new Decision(false, "DENIED no matching policy", null);
-    }
-
-    // 3) No policy -> deny.
-    logDeny(subject, membershipCandidates.size(), datasetId, false, false, "no_policy");
-    return new Decision(false, "DENIED no matching policy", null);
   }
 
-  private ScopeEvaluation evaluateScope(
-      List<DefinitionEntitlement> entitlements,
-      String scopeId,
-      Set<String> subjectCandidates,
-      Set<String> groups,
-      String requestedAction,
-      boolean datasetScope,
-      String datasetGroup) {
-    boolean exists = false;
-    boolean deny = false;
-    boolean allow = false;
-    EntitlementObligations allowObligations = EntitlementObligations.empty();
-    boolean allowObligationsChosen = false;
-
-    for (DefinitionEntitlement entitlement : entitlements) {
-      if (!enabled(entitlement == null || entitlement.envelope() == null
-          ? null
-          : entitlement.envelope().enabled())) {
-        continue;
-      }
-      if (!isInScope(entitlement == null ? null : entitlement.envelope(), datasetGroup)) {
-        continue;
-      }
-
-      String canonicalScopeId =
-          datasetScope
-              ? canonicalDatasetScopeId(entitlement == null ? null : entitlement.scopeId())
-              : canonicalNamespaceScopeId(entitlement == null ? null : entitlement.scopeId());
-
-      if (!scopeId.equals(canonicalScopeId)) {
-        continue;
-      }
-
-      exists = true;
-
-      RuleMatch match =
-          matchRules(entitlement.policies(), subjectCandidates, groups, requestedAction);
-
-      deny = deny || match.deny();
-      allow = allow || match.allow();
-      if (!allowObligationsChosen && match.allow()) {
-        allowObligations = match.allowObligations();
-        allowObligationsChosen = true;
-      }
-    }
-
-    return new ScopeEvaluation(exists, allow, deny, allowObligations);
+  public static void runAsRequestIdentity(RequestIdentity identity, Runnable action) {
+    callAsRequestIdentity(
+        identity,
+        () -> {
+          action.run();
+          return null;
+        });
   }
 
-  private boolean scopeExists(
-      List<DefinitionEntitlement> entitlements,
-      String scopeId,
-      boolean datasetScope,
-      String datasetGroup) {
-    for (DefinitionEntitlement entitlement : entitlements) {
-      if (!enabled(entitlement == null || entitlement.envelope() == null
-          ? null
-          : entitlement.envelope().enabled())) {
-        continue;
-      }
-      if (!isInScope(entitlement == null ? null : entitlement.envelope(), datasetGroup)) {
-        continue;
-      }
-      String canonicalScopeId =
-          datasetScope
-              ? canonicalDatasetScopeId(entitlement == null ? null : entitlement.scopeId())
-              : canonicalNamespaceScopeId(entitlement == null ? null : entitlement.scopeId());
-      if (scopeId.equals(canonicalScopeId)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private RuleMatch matchRules(
-      List<DefinitionEntitlement.PolicyDocument> policies,
-      Set<String> subjectCandidates,
-      Set<String> groups,
-      String requestedAction) {
-    if (policies == null || policies.isEmpty()) {
-      return RuleMatch.NONE;
-    }
-
-    boolean deny = false;
-    boolean allow = false;
-    EntitlementObligations allowObligations = EntitlementObligations.empty();
-    boolean allowObligationsChosen = false;
-
-    for (DefinitionEntitlement.PolicyDocument policy : policies) {
-      if (policy == null || !enabled(policy.enabled()) || policy.bindings() == null) {
-        continue;
-      }
-      for (DefinitionEntitlement.PolicyBinding binding : policy.bindings()) {
-        if (binding == null || !enabled(binding.enabled())) {
-          continue;
-        }
-
-        String bindingAction = requireSupportedAction(binding.action(), policy.policyId());
-
-        // Action-specific evaluation (read evaluates read only, write evaluates write only)
-        if (!Objects.equals(requestedAction, bindingAction)) {
-          continue;
-        }
-
-        if (!matchesSubject(binding.subject(), subjectCandidates, groups)) {
-          continue;
-        }
-
-        if ("DENY".equalsIgnoreCase(binding.effect())) {
-          deny = true;
-        } else if ("ALLOW".equalsIgnoreCase(binding.effect())) {
-          allow = true;
-          if (!allowObligationsChosen) {
-            allowObligations = parseObligations(binding.obligations());
-            allowObligationsChosen = true;
-          }
-        }
-      }
-    }
-
-    return new RuleMatch(allow, deny, allowObligations);
-  }
-
-  private static EntitlementObligations parseObligations(DefinitionEntitlement.ObligationSet obligationSet) {
-    if (obligationSet == null) {
-      return EntitlementObligations.empty();
-    }
-
-    List<String> rowFilters =
-        copyRowFilterExpressions(obligationSet.rowFilters());
-    List<String> columnsAllow = copyStrings(obligationSet.columnsAllow());
-    Map<String, String> columnsMask = copyColumnMasks(obligationSet.columnsMask());
-
-    return new EntitlementObligations(rowFilters, columnsAllow, columnsMask);
-  }
-
-  private static List<String> copyRowFilterExpressions(List<DefinitionEntitlement.RowFilter> rowFilters) {
-    if (rowFilters == null || rowFilters.isEmpty()) {
-      return List.of();
-    }
-    List<String> copied = new java.util.ArrayList<>(rowFilters.size());
-    for (DefinitionEntitlement.RowFilter rowFilter : rowFilters) {
-      copied.add(rowFilter == null ? null : rowFilter.expression());
-    }
-    return copied;
-  }
-
-  private static List<String> copyStrings(List<String> values) {
-    if (values == null || values.isEmpty()) {
-      return List.of();
-    }
-    return new java.util.ArrayList<>(values);
-  }
-
-  private static Map<String, String> copyColumnMasks(List<DefinitionEntitlement.ColumnMask> columnMasks) {
-    if (columnMasks == null || columnMasks.isEmpty()) {
-      return Map.of();
-    }
-    LinkedHashMap<String, String> copied = new LinkedHashMap<>();
-    for (DefinitionEntitlement.ColumnMask columnMask : columnMasks) {
-      if (columnMask == null) {
-        copied.put(null, null);
-        continue;
-      }
-      String value = columnMask.replacement();
-      if (value == null) {
-        value = columnMask.strategy();
-      }
-      copied.put(columnMask.column(), value);
-    }
-    return copied;
-  }
-
-  private boolean isInScope(DefinitionEnvelope envelope, String datasetGroup) {
-    return envelope != null && trimToNull(envelope.group()) != null;
-  }
-
-  private static String namespaceResourceId(String datasetResourceId) {
-    CanonicalIds.ParsedId parsed = CanonicalIds.parse(datasetResourceId);
-    // canonical namespace id
-    return EntitlementsScopeType.NAMESPACE.name().toLowerCase(Locale.ROOT)
-        + ":"
-        + parsed.group()
-        + "/"
-        + parsed.namespace();
-  }
-
-  private static String canonicalDatasetScopeId(String scopeId) {
-    if (scopeId == null) {
+  private static String normalizeAuthenticatedPrincipal(
+      String principal, CallerAppIdentity callerApp, String rawObo) {
+    String candidate = Strings.trimToNull(principal);
+    if (candidate == null) {
       return null;
     }
-    try {
-      return DataEntitlements.requireDatasetResourceId(scopeId);
-    } catch (RuntimeException ex) {
-      return null;
+    if (startsWithIgnoreCase(candidate, USER_PREFIX)) {
+      String userId = normalizeUserId(candidate.substring(USER_PREFIX.length()));
+      if (userId == null) {
+        throw failure(
+            Code.PERMISSION_DENIED, OboDenyRule.OBO_REQUIRES_APP_SUBJECT, callerApp, rawObo);
+      }
+      return USER_PREFIX + userId;
     }
+    if (startsWithIgnoreCase(candidate, APP_PREFIX)) {
+      String appId = normalizeAppId(candidate.substring(APP_PREFIX.length()));
+      if (appId == null) {
+        throw failure(
+            Code.PERMISSION_DENIED, OboDenyRule.OBO_REQUIRES_APP_SUBJECT, callerApp, rawObo);
+      }
+      return APP_PREFIX + appId;
+    }
+
+    String withoutRealm = stripRealm(candidate);
+    String asApp = normalizeAppId(withoutRealm);
+    if (asApp != null) {
+      return APP_PREFIX + asApp;
+    }
+    String userId = normalizeUserId(candidate);
+    if (userId == null) {
+      throw failure(
+          Code.PERMISSION_DENIED, OboDenyRule.OBO_REQUIRES_APP_SUBJECT, callerApp, rawObo);
+    }
+    return USER_PREFIX + userId;
   }
 
-  private static String canonicalNamespaceScopeId(String scopeId) {
-    if (scopeId == null) {
+  private static String normalizeOboUser(
+      String rawObo,
+      boolean requireCanonicalUser,
+      boolean allowRawUsernameInDev,
+      CallerAppIdentity callerApp,
+      String originalObo) {
+    String candidate = Strings.trimToNull(rawObo);
+    if (candidate == null) {
+      throw failure(
+          Code.PERMISSION_DENIED,
+          OboDenyRule.OBO_CANONICAL_REQUIRED,
+          callerApp,
+          originalObo);
+    }
+
+    if (startsWithIgnoreCase(candidate, USER_PREFIX)) {
+      String userId = normalizeUserId(candidate.substring(USER_PREFIX.length()));
+      if (userId == null) {
+        throw failure(
+            Code.PERMISSION_DENIED,
+            OboDenyRule.OBO_CANONICAL_REQUIRED,
+            callerApp,
+            originalObo);
+      }
+      return USER_PREFIX + userId;
+    }
+
+    if (requireCanonicalUser) {
+      throw failure(
+          Code.PERMISSION_DENIED,
+          OboDenyRule.OBO_CANONICAL_REQUIRED,
+          callerApp,
+          originalObo);
+    }
+    if (!allowRawUsernameInDev) {
+      throw failure(
+          Code.PERMISSION_DENIED,
+          OboDenyRule.OBO_RAW_USERNAME_DISALLOWED,
+          callerApp,
+          originalObo);
+    }
+    String userId = normalizeUserId(candidate);
+    if (userId == null) {
+      throw failure(
+          Code.PERMISSION_DENIED,
+          OboDenyRule.OBO_CANONICAL_REQUIRED,
+          callerApp,
+          originalObo);
+    }
+    return USER_PREFIX + userId;
+  }
+
+  private static CallerAppIdentity normalizeCallerApp(CallerAppIdentity callerApp) {
+    if (callerApp == null) {
+      return new CallerAppIdentity(null, null, null);
+    }
+    return new CallerAppIdentity(callerApp.group(), callerApp.name(), callerApp.instance());
+  }
+
+  private static CallerAppIdentity mergeCallerAppForContext(
+      CallerAppIdentity requestCallerApp, String authenticatedSubject) {
+    if (requestCallerApp != null && requestCallerApp.isPresent()) {
+      return requestCallerApp;
+    }
+    CallerAppIdentity authenticatedCaller = callerAppFromAppSubject(authenticatedSubject);
+    if (authenticatedCaller != null && authenticatedCaller.isPresent()) {
+      return authenticatedCaller;
+    }
+    return requestCallerApp == null ? new CallerAppIdentity(null, null, null) : requestCallerApp;
+  }
+
+  private static CallerAppIdentity callerAppFromAppSubject(String subject) {
+    String normalized = Strings.trimToNull(subject);
+    if (normalized == null || !startsWithIgnoreCase(normalized, APP_PREFIX)) {
       return null;
     }
-    try {
-      CanonicalIds.ParsedId parsed = CanonicalIds.parse(scopeId);
-      if (!parsed.isNamespace()) {
+    String appId = normalizeAppId(normalized.substring(APP_PREFIX.length()));
+    if (appId == null) {
+      return null;
+    }
+    int delimiter = appId.indexOf('/');
+    if (delimiter <= 0 || delimiter >= appId.length() - 1) {
+      return null;
+    }
+    return new CallerAppIdentity(appId.substring(0, delimiter), appId.substring(delimiter + 1), null);
+  }
+
+  private static String callerAppSubject(CallerAppIdentity callerApp) {
+    if (callerApp == null || !callerApp.isPresent()) {
+      return null;
+    }
+    return callerApp.asSubject();
+  }
+
+  private static DefinitionApp requireCallerAppDefinition(
+      DiscoveryCache DiscoveryCache, CallerAppIdentity callerApp, String rawObo) {
+    if (callerApp == null || !callerApp.isPresent()) {
+      throw failure(
+          Code.PERMISSION_DENIED,
+          OboDenyRule.OBO_CALLER_APP_HEADERS_REQUIRED,
+          callerApp,
+          rawObo);
+    }
+    if (DiscoveryCache == null) {
+      throw failure(
+          Code.PERMISSION_DENIED, OboDenyRule.OBO_APP_DEFINITION_MISSING, callerApp, rawObo);
+    }
+    Optional<DefinitionApp> definition =
+        DiscoveryCache.get(DefinitionApp.class, callerApp.group(), callerApp.name());
+    if (definition.isEmpty()) {
+      throw failure(
+          Code.PERMISSION_DENIED, OboDenyRule.OBO_APP_DEFINITION_MISSING, callerApp, rawObo);
+    }
+    return definition.get();
+  }
+
+  private static String normalizeUserId(String value) {
+    String candidate = Strings.trimToNull(value);
+    if (candidate == null) {
+      return null;
+    }
+    int slash = candidate.lastIndexOf('\\');
+    if (slash >= 0 && slash < candidate.length() - 1) {
+      candidate = candidate.substring(slash + 1);
+    }
+    candidate = stripRealm(candidate);
+    candidate = Strings.trimToNull(candidate);
+    if (candidate == null) {
+      return null;
+    }
+    if (candidate.contains("/") || candidate.contains(":")) {
+      return null;
+    }
+    for (int i = 0; i < candidate.length(); i++) {
+      if (Character.isWhitespace(candidate.charAt(i))) {
         return null;
       }
-      return parsed.canonical();
-    } catch (RuntimeException ex) {
+    }
+    return candidate;
+  }
+
+  private static String stripRealm(String value) {
+    String candidate = Strings.trimToNull(value);
+    if (candidate == null) {
       return null;
     }
-  }
-
-  private static void logDeny(
-      String subject,
-      int membershipCandidatesCount,
-      String datasetId,
-      boolean datasetPolicyExists,
-      boolean namespacePolicyExists,
-      String reason) {
-    LOGGER.info("[DataEntitlements][DENY] subject={} membershipCandidates={} datasetId={} datasetPolicyExists={} namespacePolicyExists={} reason={}", subject, membershipCandidatesCount, datasetId, datasetPolicyExists, namespacePolicyExists, reason);
-  }
-
-  private static Set<String> directSubjectCandidates(String subject) {
-    String normalized = trimToNull(subject);
-    if (normalized == null) {
-      return Set.of();
+    int realm = candidate.indexOf('@');
+    if (realm > 0) {
+      return candidate.substring(0, realm);
     }
-    return Set.of(normalized);
+    return candidate;
   }
 
-  private static String requireSupportedAction(String action, String policyId) {
-    // Allow only READ/WRITE actions from the canonical EntitlementsAction enum.
-    if (Objects.equals(action, READ_ACTION) || Objects.equals(action, WRITE_ACTION)) {
-      return action;
+  private static String normalizeAppId(String value) {
+    String candidate = Strings.trimToNull(value);
+    if (candidate == null) {
+      return null;
     }
-    String renderedAction = action == null ? "<null>" : action;
-    String renderedPolicyId = policyId == null ? "<null>" : policyId;
-    throw new IllegalStateException(
-        "Unsupported dataset entitlement action '"
-            + renderedAction
-            + "' in policy "
-            + renderedPolicyId
-            + "; allowed actions are 'read' and 'write'");
+    if (candidate.startsWith("/") || candidate.endsWith("/")) {
+      return null;
+    }
+    int firstSlash = candidate.indexOf('/');
+    if (firstSlash <= 0 || firstSlash >= candidate.length() - 1) {
+      return null;
+    }
+    int secondSlash = candidate.indexOf('/', firstSlash + 1);
+    if (secondSlash >= 0) {
+      return null;
+    }
+    String group = candidate.substring(0, firstSlash).trim();
+    String app = candidate.substring(firstSlash + 1).trim();
+    if (group.isEmpty() || app.isEmpty()) {
+      return null;
+    }
+    if (!isSimpleToken(group) || !isSimpleToken(app)) {
+      return null;
+    }
+    return group + "/" + app;
   }
 
-  private static boolean matchesSubject(String bindingSubject, Set<String> subjectCandidates, Set<String> groups) {
-    String normalized = trimToNull(bindingSubject);
-    if (normalized == null) {
+  private static boolean isSimpleToken(String token) {
+    if (token == null || token.isBlank()) {
       return false;
     }
-
-    if (normalized.startsWith("group:")) {
-      String normalizedGroup = normalizeGroup(normalized);
-      for (String group : groups) {
-        if (Objects.equals(normalizedGroup, normalizeGroup(group))) {
-          return true;
-        }
+    for (int i = 0; i < token.length(); i++) {
+      char ch = token.charAt(i);
+      boolean ok =
+          (ch >= 'a' && ch <= 'z')
+              || (ch >= 'A' && ch <= 'Z')
+              || (ch >= '0' && ch <= '9')
+              || ch == '-'
+              || ch == '_'
+              || ch == '.';
+      if (!ok) {
+        return false;
       }
+    }
+    return true;
+  }
+
+  private static boolean startsWithIgnoreCase(String value, String prefix) {
+    if (value == null || prefix == null || value.length() < prefix.length()) {
       return false;
     }
-
-    return subjectCandidates.contains(normalized);
+    return value.substring(0, prefix.length()).toLowerCase(Locale.ROOT)
+        .equals(prefix.toLowerCase(Locale.ROOT));
   }
 
-  private static String normalizeGroup(String value) {
-    String normalized = trimToNull(value);
-    if (normalized == null) {
-      return null;
+  private static ResolutionException failure(
+      Code code, OboDenyRule rule, CallerAppIdentity callerApp, String oboUser) {
+    return new ResolutionException(
+        code,
+        "OBO_DENIED rule="
+            + Objects.requireNonNull(rule, "rule").name()
+            + " caller="
+            + callerAppToken(callerApp)
+            + " obo="
+            + oboToken(oboUser));
+  }
+
+  private static String callerAppToken(CallerAppIdentity callerApp) {
+    if (callerApp == null || !callerApp.isPresent()) {
+      return "<none>";
     }
-    if (normalized.startsWith("group:") && normalized.length() > "group:".length()) {
-      return normalized.substring("group:".length());
+    return callerApp.asSubject();
+  }
+
+  private static String oboToken(String oboUser) {
+    String normalized = Strings.trimToNull(oboUser);
+    return normalized == null ? "<none>" : normalized;
+  }
+
+  private enum OboDenyRule {
+    OBO_PRESENT_BUT_NOT_AUTHENTICATED,
+    OBO_CALLER_APP_HEADERS_REQUIRED,
+    OBO_REQUIRES_APP_SUBJECT,
+    OBO_APP_DEFINITION_MISSING,
+    OBO_DISABLED_FOR_APP,
+    OBO_CANONICAL_REQUIRED,
+    OBO_RAW_USERNAME_DISALLOWED,
+    OBO_UNTRUSTED_HEADERS
+  }
+
+  public enum Code {
+    UNAUTHENTICATED,
+    PERMISSION_DENIED
+  }
+
+  public static final class ResolutionException extends RuntimeException {
+    private final Code code;
+
+    public ResolutionException(Code code, String message) {
+      super(message);
+      this.code = Objects.requireNonNull(code, "code");
     }
-    return normalized;
-  }
 
-  private static boolean enabled(Boolean value) {
-    return value == null || value.booleanValue();
-  }
-
-  private static String trimToNull(String value) {
-    if (value == null) {
-      return null;
+    public Code code() {
+      return code;
     }
-    String normalized = value.trim();
-    return normalized.isEmpty() ? null : normalized;
   }
 
-  private static String safeReason(RuntimeException error) {
-    if (error == null) {
-      return "unknown";
+  public record Config(
+      boolean delegatedUserEnabled,
+      boolean delegatedUserRequireCanonical,
+      boolean delegatedUserAllowRawUsernameInDev,
+      boolean delegatedUserTrustUserHeaders,
+      boolean devEnvironment) {
+    public static Config from(
+        DefinitionApp appDefinition, String runtimeEnvironment, String requestEnvironment) {
+      String effectiveEnvironment = Strings.firstNonBlank(runtimeEnvironment, requestEnvironment);
+      boolean dev = isDevEnvironment(effectiveEnvironment);
+      boolean enabled =
+          appDefinition != null && Boolean.TRUE.equals(appDefinition.delegatedUserEnabled());
+      boolean requireCanonical =
+          appDefinition == null || appDefinition.delegatedUserRequireCanonical() == null
+              ? true
+              : appDefinition.delegatedUserRequireCanonical();
+      boolean allowRawDev =
+          appDefinition != null
+              && Boolean.TRUE.equals(appDefinition.delegatedUserAllowRawUsernameInDev());
+      boolean trustHeaders =
+          appDefinition != null && Boolean.TRUE.equals(appDefinition.delegatedUserTrustUserHeaders());
+      return new Config(enabled, requireCanonical, allowRawDev, trustHeaders, dev);
     }
-    String message = trimToNull(error.getMessage());
-    return message == null ? error.getClass().getSimpleName() : message;
-  }
 
-  private record ScopeEvaluation(
-      boolean exists, boolean allow, boolean deny, EntitlementObligations obligations) {}
-
-  private record RuleMatch(boolean allow, boolean deny, EntitlementObligations allowObligations) {
-    private static final RuleMatch NONE =
-        new RuleMatch(false, false, EntitlementObligations.empty());
+    private static boolean isDevEnvironment(String value) {
+      String normalized = Strings.trimToNull(value);
+      if (normalized == null) {
+        return false;
+      }
+      return normalized.equalsIgnoreCase("dev")
+          || normalized.equalsIgnoreCase("local")
+          || normalized.equalsIgnoreCase("localhost");
+    }
   }
 }
 
