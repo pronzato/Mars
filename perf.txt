@@ -1,1059 +1,1058 @@
-package org.pronzato.fabric.api.streams.manager;
+package org.pronzato.fabric.api.connections.manager;
 
-import com.crankuptheamps.client.Message;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import java.nio.charset.StandardCharsets;
-import java.time.Instant;
+import com.crankuptheamps.client.HAClient;
+import java.io.IOException;
+import java.io.InputStream;
+import java.lang.reflect.Method;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.http.HttpClient;
+import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
-import org.pronzato.fabric.api.Fabric;
 import org.pronzato.fabric.api.connections.ConnectionManager;
 import org.pronzato.fabric.api.connections.ConnectionOptions;
+import org.pronzato.fabric.api.connectors.amps.AmpsConfig;
 import org.pronzato.fabric.api.connectors.amps.AmpsConnection;
-import org.pronzato.fabric.api.control.discovery.CanonicalIds;
+import org.pronzato.fabric.api.connectors.amps.AmpsFactory;
+import org.pronzato.fabric.api.connectors.amps.factory.AmpsFactoryOptions;
+import org.pronzato.fabric.api.connectors.http.HttpConnection;
+import org.pronzato.fabric.api.connectors.odbc.OdbcConnection;
+import org.pronzato.fabric.api.connectors.s3.S3Connection;
 import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
-import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConnection;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionSchema;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStatusData;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStream;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
-import org.pronzato.fabric.api.control.discovery.lifecycle.DeleteOutcome;
-import org.pronzato.fabric.api.control.discovery.lifecycle.DeleteResult;
-import org.pronzato.fabric.api.control.discovery.DeleteManager;
-import org.pronzato.fabric.api.control.status.data.DataStatusPublisher;
-import org.pronzato.fabric.api.schemas.SchemaCompatibility;
-import org.pronzato.fabric.api.schemas.SchemaManager;
-import org.pronzato.fabric.api.schemas.SchemaModel;
-import org.pronzato.fabric.api.schemas.SchemaType;
-import org.pronzato.fabric.api.streams.Stream;
-import org.pronzato.fabric.api.streams.StreamBytesListener;
-import org.pronzato.fabric.api.streams.StreamListener;
-import org.pronzato.fabric.api.streams.StreamManager;
-import org.pronzato.fabric.api.streams.StreamMessage;
-import org.pronzato.fabric.api.streams.StreamModel;
-import org.pronzato.fabric.api.streams.StreamPublishOptions;
-import org.pronzato.fabric.api.streams.StreamPublishResult;
-import org.pronzato.fabric.api.streams.StreamRunOptions;
-import org.pronzato.fabric.api.streams.StreamSubscribeOptions;
-import org.pronzato.fabric.api.streams.StreamSubscription;
+import org.pronzato.fabric.api.control.discovery.definitions.common.LifecycleStatus;
+import org.pronzato.fabric.api.data.duckdb.DuckdbEngine;
+import org.pronzato.fabric.api.data.duckdb.DuckdbSession;
+import org.pronzato.fabric.api.data.duckdb.OdbcRuntimeGuard;
+import org.pronzato.fabric.api.data.duckdb.OdbcSessionSupport;
+import org.pronzato.fabric.api.control.plugins.ConnectionProvider;
+import org.pronzato.fabric.api.control.plugins.ConnectionProviderContext;
+import org.pronzato.fabric.api.control.plugins.ConnectionRequest;
+import org.pronzato.fabric.api.control.plugins.FabricPlugins;
+import org.pronzato.fabric.api.control.security.secrets.SecretCrypto;
+import org.pronzato.fabric.api.control.security.secrets.SessionSecrets;
 import org.pronzato.fabric.api.control.session.SessionContext;
 import org.pronzato.fabric.api.control.session.SessionImpl;
+import org.pronzato.fabric.api.util.CloseSupport;
 import org.pronzato.fabric.api.util.IdentityParsingSupport;
 import org.pronzato.fabric.api.util.Strings;
 
-public final class StreamManagerImpl implements StreamManager, AutoCloseable {
-  private static final ObjectMapper MAPPER = DiscoveryCodec.mapper();
-  private static final String SYSTEM_ACTOR = "fabric-lite";
-  private static final String DEFAULT_LIFECYCLE_STATUS = "ACTIVE";
-  private static final String HEADER_SCHEMA_ID = "fabric.schema_id";
-  private static final String HEADER_MESSAGE_TYPE = "fabric.message_type";
-  private static final String HEADER_CONTENT_TYPE = "fabric.content_type";
+public final class ConnectionManagerImpl implements ConnectionManager, AutoCloseable {
+  private static final String PLATFORM_GROUP = "platform";
+  private static final CacheOptions NO_OPTIONS = new CacheOptions(null, -1L, 0, null);
 
-  private final Supplier<DiscoveryCache> cacheSupplier;
+  private final Supplier<DiscoveryCache> configCacheSupplier;
   private final Supplier<String> groupSupplier;
-  private final Supplier<SchemaManager> schemaManagerSupplier;
-  private final Supplier<ConnectionManager> connectionManagerSupplier;
-  private final Supplier<DeleteManager> deleteManagerSupplier;
-  private final Fabric.Session session;
-  private final ConcurrentMap<String, StreamRuntime> runtimes = new ConcurrentHashMap<>();
+  private final Supplier<SessionContext> sessionContextSupplier;
+  private final SessionImpl.SessionConfig sessionConfig;
+  private final SessionSecretDecryptor secretDecryptor;
+  private final FabricPlugins plugins;
+  private final ConcurrentHashMap<CacheKey, AutoCloseable> cache = new ConcurrentHashMap<>();
 
-  public StreamManagerImpl(
-      Supplier<DiscoveryCache> cacheSupplier,
+  public ConnectionManagerImpl(
+      Supplier<DiscoveryCache> configCacheSupplier,
       Supplier<String> groupSupplier,
-      Supplier<SchemaManager> schemaManagerSupplier,
-      Supplier<ConnectionManager> connectionManagerSupplier,
-      Supplier<DeleteManager> deleteManagerSupplier) {
+      Supplier<SessionContext> sessionContextSupplier,
+      SessionImpl.SessionConfig sessionConfig) {
     this(
-        cacheSupplier,
+        configCacheSupplier,
         groupSupplier,
-        schemaManagerSupplier,
-        connectionManagerSupplier,
-        deleteManagerSupplier,
-        null);
+        sessionContextSupplier,
+        sessionConfig,
+        (alias, encryptedValue) -> {
+          String normalizedAlias = Strings.firstNonBlank(alias, SessionSecrets.DEFAULT_KEK_ALIAS);
+          throw new IllegalStateException(
+              "S3 credentials are encrypted but no KEK was provided (alias=" + normalizedAlias + ")");
+        });
   }
 
-  public StreamManagerImpl(
-      Supplier<DiscoveryCache> cacheSupplier,
+  public ConnectionManagerImpl(
+      Supplier<DiscoveryCache> configCacheSupplier,
       Supplier<String> groupSupplier,
-      Supplier<SchemaManager> schemaManagerSupplier,
-      Supplier<ConnectionManager> connectionManagerSupplier,
-      Supplier<DeleteManager> deleteManagerSupplier,
-      Fabric.Session session) {
-    this.cacheSupplier = Objects.requireNonNull(cacheSupplier, "cacheSupplier");
+      Supplier<SessionContext> sessionContextSupplier,
+      SessionImpl.SessionConfig sessionConfig,
+      SessionSecretDecryptor secretDecryptor) {
+    this.configCacheSupplier = Objects.requireNonNull(configCacheSupplier, "configCacheSupplier");
     this.groupSupplier = Objects.requireNonNull(groupSupplier, "groupSupplier");
-    this.schemaManagerSupplier = Objects.requireNonNull(schemaManagerSupplier, "schemaManagerSupplier");
-    this.connectionManagerSupplier = Objects.requireNonNull(connectionManagerSupplier, "connectionManagerSupplier");
-    this.deleteManagerSupplier = deleteManagerSupplier == null ? () -> null : deleteManagerSupplier;
-    this.session = session;
+    this.sessionContextSupplier =
+        Objects.requireNonNull(sessionContextSupplier, "sessionContextSupplier");
+    this.sessionConfig = Objects.requireNonNull(sessionConfig, "sessionConfig");
+    this.secretDecryptor = Objects.requireNonNull(secretDecryptor, "secretDecryptor");
+    this.plugins = FabricPlugins.system();
   }
 
   @Override
-  public void register(StreamModel model) {
-    StreamModel normalized = normalizeModel(Objects.requireNonNull(model, "model"));
-    StreamModel associated = associateSchema(normalized);
-    String group = requireGroup();
-    String scoped = scopedName(associated.namespace(), associated.name());
-    DefinitionStream existing = requireCache().get(DefinitionStream.class, group, scoped).orElse(null);
-    requireCache().upsert(toDefinition(group, associated, existing));
+  public AmpsConnection amps(String connectionName) {
+    return amps(connectionName, ConnectionOptions.defaults());
   }
 
   @Override
-  public void delete(String streamName, DeleteOptions options) {
-    StreamLookup lookup = parseLookup(streamName);
-    String group = requireGroup();
-    String scoped = scopedName(lookup.namespace(), lookup.name());
-    DefinitionStream definition =
-        requireCache().get(DefinitionStream.class, group, scoped)
-            .orElseThrow(() -> new IllegalArgumentException("Unknown stream: " + group + "/" + scoped));
+  public AmpsConnection amps(String connectionName, ConnectionOptions options) {
+    String normalizedName = requireConnectionName(connectionName);
+    ConnectionOptions normalizedOptions = normalizeOptions(options);
+    CacheKey key =
+        new CacheKey(
+            ConnectionKind.AMPS, normalizedName, normalizeCacheOptions(normalizedOptions));
+    return getOrCreate(key, () -> createAmpsConnection(normalizedName, normalizedOptions));
+  }
 
-    String streamAssetId =
+  @Override
+  public HttpConnection http(String connectionName) {
+    return http(connectionName, ConnectionOptions.defaults());
+  }
+
+  @Override
+  public HttpConnection http(String connectionName, ConnectionOptions options) {
+    String normalizedName = requireConnectionName(connectionName);
+    ConnectionOptions normalizedOptions = normalizeOptions(options);
+    if (normalizedOptions.maxInflight() > 0) {
+      throw new IllegalArgumentException("maxInflight is only supported for AMPS connections");
+    }
+    CacheKey key =
+        new CacheKey(
+            ConnectionKind.HTTP, normalizedName, normalizeCacheOptions(normalizedOptions));
+    return getOrCreate(key, () -> createHttpConnection(normalizedName, normalizedOptions));
+  }
+
+  @Override
+  public S3Connection s3(String connectionName) {
+    String normalizedName = requireConnectionName(connectionName);
+    CacheKey key = new CacheKey(ConnectionKind.S3, normalizedName, NO_OPTIONS);
+    return getOrCreate(key, () -> createS3Connection(normalizedName));
+  }
+
+  @Override
+  public OdbcConnection odbc(String connectionName) {
+    return odbc(connectionName, ConnectionOptions.defaults());
+  }
+
+  @Override
+  public OdbcConnection odbc(String connectionName, ConnectionOptions options) {
+    String normalizedName = requireConnectionName(connectionName);
+    ConnectionOptions normalizedOptions = normalizeOptions(options);
+    if (normalizedOptions.maxInflight() > 0) {
+      throw new IllegalArgumentException("maxInflight is only supported for AMPS connections");
+    }
+    CacheKey key =
+        new CacheKey(
+            ConnectionKind.ODBC, normalizedName, normalizeCacheOptions(normalizedOptions));
+    return getOrCreate(key, () -> createOdbcConnection(normalizedName));
+  }
+
+  @Override
+  public <H> H get(ConnectionRequest<H> request) throws Exception {
+    Objects.requireNonNull(request, "request");
+    Class<H> handleType = Objects.requireNonNull(request.handleType(), "request.handleType");
+
+    Object builder = request.builder();
+    String connectionName = Strings.trimToNull(request.connectionName());
+    if (connectionName == null) {
+      connectionName = extractConnectionName(builder);
+    }
+    String normalizedName = requireConnectionName(connectionName);
+    ConnectionOptions options = normalizeOptions(request.options());
+
+    DefinitionConnection model = resolveDefinitionConnection(normalizedName, null);
+    String providerId =
         Strings.firstNonBlank(
-            Strings.trimToNull(definition.streamId()),
-            "stream:" + group + "/" + lookup.namespace() + "/" + lookup.name());
-    DeleteOptions resolved = options == null ? DeleteOptions.streamOnly() : options;
-    org.pronzato.fabric.api.control.discovery.lifecycle.DeleteOptions deleteOptions =
-        new org.pronzato.fabric.api.control.discovery.lifecycle.DeleteOptions(
-            true,
-            resolved.deleteSchemaDefinition(),
-            false,
-            false,
-            false,
-            false,
-            true,
-            false,
-            List.of());
-    stopRuntime(lookup.namespace(), lookup.name());
-    DeleteResult result = requireDeleteManager().delete(streamAssetId, deleteOptions);
-    if (result.outcome() == DeleteOutcome.BLOCKED) {
-      throw new IllegalStateException("Delete blocked for stream " + streamAssetId + ": " + result.blockers());
+            Strings.trimToNull(request.providerId()),
+            Strings.trimToNull(model.providerId()),
+            defaultProviderId(model.connectionType()));
+    if (providerId == null) {
+      throw new IllegalStateException(
+          "Connection '" + scopedName(normalizedName) + "' does not define a provider id");
     }
-    if (result.outcome() == DeleteOutcome.PARTIAL) {
-      throw new IllegalStateException("Delete partially completed for stream " + streamAssetId + ": " + result.warnings());
+
+    String normalizedProviderId = providerId.trim().toLowerCase(Locale.ROOT);
+    if ("odbc".equals(normalizedProviderId)) {
+      OdbcRuntimeGuard.failConnectionRuntime(normalizedName, model.odbc());
     }
-  }
-
-  @Override
-  public Optional<StreamModel> getModel(String streamName) {
-    StreamLookup lookup = parseLookup(streamName);
-    String group = requireGroup();
-    String scoped = scopedName(lookup.namespace(), lookup.name());
-    return requireCache().get(DefinitionStream.class, group, scoped).map(this::fromDefinition);
-  }
-
-  @Override
-  public List<StreamModel> listModels() {
-    String group = requireGroup();
-    List<StreamModel> models = new ArrayList<>();
-    for (DefinitionStream definition : requireCache().list(DefinitionStream.class, group)) {
-      if (definition == null || definition.envelope() == null) {
-        continue;
+    if ("amps".equals(normalizedProviderId)) {
+      if (!handleType.isAssignableFrom(AmpsConnection.class)) {
+        throw new IllegalArgumentException(
+            "AMPS provider handle type "
+                + AmpsConnection.class.getName()
+                + " is incompatible with requested "
+                + handleType.getName());
       }
-      models.add(fromDefinition(definition));
+      return handleType.cast(amps(normalizedName, options));
     }
-    models.sort(
-        Comparator.comparing(StreamModel::namespace, String.CASE_INSENSITIVE_ORDER)
-            .thenComparing(StreamModel::name, String.CASE_INSENSITIVE_ORDER)
-            .thenComparing(StreamModel::name));
-    return List.copyOf(models);
+    if ("http".equals(normalizedProviderId)) {
+      if (!handleType.isAssignableFrom(HttpConnection.class)) {
+        throw new IllegalArgumentException(
+            "HTTP provider handle type "
+                + HttpConnection.class.getName()
+                + " is incompatible with requested "
+                + handleType.getName());
+      }
+      return handleType.cast(http(normalizedName, options));
+    }
+    if ("s3".equals(normalizedProviderId)) {
+      if (!handleType.isAssignableFrom(S3Connection.class)) {
+        throw new IllegalArgumentException(
+            "S3 provider handle type "
+                + S3Connection.class.getName()
+                + " is incompatible with requested "
+                + handleType.getName());
+      }
+      return handleType.cast(s3(normalizedName));
+    }
+
+    ConnectionProvider provider = plugins.findConnectionProvider(providerId);
+    if (provider == null) {
+      throw new IllegalStateException(
+          "No connection provider registered for '" + providerId + "'");
+    }
+
+    Class<?> providerHandleType = provider.handleType();
+    if (providerHandleType == null) {
+      throw new IllegalStateException(
+          "Connection provider '" + provider.providerId() + "' reports no handle type");
+    }
+    if (!handleType.isAssignableFrom(providerHandleType)) {
+      throw new IllegalArgumentException(
+          "Connection provider '"
+              + provider.providerId()
+              + "' returns "
+              + providerHandleType.getName()
+              + " which is incompatible with requested "
+              + handleType.getName());
+    }
+
+    Class<?> builderType = provider.builderType();
+    if (builder != null && builderType != null && builderType != Object.class && !builderType.isInstance(builder)) {
+      throw new IllegalArgumentException(
+          "Connection builder type "
+              + builder.getClass().getName()
+              + " is not supported by provider '"
+              + provider.providerId()
+              + "' (expects "
+              + builderType.getName()
+              + ")");
+    }
+
+    ConnectionProviderContext context =
+        new ConnectionProviderContext(
+            this,
+            model,
+            builder,
+            connectionName,
+            normalizedName,
+            options,
+            sessionContextSupplier.get(),
+            Strings.trimToNull(groupSupplier.get()));
+    Object handle = provider.open(context);
+    if (handle == null) {
+      throw new IllegalStateException(
+          "Connection provider '" + provider.providerId() + "' returned null");
+    }
+    if (!handleType.isInstance(handle)) {
+      throw new IllegalStateException(
+          "Connection provider '"
+              + provider.providerId()
+              + "' returned "
+              + handle.getClass().getName()
+              + " which is incompatible with "
+              + handleType.getName());
+    }
+    return handleType.cast(handle);
   }
 
-  @Override
-  public Stream start(String streamName, StreamRunOptions options) {
-    StreamModel model = getModel(streamName).orElseThrow(() -> new IllegalArgumentException("Unknown stream: " + streamName));
-    String key = runtimeKey(model.namespace(), model.name());
-    StreamRuntime existing = runtimes.get(key);
-    if (existing != null) {
-      return existing;
-    }
-    StreamRunOptions resolved = options == null ? StreamRunOptions.defaults() : options;
-    ConnectionOptions connectionOptions =
-        ConnectionOptions.builder().withPinnedInstance(Strings.trimToNull(resolved.ampsConnectionInstance())).build();
-    AmpsConnection connection = requireConnectionManager().amps(model.connectionName(), connectionOptions);
-    StreamRuntime created = new StreamRuntime(model, connection, () -> runtimes.remove(key));
-    StreamRuntime prior = runtimes.putIfAbsent(key, created);
-    if (prior != null) {
-      created.close();
-      return prior;
-    }
-    return created;
-  }
-
-  @Override
-  public Stream runtime(String streamName) {
-    StreamLookup lookup = parseLookup(streamName);
-    return runtimes.get(runtimeKey(lookup.namespace(), lookup.name()));
-  }
-
-  @Override
-  public List<Stream> runtimes() {
-    return List.copyOf(runtimes.values());
+  public void evictS3Connection(String connectionName) {
+    String normalizedName = requireConnectionName(connectionName);
+    CacheKey key = new CacheKey(ConnectionKind.S3, normalizedName, NO_OPTIONS);
+    AutoCloseable removed = cache.remove(key);
+    closeCachedHandle(removed);
   }
 
   @Override
   public void close() {
-    List<StreamRuntime> snapshot = List.copyOf(runtimes.values());
-    for (StreamRuntime runtime : snapshot) {
-      runtime.close();
+    List<AutoCloseable> handles = new ArrayList<>(cache.values());
+    cache.clear();
+    for (AutoCloseable handle : handles) {
+      closeCachedHandle(handle);
     }
-    runtimes.clear();
   }
 
-  private StreamModel normalizeModel(StreamModel model) {
-    String group = requireGroup();
-    String name = Strings.requireNonBlank(model.name(), "stream.name");
-    String namespace = Strings.requireNonBlank(model.namespace(), "stream.namespace");
-    String streamId = Strings.firstNonBlank(model.streamId(), StreamModel.buildStreamId(group, namespace, name));
-    StreamModel.Transport transport = model.transport() == null ? StreamModel.Transport.AMPS : model.transport();
-    if (transport != StreamModel.Transport.AMPS) {
-      throw new IllegalArgumentException("Only AMPS stream transport is supported");
+  private AmpsConnection createAmpsConnection(String connectionName, ConnectionOptions options) {
+    DefinitionConnection definition =
+        resolveDefinitionConnection(connectionName, DefinitionConnection.ConnectionType.AMPS);
+    List<String> endpoints = resolveAmpsEndpoints(definition, options);
+    String clientName = resolveAmpsClientName(connectionName, options);
+    AmpsFactoryOptions factoryOptions = buildAmpsFactoryOptions(connectionName, definition, options);
+
+    HAClient client = null;
+    try {
+      client = AmpsFactory.create(clientName, factoryOptions);
+      AmpsFactory.connect(client, endpoints, factoryOptions);
+      AmpsFactory.logon(client, factoryOptions);
+      // Return a shared handle so user close() does not tear down the cached connection.
+      return AmpsConnection.shared(client);
+    } catch (Exception ex) {
+      closeHaClient(client);
+      throw new IllegalStateException("Failed to open AMPS connection '" + connectionName + "'", ex);
     }
-    StreamModel.Serde serde = model.serde() == null ? StreamModel.Serde.JSON : model.serde();
-    StreamModel.Address address = Objects.requireNonNull(model.address(), "stream.address");
-    String topic = Strings.requireNonBlank(address.topic(), "stream.address.topic");
-    String connectionName = Strings.requireNonBlank(model.connectionName(), "stream.connectionName");
-    return model.toBuilder()
-        .withName(name)
-        .withNamespace(namespace)
-        .withStreamId(streamId)
-        .withTransport(transport)
-        .withSerde(serde)
-        .withAddress(new StreamModel.Address(topic, address.channel(), address.streamId()))
-        .withConnectionName(connectionName)
-        .withLifecycleStatus(Strings.firstNonBlank(model.lifecycleStatus(), DEFAULT_LIFECYCLE_STATUS))
-        .build();
   }
 
-  private StreamModel associateSchema(StreamModel model) {
-    if (model.serde() == StreamModel.Serde.BYTES) {
-      return model;
-    }
-    String group = requireGroup();
-    SchemaManager schemas = requireSchemaManager();
-    String schemaName = Strings.firstNonBlank(model.schemaName(), parseSchemaNameFromKey(model.schemaKey()), model.name() + "-stream");
-    SchemaModel schemaModel = model.schema();
-    if (schemaModel != null) {
-      SchemaCompatibility compatibility = toSchemaCompatibility(model.compatibilityMode());
-      schemaModel =
-          schemaModel.toBuilder()
-              .withGroup(group)
-              .withName(schemaName)
-              .withType(SchemaType.TRANSPORT)
-              .withCompatibility(compatibility)
-              .build();
-      schemaModel = schemas.register(schemaName, SchemaType.TRANSPORT, schemaModel);
-    } else {
-      schemaModel = schemas.get(group, schemaName).orElseGet(() -> schemas.get(schemaName).orElse(null));
-    }
-    String schemaKey = "schema:" + group + "/" + schemaName;
-    String schemaId = resolveSchemaUuid(group, schemaName);
-    return model.toBuilder()
-        .withSchemaName(schemaName)
-        .withSchemaKey(schemaKey)
-        .withSchemaId(Strings.firstNonBlank(schemaId, model.schemaId()))
-        .withSchema(schemaModel)
-        .build();
-  }
-
-  private DefinitionStream toDefinition(String group, StreamModel model, DefinitionStream existing) {
-    String now = Instant.now().toString();
-    String scoped = scopedName(model.namespace(), model.name());
-    DefinitionEnvelope previous = existing == null ? null : existing.envelope();
-    String createdAt = previous == null ? now : Strings.firstNonBlank(previous.createdTimeUtc(), now);
-    String createdBy = previous == null ? SYSTEM_ACTOR : Strings.firstNonBlank(previous.createdBy(), SYSTEM_ACTOR);
-    String uuid = Strings.firstNonBlank(model.uuid(), previous == null ? null : previous.uuid(), model.streamId());
-    DefinitionEnvelope envelope =
-        new DefinitionEnvelope(
-            group,
-            DefinitionType.STREAM,
-            scoped,
-            uuid,
-            model.enabled(),
-            Strings.firstNonBlank(model.lifecycleStatus(), DEFAULT_LIFECYCLE_STATUS),
-            createdAt,
-            createdBy,
-            now,
-            SYSTEM_ACTOR);
-    List<String> refs = normalizeRefs(model.connectionRefs());
-    if (refs.isEmpty()) {
-      refs = List.of(model.connectionName());
-    }
-    return new DefinitionStream(
-        envelope,
-        model.versionNum(),
-        model.versionName(),
-        model.namespace(),
-        model.streamId(),
-        toDefinitionTransport(model.transport()),
-        new DefinitionStream.Address(model.address().topic(), model.address().channel(), model.address().streamId()),
-        model.schemaId(),
-        model.schemaKey(),
-        model.messageType(),
-        toDefinitionSerde(model.serde()),
-        toDefinitionCompatibility(model.compatibilityMode()),
-        toDefinitionResolution(model.resolutionPolicy()),
-        refs,
-        normalizeRefs(model.dependencyRefs()),
-        null,
-        null);
-  }
-
-  private StreamModel fromDefinition(DefinitionStream definition) {
-    String group = requireGroup();
-    DefinitionEnvelope envelope = definition.envelope();
-    String scoped = Strings.requireNonBlank(envelope == null ? null : envelope.name(), "stream.envelope.name");
-    IdentityParsingSupport.ScopedName parsed =
-        IdentityParsingSupport.parseScopedName(scoped, "stream.namespace", "stream.name");
-    String namespace =
-        Strings.requireNonBlank(
-            Strings.firstNonBlank(definition.namespace(), parsed.namespace()),
-            "stream.namespace");
-    String name = parsed.name();
-    String schemaName = parseSchemaNameFromKey(definition.schemaKey());
-    SchemaModel schema = null;
-    SchemaManager manager = schemaManagerSupplier.get();
-    if (manager != null && schemaName != null) {
-      schema = manager.get(group, schemaName).orElseGet(() -> manager.get(schemaName).orElse(null));
-    }
-    String streamId = Strings.firstNonBlank(definition.streamId(), StreamModel.buildStreamId(group, namespace, name));
-    String connectionName =
-        Strings.requireNonBlank(resolveConnectionName(definition.connectionRefs()), "stream.connectionName");
-    return StreamModel.builder()
-        .withName(name)
-        .withNamespace(namespace)
-        .withUuid(envelope == null ? null : envelope.uuid())
-        .withEnabled(envelope == null || envelope.enabled() == null || Boolean.TRUE.equals(envelope.enabled()))
-        .withLifecycleStatus(envelope == null ? null : envelope.lifecycleStatus())
-        .withVersionNum(definition.versionNum())
-        .withVersionName(definition.versionName())
-        .withStreamId(streamId)
-        .withTransport(fromDefinitionTransport(definition.transport()))
-        .withAddress(new StreamModel.Address(definition.address().topic(), definition.address().channel(), definition.address().streamId()))
-        .withConnectionName(connectionName)
-        .withSchemaName(schemaName)
-        .withSchemaId(definition.schemaId())
-        .withSchemaKey(definition.schemaKey())
-        .withSchema(schema)
-        .withMessageType(definition.messageType())
-        .withSerde(fromDefinitionSerde(definition.serde()))
-        .withCompatibilityMode(fromDefinitionCompatibility(definition.compatibilityMode()))
-        .withResolutionPolicy(fromDefinitionResolution(definition.resolutionPolicy()))
-        .withConnectionRefs(definition.connectionRefs())
-        .withDependencyRefs(definition.dependencyRefs())
-        .build();
-  }
-
-  private StreamLookup parseLookup(String streamName) {
-    String value = Strings.requireNonBlank(streamName, "streamName");
-    if (value.startsWith("stream:")) {
-      CanonicalIds.ParsedId parsed = CanonicalIds.parse(value);
-      if (!parsed.isStream()) {
-        throw new IllegalArgumentException("streamName must be a stream id");
-      }
-      String group = requireGroup();
-      if (!group.equalsIgnoreCase(parsed.group())) {
-        throw new IllegalArgumentException("Stream group mismatch: " + parsed.group());
-      }
-      return new StreamLookup(
-          IdentityParsingSupport.requireNamespace(parsed.namespace(), "stream.namespace"),
-          IdentityParsingSupport.requireName(parsed.name(), "stream.name"));
-    }
-    String[] parts = value.split("/");
-    if (parts.length == 1) {
+  private HttpConnection createHttpConnection(String connectionName, ConnectionOptions options) {
+    DefinitionConnection definition =
+        resolveDefinitionConnection(connectionName, DefinitionConnection.ConnectionType.HTTP);
+    DefinitionConnection.Http http =
+        Objects.requireNonNull(
+            definition.http(),
+            "Connection '" + scopedName(connectionName) + "' is missing http configuration");
+    DefinitionConnection.Http.Auth auth =
+        http.auth() == null ? DefinitionConnection.Http.Auth.NONE : http.auth();
+    if (auth != DefinitionConnection.Http.Auth.NONE) {
       throw new IllegalArgumentException(
-          "streamName must include namespace (expected namespace/name): " + value);
+          "Connection '"
+              + scopedName(connectionName)
+              + "' has unsupported HTTP auth mode "
+              + auth
+              + " (only NONE is supported)");
     }
-    if (parts.length == 2) {
-      return new StreamLookup(
-          IdentityParsingSupport.requireNamespace(parts[0], "stream.namespace"),
-          IdentityParsingSupport.requireName(parts[1], "stream.name"));
+
+    URI baseUri = resolveHttpBaseUri(connectionName, definition);
+    HttpClient.Builder builder = HttpClient.newBuilder();
+    if (options.timeout() != null) {
+      builder.connectTimeout(options.timeout());
     }
-    if (parts.length == 3 && requireGroup().equalsIgnoreCase(parts[0])) {
-      return new StreamLookup(
-          IdentityParsingSupport.requireNamespace(parts[1], "stream.namespace"),
-          IdentityParsingSupport.requireName(parts[2], "stream.name"));
-    }
-    throw new IllegalArgumentException("Invalid streamName format: " + value);
+    HttpClient client = builder.build();
+    return new HttpConnection(baseUri, client, options.timeout());
   }
 
-  private String requireGroup() {
-    return IdentityParsingSupport.requireGroup(groupSupplier.get());
+  private S3Connection createS3Connection(String connectionName) {
+    DefinitionConnection definition =
+        resolveDefinitionConnection(connectionName, DefinitionConnection.ConnectionType.S3);
+    DefinitionConnection.S3 s3 =
+        Objects.requireNonNull(
+            definition.s3(),
+            "Connection '" + scopedName(connectionName) + "' is missing s3 configuration");
+    ensureNoPlaintextS3Credentials(connectionName, definition, s3);
+
+    String region = Strings.requireNonBlank(s3.region(), "s3.region");
+    String bucket = Strings.requireNonBlank(s3.bucket(), "s3.bucket");
+    String accessKeyIdEnc = Strings.trimToNull(s3.accessKeyIdEnc());
+    String secretAccessKeyEnc = Strings.trimToNull(s3.secretAccessKeyEnc());
+    String sessionTokenEnc = Strings.trimToNull(s3.sessionTokenEnc());
+    if (accessKeyIdEnc == null || secretAccessKeyEnc == null) {
+      throw new IllegalStateException(
+          "S3 connection '" + scopedName(connectionName) + "' is missing encrypted credentials");
+    }
+    String encFormat = Strings.firstNonBlank(s3.encFormat(), SecretCrypto.ENCRYPTION_FORMAT);
+    if (!SecretCrypto.ENCRYPTION_FORMAT.equals(encFormat)) {
+      throw new IllegalArgumentException("Unsupported S3 credential encryption format: " + encFormat);
+    }
+    String kekAlias = Strings.firstNonBlank(s3.kekAlias(), SessionSecrets.DEFAULT_KEK_ALIAS);
+    String accessKeyId = decryptS3Credential(kekAlias, accessKeyIdEnc);
+    String secretAccessKey = decryptS3Credential(kekAlias, secretAccessKeyEnc);
+    String sessionToken = sessionTokenEnc == null ? null : decryptS3Credential(kekAlias, sessionTokenEnc);
+
+    return new S3Connection(
+            connectionName,
+            region,
+            bucket,
+            Strings.trimToNull(s3.endpoint()),
+            s3.pathStyleAccess(),
+            Strings.trimToNull(s3.basePrefix()),
+            s3.attributes(),
+            accessKeyId,
+            secretAccessKey,
+            sessionToken)
+        .shared();
   }
 
-  private DiscoveryCache requireCache() {
-    return IdentityParsingSupport.requireNonNullRuntime(
-        cacheSupplier.get(), "DiscoveryCache is not initialized");
+  private OdbcConnection createOdbcConnection(String connectionName) {
+    return new OdbcConnectionImpl(connectionName);
   }
 
-  private SchemaManager requireSchemaManager() {
-    return IdentityParsingSupport.requireNonNullRuntime(
-        schemaManagerSupplier.get(), "SchemaManager is not initialized");
-  }
-
-  private DeleteManager requireDeleteManager() {
-    return IdentityParsingSupport.requireNonNullRuntime(
-        deleteManagerSupplier.get(), "DeleteManager is not initialized");
-  }
-
-  private ConnectionManager requireConnectionManager() {
-    return IdentityParsingSupport.requireNonNullRuntime(
-        connectionManagerSupplier.get(), "ConnectionManager is not initialized");
-  }
-
-  private DataStatusPublisher createDataStatusPublisher(StreamModel model) {
-    if (!(session instanceof SessionImpl sessionImpl)) {
-      return null;
-    }
-    if (sessionImpl.controlPlaneConnection() == null || sessionImpl.context() == null) {
-      return null;
-    }
-    SessionContext context = sessionImpl.context();
-    String group = Strings.trimToNull(context.getGroup());
-    String instance = Strings.trimToNull(context.getInstance());
-    if (group == null || instance == null) {
-      return null;
-    }
-    String namespace = IdentityParsingSupport.requireNamespace(model.namespace(), "stream.namespace");
-    String statusName = "stream/" + namespace + "/" + model.name();
-    String producerId =
-        Strings.firstNonBlank(
-            Strings.trimToNull(model.streamId()),
-            "stream:" + group + "/" + namespace + "/" + model.name());
-    Map<String, String> tags = new LinkedHashMap<>();
-    tags.put("namespace", namespace);
-    tags.put("streamName", model.name());
-    tags.put("transport", model.transport() == null ? "UNKNOWN" : model.transport().name());
-    tags.put("serde", model.serde() == null ? "UNKNOWN" : model.serde().name());
-    tags.put("topic", model.address() == null ? null : model.address().topic());
-    tags.put("connectionName", model.connectionName());
-    return new DataStatusPublisher(
-        sessionImpl.controlPlaneConnection(),
-        group,
-        statusName,
-        instance,
-        DefinitionStatusData.ProducerType.STREAM,
-        producerId,
-        null,
-        sessionImpl.runtimePlacementHost(),
-        Strings.trimToNull(context.getAppName()),
-        Strings.trimToNull(context.getInstance()),
-        Strings.trimToNull(context.getGroup()),
-        tags,
-        sessionImpl.dataStatusCadenceSeconds(),
-        sessionImpl.statusScheduler());
-  }
-
-  private void stopRuntime(String namespace, String name) {
-    StreamRuntime runtime = runtimes.remove(runtimeKey(namespace, name));
-    if (runtime != null) {
-      runtime.close();
-    }
-  }
-
-  private static String scopedName(String namespace, String name) {
-    return IdentityParsingSupport.requireNamespace(namespace, "stream.namespace")
-        + "/"
-        + IdentityParsingSupport.requireName(name, "stream.name");
-  }
-
-  private static String runtimeKey(String namespace, String name) {
-    return IdentityParsingSupport.requireNamespace(namespace, "stream.namespace").toLowerCase(Locale.ROOT)
-        + "/"
-        + IdentityParsingSupport.requireName(name, "stream.name").toLowerCase(Locale.ROOT);
-  }
-
-  private static String parseSchemaNameFromKey(String schemaKey) {
-    String normalized = Strings.trimToNull(schemaKey);
-    if (normalized == null) {
-      return null;
-    }
-    if (!normalized.startsWith("schema:")) {
-      return normalized;
-    }
-    String payload = normalized.substring("schema:".length());
-    int slash = payload.indexOf('/');
-    return slash < 0 || slash + 1 >= payload.length() ? payload : payload.substring(slash + 1);
-  }
-
-  private String resolveSchemaUuid(String group, String schemaName) {
-    return requireCache()
-        .get(DefinitionSchema.class, group, schemaName)
-        .map(DefinitionSchema::envelope)
-        .map(DefinitionEnvelope::uuid)
-        .map(Strings::trimToNull)
-        .orElse(null);
-  }
-
-  private static List<String> normalizeRefs(List<String> refs) {
-    if (Strings.isEmpty(refs)) {
-      return List.of();
-    }
-    List<String> normalized = new ArrayList<>();
-    for (String ref : refs) {
-      String value = Strings.trimToNull(ref);
-      if (value != null) {
-        normalized.add(value);
-      }
-    }
-    return normalized.isEmpty() ? List.of() : List.copyOf(normalized);
-  }
-
-  private static String resolveConnectionName(List<String> refs) {
-    if (Strings.isEmpty(refs)) {
-      return null;
-    }
-    String value = Strings.trimToNull(refs.get(0));
-    if (value == null) {
-      return null;
-    }
-    if (value.startsWith("connection:")) {
-      value = value.substring("connection:".length());
-    }
-    int slash = value.indexOf('/');
-    return slash >= 0 && slash + 1 < value.length() ? value.substring(slash + 1) : value;
-  }
-
-  private static SchemaCompatibility toSchemaCompatibility(StreamModel.SchemaCompatibilityMode mode) {
-    if (mode == null) {
-      return SchemaCompatibility.BACKWARDS;
-    }
-    return switch (mode) {
-      case NONE -> SchemaCompatibility.NONE;
-      case FORWARD -> SchemaCompatibility.FORWARD;
-      case FULL, TRANSITIVE_FULL -> SchemaCompatibility.FULL;
-      case BACKWARD, TRANSITIVE_BACKWARD -> SchemaCompatibility.BACKWARDS;
-    };
-  }
-
-  private static DefinitionStream.TransportType toDefinitionTransport(StreamModel.Transport value) {
-    return DefinitionStream.TransportType.AMPS;
-  }
-
-  private static StreamModel.Transport fromDefinitionTransport(DefinitionStream.TransportType value) {
-    return StreamModel.Transport.AMPS;
-  }
-
-  private static DefinitionStream.SerdeType toDefinitionSerde(StreamModel.Serde value) {
-    if (value == null) {
-      return DefinitionStream.SerdeType.JSON;
-    }
-    return switch (value) {
-      case NVFIX -> DefinitionStream.SerdeType.NVFIX;
-      case JSON -> DefinitionStream.SerdeType.JSON;
-      case PROTOBUF -> DefinitionStream.SerdeType.PROTOBUF;
-      case BYTES -> DefinitionStream.SerdeType.BYTES;
-    };
-  }
-
-  private static StreamModel.Serde fromDefinitionSerde(DefinitionStream.SerdeType value) {
-    if (value == null) {
-      return StreamModel.Serde.JSON;
-    }
-    return switch (value) {
-      case NVFIX -> StreamModel.Serde.NVFIX;
-      case JSON, UNKNOWN -> StreamModel.Serde.JSON;
-      case PROTOBUF -> StreamModel.Serde.PROTOBUF;
-      case BYTES -> StreamModel.Serde.BYTES;
-    };
-  }
-
-  private static DefinitionStream.SchemaCompatibilityMode toDefinitionCompatibility(StreamModel.SchemaCompatibilityMode value) {
-    if (value == null) {
-      return DefinitionStream.SchemaCompatibilityMode.BACKWARD;
-    }
-    return switch (value) {
-      case NONE -> DefinitionStream.SchemaCompatibilityMode.NONE;
-      case BACKWARD -> DefinitionStream.SchemaCompatibilityMode.BACKWARD;
-      case FORWARD -> DefinitionStream.SchemaCompatibilityMode.FORWARD;
-      case FULL -> DefinitionStream.SchemaCompatibilityMode.FULL;
-      case TRANSITIVE_BACKWARD -> DefinitionStream.SchemaCompatibilityMode.TRANSITIVE_BACKWARD;
-      case TRANSITIVE_FULL -> DefinitionStream.SchemaCompatibilityMode.TRANSITIVE_FULL;
-    };
-  }
-
-  private static StreamModel.SchemaCompatibilityMode fromDefinitionCompatibility(DefinitionStream.SchemaCompatibilityMode value) {
-    if (value == null) {
-      return StreamModel.SchemaCompatibilityMode.BACKWARD;
-    }
-    return switch (value) {
-      case NONE -> StreamModel.SchemaCompatibilityMode.NONE;
-      case BACKWARD, UNKNOWN -> StreamModel.SchemaCompatibilityMode.BACKWARD;
-      case FORWARD -> StreamModel.SchemaCompatibilityMode.FORWARD;
-      case FULL -> StreamModel.SchemaCompatibilityMode.FULL;
-      case TRANSITIVE_BACKWARD -> StreamModel.SchemaCompatibilityMode.TRANSITIVE_BACKWARD;
-      case TRANSITIVE_FULL -> StreamModel.SchemaCompatibilityMode.TRANSITIVE_FULL;
-    };
-  }
-
-  private static DefinitionStream.SchemaResolutionPolicy toDefinitionResolution(StreamModel.SchemaResolutionPolicy value) {
-    if (value == null) {
-      return DefinitionStream.SchemaResolutionPolicy.COMPATIBLE;
-    }
-    return switch (value) {
-      case EXACT_ID -> DefinitionStream.SchemaResolutionPolicy.EXACT_ID;
-      case LATEST -> DefinitionStream.SchemaResolutionPolicy.LATEST;
-      case COMPATIBLE -> DefinitionStream.SchemaResolutionPolicy.COMPATIBLE;
-    };
-  }
-
-  private static StreamModel.SchemaResolutionPolicy fromDefinitionResolution(DefinitionStream.SchemaResolutionPolicy value) {
-    if (value == null) {
-      return StreamModel.SchemaResolutionPolicy.COMPATIBLE;
-    }
-    return switch (value) {
-      case EXACT_ID -> StreamModel.SchemaResolutionPolicy.EXACT_ID;
-      case LATEST -> StreamModel.SchemaResolutionPolicy.LATEST;
-      case COMPATIBLE, UNKNOWN -> StreamModel.SchemaResolutionPolicy.COMPATIBLE;
-    };
-  }
-
-  private static Map<String, byte[]> resolvePublishHeaders(StreamModel model, StreamPublishOptions options) {
-    Map<String, byte[]> headers = new LinkedHashMap<>();
-    if (options != null && Strings.isNotEmpty(options.headers())) {
-      options.headers().forEach(
-          (key, value) -> {
-            String normalizedKey = Strings.trimToNull(key);
-            if (normalizedKey != null && value != null) {
-              headers.put(normalizedKey, value.clone());
-            }
-          });
-    }
-    String schemaId = Strings.trimToNull(options == null ? null : options.schemaId());
-    if (schemaId == null) {
-      schemaId = Strings.trimToNull(model.schemaId());
-    }
-    if (schemaId != null) {
-      headers.put(HEADER_SCHEMA_ID, schemaId.getBytes(StandardCharsets.UTF_8));
-    }
-    String messageType = Strings.trimToNull(options == null ? null : options.messageType());
-    if (messageType == null) {
-      messageType = Strings.trimToNull(model.messageType());
-    }
-    if (messageType != null) {
-      headers.put(HEADER_MESSAGE_TYPE, messageType.getBytes(StandardCharsets.UTF_8));
-    }
-    String contentType = Strings.trimToNull(options == null ? null : options.contentType());
-    if (contentType == null) {
-      contentType = contentTypeFor(model.serde());
-    }
-    if (contentType != null) {
-      headers.put(HEADER_CONTENT_TYPE, contentType.getBytes(StandardCharsets.UTF_8));
-    }
-    return headers.isEmpty() ? Map.of() : Map.copyOf(headers);
-  }
-
-  private static String encodeOptions(Map<String, byte[]> headers) {
-    if (Strings.isEmpty(headers)) {
-      return null;
-    }
-    List<String> values = new ArrayList<>();
-    for (Map.Entry<String, byte[]> entry : headers.entrySet()) {
-      String key = Strings.trimToNull(entry.getKey());
-      byte[] value = entry.getValue();
-      if (key == null || value == null) {
-        continue;
-      }
-      values.add(key + "=" + new String(value, StandardCharsets.UTF_8));
-    }
-    return values.isEmpty() ? null : String.join(";", values);
-  }
-
-  private static String contentTypeFor(StreamModel.Serde serde) {
-    if (serde == null) {
-      return null;
-    }
-    return switch (serde) {
-      case NVFIX -> "application/nvfix";
-      case JSON -> "application/json";
-      case PROTOBUF -> "application/x-protobuf";
-      case BYTES -> "application/octet-stream";
-    };
-  }
-
-  private static byte[] encodePayload(StreamModel model, Object value) {
-    if (value instanceof byte[] bytes) {
-      return bytes;
-    }
-    return switch (model.serde()) {
-      case NVFIX -> encodeNvfix(toMap(value)).getBytes(StandardCharsets.UTF_8);
-      case JSON -> {
-        try {
-          yield MAPPER.writeValueAsBytes(value);
-        } catch (Exception ex) {
-          throw new IllegalArgumentException("Failed to encode JSON payload", ex);
-        }
-      }
-      case PROTOBUF -> throw new IllegalArgumentException("PROTOBUF publish requires byte[] payload");
-      case BYTES -> throw new IllegalArgumentException("BYTES publish requires byte[] payload");
-    };
-  }
-
-  private static <T> T decodePayload(StreamModel model, byte[] payload, Class<T> targetType) {
-    Objects.requireNonNull(targetType, "targetType");
-    byte[] bytes = payload == null ? new byte[0] : payload;
-    if (targetType == byte[].class) {
-      return targetType.cast(bytes);
-    }
-    if (targetType == String.class) {
-      return targetType.cast(new String(bytes, StandardCharsets.UTF_8));
-    }
-    return switch (model.serde()) {
-      case JSON -> {
-        try {
-          yield MAPPER.readValue(bytes, targetType);
-        } catch (Exception ex) {
-          throw new IllegalArgumentException("Failed to decode JSON payload", ex);
-        }
-      }
-      case NVFIX -> {
-        Map<String, String> decoded = decodeNvfix(bytes);
-        if (targetType == Object.class || Map.class.isAssignableFrom(targetType)) {
-          @SuppressWarnings("unchecked")
-          T cast = (T) decoded;
-          yield cast;
-        }
-        yield MAPPER.convertValue(decoded, targetType);
-      }
-      case PROTOBUF, BYTES -> throw new UnsupportedOperationException("Typed decode for " + model.serde() + " supports byte[] or String only");
-    };
-  }
-
-  private static Map<String, Object> toMap(Object value) {
-    if (value instanceof Map<?, ?> map) {
-      Map<String, Object> out = new LinkedHashMap<>();
-      for (Map.Entry<?, ?> entry : map.entrySet()) {
-        String key = Strings.trimToNull(entry.getKey() == null ? null : String.valueOf(entry.getKey()));
-        if (key != null && entry.getValue() != null) {
-          out.put(key, entry.getValue());
-        }
-      }
-      return out;
-    }
-    return MAPPER.convertValue(value, Map.class);
-  }
-
-  private static String encodeNvfix(Map<String, Object> fields) {
-    if (Strings.isEmpty(fields)) {
-      throw new IllegalArgumentException("NVFIX payload requires fields");
-    }
-    StringBuilder builder = new StringBuilder();
-    for (Map.Entry<String, Object> entry : fields.entrySet()) {
-      String key = Strings.trimToNull(entry.getKey());
-      if (key == null || entry.getValue() == null) {
-        continue;
-      }
-      builder.append(key).append('=').append(entry.getValue()).append('\u0001');
-    }
-    if (builder.isEmpty()) {
-      throw new IllegalArgumentException("NVFIX payload requires at least one non-null field");
-    }
-    return builder.toString();
-  }
-
-  private static Map<String, String> decodeNvfix(byte[] payload) {
-    Map<String, String> out = new LinkedHashMap<>();
-    String text = payload == null ? "" : new String(payload, StandardCharsets.UTF_8);
-    for (String token : text.split("\u0001")) {
-      String normalized = Strings.trimToNull(token);
-      if (normalized == null) {
-        continue;
-      }
-      int equals = normalized.indexOf('=');
-      if (equals <= 0 || equals + 1 >= normalized.length()) {
-        continue;
-      }
-      String key = Strings.trimToNull(normalized.substring(0, equals));
-      String value = Strings.trimToNull(normalized.substring(equals + 1));
-      if (key != null && value != null) {
-        out.put(key, value);
-      }
-    }
-    return out;
-  }
-
-  private static Map<String, byte[]> parseHeaders(AmpsConnection.AmpsMessage message) {
-    String raw = Strings.trimToNull(message == null ? null : message.options());
-    if (raw == null) {
-      return Map.of();
-    }
-    Map<String, byte[]> headers = new LinkedHashMap<>();
-    for (String token : raw.split(";")) {
-      String normalized = Strings.trimToNull(token);
-      if (normalized == null) {
-        continue;
-      }
-      int equals = normalized.indexOf('=');
-      if (equals <= 0 || equals + 1 >= normalized.length()) {
-        continue;
-      }
-      String key = Strings.trimToNull(normalized.substring(0, equals));
-      String value = Strings.trimToNull(normalized.substring(equals + 1));
-      if (key != null && value != null) {
-        headers.put(key, value.getBytes(StandardCharsets.UTF_8));
-      }
-    }
-    return headers.isEmpty() ? Map.of() : Map.copyOf(headers);
-  }
-
-  private static long messageTimestamp(AmpsConnection.AmpsMessage message) {
-    Message raw = message == null ? null : message.raw();
-    if (raw == null) {
-      return System.currentTimeMillis();
-    }
-    String text = Strings.trimToNull(raw.getTimestamp());
-    if (text == null) {
-      return System.currentTimeMillis();
-    }
+  private OdbcSessionSupport.OdbcConnectionHealth testOdbcConnection(String connectionName) {
+    String normalizedName = requireConnectionName(connectionName);
+    OdbcSessionSupport.OdbcConnectionSpec spec;
     try {
-      return Instant.parse(text).toEpochMilli();
-    } catch (Exception ignore) {
+      spec = resolveOdbcConnectionSpec(normalizedName);
+    } catch (RuntimeException ex) {
+      return new OdbcSessionSupport.OdbcConnectionHealth(
+          false,
+          normalizedName,
+          DefinitionConnection.Odbc.DatabaseType.OTHER,
+          null,
+          false,
+          false,
+          null,
+          Strings.firstNonBlank(Strings.trimToNull(ex.getMessage()), "ODBC_CONNECTION_TEST_FAILED"),
+          null,
+          null,
+          0L,
+          List.of(),
+          false);
     }
-    try {
-      return Long.parseLong(text);
-    } catch (Exception ignore) {
+    try (DuckdbEngine engine = new DuckdbEngine();
+        DuckdbSession session = engine.openSession()) {
+      return OdbcSessionSupport.probeConnection(session, spec);
+    } catch (RuntimeException ex) {
+      return new OdbcSessionSupport.OdbcConnectionHealth(
+          false,
+          spec.connectionName(),
+          spec.databaseType(),
+          null,
+          false,
+          false,
+          null,
+          Strings.firstNonBlank(Strings.trimToNull(ex.getMessage()), "ODBC_CONNECTION_TEST_FAILED"),
+          null,
+          null,
+          0L,
+          List.of(),
+          false);
     }
-    return System.currentTimeMillis();
   }
 
-  private static boolean isBoundary(AmpsConnection.AmpsMessage message) {
-    Message raw = message == null ? null : message.raw();
-    if (raw == null) {
+  private OdbcSessionSupport.OdbcSchemaInspection inspectOdbcSchema(
+      String connectionName, String remoteSql) {
+    String normalizedName = requireConnectionName(connectionName);
+    String resolvedRemoteSql = Strings.requireNonBlank(remoteSql, "remoteSql");
+    OdbcSessionSupport.OdbcConnectionSpec spec;
+    try {
+      spec = resolveOdbcConnectionSpec(normalizedName);
+    } catch (RuntimeException ex) {
+      return new OdbcSessionSupport.OdbcSchemaInspection(
+          false,
+          normalizedName,
+          DefinitionConnection.Odbc.DatabaseType.OTHER,
+          null,
+          Strings.firstNonBlank(Strings.trimToNull(ex.getMessage()), "ODBC_SCHEMA_INSPECT_FAILED"),
+          List.of(),
+          0L,
+          List.of());
+    }
+    try (DuckdbEngine engine = new DuckdbEngine();
+        DuckdbSession session = engine.openSession()) {
+      return OdbcSessionSupport.inspectSchema(session, spec, resolvedRemoteSql);
+    } catch (RuntimeException ex) {
+      return new OdbcSessionSupport.OdbcSchemaInspection(
+          false,
+          spec.connectionName(),
+          spec.databaseType(),
+          null,
+          Strings.firstNonBlank(Strings.trimToNull(ex.getMessage()), "ODBC_SCHEMA_INSPECT_FAILED"),
+          List.of(),
+          0L,
+          List.of());
+    }
+  }
+
+  private String decryptS3Credential(String kekAlias, String encryptedValue) {
+    try {
+      return secretDecryptor.decrypt(kekAlias, encryptedValue);
+    } catch (IllegalStateException ex) {
+      throw ex;
+    } catch (RuntimeException ex) {
+      throw new IllegalStateException(
+          "Unable to decrypt S3 credential with provided KEK (alias=" + kekAlias + ")");
+    }
+  }
+
+  private static void ensureNoPlaintextS3Credentials(
+      String connectionName, DefinitionConnection definition, DefinitionConnection.S3 s3) {
+    if (hasAnyPlaintextCredential(definition.properties()) || hasAnyPlaintextCredential(s3.attributes())) {
+      throw new IllegalArgumentException(
+          "Plaintext S3 credentials are not supported for connection '" + connectionName + "'");
+    }
+  }
+
+  private static boolean hasAnyPlaintextCredential(Map<String, String> map) {
+    if (map == null || map.isEmpty()) {
       return false;
     }
-    return raw.getCommand() == Message.Command.GroupBegin || raw.getCommand() == Message.Command.GroupEnd;
+    return hasCredentialValue(map, "accessKeyId")
+        || hasCredentialValue(map, "secretAccessKey")
+        || hasCredentialValue(map, "sessionToken")
+        || hasCredentialValue(map, "aws_access_key_id")
+        || hasCredentialValue(map, "aws_secret_access_key")
+        || hasCredentialValue(map, "aws_session_token")
+        || hasCredentialValue(map, "s3_access_key_id")
+        || hasCredentialValue(map, "s3_secret_access_key")
+        || hasCredentialValue(map, "s3_session_token");
   }
 
-  private record StreamLookup(String namespace, String name) {}
+  private static boolean hasCredentialValue(Map<String, String> map, String key) {
+    return Strings.trimToNull(map.get(key)) != null;
+  }
+
+  private DefinitionConnection resolveDefinitionConnection(
+      String connectionName, DefinitionConnection.ConnectionType expectedType) {
+    DiscoveryCache cache = configCacheSupplier.get();
+    if (cache == null) {
+      throw new IllegalStateException("Session DiscoveryCache is not available");
+    }
+    String group = Strings.trimToNull(groupSupplier.get());
+    if (group == null) {
+      throw new IllegalStateException("Session group is not resolved");
+    }
+    Optional<DefinitionConnection> optional = cache.get(DefinitionConnection.class, group, connectionName);
+    if (optional.isEmpty()) {
+      optional = cache.get(DefinitionConnection.class, PLATFORM_GROUP, connectionName);
+    }
+    if (optional.isEmpty()) {
+      throw new IllegalArgumentException(
+          "Connection '"
+              + group
+              + "/"
+              + connectionName
+              + "' or '"
+              + PLATFORM_GROUP
+              + "/"
+              + connectionName
+              + "' was not found");
+    }
+    DefinitionConnection definition = optional.get();
+    ensureConnectionEnabled(group, connectionName, definition);
+    if (expectedType != null) {
+      DefinitionConnection.ConnectionType actualType = definition.connectionType();
+      if (actualType != expectedType) {
+        throw new IllegalArgumentException(
+            "Connection '"
+                + group
+                + "/"
+                + connectionName
+                + "' has type "
+                + actualType
+                + ", expected "
+                + expectedType);
+      }
+    }
+    return definition;
+  }
+
+  private OdbcSessionSupport.OdbcConnectionSpec resolveOdbcConnectionSpec(String connectionName) {
+    DefinitionConnection definition =
+        resolveDefinitionConnection(connectionName, DefinitionConnection.ConnectionType.ODBC);
+    DefinitionConnection.Odbc odbc =
+        Objects.requireNonNull(
+            definition.odbc(),
+            "Connection '" + scopedName(connectionName) + "' is missing ODBC configuration");
+    String group = Strings.trimToNull(groupSupplier.get());
+    String normalizedGroup = group == null ? PLATFORM_GROUP : group;
+    return OdbcSessionSupport.resolveConnection(
+        configCacheSupplier.get(),
+        normalizedGroup,
+        connectionName,
+        odbc.databaseType(),
+        "connection:" + scopedName(connectionName));
+  }
+
+  private URI resolveHttpBaseUri(String connectionName, DefinitionConnection definition) {
+    DefinitionConnection.Http http = definition.http();
+    String endpoint =
+        firstNonBlank(
+            http == null ? null : http.endpoints(), definition.properties(), "endpoint", "url", "baseUrl");
+    if (endpoint == null) {
+      throw new IllegalArgumentException(
+          "HTTP connection '" + scopedName(connectionName) + "' is missing endpoints");
+    }
+
+    boolean httpsRequired =
+        (http != null && http.transport() == DefinitionConnection.Http.Transport.HTTPS)
+            || (http != null && http.tls() != null && http.tls().enabled());
+    URI uri = parseHttpEndpoint(endpoint, httpsRequired, connectionName);
+    return ensureTrailingSlash(uri);
+  }
+
+  private AmpsFactoryOptions buildAmpsFactoryOptions(
+      String connectionName, DefinitionConnection definition, ConnectionOptions options) {
+    AmpsFactoryOptions factoryOptions = AmpsFactoryOptions.fromSystemProperties();
+    if (factoryOptions == null) {
+      factoryOptions = new AmpsFactoryOptions();
+    }
+    configureKerberos(factoryOptions);
+    SessionContext context = sessionContextSupplier.get();
+    String sessionId = context == null ? null : Strings.trimToNull(context.getSessionId());
+    if (sessionId != null) {
+      factoryOptions.kerberos().cacheKeyPrefix("session:" + sessionId + ":connection:" + connectionName);
+    }
+    if (options.timeout() != null) {
+      factoryOptions.connection().connectTimeout(options.timeout());
+    }
+    DefinitionConnection.Amps amps = definition.amps();
+    if (amps != null && amps.kerberosEnabled()) {
+      factoryOptions.kerberos().enabled(true);
+      String service = Strings.trimToNull(amps.kerberosService());
+      if (service != null) {
+        factoryOptions.kerberos().service(service);
+      }
+      String host = Strings.trimToNull(amps.kerberosHost());
+      if (host != null) {
+        factoryOptions.kerberos().saslHost(host);
+      }
+    }
+    return factoryOptions;
+  }
+
+  private void configureKerberos(AmpsFactoryOptions options) {
+    if (options == null) {
+      return;
+    }
+    AmpsFactoryOptions.Kerberos kerberos = options.kerberos();
+    if (Strings.isNotBlank(sessionConfig.kerberosPrincipal()) || sessionConfig.kerberosKeytab() != null) {
+      kerberos.enabled(true);
+    }
+    if (Strings.isNotBlank(sessionConfig.kerberosPrincipal())) {
+      kerberos.principal(sessionConfig.kerberosPrincipal());
+    }
+    Path keytab = sessionConfig.kerberosKeytab();
+    if (keytab != null) {
+      kerberos.keytab(keytab.toAbsolutePath().toString());
+    }
+    maybeApplyClasspathKrb5Conf(kerberos);
+  }
+
+  private static void maybeApplyClasspathKrb5Conf(AmpsFactoryOptions.Kerberos kerberos) {
+    if (kerberos == null || !kerberos.isEnabled()) {
+      return;
+    }
+    if (Strings.isNotBlank(kerberos.getKrb5ConfPath())) {
+      return;
+    }
+    byte[] existingData = kerberos.getKrb5ConfData();
+    if (existingData != null && existingData.length > 0) {
+      return;
+    }
+    try (InputStream input = ConnectionManagerImpl.class.getClassLoader().getResourceAsStream("krb5.conf")) {
+      if (input == null) {
+        return;
+      }
+      byte[] data = input.readAllBytes();
+      if (data.length > 0) {
+        kerberos.krb5ConfData(data);
+      }
+    } catch (IOException ignore) {
+      // keep default kerberos config lookup if classpath file cannot be loaded
+    }
+  }
+
+  private List<String> resolveAmpsEndpoints(DefinitionConnection definition, ConnectionOptions options) {
+    DefinitionConnection.Amps amps = definition == null ? null : definition.amps();
+    String pinnedInstance = options == null ? null : Strings.trimToNull(options.pinnedInstance());
+    if (pinnedInstance != null) {
+      if (amps == null || amps.instances() == null || amps.instances().isEmpty()) {
+        throw new IllegalArgumentException(
+            "AMPS connection '"
+                + scopedName(definition == null || definition.envelope() == null ? null : definition.envelope().name())
+                + "' does not define instances; cannot pin to instance '"
+                + pinnedInstance
+                + "'");
+      }
+      DefinitionConnection.Amps.AmpsInstanceSpec matched = null;
+      List<String> names = new ArrayList<>();
+      for (DefinitionConnection.Amps.AmpsInstanceSpec instance : amps.instances()) {
+        if (instance == null) {
+          continue;
+        }
+        String name = Strings.trimToNull(instance.name());
+        if (name != null) {
+          names.add(name);
+        }
+        if (name != null && name.equalsIgnoreCase(pinnedInstance)) {
+          matched = instance;
+        }
+      }
+      if (matched == null) {
+        throw new IllegalArgumentException(
+            "AMPS connection '"
+                + scopedName(definition == null || definition.envelope() == null ? null : definition.envelope().name())
+                + "' does not define instance '"
+                + pinnedInstance
+                + "'. Available instances="
+                + names);
+      }
+      List<String> matchedUris = normalizedList(matched.uris());
+      if (!matchedUris.isEmpty()) {
+        return matchedUris;
+      }
+      throw new IllegalArgumentException(
+          "AMPS connection instance '"
+              + Strings.trimToNull(matched.name())
+              + "' for connection '"
+              + scopedName(definition == null || definition.envelope() == null ? null : definition.envelope().name())
+              + "' has no URIs configured");
+    }
+
+    List<String> uris = normalizedList(amps == null ? null : amps.uris());
+    if (!uris.isEmpty()) {
+      return uris;
+    }
+    String fromProperties =
+        firstNonBlank(null, definition.properties(), "uris", "uri", "endpoints", "endpoint", "brokers");
+    if (fromProperties == null) {
+      throw new IllegalArgumentException(
+          "AMPS connection '"
+              + scopedName(definition.envelope() == null ? null : definition.envelope().name())
+              + "' is missing endpoints");
+    }
+    List<String> resolved = new ArrayList<>();
+    for (String value : fromProperties.split(",")) {
+      String trimmed = Strings.trimToNull(value);
+      if (trimmed != null) {
+        resolved.add(trimmed);
+      }
+    }
+    if (resolved.isEmpty()) {
+      throw new IllegalArgumentException(
+          "AMPS connection '"
+              + scopedName(definition.envelope() == null ? null : definition.envelope().name())
+              + "' is missing endpoints");
+    }
+    return List.copyOf(resolved);
+  }
+
+  private String resolveAmpsClientName(String connectionName, ConnectionOptions options) {
+    String explicit = Strings.trimToNull(options == null ? null : options.clientName());
+    if (explicit != null) {
+      return explicit;
+    }
+    SessionContext context = Objects.requireNonNull(sessionContextSupplier.get(), "session context");
+    String group = IdentityParsingSupport.requireGroup(groupSupplier.get());
+    String app = Strings.requireNonBlank(context.getAppName(), "session.appName");
+    String instance = Strings.requireNonBlank(context.getInstance(), "session.instance");
+    String base =
+        AmpsConfig.buildCpClientId(group, app, instance);
+    String token = sanitizeClientToken(connectionName);
+    String pinnedInstance = Strings.trimToNull(options == null ? null : options.pinnedInstance());
+    if (pinnedInstance != null) {
+      token = token + "-inst-" + sanitizeClientToken(pinnedInstance);
+    }
+    return base + "-conn-" + token;
+  }
+
+  private String scopedName(String connectionName) {
+    String group = IdentityParsingSupport.requireGroup(groupSupplier.get());
+    String name = IdentityParsingSupport.requireName(connectionName, "connectionName");
+    return group + "/" + name;
+  }
+
+  private static String defaultProviderId(DefinitionConnection.ConnectionType connectionType) {
+    if (connectionType == null) {
+      return null;
+    }
+    return switch (connectionType) {
+      case AMPS -> "amps";
+      case HTTP -> "http";
+      case S3 -> "s3";
+      case UNKNOWN -> null;
+      default -> connectionType.name().toLowerCase(Locale.ROOT);
+    };
+  }
+
+  private static ConnectionOptions normalizeOptions(ConnectionOptions options) {
+    return options == null ? ConnectionOptions.defaults() : options;
+  }
+
+  private static String extractConnectionName(Object builder) {
+    if (builder == null) {
+      return null;
+    }
+    for (String methodName : List.of("connectionName", "name", "getConnectionName", "getName")) {
+      String value = invokeNameMethod(builder, methodName);
+      if (value != null) {
+        return value;
+      }
+    }
+    return null;
+  }
+
+  private static String invokeNameMethod(Object target, String methodName) {
+    try {
+      Method method = target.getClass().getMethod(methodName);
+      if (method.getParameterCount() != 0 || method.getReturnType() != String.class) {
+        return null;
+      }
+      return Strings.trimToNull((String) method.invoke(target));
+    } catch (ReflectiveOperationException ex) {
+      return null;
+    }
+  }
+
+  private static String requireConnectionName(String value) {
+    String normalized = Strings.trimToNull(value);
+    if (normalized == null) {
+      throw new IllegalArgumentException("connectionName is required");
+    }
+    return normalized;
+  }
+
+  private static URI ensureTrailingSlash(URI uri) {
+    String path = Strings.trimToNull(uri.getPath());
+    if (path == null) {
+      path = "/";
+    } else if (!path.endsWith("/")) {
+      path = path + "/";
+    }
+    try {
+      return new URI(uri.getScheme(), uri.getUserInfo(), uri.getHost(), uri.getPort(), path, null, null);
+    } catch (URISyntaxException ex) {
+      throw new IllegalArgumentException("Invalid HTTP endpoint URI: " + uri, ex);
+    }
+  }
+
+  private static URI parseHttpEndpoint(String endpoint, boolean httpsRequired, String connectionName) {
+    String normalized = Strings.trimToNull(endpoint);
+    if (normalized == null) {
+      throw new IllegalArgumentException("HTTP endpoint is required for connection '" + connectionName + "'");
+    }
+
+    URI parsed;
+    try {
+      if (normalized.contains("://")) {
+        parsed = URI.create(normalized);
+      } else {
+        String scheme = httpsRequired ? "https://" : "http://";
+        parsed = URI.create(scheme + normalized);
+      }
+    } catch (IllegalArgumentException ex) {
+      throw new IllegalArgumentException(
+          "Invalid HTTP endpoint for connection '" + connectionName + "': " + endpoint, ex);
+    }
+
+    String scheme = Strings.trimToNull(parsed.getScheme());
+    if (scheme == null || parsed.getHost() == null) {
+      throw new IllegalArgumentException(
+          "HTTP endpoint must be an absolute URI for connection '" + connectionName + "'");
+    }
+    if (httpsRequired && "http".equalsIgnoreCase(scheme)) {
+      try {
+        parsed =
+            new URI(
+                "https",
+                parsed.getUserInfo(),
+                parsed.getHost(),
+                parsed.getPort(),
+                parsed.getPath(),
+                parsed.getQuery(),
+                parsed.getFragment());
+      } catch (URISyntaxException ex) {
+        throw new IllegalArgumentException(
+            "Invalid HTTPS endpoint for connection '" + connectionName + "'", ex);
+      }
+    }
+    if (!"http".equalsIgnoreCase(parsed.getScheme()) && !"https".equalsIgnoreCase(parsed.getScheme())) {
+      throw new IllegalArgumentException(
+          "HTTP endpoint must use http or https scheme for connection '" + connectionName + "'");
+    }
+    return parsed;
+  }
+
+  private static String sanitizeClientToken(String value) {
+    String normalized = Strings.requireNonBlank(value, "connection token");
+    StringBuilder builder = new StringBuilder(normalized.length());
+    for (int i = 0; i < normalized.length(); i++) {
+      char ch = normalized.charAt(i);
+      boolean allowed =
+          (ch >= 'a' && ch <= 'z')
+              || (ch >= 'A' && ch <= 'Z')
+              || (ch >= '0' && ch <= '9')
+              || ch == '-'
+              || ch == '_'
+              || ch == '.';
+      builder.append(allowed ? ch : '-');
+    }
+    String token = Strings.trimToNull(builder.toString());
+    if (token == null) {
+      throw new IllegalArgumentException("connection token must contain at least one non-blank character");
+    }
+    return token;
+  }
+
+  private static CacheOptions normalizeCacheOptions(ConnectionOptions options) {
+    Duration timeout = options.timeout();
+    long timeoutMillis = timeout == null ? -1L : timeout.toMillis();
+    return new CacheOptions(
+        options.clientName(),
+        timeoutMillis,
+        options.maxInflight(),
+        Strings.trimToNull(options.pinnedInstance()));
+  }
+
+  private static void ensureConnectionEnabled(
+      String group, String connectionName, DefinitionConnection connection) {
+    DefinitionEnvelope envelope = connection == null ? null : connection.envelope();
+    if (Boolean.FALSE.equals(envelope == null ? null : envelope.enabled())) {
+      throw new IllegalArgumentException("Connection '" + group + "/" + connectionName + "' is disabled");
+    }
+    LifecycleStatus status = lifecycleStatus(envelope);
+    if (status != LifecycleStatus.ACTIVE) {
+      throw new IllegalArgumentException(
+          "Connection '"
+              + group
+              + "/"
+              + connectionName
+              + "' is not active (lifecycleStatus="
+              + status
+              + ")");
+    }
+  }
+
+  private static LifecycleStatus lifecycleStatus(DefinitionEnvelope envelope) {
+    if (envelope == null) {
+      return LifecycleStatus.ACTIVE;
+    }
+    String status = Strings.trimToNull(envelope.lifecycleStatus());
+    if (status == null) {
+      return LifecycleStatus.ACTIVE;
+    }
+    try {
+      return LifecycleStatus.valueOf(status.trim().toUpperCase(Locale.ROOT));
+    } catch (IllegalArgumentException ex) {
+      throw new IllegalArgumentException("Unsupported lifecycleStatus '" + status + "'", ex);
+    }
+  }
+
+  private static List<String> normalizedList(List<String> values) {
+    if (values == null || values.isEmpty()) {
+      return List.of();
+    }
+    List<String> result = new ArrayList<>(values.size());
+    for (String value : values) {
+      String trimmed = Strings.trimToNull(value);
+      if (trimmed != null) {
+        result.add(trimmed);
+      }
+    }
+    return result.isEmpty() ? List.of() : List.copyOf(result);
+  }
+
+  private static String firstNonBlank(
+      List<String> preferredValues, Map<String, String> fallbackMap, String... fallbackKeys) {
+    if (preferredValues != null) {
+      for (String value : preferredValues) {
+        String trimmed = Strings.trimToNull(value);
+        if (trimmed != null) {
+          return trimmed;
+        }
+      }
+    }
+    if (fallbackMap == null || fallbackMap.isEmpty() || fallbackKeys == null) {
+      return null;
+    }
+    for (String key : fallbackKeys) {
+      String value = Strings.trimToNull(fallbackMap.get(key));
+      if (value != null) {
+        return value;
+      }
+    }
+    return null;
+  }
+
+  private static void closeHaClient(HAClient client) {
+    if (client == null) {
+      return;
+    }
+    try {
+      client.disconnect();
+    } catch (Exception ignore) {
+    }
+    try {
+      client.close();
+    } catch (Exception ignore) {
+    }
+  }
+
+  @SuppressWarnings("unchecked")
+  private <T extends AutoCloseable> T getOrCreate(CacheKey key, ThrowingSupplier<T> supplier) {
+    AutoCloseable existing = cache.get(key);
+    if (existing != null) {
+      return (T) existing;
+    }
+    T created;
+    try {
+      created = supplier.get();
+    } catch (RuntimeException ex) {
+      throw ex;
+    } catch (Exception ex) {
+      throw new IllegalStateException("Failed to create connection", ex);
+    }
+    AutoCloseable prior = cache.putIfAbsent(key, created);
+    if (prior != null) {
+      closeCachedHandle(created);
+      return (T) prior;
+    }
+    return created;
+  }
+
+  private static void closeCachedHandle(AutoCloseable handle) {
+    if (handle == null) {
+      return;
+    }
+    if (handle instanceof AmpsConnection ampsConnection) {
+      closeHaClient(ampsConnection.client());
+      return;
+    }
+    if (handle instanceof S3Connection s3Connection) {
+      CloseSupport.closeQuietly(s3Connection.admin());
+      return;
+    }
+    CloseSupport.closeQuietly(handle);
+  }
 
   @FunctionalInterface
-  private interface MessageConsumer {
-    void onMessage(StreamMessage message);
+  private interface ThrowingSupplier<T> {
+    T get() throws Exception;
   }
 
-  private final class StreamRuntime implements Stream {
-    private final StreamModel model;
-    private final AmpsConnection amps;
-    private final Runnable onClose;
-    private final DataStatusPublisher statusPublisher;
-    private final AtomicLong messagesPublished = new AtomicLong(0L);
-    private final AtomicLong messagesReceived = new AtomicLong(0L);
-    private final CopyOnWriteArrayList<ManagedSubscription> subscriptions = new CopyOnWriteArrayList<>();
-    private final AtomicBoolean closed = new AtomicBoolean(false);
+  @FunctionalInterface
+  public interface SessionSecretDecryptor {
+    String decrypt(String alias, String encryptedValue);
+  }
 
-    private StreamRuntime(StreamModel model, AmpsConnection amps, Runnable onClose) {
-      this.model = model;
-      this.amps = amps;
-      this.onClose = onClose == null ? () -> {} : onClose;
-      this.statusPublisher = createDataStatusPublisher(model);
-      if (statusPublisher != null) {
-        statusPublisher.start();
-        statusPublisher.publishOnline("stream runtime opened");
-      }
+  private enum ConnectionKind {
+    AMPS,
+    HTTP,
+    ODBC,
+    S3
+  }
+
+  private final class OdbcConnectionImpl implements OdbcConnection {
+    private final String connectionName;
+
+    private OdbcConnectionImpl(String connectionName) {
+      this.connectionName = requireConnectionName(connectionName);
     }
 
     @Override
-    public StreamPublishResult publish(byte[] payload, StreamPublishOptions options) {
-      ensureOpen();
-      try {
-        String encodedOptions = encodeOptions(resolvePublishHeaders(model, options));
-        amps.publish(model.address().topic(), payload == null ? new byte[0] : payload, encodedOptions);
-        long published = messagesPublished.incrementAndGet();
-        if (statusPublisher != null) {
-          statusPublisher.putTag("messagesPublished", Long.toString(published));
-        }
-        return new StreamPublishResult(model.streamId(), true, model.address().topic());
-      } catch (Exception ex) {
-        if (statusPublisher != null) {
-          statusPublisher.publishError(
-              "publish failed: "
-                  + Strings.firstNonBlank(
-                      Strings.trimToNull(ex.getMessage()), ex.getClass().getSimpleName()));
-        }
-        throw new IllegalStateException("Failed to publish stream " + model.streamId(), ex);
-      }
+    public OdbcSessionSupport.OdbcConnectionHealth test() {
+      return testOdbcConnection(connectionName);
     }
 
     @Override
-    public StreamPublishResult publish(Object value, StreamPublishOptions options) {
-      return publish(encodePayload(model, value), options);
-    }
-
-    @Override
-    public StreamSubscription subscribeBytes(StreamBytesListener listener) {
-      Objects.requireNonNull(listener, "listener");
-      return subscribeInternal(StreamSubscribeOptions.defaults(), listener::onMessage);
-    }
-
-    @Override
-    public <T> StreamSubscription subscribe(Class<T> targetType, StreamListener<T> listener, StreamSubscribeOptions options) {
-      Objects.requireNonNull(targetType, "targetType");
-      Objects.requireNonNull(listener, "listener");
-      StreamSubscribeOptions resolved = options == null ? StreamSubscribeOptions.defaults() : options;
-      return subscribeInternal(
-          resolved,
-          message -> listener.onMessage(decodePayload(model, message.payload(), targetType), message.headers()));
+    public OdbcSessionSupport.OdbcSchemaInspection inspectSchema(String remoteSql) {
+      return inspectOdbcSchema(connectionName, remoteSql);
     }
 
     @Override
     public void close() {
-      if (!closed.compareAndSet(false, true)) {
-        return;
-      }
-      for (ManagedSubscription subscription : List.copyOf(subscriptions)) {
-        subscription.close();
-      }
-      subscriptions.clear();
-      try {
-        amps.close();
-      } catch (Exception ignore) {
-      }
-      if (statusPublisher != null) {
-        statusPublisher.putTag("messagesPublished", Long.toString(messagesPublished.get()));
-        statusPublisher.putTag("messagesReceived", Long.toString(messagesReceived.get()));
-        statusPublisher.close();
-      }
-      onClose.run();
-    }
-
-    private ManagedSubscription subscribeInternal(StreamSubscribeOptions options, MessageConsumer consumer) {
-      ensureOpen();
-      AmpsConnection.SubscriptionSpec spec =
-          new AmpsConnection.SubscriptionSpec(
-              options.sowSubscribe(),
-              options.sowOnly(),
-              model.address().topic(),
-              options.options(),
-              options.filter(),
-              options.bookmarkStart(),
-              options.bookmarkFile());
-      AtomicBoolean subscriptionClosed = new AtomicBoolean(false);
-      try {
-        AmpsConnection.Subscription nativeSubscription =
-            amps.subscribe(
-                spec,
-                (AmpsConnection.SubscriptionListener)
-                    message -> {
-                  if (closed.get() || subscriptionClosed.get() || isBoundary(message)) {
-                    return;
-                  }
-                  byte[] payload = message.dataBytes();
-                  Map<String, byte[]> headers = parseHeaders(message);
-                  BasicStreamMessage streamMessage =
-                      new BasicStreamMessage(
-                          model.streamId(),
-                          Strings.firstNonBlank(message.topic(), model.address().topic()),
-                          messageTimestamp(message),
-                          headers,
-                          payload == null ? new byte[0] : payload);
-                  if (statusPublisher != null) {
-                    long received = messagesReceived.incrementAndGet();
-                    statusPublisher.putTag("messagesReceived", Long.toString(received));
-                  }
-                  consumer.onMessage(streamMessage);
-                });
-        ManagedSubscription managed = new ManagedSubscription(subscriptionClosed, nativeSubscription, () -> subscriptions.removeIf(ManagedSubscription::isClosed));
-        subscriptions.add(managed);
-        return managed;
-      } catch (Exception ex) {
-        throw new IllegalStateException("Failed to subscribe stream " + model.streamId(), ex);
-      }
-    }
-
-    private void ensureOpen() {
-      if (closed.get()) {
-        throw new IllegalStateException("Stream runtime is closed: " + model.streamId());
-      }
+      // ODBC connector methods are one-shot and do not hold pooled handles.
     }
   }
 
-  private static final class ManagedSubscription implements StreamSubscription {
-    private final AtomicBoolean closed;
-    private final AmpsConnection.Subscription delegate;
-    private final Runnable onClose;
+  private record CacheKey(ConnectionKind kind, String name, CacheOptions options) {}
 
-    private ManagedSubscription(AtomicBoolean closed, AmpsConnection.Subscription delegate, Runnable onClose) {
-      this.closed = closed;
-      this.delegate = delegate;
-      this.onClose = onClose == null ? () -> {} : onClose;
-    }
-
-    @Override
-    public void close() {
-      if (!closed.compareAndSet(false, true)) {
-        return;
-      }
-      try {
-        if (delegate != null) {
-          delegate.close();
-        }
-      } finally {
-        onClose.run();
-      }
-    }
-
-    @Override
-    public boolean isClosed() {
-      return closed.get();
-    }
-  }
-
-  private static final class BasicStreamMessage implements StreamMessage {
-    private final String streamId;
-    private final String topic;
-    private final long timestampEpochMillis;
-    private final Map<String, byte[]> headers;
-    private final byte[] payload;
-
-    private BasicStreamMessage(
-        String streamId,
-        String topic,
-        long timestampEpochMillis,
-        Map<String, byte[]> headers,
-        byte[] payload) {
-      this.streamId = streamId;
-      this.topic = topic;
-      this.timestampEpochMillis = timestampEpochMillis;
-      this.headers = headers == null ? Map.of() : Map.copyOf(headers);
-      this.payload = payload == null ? new byte[0] : payload.clone();
-    }
-
-    @Override
-    public String streamId() {
-      return streamId;
-    }
-
-    @Override
-    public String topic() {
-      return topic;
-    }
-
-    @Override
-    public long timestampEpochMillis() {
-      return timestampEpochMillis;
-    }
-
-    @Override
-    public Map<String, byte[]> headers() {
-      return headers;
-    }
-
-    @Override
-    public byte[] payload() {
-      return payload.clone();
-    }
-  }
+  private record CacheOptions(
+      String clientName, long timeoutMillis, int maxInflight, String pinnedInstance) {}
 }
+
+
+
+
+
+
 
 
