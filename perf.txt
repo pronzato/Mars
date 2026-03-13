@@ -1,780 +1,771 @@
-package org.pronzato.fabric.api.data.manager;
+package org.pronzato.fabric.api.data.ingest.model;
 
-import java.io.ByteArrayInputStream;
-import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.nio.channels.Channels;
-import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
-import java.util.concurrent.atomic.AtomicBoolean;
-import io.opentelemetry.api.common.AttributeKey;
-import io.opentelemetry.api.common.Attributes;
-import io.opentelemetry.api.trace.Span;
-import io.opentelemetry.api.trace.SpanKind;
-import org.apache.arrow.flight.CallOption;
-import org.apache.arrow.flight.Criteria;
-import org.apache.arrow.flight.FlightClient;
-import org.apache.arrow.flight.FlightEndpoint;
-import org.apache.arrow.flight.FlightInfo;
-import org.apache.arrow.flight.FlightStream;
-import org.apache.arrow.flight.Ticket;
-import org.apache.arrow.flight.sql.FlightSqlClient;
-import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.vector.VectorLoader;
-import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.VectorUnloader;
-import org.apache.arrow.vector.ipc.ArrowStreamWriter;
-import org.apache.arrow.vector.ipc.ReadChannel;
-import org.apache.arrow.vector.ipc.message.MessageSerializer;
-import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
-import org.apache.arrow.vector.types.pojo.Schema;
-import org.apache.arrow.vector.util.Text;
-import org.pronzato.fabric.api.Fabric;
-import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionService;
-import org.pronzato.fabric.api.data.DataOptions;
-import org.pronzato.fabric.api.util.Bytes;
-import org.pronzato.fabric.api.data.DataQuery;
-import org.pronzato.fabric.api.data.TabularManager;
-import org.pronzato.fabric.api.data.TabularTableMetadata;
-import org.pronzato.fabric.api.data.TabularStreamOptions;
-import org.pronzato.fabric.api.data.TabularStreamSubscription;
-import org.pronzato.fabric.api.control.security.UserContext;
-import org.pronzato.fabric.api.control.security.UserPrincipal;
-import org.pronzato.fabric.api.control.security.identity.CallerAppContext;
-import org.pronzato.fabric.api.control.security.identity.CallerAppIdentity;
-import org.pronzato.fabric.api.control.session.SessionImpl;
-import org.pronzato.fabric.api.services.ServiceRunOptions;
-import org.pronzato.fabric.api.services.common.ServiceInstanceResolver;
-import org.pronzato.fabric.api.services.common.routing.ServiceRoutingContext;
-import org.pronzato.fabric.api.services.common.routing.ServiceRoutingState;
-import org.pronzato.fabric.api.services.flight.FlightDatasetStreamTicket;
-import org.pronzato.fabric.api.services.flight.FlightDatasetStreamTicketCodec;
-import org.pronzato.fabric.api.telemetry.manager.FabricOtelAttributes;
-import org.pronzato.fabric.api.telemetry.manager.FabricOtelEnablement;
-import org.pronzato.fabric.api.telemetry.OtelManager;
-import org.pronzato.fabric.api.telemetry.manager.FabricOtelSupport;
+import org.pronzato.fabric.api.connectors.amps.AmpsConnection;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConnection;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngest;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngestSource;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
+import org.pronzato.fabric.api.data.dataset.DatasetId;
+import org.pronzato.fabric.api.data.dataset.DatasetType;
+import org.pronzato.fabric.api.control.plugins.FabricPlugins;
+import org.pronzato.fabric.api.control.plugins.IngestSourceProvider;
+import org.pronzato.fabric.api.control.plugins.IngestSourceProviderContext;
+import org.pronzato.fabric.api.control.plugins.IngestTargetProvider;
+import org.pronzato.fabric.api.control.plugins.IngestTargetProviderContext;
+import org.pronzato.fabric.api.schemas.SchemaModel;
+import org.pronzato.fabric.api.util.DefinitionModelMapperSupport;
 import org.pronzato.fabric.api.util.Strings;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
-public final class RemoteTabularManager implements TabularManager, AutoCloseable {
-  private static final Logger LOGGER = LoggerFactory.getLogger(RemoteTabularManager.class);
-  private static final long IPC_READ_ALLOCATOR_BYTES = 64L * 1024L * 1024L;
-  private static final AttributeKey<String> FABRIC_STATEMENT_TYPE =
-      AttributeKey.stringKey("fabric.statement.type");
+public final class IngestModelMapper {
+  private static final String INPUT_TYPE_API_IPC = "API_IPC";
+  private static final String ODBC = "ODBC";
 
-  private final DiscoveryCache DiscoveryCache;
-  private final String group;
-  private final String queryServiceName;
-  private final ServiceRunOptions options;
-  private final String sessionKerberosPrincipal;
-  private final Path sessionKerberosKeytab;
-  private final ServiceInstanceResolver endpointResolver;
-  private final CallerAppIdentity callerApp;
-  private final String environment;
-  private final String region;
-  private final String site;
-  private final SessionImpl session;
-  private final RootAllocator ipcDecodeAllocator = new RootAllocator(IPC_READ_ALLOCATOR_BYTES);
-  private final AtomicBoolean closed = new AtomicBoolean(false);
-  private final ServiceRoutingState queryRoutingState = new ServiceRoutingState();
+  private final FabricPlugins plugins;
 
-  public RemoteTabularManager(
-      Fabric.Session session,
-      DiscoveryCache DiscoveryCache,
-      String group,
-      String callerAppName,
-      String callerAppInstance,
-      String environment,
-      String region,
-      String site,
-      DataOptions.ServiceOptions dataOptions,
-      String kerberosPrincipal,
-      Path kerberosKeytab,
-      ServiceInstanceResolver endpointResolver) {
-    this.session = (SessionImpl) Objects.requireNonNull(session, "session");
-    this.DiscoveryCache = Objects.requireNonNull(DiscoveryCache, "DiscoveryCache");
-    this.group = Strings.requireNonBlank(group, "session group");
-    DataOptions.ServiceOptions configured = Objects.requireNonNull(dataOptions, "dataOptions");
-    if (!configured.enabled()) {
-      throw new IllegalArgumentException(
-          "RemoteTabularManager requires DataOptions service.enabled=true");
-    }
-    this.queryServiceName = Strings.requireNonBlank(configured.queryService(), "query service name");
-    this.options =
-        configured.serviceOptions() == null
-            ? ServiceRunOptions.defaults()
-            : configured.serviceOptions();
-    this.sessionKerberosPrincipal = Strings.trimToNull(kerberosPrincipal);
-    this.sessionKerberosKeytab = kerberosKeytab;
-    this.endpointResolver = endpointResolver;
-    this.callerApp = new CallerAppIdentity(group, callerAppName, callerAppInstance);
-    this.environment = Strings.trimToNull(environment);
-    this.region = Strings.trimToNull(region);
-    this.site = Strings.trimToNull(site);
+  public IngestModelMapper() {
+    this(FabricPlugins.system());
   }
 
-  boolean check() {
-    RemoteFlightClientSupport.ServiceEndpoint endpoint = resolveQueryService();
-    OtelManager otelRuntime = resolveClientRuntime(endpoint, true);
-    Attributes otelAttrs = otelAttributes(endpoint, "arrow-flight-sql");
-    long otelStartedAt = System.nanoTime();
-    Span otelSpan =
-        FabricOtelSupport.startSpan(
-            otelRuntime, "fabric.flight.sql.client.check", SpanKind.CLIENT, otelAttrs);
-    Throwable otelError = null;
-    try (RemoteFlightClientSupport.ClientResources client =
-        RemoteFlightClientSupport.openClient(
-            endpoint, options, sessionKerberosPrincipal, sessionKerberosKeytab)) {
-      CallOption[] callOptions =
-          RemoteFlightClientSupport.buildCallOptions(
-              callerApp, environment, region, site, client, null);
-      for (FlightInfo ignored : client.flightClient().listFlights(Criteria.ALL, callOptions)) {
-        break;
-      }
-      return true;
-    } catch (Exception ex) {
-      otelError = ex;
-      return false;
-    } finally {
-      FabricOtelSupport.endSpan(otelRuntime, otelSpan, otelAttrs, otelStartedAt, otelError);
-    }
+  public IngestModelMapper(FabricPlugins plugins) {
+    this.plugins = Objects.requireNonNull(plugins, "plugins");
   }
 
-  @Override
-  public byte[] queryIpc(DataQuery query) {
-    return Bytes.toByteArray(queryIpcBuffer(query));
-  }
-
-  @Override
-  public ByteBuffer queryIpcBuffer(DataQuery query) {
-    if (closed.get()) {
-      throw new IllegalStateException("Remote tabular manager is closed");
-    }
-    Objects.requireNonNull(query, "query");
-    int limit = query.limit() == null ? -1 : query.limit();
-    ByteBuffer buffer = queryIpcBuffer(query.sql(), limit);
-    assert buffer.isDirect();
-    assert buffer.position() == 0;
-    return buffer;
-  }
-
-  @Override
-  public byte[] queryIpc(String sql, int limit) {
-    return Bytes.toByteArray(queryIpcBuffer(sql, limit));
-  }
-
-  @Override
-  public ByteBuffer queryIpcBuffer(String sql, int limit) {
-    if (closed.get()) {
-      throw new IllegalStateException("Remote tabular manager is closed");
-    }
-    String plannedSql = Strings.requireNonBlank(sql, "sql");
-    Integer resolvedLimit = null;
-    if (limit > 0) {
-      resolvedLimit = limit;
-    } else if (limit == 0) {
-      throw new IllegalArgumentException("limit must be > 0");
-    }
-    if (resolvedLimit != null) {
-      plannedSql = stripTrailingSemicolons(plannedSql) + " limit " + resolvedLimit;
-    }
-
-    RemoteFlightClientSupport.ServiceEndpoint endpoint = resolveQueryService();
-    OtelManager otelRuntime = resolveClientRuntime(endpoint, true);
-    Attributes otelAttrs =
-        otelAttributesWithStatementType(
-            endpoint, "arrow-flight-sql", statementType(plannedSql));
-    long otelStartedAt = System.nanoTime();
-    Span otelSpan =
-        FabricOtelSupport.startSpan(
-            otelRuntime, "fabric.flight.sql.client.query", SpanKind.CLIENT, otelAttrs);
-    Throwable otelError = null;
-    try (RemoteFlightClientSupport.ClientResources client =
-            RemoteFlightClientSupport.openClient(
-                endpoint, options, sessionKerberosPrincipal, sessionKerberosKeytab);
-        FlightSqlClient sqlClient = new FlightSqlClient(client.flightClient())) {
-      CallOption[] callOptions =
-          RemoteFlightClientSupport.buildCallOptions(
-              callerApp, environment, region, site, client, null);
-      FlightInfo info = sqlClient.execute(plannedSql, callOptions);
-      ByteBuffer buffer = toArrowIpcBuffer(client.flightClient(), client.allocator(), info, callOptions);
-      assert buffer.isDirect();
-      assert buffer.position() == 0;
-      return buffer;
-    } catch (Exception ex) {
-      otelError = ex;
-      String kerberosDetails =
-          RemoteFlightClientSupport.kerberosAuthFailureDetails(
-              endpoint, ex, sessionKerberosPrincipal);
-      String endpointContext = RemoteFlightClientSupport.endpointSecurityContext(endpoint);
-      String clientDiagnostics =
-          RemoteFlightClientSupport.clientDiagnostics(
-              endpoint, options, sessionKerberosPrincipal, sessionKerberosKeytab, null);
-      String detailSuffix = kerberosDetails == null ? "" : " " + kerberosDetails;
-      LOGGER.error("[RemoteTabularManager][queryIpcSql][failed] {} sql={} diagnostics={} throwableChain={}", endpointContext, summarizeSqlForLogs(plannedSql), clientDiagnostics, RemoteFlightClientSupport.summarizeThrowable(ex), ex);
-      throw new IllegalStateException(
-          "Remote query failed ["
-              + endpointContext
-              + "] sql="
-              + plannedSql
-              + ": "
-              + ex.getMessage()
-              + detailSuffix,
-          ex);
-    } finally {
-      FabricOtelSupport.endSpan(otelRuntime, otelSpan, otelAttrs, otelStartedAt, otelError);
-    }
-  }
-
-  @Override
-  public List<Map<String, Object>> decodeIpcRows(byte[] ipcBytes) {
-    if (closed.get()) {
-      throw new IllegalStateException("Remote tabular manager is closed");
-    }
-    return ArrowIpcRowDecoder.decodeToRowMaps(ipcBytes, ipcDecodeAllocator);
-  }
-
-  @Override
-  public List<Map<String, Object>> decodeIpcRows(ByteBuffer ipcBuffer) {
-    if (closed.get()) {
-      throw new IllegalStateException("Remote tabular manager is closed");
-    }
-    return ArrowIpcRowDecoder.decodeToRowMaps(ipcBuffer, ipcDecodeAllocator);
-  }
-
-  @Override
-  public List<TabularTableMetadata> listTables() {
-    if (closed.get()) {
-      throw new IllegalStateException("Remote tabular manager is closed");
-    }
-    RemoteFlightClientSupport.ServiceEndpoint endpoint = resolveQueryService();
-    OtelManager otelRuntime = resolveClientRuntime(endpoint, true);
-    Attributes otelAttrs = otelAttributes(endpoint, "arrow-flight-sql");
-    long otelStartedAt = System.nanoTime();
-    Span otelSpan =
-        FabricOtelSupport.startSpan(
-            otelRuntime, "fabric.flight.sql.client.listTables", SpanKind.CLIENT, otelAttrs);
-    Throwable otelError = null;
-    try (RemoteFlightClientSupport.ClientResources client =
-            RemoteFlightClientSupport.openClient(
-                endpoint, options, sessionKerberosPrincipal, sessionKerberosKeytab);
-        FlightSqlClient sqlClient = new FlightSqlClient(client.flightClient())) {
-      CallOption[] callOptions =
-          RemoteFlightClientSupport.buildCallOptions(
-              callerApp, environment, region, site, client, null);
-      FlightInfo info = sqlClient.getTables("fabric", null, null, List.of(), false, callOptions);
-      return readTableMetadataRows(client.flightClient(), info, callOptions);
-    } catch (Exception ex) {
-      otelError = ex;
-      String endpointContext = RemoteFlightClientSupport.endpointSecurityContext(endpoint);
-      throw new IllegalStateException(
-          "Remote metadata listTables failed [" + endpointContext + "]: " + ex.getMessage(), ex);
-    } finally {
-      FabricOtelSupport.endSpan(otelRuntime, otelSpan, otelAttrs, otelStartedAt, otelError);
-    }
-  }
-
-  @Override
-  public List<String> listSchemas() {
-    if (closed.get()) {
-      throw new IllegalStateException("Remote tabular manager is closed");
-    }
-    RemoteFlightClientSupport.ServiceEndpoint endpoint = resolveQueryService();
-    OtelManager otelRuntime = resolveClientRuntime(endpoint, true);
-    Attributes otelAttrs = otelAttributes(endpoint, "arrow-flight-sql");
-    long otelStartedAt = System.nanoTime();
-    Span otelSpan =
-        FabricOtelSupport.startSpan(
-            otelRuntime, "fabric.flight.sql.client.listSchemas", SpanKind.CLIENT, otelAttrs);
-    Throwable otelError = null;
-    try (RemoteFlightClientSupport.ClientResources client =
-            RemoteFlightClientSupport.openClient(
-                endpoint, options, sessionKerberosPrincipal, sessionKerberosKeytab);
-        FlightSqlClient sqlClient = new FlightSqlClient(client.flightClient())) {
-      CallOption[] callOptions =
-          RemoteFlightClientSupport.buildCallOptions(
-              callerApp, environment, region, site, client, null);
-      FlightInfo info = sqlClient.getSchemas("fabric", null, callOptions);
-      return readSchemaNames(client.flightClient(), info, callOptions);
-    } catch (Exception ex) {
-      otelError = ex;
-      String endpointContext = RemoteFlightClientSupport.endpointSecurityContext(endpoint);
-      throw new IllegalStateException(
-          "Remote metadata listSchemas failed [" + endpointContext + "]: " + ex.getMessage(), ex);
-    } finally {
-      FabricOtelSupport.endSpan(otelRuntime, otelSpan, otelAttrs, otelStartedAt, otelError);
-    }
-  }
-
-  @Override
-  public Schema getSchema(org.pronzato.fabric.api.data.dataset.DatasetId datasetId) {
-    if (closed.get()) {
-      throw new IllegalStateException("Remote tabular manager is closed");
-    }
-    Objects.requireNonNull(datasetId, "datasetId");
-    RemoteFlightClientSupport.ServiceEndpoint endpoint = resolveQueryService();
-    OtelManager otelRuntime = resolveClientRuntime(endpoint, true);
-    Attributes otelAttrs = otelAttributes(endpoint, "arrow-flight-sql");
-    long otelStartedAt = System.nanoTime();
-    Span otelSpan =
-        FabricOtelSupport.startSpan(
-            otelRuntime, "fabric.flight.sql.client.getSchema", SpanKind.CLIENT, otelAttrs);
-    Throwable otelError = null;
-    try (RemoteFlightClientSupport.ClientResources client =
-            RemoteFlightClientSupport.openClient(
-                endpoint, options, sessionKerberosPrincipal, sessionKerberosKeytab);
-        FlightSqlClient sqlClient = new FlightSqlClient(client.flightClient())) {
-      CallOption[] callOptions =
-          RemoteFlightClientSupport.buildCallOptions(
-              callerApp, environment, region, site, client, null);
-      FlightInfo info =
-          sqlClient.getTables(
-              "fabric",
-              datasetId.namespace(),
-              datasetId.name(),
-              List.of("TABLE", "VIEW", "STREAM"),
-              true,
-              callOptions);
-      byte[] schemaBytes = readSingleTableSchema(client.flightClient(), info, callOptions, datasetId);
-      try (ByteArrayInputStream in = new ByteArrayInputStream(schemaBytes)) {
-        return MessageSerializer.deserializeSchema(new ReadChannel(Channels.newChannel(in)));
-      }
-    } catch (Exception ex) {
-      otelError = ex;
-      String endpointContext = RemoteFlightClientSupport.endpointSecurityContext(endpoint);
-      throw new IllegalStateException(
-          "Remote metadata getSchema failed ["
-              + endpointContext
-              + "] dataset="
-              + datasetId
-              + ": "
-              + ex.getMessage(),
-          ex);
-    } finally {
-      FabricOtelSupport.endSpan(otelRuntime, otelSpan, otelAttrs, otelStartedAt, otelError);
-    }
-  }
-
-  @Override
-  public TabularStreamSubscription subscribeDataset(
-      org.pronzato.fabric.api.data.dataset.DatasetId datasetId, TabularStreamOptions options) {
-    if (closed.get()) {
-      throw new IllegalStateException("Remote tabular manager is closed");
-    }
-    Objects.requireNonNull(datasetId, "datasetId");
-    TabularStreamOptions resolved = options == null ? TabularStreamOptions.defaults() : options;
-    RemoteFlightClientSupport.ServiceEndpoint endpoint = resolveQueryService();
-    OtelManager otelRuntime = resolveClientRuntime(endpoint, true);
-    Attributes otelAttrs = otelAttributes(endpoint, "arrow-flight-sql");
-    long otelStartedAt = System.nanoTime();
-    Span otelSpan =
-        FabricOtelSupport.startSpan(
-            otelRuntime, "fabric.flight.sql.client.subscribe", SpanKind.CLIENT, otelAttrs);
-    Throwable otelError = null;
-    RemoteFlightClientSupport.ClientResources client = null;
-    try {
-      client =
-          RemoteFlightClientSupport.openClient(
-              endpoint, this.options, sessionKerberosPrincipal, sessionKerberosKeytab);
-      boolean includeDelegatedUser = !Boolean.TRUE.equals(resolved.publicAccess());
-      CallOption[] callOptions =
-          RemoteFlightClientSupport.buildCallOptions(
-              callerApp,
-              environment,
-              region,
-              site,
-              client,
-              datasetId.toString(),
-              includeDelegatedUser);
-      Ticket ticket = FlightDatasetStreamTicketCodec.encode(toStreamTicket(datasetId, resolved));
-      FlightStream stream = client.flightClient().getStream(ticket, callOptions);
-      return new RemoteTabularStreamSubscription(client, stream);
-    } catch (Exception ex) {
-      otelError = ex;
-      if (client != null) {
-        client.close();
-      }
-      String endpointContext = RemoteFlightClientSupport.endpointSecurityContext(endpoint);
-      throw new IllegalStateException(
-          "Remote stream subscription failed ["
-              + endpointContext
-              + "] dataset="
-              + datasetId
-              + ": "
-              + ex.getMessage(),
-          ex);
-    } finally {
-      FabricOtelSupport.endSpan(otelRuntime, otelSpan, otelAttrs, otelStartedAt, otelError);
-    }
-  }
-
-  @Override
-  public void close() {
-    if (!closed.compareAndSet(false, true)) {
-      return;
-    }
-    ipcDecodeAllocator.close();
-  }
-
-  BufferAllocator decodeAllocator() {
-    return ipcDecodeAllocator;
-  }
-
-  private OtelManager resolveClientRuntime(
-      RemoteFlightClientSupport.ServiceEndpoint endpoint, boolean flightSql) {
-    OtelManager runtime = session.telemetry();
-    DefinitionService service = endpoint == null ? null : endpoint.definition();
-    if (flightSql) {
-      return FabricOtelEnablement.isArrowFlightSqlClientTracingEnabled(service)
-          ? runtime
-          : null;
-    }
-    return FabricOtelEnablement.isArrowFlightClientTracingEnabled(service)
-        ? runtime
-        : null;
-  }
-
-  private Attributes otelAttributes(
-      RemoteFlightClientSupport.ServiceEndpoint endpoint, String transport) {
-    String endpointAddress =
-        endpoint == null ? null : endpoint.connectHost() + ":" + endpoint.port();
-    String serviceName = endpoint == null ? null : endpoint.serviceName();
-    String serviceGroup = endpoint == null ? null : endpoint.group();
-    return FabricOtelAttributes.common(
-        serviceGroup,
-        callerApp == null ? null : callerApp.name(),
-        serviceName,
-        transport,
-        callerApp == null ? null : callerApp.asSubject(),
-        endpointAddress);
-  }
-
-  private Attributes otelAttributesWithStatementType(
-      RemoteFlightClientSupport.ServiceEndpoint endpoint, String transport, String statementType) {
-    Attributes base = otelAttributes(endpoint, transport);
-    String normalizedType = Strings.trimToNull(statementType);
-    if (normalizedType == null) {
-      return base;
-    }
-    return Attributes.builder().putAll(base).put(FABRIC_STATEMENT_TYPE, normalizedType).build();
-  }
-
-  private RemoteFlightClientSupport.ServiceEndpoint resolveQueryService() {
-    String serviceGroup = Strings.firstNonBlank(options.group(), group);
-    return RemoteFlightClientSupport.resolveArrowService(
-        DiscoveryCache,
-        serviceGroup,
-        queryServiceName,
-        DefinitionService.ServiceType.ARROW_FLIGHT_SQL,
-        endpointResolver,
-        currentRoutingContext(),
-        queryRoutingState);
-  }
-
-  private ServiceRoutingContext currentRoutingContext() {
-    UserPrincipal principal = UserContext.get().orElse(null);
-    CallerAppContext.ContextValue callerContext = CallerAppContext.get().orElse(null);
-    String effectiveSubject =
-        Strings.firstNonBlank(
-            principal == null ? null : Strings.trimToNull(principal.username()),
-            sessionKerberosPrincipal);
-    String callerAppSubject =
-        Strings.firstNonBlank(
-            callerContext == null ? null : callerContext.callerAppSubject(),
-            callerApp == null ? null : callerApp.asSubject());
-    return new ServiceRoutingContext(
-        null,
-        "ARROW_FLIGHT_SQL",
-        effectiveSubject,
-        callerAppSubject,
-        options.routingKey(),
-        callerContext == null ? null : callerContext.requestId(),
+  public DefinitionIngest toDefinition(
+      IngestModel model, String sessionGroup, String actor, String outputSchemaName) {
+    Objects.requireNonNull(model, "model");
+    String group = DefinitionModelMapperSupport.requireNonBlank(sessionGroup, "sessionGroup");
+    String ingestName = DefinitionModelMapperSupport.requireNonBlank(model.name(), "model.name");
+    String namespace =
+        DefinitionModelMapperSupport.requireNonBlank(model.namespace(), "model.namespace");
+    String resolvedSchemaName =
+        DefinitionModelMapperSupport.requireNonBlank(outputSchemaName, "outputSchemaName");
+    DatasetId datasetId = resolveDatasetId(group, namespace, model);
+    DefinitionEnvelope envelope =
+        DefinitionModelMapperSupport.envelopeNow(
+            group,
+            DefinitionType.INGEST,
+            ingestName,
+            Strings.firstNonBlank(
+                model.uuid(),
+                DefinitionModelMapperSupport.buildDefinitionId("ingest", group, ingestName)),
+            model.enabled(),
+            model.lifecycleStatus(),
+            actor);
+    return new DefinitionIngest(
+        envelope,
+        datasetId.toString(),
+        resolvedSchemaName,
+        new DefinitionIngest.Input(INPUT_TYPE_API_IPC),
+        toDefinitionSchemaMode(model.schemaMode()),
         null);
   }
 
-  private static String stripTrailingSemicolons(String sql) {
-    String value = Strings.requireNonBlank(sql, "sql");
-    while (value.endsWith(";")) {
-      value = value.substring(0, value.length() - 1).trim();
+  public DefinitionIngestSource toDefinition(
+      IngestSourceModel model, String sessionGroup, String actor) {
+    Objects.requireNonNull(model, "model");
+    String group = DefinitionModelMapperSupport.requireNonBlank(sessionGroup, "sessionGroup");
+    String ingestName =
+        DefinitionModelMapperSupport.requireNonBlank(model.ingestName(), "source.ingestName");
+    String namespace =
+        DefinitionModelMapperSupport.requireNonBlank(model.namespace(), "source.namespace");
+    DefinitionEnvelope envelope =
+        DefinitionModelMapperSupport.envelopeNow(
+            group,
+            DefinitionType.INGEST_SOURCE,
+            ingestName,
+            Strings.firstNonBlank(
+                model.uuid(),
+                DefinitionModelMapperSupport.buildDefinitionId(
+                    "ingest-source", group, ingestName)),
+            model.enabled() == null || model.enabled(),
+            model.lifecycleStatus(),
+            actor);
+    String format = toFormatToken(model.format());
+
+    if (model instanceof IngestSourceApiModel api) {
+      DefinitionIngestSource.JsonConfig json =
+          "JSON".equals(format)
+              ? new DefinitionIngestSource.JsonConfig("OBJECT_PER_MESSAGE", api.jsonRootField())
+              : null;
+      DefinitionIngestSource.NvFixConfig nvfix =
+          "NVFIX".equals(format)
+              ? new DefinitionIngestSource.NvFixConfig(
+                  normalizedNvFixPairDelimiter(api.nvFixPairDelimiter()),
+                  normalizedNvFixKvDelimiter(api.nvFixKvDelimiter()),
+                  normalizedNvFixTrim(api.nvFixTrimKeys()),
+                  normalizedNvFixTrim(api.nvFixTrimValues()))
+              : null;
+      return new DefinitionIngestSource(
+          envelope, namespace, ingestName, format, json, nvfix, null, null, null, null);
     }
-    return value;
+
+    if (model instanceof IngestSourceAmpsModel amps) {
+      DefinitionIngestSource.JsonConfig json =
+          "JSON".equals(format)
+              ? new DefinitionIngestSource.JsonConfig("OBJECT_PER_MESSAGE", amps.jsonRootField())
+              : null;
+      DefinitionIngestSource.NvFixConfig nvfix =
+          "NVFIX".equals(format)
+              ? new DefinitionIngestSource.NvFixConfig(
+                  normalizedNvFixPairDelimiter(amps.nvFixPairDelimiter()),
+                  normalizedNvFixKvDelimiter(amps.nvFixKvDelimiter()),
+                  normalizedNvFixTrim(amps.nvFixTrimKeys()),
+                  normalizedNvFixTrim(amps.nvFixTrimValues()))
+              : null;
+      DefinitionIngestSource.Mode mode =
+          amps.mode() == IngestSourceAmpsModel.Mode.BATCH
+              ? DefinitionIngestSource.Mode.BATCH
+              : DefinitionIngestSource.Mode.STREAM;
+      DefinitionIngestSource.OofHandling definitionOofHandling = null;
+      if (amps.oofHandling() == IngestSourceAmpsModel.OofHandling.MARK_AS_DELETED) {
+        definitionOofHandling = DefinitionIngestSource.OofHandling.MARK_AS_DELETED;
+      } else if (hasSubscribeOption(amps.options(), "oof")) {
+        definitionOofHandling = DefinitionIngestSource.OofHandling.DELETE_EVENT;
+      }
+      DefinitionIngestSource.AmpsSource ampsSource =
+          new DefinitionIngestSource.AmpsSource(
+              Strings.requireNonBlank(amps.connectionName(), "source.amps.connectionName"),
+              Strings.requireNonBlank(amps.topic(), "source.amps.topic"),
+              amps.sow(),
+              amps.sowOnly(),
+              amps.options(),
+              amps.filter(),
+              mode,
+              definitionOofHandling,
+              amps.batchMaxMessages(),
+              amps.batchMaxBytes(),
+              amps.batchFlushMillis());
+      return new DefinitionIngestSource(
+          envelope, namespace, ingestName, format, json, nvfix, ampsSource, null, null, null);
+    }
+    if (model instanceof IngestSourceExternalModel externalModel) {
+      if (ODBC.equalsIgnoreCase(Strings.trimToNull(externalModel.providerId()))) {
+        return new DefinitionIngestSource(
+            envelope,
+            namespace,
+            ingestName,
+            format,
+            null,
+            null,
+            null,
+            null,
+            toDefinitionOdbcSource(externalModel),
+            null);
+      }
+      return new DefinitionIngestSource(
+          envelope,
+          namespace,
+          ingestName,
+          format,
+          null,
+          null,
+          null,
+          new DefinitionIngestSource.ExternalSource(
+              externalModel.providerId(), externalModel.reference(), externalModel.options()),
+          null,
+          null);
+    }
+    @SuppressWarnings("unchecked")
+    IngestSourceProvider provider =
+        plugins.findIngestSourceProviderForModel((Class<? extends IngestSourceModel>) model.getClass());
+    if (provider != null) {
+      try {
+        DefinitionIngestSource.ExternalSource external = provider.toExternalSource(model);
+        if (external == null) {
+          throw new IllegalStateException(
+              "Ingest source provider '" + provider.providerId() + "' returned null external mapping");
+        }
+        String externalType = Strings.firstNonBlank(external.sourceType(), provider.providerId());
+        return new DefinitionIngestSource(
+            envelope,
+            namespace,
+            ingestName,
+            format,
+            null,
+            null,
+            null,
+            new DefinitionIngestSource.ExternalSource(
+                externalType,
+                external.reference(),
+                external.options()),
+            null,
+            null);
+      } catch (RuntimeException ex) {
+        throw ex;
+      } catch (Exception ex) {
+        throw new IllegalStateException(
+            "Failed to map source model via provider '" + provider.providerId() + "'",
+            ex);
+      }
+    }
+    throw new IllegalArgumentException(
+        "Unsupported source model: " + model.getClass().getName());
   }
 
-  private static String summarizeSqlForLogs(String sql) {
-    String normalized = Strings.trimToNull(sql);
-    if (normalized == null) {
-      return "<empty>";
-    }
-    if (normalized.length() > 512) {
-      return normalized.substring(0, 512) + "...";
-    }
-    return normalized;
+  public DefinitionDataset toDefinitionDataset(IngestModel model, String sessionGroup, String actor) {
+    return toDefinitionDataset(model, sessionGroup, actor, null);
   }
 
-  private static String statementType(String sql) {
-    String normalized = Strings.trimToNull(sql);
-    if (normalized == null) {
+  public DefinitionDataset toDefinitionDataset(
+      IngestModel model, String sessionGroup, String actor, String parquetUriOverride) {
+    Objects.requireNonNull(model, "model");
+    String group = DefinitionModelMapperSupport.requireNonBlank(sessionGroup, "sessionGroup");
+    String ingestName = DefinitionModelMapperSupport.requireNonBlank(model.name(), "model.name");
+    String namespace =
+        DefinitionModelMapperSupport.requireNonBlank(model.namespace(), "model.namespace");
+    DatasetId datasetId = resolveDatasetId(group, namespace, model);
+    IngestTargetModel target = model.target();
+    if (target == null) {
       return null;
     }
-    int firstSpace = normalized.indexOf(' ');
-    String token = firstSpace < 0 ? normalized : normalized.substring(0, firstSpace);
-    return Strings.trimToNull(token == null ? null : token.toUpperCase(java.util.Locale.ROOT));
+    DefinitionDataset.Binding binding;
+    DatasetType type;
+    if (target instanceof IngestTargetParquetModel parquet) {
+      type = DatasetType.PARQUET;
+      String parquetUri = Strings.firstNonBlank(parquetUriOverride, parquet.parquetPath());
+      binding =
+          new DefinitionDataset.Binding(
+              null,
+              new DefinitionDataset.ParquetBinding(
+                  parquetUri,
+                  parquet.glob(),
+                  parquet.hivePartitioning(),
+                  null,
+                  parquet.partitionKey(),
+                  parquet.partitionValueField(),
+                  parquet.connectionName()),
+              null);
+    } else if (target instanceof IngestTargetDuckDbActiveModel duckdbActive) {
+      type = DatasetType.DUCKDB;
+      String relationName = Strings.firstNonBlank(duckdbActive.tableName(), datasetId.name());
+      binding =
+          new DefinitionDataset.Binding(
+              new DefinitionDataset.DuckdbBinding(
+                  relationName,
+                  IngestTargetType.DUCKDB_ACTIVE.name(),
+                  duckdbActive.primaryKey(),
+                  duckdbActive.memory(),
+                  duckdbActive.databasePath(),
+                  duckdbActive.parquetHistoryPath(),
+                  duckdbActive.persistOnStop(),
+                  duckdbActive.createIfMissing()),
+              null,
+              null);
+    } else if (target instanceof IngestTargetDuckDbModel duckdb) {
+      type = DatasetType.DUCKDB;
+      String relationName = Strings.firstNonBlank(duckdb.table(), datasetId.name());
+      binding =
+          new DefinitionDataset.Binding(
+              new DefinitionDataset.DuckdbBinding(
+                  relationName, IngestTargetType.DUCKDB.name(), List.of(), null, null, null, null, null),
+              null,
+              null);
+    } else if (target instanceof IngestTargetExternalModel external) {
+      type = DatasetType.EXTERNAL;
+      if (ODBC.equalsIgnoreCase(Strings.trimToNull(external.providerId()))) {
+        binding =
+            new DefinitionDataset.Binding(
+                null,
+                null,
+                null,
+                toDefinitionOdbcBinding(external));
+      } else {
+        binding =
+            new DefinitionDataset.Binding(
+                null,
+                null,
+                new DefinitionDataset.ExternalBinding(
+                    external.providerId(),
+                    external.reference(),
+                    external.options()),
+                null);
+      }
+    } else {
+      @SuppressWarnings("unchecked")
+      IngestTargetProvider provider =
+          plugins.findIngestTargetProviderForModel((Class<? extends IngestTargetModel>) target.getClass());
+      if (provider == null) {
+        throw new IllegalArgumentException("Unsupported target model: " + target.getClass().getName());
+      }
+      DefinitionDataset.ExternalBinding externalBinding;
+      try {
+        externalBinding = provider.toExternalBinding(target);
+      } catch (RuntimeException ex) {
+        throw ex;
+      } catch (Exception ex) {
+        throw new IllegalStateException(
+            "Failed to map target model via provider '" + provider.providerId() + "'",
+            ex);
+      }
+      if (externalBinding == null) {
+        throw new IllegalStateException(
+            "Ingest target provider '" + provider.providerId() + "' returned null external binding");
+      }
+      type = DatasetType.EXTERNAL;
+      binding =
+          new DefinitionDataset.Binding(
+              null,
+              null,
+              new DefinitionDataset.ExternalBinding(
+                  Strings.firstNonBlank(externalBinding.externalType(), provider.providerId()),
+                  externalBinding.reference(),
+                  externalBinding.options()),
+              null);
+    }
+    DefinitionEnvelope envelope =
+        DefinitionModelMapperSupport.envelopeNow(
+            group,
+            DefinitionType.DATASET,
+            DefinitionModelMapperSupport.buildScopedName(
+                datasetId.namespace(), datasetId.name(), "dataset.namespace", "dataset.name"),
+            DefinitionModelMapperSupport.buildDefinitionId(
+                "dataset",
+                group,
+                DefinitionModelMapperSupport.buildScopedName(
+                    datasetId.namespace(), datasetId.name(), "dataset.namespace", "dataset.name")),
+            model.enabled(),
+            model.lifecycleStatus(),
+            actor);
+    return new DefinitionDataset(envelope, type, datasetId.namespace(), binding);
   }
 
-  private static FlightDatasetStreamTicket toStreamTicket(
-      org.pronzato.fabric.api.data.dataset.DatasetId datasetId, TabularStreamOptions options) {
-    FlightDatasetStreamTicket.Builder builder =
-        FlightDatasetStreamTicket.builder()
-            .withDatasetId(datasetId)
-            .withBatchMaxRows(options.batchMaxRows())
-            .withFlushMillis(options.flushMillis())
-            .withSubscriptionId(options.subscriptionId())
-            .withFilterSql(options.filterSql());
-    if (options.publicAccess() != null) {
-      builder.withPublic(options.publicAccess());
-    }
-    if (options.start() == TabularStreamOptions.Start.BEGINNING) {
-      builder.withStart(FlightDatasetStreamTicket.Start.BEGINNING);
-    } else if (options.start() == TabularStreamOptions.Start.RESUME) {
-      builder.withStart(FlightDatasetStreamTicket.Start.RESUME);
-    } else if (options.start() == TabularStreamOptions.Start.FROM_SEQUENCE) {
-      builder.withFromSequence(options.fromSequence() == null ? 0L : options.fromSequence());
+  public IngestModel fromDefinitions(
+      DefinitionIngest ingest,
+      DefinitionIngestSource sourceOrNull,
+      SchemaModel schemaOrNull) {
+    Objects.requireNonNull(ingest, "ingest");
+    DefinitionEnvelope envelope = ingest.envelope();
+    String ingestName =
+        Strings.requireNonBlank(envelope == null ? null : envelope.name(), "ingest.envelope.name");
+    String namespace =
+        Strings.requireNonBlank(
+            Strings.firstNonBlank(
+                sourceOrNull == null ? null : sourceOrNull.namespace(),
+                parseNamespace(ingest.datasetId())),
+            "ingest.namespace");
+    IngestModel.Builder builder =
+        IngestModel.builder()
+            .withName(ingestName)
+            .withNamespace(namespace)
+            .withResolvedUuid(envelope == null ? null : envelope.uuid())
+            .withEnabled(envelope == null || !Boolean.FALSE.equals(envelope.enabled()))
+            .withResolvedLifecycleStatus(envelope == null ? null : envelope.lifecycleStatus())
+            .withSchemaMode(fromDefinitionSchemaMode(ingest.schemaMode()))
+            .withSchema(Objects.requireNonNull(schemaOrNull, "ingest schema is required"))
+            .withResolvedDatasetId(ingest.datasetId());
+
+    if (sourceOrNull != null) {
+      builder.withSource(fromDefinitionSource(sourceOrNull));
     } else {
-      builder.withStart(FlightDatasetStreamTicket.Start.LATEST);
+      builder.withSourceApi();
     }
     return builder.build();
   }
 
-  private static List<TabularTableMetadata> readTableMetadataRows(
-      FlightClient client, FlightInfo info, CallOption[] callOptions) throws Exception {
-    if (info == null) {
-      return List.of();
-    }
-    List<TabularTableMetadata> rows = new ArrayList<>();
-    for (FlightEndpoint endpoint : info.getEndpoints()) {
-      if (endpoint == null || endpoint.getTicket() == null) {
-        continue;
-      }
-      try (FlightStream stream = client.getStream(endpoint.getTicket(), callOptions)) {
-        while (stream.next()) {
-          VectorSchemaRoot root = stream.getRoot();
-          for (int row = 0; row < root.getRowCount(); row++) {
-            rows.add(
-                new TabularTableMetadata(
-                    stringValue(root, "catalog_name", row),
-                    stringValue(root, "db_schema_name", row),
-                    stringValue(root, "table_name", row),
-                    stringValue(root, "table_type", row)));
-          }
-        }
-      }
-    }
-    rows.sort(
-        Comparator.comparing(TabularTableMetadata::schemaName, String.CASE_INSENSITIVE_ORDER)
-            .thenComparing(TabularTableMetadata::schemaName)
-            .thenComparing(TabularTableMetadata::tableName, String.CASE_INSENSITIVE_ORDER)
-            .thenComparing(TabularTableMetadata::tableName)
-            .thenComparing(TabularTableMetadata::tableType, String.CASE_INSENSITIVE_ORDER)
-            .thenComparing(TabularTableMetadata::tableType));
-    return List.copyOf(rows);
-  }
-
-  private static List<String> readSchemaNames(
-      FlightClient client, FlightInfo info, CallOption[] callOptions) throws Exception {
-    if (info == null) {
-      return List.of();
-    }
-    LinkedHashSet<String> names = new LinkedHashSet<>();
-    for (FlightEndpoint endpoint : info.getEndpoints()) {
-      if (endpoint == null || endpoint.getTicket() == null) {
-        continue;
-      }
-      try (FlightStream stream = client.getStream(endpoint.getTicket(), callOptions)) {
-        while (stream.next()) {
-          VectorSchemaRoot root = stream.getRoot();
-          for (int row = 0; row < root.getRowCount(); row++) {
-            String value = stringValue(root, "db_schema_name", row);
-            if (value != null) {
-              names.add(value);
-            }
-          }
-        }
-      }
-    }
-    List<String> sorted = new ArrayList<>(names);
-    sorted.sort(String.CASE_INSENSITIVE_ORDER.thenComparing(Comparator.naturalOrder()));
-    return List.copyOf(sorted);
-  }
-
-  private static byte[] readSingleTableSchema(
-      FlightClient client,
-      FlightInfo info,
-      CallOption[] callOptions,
-      org.pronzato.fabric.api.data.dataset.DatasetId datasetId)
-      throws Exception {
-    List<byte[]> schemas = new ArrayList<>();
-    if (info == null) {
-      throw new IllegalStateException("Remote table schema not found: " + datasetId);
-    }
-    for (FlightEndpoint endpoint : info.getEndpoints()) {
-      if (endpoint == null || endpoint.getTicket() == null) {
-        continue;
-      }
-      try (FlightStream stream = client.getStream(endpoint.getTicket(), callOptions)) {
-        while (stream.next()) {
-          VectorSchemaRoot root = stream.getRoot();
-          for (int row = 0; row < root.getRowCount(); row++) {
-            Object value = root.getVector("table_schema").getObject(row);
-            if (value instanceof byte[] bytes && bytes.length > 0) {
-              schemas.add(bytes);
-            }
-          }
-        }
-      }
-    }
-    if (schemas.isEmpty()) {
-      throw new IllegalStateException("Remote table schema not found: " + datasetId);
-    }
-    return schemas.get(0);
-  }
-
-  private static String stringValue(VectorSchemaRoot root, String fieldName, int row) {
-    if (root == null || root.getVector(fieldName) == null) {
+  public IngestSourceModel fromDefinitionSource(DefinitionIngestSource source) {
+    if (source == null) {
       return null;
     }
-    Object value = root.getVector(fieldName).getObject(row);
+    DefinitionEnvelope envelope = source.envelope();
+    String ingestName = Strings.trimToNull(envelope == null ? null : envelope.name());
+    String namespace = Strings.requireNonBlank(source.namespace(), "source.namespace");
+    IngestFormat format = IngestFormat.fromToken(Strings.requireNonBlank(source.format(), "source.format"));
+    if (source.external() != null) {
+      DefinitionIngestSource.ExternalSource external = source.external();
+      String sourceType = Strings.requireNonBlank(external.sourceType(), "source.external.sourceType");
+      IngestSourceProvider provider = plugins.findIngestSourceProvider(sourceType);
+      if (provider != null) {
+        try {
+          return provider.fromExternalSource(
+              new IngestSourceProviderContext(
+                  source,
+                  Strings.requireNonBlank(ingestName, "source.envelope.name"),
+                  namespace,
+                  envelope == null ? null : envelope.uuid(),
+                  envelope == null ? null : envelope.enabled(),
+                  envelope == null ? null : envelope.lifecycleStatus(),
+                  format,
+                  external));
+        } catch (RuntimeException ex) {
+          throw ex;
+        } catch (Exception ex) {
+          throw new IllegalStateException(
+              "Failed to rebuild source model via provider '" + provider.providerId() + "'",
+              ex);
+        }
+      }
+      return IngestSourceExternalModel.builder()
+          .withResolvedIngestName(ingestName)
+          .withNamespace(namespace)
+          .withUuid(envelope == null ? null : envelope.uuid())
+          .withEnabled(envelope == null ? null : envelope.enabled())
+          .withLifecycleStatus(envelope == null ? null : envelope.lifecycleStatus())
+          .withFormat(format)
+          .withProviderId(sourceType)
+          .withReference(external.reference())
+          .withOptions(external.options())
+          .build();
+    }
+    if (source.odbc() != null) {
+      DefinitionIngestSource.OdbcSource odbc = source.odbc();
+      return IngestSourceExternalModel.builder()
+          .withResolvedIngestName(ingestName)
+          .withNamespace(namespace)
+          .withUuid(envelope == null ? null : envelope.uuid())
+          .withEnabled(envelope == null ? null : envelope.enabled())
+          .withLifecycleStatus(envelope == null ? null : envelope.lifecycleStatus())
+          .withFormat(format)
+          .withProviderId(ODBC)
+          .withReference(odbc.connectionName())
+          .withOptions(toExternalOptions(odbc))
+          .build();
+    }
+    if (source.amps() == null) {
+      return IngestSourceApiModel.builder()
+          .withResolvedIngestName(ingestName)
+          .withNamespace(namespace)
+          .withUuid(envelope == null ? null : envelope.uuid())
+          .withEnabled(envelope == null ? null : envelope.enabled())
+          .withLifecycleStatus(envelope == null ? null : envelope.lifecycleStatus())
+          .withFormat(format)
+          .withJsonRootField(source.json() == null ? null : source.json().rootField())
+          .withNvFixPairDelimiter(source.nvfix() == null ? null : source.nvfix().pairDelimiter())
+          .withNvFixKvDelimiter(source.nvfix() == null ? null : source.nvfix().kvDelimiter())
+          .withNvFixTrimKeys(source.nvfix() == null ? null : source.nvfix().trimKeys())
+          .withNvFixTrimValues(source.nvfix() == null ? null : source.nvfix().trimValues())
+          .build();
+    }
+    DefinitionIngestSource.AmpsSource amps = source.amps();
+    IngestSourceAmpsModel.Builder builder =
+        IngestSourceAmpsModel.builder()
+        .withResolvedIngestName(ingestName)
+        .withNamespace(namespace)
+        .withUuid(envelope == null ? null : envelope.uuid())
+        .withEnabled(envelope == null ? null : envelope.enabled())
+        .withLifecycleStatus(envelope == null ? null : envelope.lifecycleStatus())
+        .withFormat(format)
+        .withConnectionName(amps.connectionName())
+        .withTopic(amps.topic())
+        .withSowSubscribe(amps.sow())
+        .withSow(amps.sowOnly())
+        .withOptions(amps.options())
+        .withFilter(amps.filter())
+        .withMode(
+            amps.mode() == DefinitionIngestSource.Mode.BATCH
+                ? IngestSourceAmpsModel.Mode.BATCH
+                : IngestSourceAmpsModel.Mode.STREAM)
+        .withBatchMaxMessages(amps.batchMaxMessages())
+        .withBatchMaxBytes(amps.batchMaxBytes())
+        .withBatchFlushMillis(amps.batchFlushMillis())
+        .withJsonRootField(source.json() == null ? null : source.json().rootField())
+        .withNvFixPairDelimiter(source.nvfix() == null ? null : source.nvfix().pairDelimiter())
+        .withNvFixKvDelimiter(source.nvfix() == null ? null : source.nvfix().kvDelimiter())
+        .withNvFixTrimKeys(source.nvfix() == null ? null : source.nvfix().trimKeys())
+        .withNvFixTrimValues(source.nvfix() == null ? null : source.nvfix().trimValues());
+    if (amps.oofHandling() != null) {
+      builder.withOofHandling(
+          amps.oofHandling() == DefinitionIngestSource.OofHandling.MARK_AS_DELETED
+              ? IngestSourceAmpsModel.OofHandling.MARK_AS_DELETED
+              : IngestSourceAmpsModel.OofHandling.DELETE_EVENT);
+    }
+    return builder.build();
+  }
+
+  public IngestTargetModel fromDefinitionDataset(DefinitionDataset dataset) {
+    if (dataset == null || dataset.binding() == null) {
+      return null;
+    }
+    if (dataset.type() == DatasetType.PARQUET && dataset.binding().parquet() != null) {
+      DefinitionDataset.ParquetBinding parquet = dataset.binding().parquet();
+      return IngestTargetParquetModel.builder()
+          .withParquetPath(parquet.uri())
+          .withGlob(parquet.glob())
+          .withHivePartitioning(parquet.hivePartitioning())
+          .withPartitionKey(parquet.partitionKey())
+          .withPartitionValueField(parquet.partitionValueField())
+          .withConnectionName(parquet.connectionName())
+          .build();
+    }
+    if (dataset.type() == DatasetType.DUCKDB && dataset.binding().duckdb() != null) {
+      DefinitionDataset.DuckdbBinding duckdb = dataset.binding().duckdb();
+      String targetTypeToken = Strings.trimToNull(duckdb.targetType());
+      if (IngestTargetType.DUCKDB_ACTIVE.name().equalsIgnoreCase(Strings.firstNonBlank(targetTypeToken, ""))) {
+        return IngestTargetDuckDbActiveModel.builder()
+            .withTableName(duckdb.relationName())
+            .withPrimaryKey(duckdb.primaryKey())
+            .withMemory(duckdb.memory())
+            .withDatabasePath(duckdb.databasePath())
+            .withParquetHistoryPath(duckdb.parquetHistoryPath())
+            .withPersistOnStop(duckdb.persistOnStop())
+            .withCreateIfMissing(duckdb.createIfMissing())
+            .build();
+      }
+      return IngestTargetDuckDbModel.builder()
+          .withType(IngestTargetDuckDbModel.Type.MEMORY)
+          .withTable(duckdb.relationName())
+          .build();
+    }
+    if (dataset.binding().external() != null
+        && (dataset.type() == DatasetType.EXTERNAL || dataset.type() == null)) {
+      DefinitionDataset.ExternalBinding external = dataset.binding().external();
+      String targetType = Strings.requireNonBlank(external.externalType(), "dataset.binding.external.externalType");
+      IngestTargetProvider provider = plugins.findIngestTargetProvider(targetType);
+      if (provider != null) {
+        try {
+          return provider.fromExternalBinding(
+              new IngestTargetProviderContext(dataset, toDatasetId(dataset), external));
+        } catch (RuntimeException ex) {
+          throw ex;
+        } catch (Exception ex) {
+          throw new IllegalStateException(
+              "Failed to rebuild target model via provider '" + provider.providerId() + "'",
+              ex);
+        }
+      }
+      return IngestTargetExternalModel.builder()
+          .withProviderId(targetType)
+          .withReference(external.reference())
+          .withOptions(external.options())
+          .build();
+    }
+    if (dataset.binding().odbc() != null
+        && (dataset.type() == DatasetType.EXTERNAL || dataset.type() == null)) {
+      DefinitionDataset.OdbcBinding odbc = dataset.binding().odbc();
+      return IngestTargetExternalModel.builder()
+          .withProviderId(ODBC)
+          .withReference(odbc.connectionName())
+          .withOptions(toExternalOptions(odbc))
+          .build();
+    }
+    return null;
+  }
+
+  public String deterministicSchemaName(String sessionGroup, String namespace, String ingestName) {
+    DefinitionModelMapperSupport.requireNonBlank(sessionGroup, "sessionGroup");
+    String normalizedNamespace =
+        DefinitionModelMapperSupport.requireNonBlank(namespace, "namespace");
+    String normalizedIngestName =
+        DefinitionModelMapperSupport.requireNonBlank(ingestName, "ingestName");
+    return "ingest:" + normalizedNamespace + "/" + normalizedIngestName;
+  }
+
+  public DatasetId resolveDatasetId(String group, String namespace, IngestModel model) {
+    String datasetCanonical = Strings.trimToNull(model.datasetId());
+    if (datasetCanonical != null) {
+      return DatasetId.parse(datasetCanonical);
+    }
+    String datasetName = defaultDatasetName(model);
+    return DatasetId.of(group, namespace, datasetName);
+  }
+
+  private static String defaultDatasetName(IngestModel model) {
+    IngestTargetModel target = model.target();
+    if (target instanceof IngestTargetDuckDbModel duckdb) {
+      return Strings.firstNonBlank(duckdb.table(), model.name());
+    }
+    if (target instanceof IngestTargetDuckDbActiveModel duckdbActive) {
+      return Strings.firstNonBlank(duckdbActive.tableName(), model.name());
+    }
+    return model.name();
+  }
+
+  private static String normalizedNvFixPairDelimiter(String configured) {
+    String value = Strings.trimToNull(configured);
+    return value == null ? String.valueOf(AmpsConnection.SOH) : value;
+  }
+
+  private static String normalizedNvFixKvDelimiter(String configured) {
+    String value = Strings.trimToNull(configured);
     if (value == null) {
+      return "=";
+    }
+    if (value.isEmpty()) {
+      throw new IllegalArgumentException("nvFixKvDelimiter must not be empty");
+    }
+    return value;
+  }
+
+  private static Boolean normalizedNvFixTrim(Boolean configured) {
+    return configured == null || configured;
+  }
+
+  private static IngestSchemaMode fromDefinitionSchemaMode(DefinitionIngest.SchemaMode mode) {
+    if (mode == null) {
+      return IngestSchemaMode.STRICT;
+    }
+    return switch (mode) {
+      case STRICT -> IngestSchemaMode.STRICT;
+      case ADD_COLUMNS -> IngestSchemaMode.ADD_COLUMNS;
+      case RELAXED -> IngestSchemaMode.RELAXED;
+      case UNKNOWN ->
+          throw new IllegalArgumentException("Unsupported ingest schemaMode UNKNOWN");
+    };
+  }
+
+  private static DefinitionIngest.SchemaMode toDefinitionSchemaMode(IngestSchemaMode mode) {
+    IngestSchemaMode normalized = mode == null ? IngestSchemaMode.STRICT : mode;
+    return switch (normalized) {
+      case STRICT -> DefinitionIngest.SchemaMode.STRICT;
+      case ADD_COLUMNS -> DefinitionIngest.SchemaMode.ADD_COLUMNS;
+      case RELAXED -> DefinitionIngest.SchemaMode.RELAXED;
+    };
+  }
+
+  private static String toFormatToken(IngestFormat format) {
+    IngestFormat normalized = format == null ? IngestFormat.JSON : format;
+    return normalized.name().toUpperCase(Locale.ROOT);
+  }
+
+  private static String parseNamespace(String datasetIdCanonical) {
+    String datasetId = Strings.trimToNull(datasetIdCanonical);
+    if (datasetId == null) {
       return null;
     }
-    if (value instanceof Text text) {
-      return text.toString();
-    }
-    return String.valueOf(value);
-  }
-
-  private static final class RemoteTabularStreamSubscription implements TabularStreamSubscription {
-    private final RemoteFlightClientSupport.ClientResources client;
-    private final FlightStream stream;
-    private final AtomicBoolean closed = new AtomicBoolean(false);
-
-    private RemoteTabularStreamSubscription(
-        RemoteFlightClientSupport.ClientResources client, FlightStream stream) {
-      this.client = Objects.requireNonNull(client, "client");
-      this.stream = Objects.requireNonNull(stream, "stream");
-    }
-
-    @Override
-    public FlightStream stream() {
-      return stream;
-    }
-
-    @Override
-    public void close() {
-      if (!closed.compareAndSet(false, true)) {
-        return;
-      }
-      try {
-        stream.close();
-      } catch (Exception ignore) {
-      }
-      client.close();
+    try {
+      return DatasetId.parse(datasetId).namespace();
+    } catch (RuntimeException ex) {
+      return null;
     }
   }
 
-  private static ByteBuffer toArrowIpcBuffer(
-      FlightClient client, BufferAllocator allocator, FlightInfo info, CallOption[] callOptions) {
-    if (info == null) {
-      throw new IllegalStateException("Remote query returned no FlightInfo");
+  private static DatasetId toDatasetId(DefinitionDataset dataset) {
+    DefinitionEnvelope envelope = dataset == null ? null : dataset.envelope();
+    String group =
+        DefinitionModelMapperSupport.requireNonBlank(
+            envelope == null ? null : envelope.group(), "dataset.envelope.group");
+    String namespace =
+        DefinitionModelMapperSupport.requireNonBlank(
+            dataset == null ? null : dataset.namespace(), "dataset.namespace");
+    String envelopeName = Strings.trimToNull(envelope == null ? null : envelope.name());
+    String datasetName = envelopeName;
+    if (datasetName != null && datasetName.contains("/")) {
+      int delimiter = datasetName.indexOf('/');
+      datasetName = datasetName.substring(delimiter + 1);
     }
-    List<FlightEndpoint> endpoints =
-        info.getEndpoints() == null ? List.of() : List.copyOf(info.getEndpoints());
-    Schema schema = info.getSchema();
-    try (Bytes.DirectBufferOutputStream out = Bytes.directOutputStream()) {
-      VectorSchemaRoot writeRoot = null;
-      VectorLoader loader = null;
-      ArrowStreamWriter writer = null;
-      boolean started = false;
-      try {
-        for (FlightEndpoint endpoint : endpoints) {
-          if (endpoint == null || endpoint.getTicket() == null) {
-            continue;
-          }
-          try {
-            try (FlightStream stream = client.getStream(endpoint.getTicket(), callOptions)) {
-              VectorSchemaRoot streamRoot = stream.getRoot();
-              if (schema == null && streamRoot != null) {
-                schema = streamRoot.getSchema();
-              }
-              if (!started) {
-                Schema effectiveSchema = schema;
-                if (effectiveSchema == null && streamRoot != null) {
-                  effectiveSchema = streamRoot.getSchema();
-                }
-                if (effectiveSchema == null) {
-                  throw new IllegalStateException("Remote query response schema is required");
-                }
-                writeRoot = VectorSchemaRoot.create(effectiveSchema, allocator);
-                loader = new VectorLoader(writeRoot);
-                writer = new ArrowStreamWriter(writeRoot, null, out);
-                writer.start();
-                started = true;
-              }
-              if (streamRoot == null) {
-                continue;
-              }
-              while (stream.next()) {
-                try (ArrowRecordBatch batch = new VectorUnloader(streamRoot).getRecordBatch()) {
-                  loader.load(batch);
-                  writer.writeBatch();
-                }
-              }
-            }
-          } catch (Exception ex) {
-            throw new IllegalStateException("Failed to read remote query endpoint stream", ex);
-          }
-        }
+    datasetName =
+        DefinitionModelMapperSupport.requireNonBlank(datasetName, "dataset.envelope.name");
+    return DatasetId.of(group, namespace, datasetName);
+  }
 
-        if (!started) {
-          if (schema == null) {
-            throw new IllegalStateException("Remote query response schema is required");
-          }
-          writeRoot = VectorSchemaRoot.create(schema, allocator);
-          writer = new ArrowStreamWriter(writeRoot, null, out);
-          writer.start();
-        }
-        writer.end();
-        ByteBuffer buffer = out.toDirectByteBuffer();
-        assert buffer.isDirect();
-        assert buffer.position() == 0;
-        return buffer;
-      } finally {
-        if (writer != null) {
-          try {
-            writer.close();
-          } catch (Exception ignore) {
-          }
-        }
-        if (writeRoot != null) {
-          try {
-            writeRoot.close();
-          } catch (Exception ignore) {
-          }
-        }
+  private static boolean hasSubscribeOption(String options, String optionToken) {
+    String normalizedToken = Strings.trimToNull(optionToken);
+    String normalizedOptions = Strings.trimToNull(options);
+    if (normalizedToken == null || normalizedOptions == null) {
+      return false;
+    }
+    for (String token : normalizedOptions.split(";")) {
+      String normalized = Strings.trimToNull(token);
+      if (normalized != null && normalizedToken.equalsIgnoreCase(normalized)) {
+        return true;
       }
-    } catch (IOException ex) {
-      throw new IllegalStateException("Failed to serialize remote Arrow IPC stream", ex);
+    }
+    return false;
+  }
+
+  private static DefinitionIngestSource.OdbcSource toDefinitionOdbcSource(
+      IngestSourceExternalModel externalModel) {
+    String connectionName =
+        Strings.firstNonBlank(
+            Strings.trimToNull(externalModel.reference()),
+            optionValue(externalModel.options(), "connectionName"));
+    DefinitionConnection.Odbc.DatabaseType databaseType =
+        parseDatabaseType(optionValue(externalModel.options(), "databaseType"));
+    String tableName = optionValue(externalModel.options(), "tableName");
+    String querySql = optionValue(externalModel.options(), "querySql");
+    return new DefinitionIngestSource.OdbcSource(
+        connectionName,
+        databaseType,
+        tableName,
+        querySql,
+        copyOptions(externalModel.options()));
+  }
+
+  private static DefinitionDataset.OdbcBinding toDefinitionOdbcBinding(
+      IngestTargetExternalModel externalModel) {
+    if (!ODBC.equalsIgnoreCase(Strings.trimToNull(externalModel.providerId()))) {
+      return null;
+    }
+    String connectionName =
+        Strings.firstNonBlank(
+            Strings.trimToNull(externalModel.reference()),
+            optionValue(externalModel.options(), "connectionName"));
+    return new DefinitionDataset.OdbcBinding(
+        connectionName,
+        parseDatabaseType(optionValue(externalModel.options(), "databaseType")),
+        optionValue(externalModel.options(), "catalogName"),
+        optionValue(externalModel.options(), "schemaName"),
+        optionValue(externalModel.options(), "tableName"),
+        optionValue(externalModel.options(), "querySql"),
+        optionValue(externalModel.options(), "primaryKey"),
+        copyOptions(externalModel.options()));
+  }
+
+  private static Map<String, String> toExternalOptions(DefinitionIngestSource.OdbcSource odbc) {
+    java.util.LinkedHashMap<String, String> options = new java.util.LinkedHashMap<>();
+    putOption(options, "connectionName", odbc.connectionName());
+    putOption(options, "databaseType", odbc.databaseType() == null ? null : odbc.databaseType().name());
+    putOption(options, "tableName", odbc.tableName());
+    putOption(options, "querySql", odbc.querySql());
+    if (odbc.options() != null) {
+      options.putAll(odbc.options());
+    }
+    return options.isEmpty() ? Map.of() : Map.copyOf(options);
+  }
+
+  private static Map<String, String> toExternalOptions(DefinitionDataset.OdbcBinding odbc) {
+    java.util.LinkedHashMap<String, String> options = new java.util.LinkedHashMap<>();
+    putOption(options, "connectionName", odbc.connectionName());
+    putOption(options, "databaseType", odbc.databaseType() == null ? null : odbc.databaseType().name());
+    putOption(options, "catalogName", odbc.catalogName());
+    putOption(options, "schemaName", odbc.schemaName());
+    putOption(options, "tableName", odbc.tableName());
+    putOption(options, "querySql", odbc.querySql());
+    putOption(options, "primaryKey", odbc.primaryKey());
+    if (odbc.options() != null) {
+      options.putAll(odbc.options());
+    }
+    return options.isEmpty() ? Map.of() : Map.copyOf(options);
+  }
+
+  private static DefinitionConnection.Odbc.DatabaseType parseDatabaseType(String value) {
+    String normalized = Strings.trimToNull(value);
+    if (normalized == null) {
+      return null;
+    }
+    try {
+      return DefinitionConnection.Odbc.DatabaseType.valueOf(normalized.toUpperCase(Locale.ROOT));
+    } catch (IllegalArgumentException ex) {
+      return DefinitionConnection.Odbc.DatabaseType.OTHER;
+    }
+  }
+
+  private static String optionValue(Map<String, String> options, String key) {
+    if (options == null || options.isEmpty()) {
+      return null;
+    }
+    return Strings.trimToNull(options.get(key));
+  }
+
+  private static Map<String, String> copyOptions(Map<String, String> options) {
+    if (options == null || options.isEmpty()) {
+      return Map.of();
+    }
+    return Map.copyOf(options);
+  }
+
+  private static void putOption(Map<String, String> options, String key, String value) {
+    String normalized = Strings.trimToNull(value);
+    if (normalized != null) {
+      options.put(key, normalized);
     }
   }
 }
-
 
 
 
