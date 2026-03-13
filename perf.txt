@@ -1,535 +1,522 @@
-package org.pronzato.fabric.api.control.entitlements.provider;
+package org.pronzato.fabric.api.services.flight.streaming;
 
-import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.nio.ByteBuffer;
 import java.util.Objects;
-import java.util.Set;
-import org.pronzato.fabric.api.control.discovery.CanonicalIds;
-import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEntitlement;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvironment;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionService;
-import org.pronzato.fabric.api.control.discovery.definitions.common.EntitlementsProvider;
-import org.pronzato.fabric.api.control.entitlements.core.EntitlementsScopeType;
-import org.pronzato.fabric.api.control.entitlements.core.data.DataEntitlements;
-import org.pronzato.fabric.api.control.entitlements.core.services.ServiceEntitlements;
+import java.util.OptionalLong;
+import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.TimeUnit;
+import org.pronzato.fabric.api.data.dataset.DatasetId;
+import org.pronzato.fabric.api.data.manager.DuckdbActiveChangeLog;
+import org.pronzato.fabric.api.data.manager.RowManagerImpl;
+import org.pronzato.fabric.api.data.duckdb.DuckdbNotifier;
+import org.pronzato.fabric.api.util.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public final class EntitlementProviderSelector {
-  private static final Logger LOGGER = LoggerFactory.getLogger(EntitlementProviderSelector.class);
-  private static final String PLATFORM_GROUP = "platform";
-  private static final String ENVIRONMENT_NAME = "environment";
-  private static final String KEY_SUBJECT_PROVIDER = "entitlements.subjectProvider";
-  private static final String KEY_PROVIDER = "entitlements.provider";
+public final class DatasetStreamHub {
+  private static final Logger LOGGER = LoggerFactory.getLogger(DatasetStreamHub.class);
+  private static final int SUBSCRIBER_QUEUE_CAPACITY = 32;
+  private static final int CHANGE_READ_LIMIT = 1024;
+  private static final long IDLE_STOP_MILLIS = 2_000L;
+  private static final long AWAIT_MAX_MILLIS = 1_000L;
 
-  private final DiscoveryCache DiscoveryCache;
-  private final EntitlementProviderRegistry registry;
-  private final String configuredEnvironmentDefaultProviderId;
+  private final DatasetId datasetId;
+  private final String accessMode;
+  private final List<String> primaryKeyColumns;
+  private final RowManagerImpl rowManager;
+  private final DuckdbNotifier changeNotifier;
+  private final ArrowBatchPublisher batchPublisher;
+  private final DatasetStreamHubRegistry registry;
+  private final Object lock = new Object();
+  private final LinkedHashMap<String, SubscriberState> subscribers = new LinkedHashMap<>();
 
-  public EntitlementProviderSelector(DiscoveryCache DiscoveryCache, EntitlementProviderRegistry registry) {
-    this(DiscoveryCache, registry, null);
-  }
+  private volatile Thread producerThread;
+  private volatile boolean closed;
+  private volatile boolean stopRequested;
+  private volatile RuntimeException fatalFailure;
+  private volatile long lastActivityMillis = System.currentTimeMillis();
 
-  public EntitlementProviderSelector(
-      DiscoveryCache DiscoveryCache,
-      EntitlementProviderRegistry registry,
-      String configuredEnvironmentDefaultProviderId) {
-    this.DiscoveryCache = Objects.requireNonNull(DiscoveryCache, "DiscoveryCache");
+  private long knownSeq;
+  private String publicFilterSql;
+  private int publicBatchMaxRows;
+  private int publicFlushMillis;
+  private long publicCursorSeq;
+  private long publicPendingMaxSeq;
+  private long publicDeadlineMillis;
+  private final LinkedHashSet<String> publicPendingKeys = new LinkedHashSet<>();
+
+  public DatasetStreamHub(
+      DatasetId datasetId,
+      String accessMode,
+      List<String> primaryKeyColumns,
+      RowManagerImpl rowManager,
+      DuckdbNotifier changeNotifier,
+      ArrowBatchPublisher batchPublisher,
+      DatasetStreamHubRegistry registry) {
+    this.datasetId = Objects.requireNonNull(datasetId, "datasetId");
+    this.accessMode = normalizeAccessMode(accessMode);
+    this.primaryKeyColumns = List.copyOf(Objects.requireNonNull(primaryKeyColumns, "primaryKeyColumns"));
+    this.rowManager = Objects.requireNonNull(rowManager, "rowManager");
+    this.changeNotifier = Objects.requireNonNull(changeNotifier, "changeNotifier");
+    this.batchPublisher = Objects.requireNonNull(batchPublisher, "batchPublisher");
     this.registry = Objects.requireNonNull(registry, "registry");
-    this.configuredEnvironmentDefaultProviderId = trimToNull(configuredEnvironmentDefaultProviderId);
+    this.knownSeq = Math.max(0L, rowManager.duckDbActiveChangeMaxSeq(datasetId));
   }
 
-  public Selection select(EntitlementsScopeType scopeType, String resourceId) {
-    EntitlementsScopeType normalizedScopeType = Objects.requireNonNull(scopeType, "scopeType");
-    String normalizedResourceId = canonicalResourceId(normalizedScopeType, resourceId);
-
-    ProviderChoice resourceProvider = resourceProviderChoice(normalizedScopeType, normalizedResourceId);
-    ProviderChoice namespaceProvider = namespaceProviderChoice(normalizedScopeType, normalizedResourceId);
-    ProviderChoice environmentProvider = environmentProviderChoice();
-    ProviderChoice configured = firstNonNull(resourceProvider, namespaceProvider, environmentProvider);
-
-    String defaultProvider = defaultProviderForTrace();
-    Selection selected;
-    if (configured != null) {
-      selected = explicitSelection(configured, normalizedScopeType, normalizedResourceId);
-    } else {
-      EntitlementSubjectProvider provider = registry.defaultProvider();
-      if (provider == null) {
-        throw new IllegalStateException("No default entitlement subject provider is registered");
+  public SubscriberHandle addSubscriber(StreamSubscriptionContext context) {
+    Objects.requireNonNull(context, "context");
+    if (!datasetId.equals(context.datasetId())) {
+      throw new IllegalArgumentException("Hub dataset mismatch: " + context.datasetId());
+    }
+    if (!accessMode.equals(context.accessMode())) {
+      throw new IllegalArgumentException(
+          "STREAM_ACCESS_MODE_MISMATCH dataset="
+              + datasetId
+              + " expected="
+              + accessMode
+              + " requested="
+              + context.accessMode());
+    }
+    synchronized (lock) {
+      if (closed) {
+        throw new IllegalStateException("Dataset stream hub is closed for " + datasetId);
       }
-      selected =
-          new Selection(defaultProviderId(provider), provider, SelectionSource.REGISTRY_DEFAULT, false);
+      if (fatalFailure != null) {
+        throw fatalFailure;
+      }
+      String token = "sub-" + UUID.randomUUID();
+      long startingSeq = resolveStartingSeqLocked(context);
+      SubscriberState state =
+          new SubscriberState(
+              token,
+              context,
+              new ArrayBlockingQueue<>(SUBSCRIBER_QUEUE_CAPACITY),
+              Math.max(0L, startingSeq));
+      if (context.isPublic()) {
+        configurePublicContractLocked(context);
+      }
+      subscribers.put(token, state);
+      stopRequested = false;
+      lastActivityMillis = System.currentTimeMillis();
+      startProducerLocked();
+      return new SubscriberHandle(this, token, state.queue, state.lastSeq);
     }
-
-    if (LOGGER.isDebugEnabled()) {
-      LOGGER.debug(
-          "[Entitlements][ProviderTrace] resource={} resourceProvider={} namespaceProvider={} environmentProvider={} defaultProvider={} selectedProvider={}",
-          normalizedResourceId,
-          providerId(resourceProvider),
-          providerId(namespaceProvider),
-          providerId(environmentProvider),
-          defaultProvider,
-          selected.providerId());
-      LOGGER.debug(
-          "[Entitlements][ProviderSelected] resource={} provider={} source={}",
-          normalizedResourceId,
-          selectedProviderForLog(selected, defaultProvider),
-          sourceLabel(selected.source()));
-    }
-
-    return selected;
   }
 
-  private Selection explicitSelection(
-      ProviderChoice configured, EntitlementsScopeType scopeType, String resourceId) {
-    EntitlementSubjectProvider provider = registry.provider(configured.providerId());
-    if (provider == null) {
-      throw new IllegalStateException(
-          "Unknown entitlement subject provider '"
-              + configured.providerId()
-              + "' configured at "
-              + configured.source()
-              + " scopeType="
-              + scopeType.name()
-              + " resourceId="
-              + resourceId);
+  public void removeSubscriber(String token) {
+    if (Strings.trimToNull(token) == null) {
+      return;
     }
-    return new Selection(configured.providerId(), provider, configured.source(), true);
-  }
-
-  private ProviderChoice resourceProviderChoice(EntitlementsScopeType scopeType, String resourceId) {
-    String fromDefinition = resourceDefinitionProviderId(scopeType, resourceId);
-    if (fromDefinition != null) {
-      return new ProviderChoice(fromDefinition, SelectionSource.RESOURCE);
-    }
-
-    String fromEntitlements = entitlementsScopeProviderId(scopeType, resourceId);
-    if (fromEntitlements != null) {
-      return new ProviderChoice(fromEntitlements, SelectionSource.RESOURCE);
-    }
-    return null;
-  }
-
-  private ProviderChoice namespaceProviderChoice(EntitlementsScopeType scopeType, String resourceId) {
-    String namespaceId = namespaceResourceId(scopeType, resourceId);
-    if (namespaceId == null) {
-      return null;
-    }
-    String fromEntitlements = entitlementsScopeProviderId(EntitlementsScopeType.NAMESPACE, namespaceId);
-    if (fromEntitlements == null) {
-      return null;
-    }
-    return new ProviderChoice(fromEntitlements, SelectionSource.NAMESPACE);
-  }
-
-  private ProviderChoice environmentProviderChoice() {
-    String configured = trimToNull(configuredEnvironmentDefaultProviderId);
-    if (configured != null) {
-      return new ProviderChoice(configured, SelectionSource.ENVIRONMENT);
-    }
-
-    DefinitionEnvironment environment = findEnvironmentDefinition();
-    if (environment == null) {
-      return null;
-    }
-    String value = providerIdFromEnvironment(environment.entitlements());
-    if (value == null) {
-      return null;
-    }
-    return new ProviderChoice(value, SelectionSource.ENVIRONMENT);
-  }
-
-  private String resourceDefinitionProviderId(EntitlementsScopeType scopeType, String resourceId) {
-    CanonicalIds.ParsedId parsed = CanonicalIds.parse(resourceId);
-    if (scopeType == EntitlementsScopeType.SERVICE && parsed.isService()) {
-      DefinitionService definition = findServiceDefinition(parsed.group(), parsed.name());
-      return providerIdFromService(definition);
-    }
-    if (scopeType == EntitlementsScopeType.DATASET && parsed.isDataset()) {
-      DefinitionDataset definition = findDatasetDefinition(parsed.group(), parsed.namespace(), parsed.name());
-      return providerIdFromDataset(definition);
-    }
-    return null;
-  }
-
-  private String providerIdFromService(DefinitionService definition) {
-    if (definition == null) {
-      return null;
-    }
-    String typed = providerIdFromTypedConfig(definition.entitlements());
-    if (typed != null) {
-      return typed;
-    }
-    return providerIdFromObject(definition);
-  }
-
-  private String providerIdFromDataset(DefinitionDataset definition) {
-    if (definition == null) {
-      return null;
-    }
-    String typed = providerIdFromTypedConfig(definition.entitlements());
-    if (typed != null) {
-      return typed;
-    }
-    return providerIdFromObject(definition);
-  }
-
-  private String providerIdFromEnvironment(DefinitionEnvironment.Entitlements entitlements) {
-    if (entitlements == null) {
-      return null;
-    }
-    String typed = trimToNull(entitlements.defaultProviderId());
-    if (typed != null) {
-      return typed;
-    }
-    return providerIdFromObject(entitlements);
-  }
-
-  private DefinitionService findServiceDefinition(String group, String name) {
-    List<DefinitionService> services = DiscoveryCache.list(DefinitionService.class, group);
-    if (services == null || services.isEmpty()) {
-      return null;
-    }
-    for (DefinitionService service : services) {
-      DefinitionEnvelope envelope = service == null ? null : service.envelope();
-      if (envelope != null && Objects.equals(name, envelope.name())) {
-        return service;
+    synchronized (lock) {
+      SubscriberState removed = subscribers.remove(token);
+      if (removed == null) {
+        return;
+      }
+      removed.closed = true;
+      removed.queue.offer(Delivery.terminal(removed.lastSeq));
+      if (subscribers.isEmpty()) {
+        stopRequested = true;
+        lastActivityMillis = System.currentTimeMillis();
       }
     }
-    return null;
   }
 
-  private DefinitionDataset findDatasetDefinition(String group, String namespace, String name) {
-    List<DefinitionDataset> datasets = DiscoveryCache.list(DefinitionDataset.class, group);
-    if (datasets == null || datasets.isEmpty()) {
-      return null;
+  public boolean isIdle() {
+    synchronized (lock) {
+      return subscribers.isEmpty() && (producerThread == null || !producerThread.isAlive());
     }
-    String canonicalName = trimToNull(namespace) == null ? null : namespace + "/" + name;
-    for (DefinitionDataset dataset : datasets) {
-      DefinitionEnvelope envelope = dataset == null ? null : dataset.envelope();
-      if (envelope == null) {
-        continue;
-      }
-      if (Objects.equals(name, envelope.name()) || Objects.equals(canonicalName, envelope.name())) {
-        return dataset;
-      }
-    }
-    return null;
   }
 
-  private DefinitionEnvironment findEnvironmentDefinition() {
-    List<DefinitionEnvironment> environments = DiscoveryCache.list(DefinitionEnvironment.class, PLATFORM_GROUP);
-    if (environments == null || environments.isEmpty()) {
-      return null;
-    }
-    for (DefinitionEnvironment environment : environments) {
-      DefinitionEnvelope envelope = environment == null ? null : environment.envelope();
-      if (envelope != null && Objects.equals(ENVIRONMENT_NAME, envelope.name())) {
-        return environment;
+  public void close() {
+    Thread thread;
+    synchronized (lock) {
+      closed = true;
+      stopRequested = true;
+      thread = producerThread;
+      for (SubscriberState state : subscribers.values()) {
+        state.closed = true;
+        state.queue.offer(Delivery.terminal(state.lastSeq));
       }
+      subscribers.clear();
     }
-    return null;
+    if (thread != null) {
+      thread.interrupt();
+    }
   }
 
-  private String entitlementsScopeProviderId(EntitlementsScopeType scopeType, String scopeId) {
-    List<DefinitionEntitlement> definitions = DiscoveryCache.list(DefinitionEntitlement.class);
-    if (definitions == null || definitions.isEmpty()) {
-      return null;
+  private long resolveStartingSeqLocked(StreamSubscriptionContext context) {
+    if (context.isPublic() && !subscribers.isEmpty()) {
+      return publicCursorSeq;
     }
-
-    LinkedHashSet<String> matches = new LinkedHashSet<>();
-    for (DefinitionEntitlement definition : definitions) {
-      if (definition == null || !enabled(definition.envelope() == null ? null : definition.envelope().enabled())) {
-        continue;
-      }
-      String canonicalScopeId = canonicalScopeId(scopeType, definition.scopeId());
-      if (!scopeId.equals(canonicalScopeId)) {
-        continue;
-      }
-      String configured = providerIdFromEntitlement(definition);
-      if (configured != null) {
-        matches.add(configured);
-      }
-    }
-
-    if (matches.isEmpty()) {
-      return null;
-    }
-    if (matches.size() == 1) {
-      return matches.iterator().next();
-    }
-    List<String> values = new ArrayList<>(matches);
-    values.sort(String.CASE_INSENSITIVE_ORDER);
-    throw new IllegalStateException(
-        "Conflicting entitlement subject provider configuration for scopeType="
-            + scopeType.name()
-            + " scopeId="
-            + scopeId
-            + " providers="
-            + values);
+    return context.startingSeq();
   }
 
-  private String providerIdFromEntitlement(DefinitionEntitlement definition) {
-    if (definition == null) {
-      return null;
+  private void configurePublicContractLocked(StreamSubscriptionContext context) {
+    if (subscribers.isEmpty()) {
+      publicFilterSql = context.filterSql();
+      publicBatchMaxRows = context.batchMaxRows();
+      publicFlushMillis = context.flushMillis();
+      publicCursorSeq = context.startingSeq();
+      publicPendingMaxSeq = publicCursorSeq;
+      publicDeadlineMillis = 0L;
+      publicPendingKeys.clear();
+      return;
     }
-    String fromLabels = providerIdFromMap(definition.labels());
-    if (fromLabels != null) {
-      return fromLabels;
+    if (!Objects.equals(publicFilterSql, context.filterSql())
+        || publicBatchMaxRows != context.batchMaxRows()
+        || publicFlushMillis != context.flushMillis()) {
+      throw new IllegalArgumentException(
+          "PUBLIC_STREAM_OPTIONS_MISMATCH dataset="
+              + datasetId
+              + " expected(batchMaxRows="
+              + publicBatchMaxRows
+              + ", flushMillis="
+              + publicFlushMillis
+              + ", filterSql="
+              + Strings.firstNonBlank(publicFilterSql, "<none>")
+              + ")");
     }
-    if (definition.policies() == null || definition.policies().isEmpty()) {
-      return null;
-    }
-    LinkedHashSet<String> matches = new LinkedHashSet<>();
-    for (DefinitionEntitlement.PolicyDocument policy : definition.policies()) {
-      if (policy == null) {
-        continue;
-      }
-      String fromMetadata = providerIdFromMap(policy.metadata());
-      if (fromMetadata != null) {
-        matches.add(fromMetadata);
-      }
-    }
-    if (matches.isEmpty()) {
-      return null;
-    }
-    if (matches.size() == 1) {
-      return matches.iterator().next();
-    }
-    List<String> values = new ArrayList<>(matches);
-    values.sort(String.CASE_INSENSITIVE_ORDER);
-    throw new IllegalStateException(
-        "Conflicting policy metadata entitlement subject provider configuration providers="
-            + values);
   }
 
-  private static String providerIdFromTypedConfig(EntitlementsProvider config) {
-    if (config == null) {
-      return null;
+  private void startProducerLocked() {
+    if (producerThread != null && producerThread.isAlive()) {
+      return;
     }
-    return trimToNull(config.providerId());
+    Thread thread =
+        Thread.ofPlatform()
+            .daemon()
+            .name("flight-stream-hub-" + datasetId.toString().replace(':', '_').replace('/', '_'))
+            .start(this::runProducerLoop);
+    producerThread = thread;
   }
 
-  private String providerIdFromObject(Object object) {
-    if (object == null) {
-      return null;
-    }
-
-    String fromAccessor = providerIdFromAccessor(object, "subjectProvider");
-    if (fromAccessor != null) {
-      return fromAccessor;
-    }
-
-    fromAccessor = providerIdFromAccessor(object, "provider");
-    if (fromAccessor != null) {
-      return fromAccessor;
-    }
-
-    Object labels = valueFromAccessor(object, "labels");
-    if (labels instanceof Map<?, ?> map) {
-      return providerIdFromMap(castStringMap(map));
-    }
-
-    Object metadata = valueFromAccessor(object, "metadata");
-    if (metadata instanceof Map<?, ?> map) {
-      return providerIdFromMap(castStringMap(map));
-    }
-    return null;
-  }
-
-  private static String providerIdFromAccessor(Object object, String accessor) {
-    Object value = valueFromAccessor(object, accessor);
-    if (!(value instanceof String stringValue)) {
-      return null;
-    }
-    return trimToNull(stringValue);
-  }
-
-  private static Object valueFromAccessor(Object object, String accessor) {
-    if (object == null || accessor == null || accessor.isBlank()) {
-      return null;
-    }
+  private void runProducerLoop() {
     try {
-      Method method = object.getClass().getMethod(accessor);
-      return method.invoke(object);
-    } catch (Exception ignored) {
-      return null;
-    }
-  }
-
-  private static Map<String, String> castStringMap(Map<?, ?> value) {
-    if (value == null || value.isEmpty()) {
-      return Map.of();
-    }
-    java.util.LinkedHashMap<String, String> casted = new java.util.LinkedHashMap<>();
-    for (Map.Entry<?, ?> entry : value.entrySet()) {
-      Object key = entry.getKey();
-      Object raw = entry.getValue();
-      if (!(key instanceof String keyString) || !(raw instanceof String valueString)) {
-        continue;
+      while (!Thread.currentThread().isInterrupted()) {
+        if (closed) {
+          return;
+        }
+        List<SubscriberState> snapshot = snapshotSubscribers();
+        if (snapshot.isEmpty()) {
+          if (stopRequested) {
+            return;
+          }
+          if (System.currentTimeMillis() - lastActivityMillis >= IDLE_STOP_MILLIS) {
+            return;
+          }
+          awaitWithoutChanges();
+          continue;
+        }
+        if ("PUBLIC".equals(accessMode)) {
+          producePublic(snapshot);
+        } else {
+          producePrivate(snapshot);
+        }
       }
-      casted.put(keyString, valueString);
-    }
-    return casted.isEmpty() ? Map.of() : Map.copyOf(casted);
-  }
-
-  private static String providerIdFromMap(Map<String, String> values) {
-    if (values == null || values.isEmpty()) {
-      return null;
-    }
-    String fromSubjectProvider = trimToNull(values.get(KEY_SUBJECT_PROVIDER));
-    if (fromSubjectProvider != null) {
-      return fromSubjectProvider;
-    }
-    return trimToNull(values.get(KEY_PROVIDER));
-  }
-
-  private static String canonicalResourceId(EntitlementsScopeType scopeType, String resourceId) {
-    if (scopeType == EntitlementsScopeType.DATASET) {
-      return DataEntitlements.requireDatasetResourceId(resourceId);
-    }
-    if (scopeType == EntitlementsScopeType.SERVICE) {
-      return ServiceEntitlements.requireAssetResourceId(resourceId);
-    }
-    if (scopeType == EntitlementsScopeType.NAMESPACE) {
-      CanonicalIds.ParsedId parsed = CanonicalIds.parse(resourceId);
-      if (!parsed.isNamespace()) {
-        throw new IllegalArgumentException("resourceId must be canonical namespace:<group>/<namespace>");
-      }
-      return parsed.canonical();
-    }
-    return requireTrimmed(resourceId, "resourceId");
-  }
-
-  private static String canonicalScopeId(EntitlementsScopeType scopeType, String scopeId) {
-    if (scopeId == null) {
-      return null;
-    }
-    try {
-      if (scopeType == EntitlementsScopeType.DATASET) {
-        return DataEntitlements.requireDatasetResourceId(scopeId);
-      }
-      if (scopeType == EntitlementsScopeType.SERVICE) {
-        return ServiceEntitlements.requireAssetResourceId(scopeId);
-      }
-      if (scopeType == EntitlementsScopeType.NAMESPACE) {
-        CanonicalIds.ParsedId parsed = CanonicalIds.parse(scopeId);
-        return parsed.isNamespace() ? parsed.canonical() : null;
-      }
-      return trimToNull(scopeId);
     } catch (RuntimeException ex) {
-      return null;
+      fatalFailure = ex;
+      LOGGER.warn("[FlightStreamHub][fatal] dataset={} mode={} message={}", datasetId, accessMode, ex.getMessage(), ex);
+      failAllSubscribers(ex);
+    } finally {
+      synchronized (lock) {
+        producerThread = null;
+      }
+      registry.evict(datasetId, this);
     }
   }
 
-  private static String namespaceResourceId(EntitlementsScopeType scopeType, String resourceId) {
-    if (scopeType == EntitlementsScopeType.NAMESPACE) {
-      return canonicalScopeId(EntitlementsScopeType.NAMESPACE, resourceId);
+  private void producePublic(List<SubscriberState> snapshot) {
+    long now = System.currentTimeMillis();
+    long timeout = publicAwaitTimeout(now);
+    awaitForNextKnownSeq(publicCursorSeq, timeout);
+    if (publicCursorSeq < knownSeq) {
+      List<DuckdbActiveChangeLog.ChangeEvent> changes = readChangesAfter(publicCursorSeq);
+      if (!changes.isEmpty()) {
+        for (DuckdbActiveChangeLog.ChangeEvent change : changes) {
+          if (change.seq() <= publicCursorSeq) {
+            continue;
+          }
+          if (publicPendingKeys.add(change.pk()) && publicPendingKeys.size() == 1) {
+            publicDeadlineMillis = now + Math.max(1L, publicFlushMillis);
+          }
+          publicPendingMaxSeq = Math.max(publicPendingMaxSeq, change.seq());
+          if (publicPendingKeys.size() >= publicBatchMaxRows) {
+            flushPublic(snapshot);
+          }
+        }
+      }
     }
-    CanonicalIds.ParsedId parsed = CanonicalIds.parse(resourceId);
-    if (scopeType == EntitlementsScopeType.DATASET && parsed.isDataset()) {
-      return "namespace:" + parsed.group() + "/" + parsed.namespace();
-    }
-    return null;
-  }
-
-  private static boolean enabled(Boolean value) {
-    return value == null || value.booleanValue();
-  }
-
-  private static String requireTrimmed(String value, String name) {
-    String normalized = trimToNull(value);
-    if (normalized == null) {
-      throw new IllegalArgumentException(name + " is required");
-    }
-    return normalized;
-  }
-
-  private static <T> T firstNonNull(T first, T second, T third) {
-    if (first != null) {
-      return first;
-    }
-    if (second != null) {
-      return second;
-    }
-    return third;
-  }
-
-  private static String providerId(ProviderChoice choice) {
-    return choice == null ? null : choice.providerId();
-  }
-
-  private String defaultProviderForTrace() {
-    if (registry instanceof DefaultEntitlementProviderRegistry defaultRegistry) {
-      return defaultRegistry.defaultProviderIdHint();
-    }
-    return "default";
-  }
-
-  private static String sourceLabel(SelectionSource source) {
-    if (source == SelectionSource.REGISTRY_DEFAULT) {
-      return "default";
-    }
-    return source.name().toLowerCase(java.util.Locale.ROOT);
-  }
-
-  private static String selectedProviderForLog(Selection selected, String defaultProviderId) {
-    if (selected == null) {
-      return null;
-    }
-    if (selected.source() == SelectionSource.REGISTRY_DEFAULT
-        && Objects.equals("default", selected.providerId())) {
-      return defaultProviderId;
-    }
-    return selected.providerId();
-  }
-
-  private String defaultProviderId(EntitlementSubjectProvider provider) {
-    EntitlementSubjectProvider platformProvider =
-        registry.provider(DefaultEntitlementProviderRegistry.PLATFORM_MODEL_PROVIDER_ID);
-    if (platformProvider != null && platformProvider == provider) {
-      return DefaultEntitlementProviderRegistry.PLATFORM_MODEL_PROVIDER_ID;
-    }
-    return "default";
-  }
-
-  private static String trimToNull(String value) {
-    if (value == null) {
-      return null;
-    }
-    String normalized = value.trim();
-    return normalized.isEmpty() ? null : normalized;
-  }
-
-  public record Selection(
-      String providerId,
-      EntitlementSubjectProvider provider,
-      SelectionSource source,
-      boolean explicit) {
-    public Selection {
-      providerId = trimToNull(providerId);
-      provider = Objects.requireNonNull(provider, "provider");
-      source = Objects.requireNonNull(source, "source");
+    if (!publicPendingKeys.isEmpty() && System.currentTimeMillis() >= publicDeadlineMillis) {
+      flushPublic(snapshot);
     }
   }
 
-  public enum SelectionSource {
-    RESOURCE,
-    NAMESPACE,
-    ENVIRONMENT,
-    REGISTRY_DEFAULT
+  private void producePrivate(List<SubscriberState> snapshot) {
+    long minSeq = minSubscriberSeq(snapshot);
+    long now = System.currentTimeMillis();
+    long timeout = privateAwaitTimeout(snapshot, now);
+    awaitForNextKnownSeq(minSeq, timeout);
+    if (minSeq < knownSeq) {
+      List<DuckdbActiveChangeLog.ChangeEvent> changes = readChangesAfter(minSeq);
+      if (!changes.isEmpty()) {
+        for (DuckdbActiveChangeLog.ChangeEvent change : changes) {
+          for (SubscriberState state : snapshot) {
+            if (state.closed || change.seq() <= state.lastSeq) {
+              continue;
+            }
+            if (state.pendingKeys.add(change.pk()) && state.pendingKeys.size() == 1) {
+              state.deadlineMillis = System.currentTimeMillis() + Math.max(1L, state.context.flushMillis());
+            }
+            state.pendingMaxSeq = Math.max(state.pendingMaxSeq, change.seq());
+            if (state.pendingKeys.size() >= state.context.batchMaxRows()) {
+              flushPrivate(state);
+            }
+          }
+        }
+      }
+    }
+    now = System.currentTimeMillis();
+    for (SubscriberState state : snapshot) {
+      if (!state.pendingKeys.isEmpty() && now >= state.deadlineMillis) {
+        flushPrivate(state);
+      }
+    }
   }
 
-  private record ProviderChoice(String providerId, SelectionSource source) {
-    private ProviderChoice {
-      providerId = requireTrimmed(providerId, "providerId");
-      source = Objects.requireNonNull(source, "source");
+  private long publicAwaitTimeout(long now) {
+    if (publicPendingKeys.isEmpty()) {
+      return AWAIT_MAX_MILLIS;
+    }
+    return Math.max(1L, Math.min(AWAIT_MAX_MILLIS, publicDeadlineMillis - now));
+  }
+
+  private long privateAwaitTimeout(List<SubscriberState> states, long now) {
+    long deadline = Long.MAX_VALUE;
+    for (SubscriberState state : states) {
+      if (state.pendingKeys.isEmpty()) {
+        continue;
+      }
+      deadline = Math.min(deadline, state.deadlineMillis);
+    }
+    if (deadline == Long.MAX_VALUE) {
+      return AWAIT_MAX_MILLIS;
+    }
+    return Math.max(1L, Math.min(AWAIT_MAX_MILLIS, deadline - now));
+  }
+
+  private long minSubscriberSeq(List<SubscriberState> states) {
+    long min = Long.MAX_VALUE;
+    for (SubscriberState state : states) {
+      min = Math.min(min, state.lastSeq);
+    }
+    return min == Long.MAX_VALUE ? 0L : min;
+  }
+
+  private void awaitWithoutChanges() {
+    awaitForNextKnownSeq(knownSeq, Math.min(250L, AWAIT_MAX_MILLIS));
+  }
+
+  private void awaitForNextKnownSeq(long afterSeq, long timeoutMillis) {
+    OptionalLong nextSeq =
+        changeNotifier.awaitNextSeq(
+            datasetId.toString(),
+            Math.max(0L, afterSeq),
+            Math.max(1L, timeoutMillis),
+            () -> Thread.currentThread().isInterrupted() || closed || stopRequested);
+    if (nextSeq.isPresent()) {
+      knownSeq = Math.max(knownSeq, nextSeq.getAsLong());
+    }
+  }
+
+  private List<DuckdbActiveChangeLog.ChangeEvent> readChangesAfter(long afterSeq) {
+    List<DuckdbActiveChangeLog.ChangeEvent> changes =
+        rowManager.readDuckDbActiveChanges(datasetId, Math.max(0L, afterSeq), CHANGE_READ_LIMIT);
+    if (!changes.isEmpty()) {
+      knownSeq = Math.max(knownSeq, changes.get(changes.size() - 1).seq());
+      return changes;
+    }
+    knownSeq = Math.max(knownSeq, rowManager.duckDbActiveChangeMaxSeq(datasetId));
+    return List.of();
+  }
+
+  private void flushPublic(List<SubscriberState> snapshot) {
+    if (publicPendingKeys.isEmpty()) {
+      return;
+    }
+    List<String> keys = List.copyOf(publicPendingKeys);
+    long seq = publicPendingMaxSeq;
+    ByteBuffer ipc =
+        batchPublisher.buildBatchIpc(
+            new StreamSubscriptionContext(
+                datasetId,
+                "PUBLIC",
+                null,
+                snapshot.isEmpty() ? null : snapshot.get(0).context.callerAppSubject(),
+                snapshot.isEmpty() ? null : snapshot.get(0).context.requestMetadata(),
+                snapshot.isEmpty() ? "default" : snapshot.get(0).context.subscriptionId(),
+                snapshot.isEmpty() ? null : snapshot.get(0).context.startMode(),
+                publicCursorSeq,
+                publicBatchMaxRows,
+                publicFlushMillis,
+                publicFilterSql,
+                null),
+            primaryKeyColumns,
+            keys);
+    Delivery delivery = Delivery.data(seq, ipc);
+    for (SubscriberState state : snapshot) {
+      if (state.closed) {
+        continue;
+      }
+      enqueuePublic(state, delivery);
+      state.lastSeq = Math.max(state.lastSeq, seq);
+    }
+    publicCursorSeq = Math.max(publicCursorSeq, seq);
+    publicPendingKeys.clear();
+    publicPendingMaxSeq = publicCursorSeq;
+    publicDeadlineMillis = 0L;
+  }
+
+  private void flushPrivate(SubscriberState state) {
+    if (state.closed || state.pendingKeys.isEmpty()) {
+      return;
+    }
+    List<String> keys = List.copyOf(state.pendingKeys);
+    long seq = state.pendingMaxSeq;
+    ByteBuffer ipc = batchPublisher.buildBatchIpc(state.context, primaryKeyColumns, keys);
+    enqueuePrivate(state, Delivery.data(seq, ipc));
+    state.lastSeq = Math.max(state.lastSeq, seq);
+    state.pendingKeys.clear();
+    state.pendingMaxSeq = state.lastSeq;
+    state.deadlineMillis = 0L;
+  }
+
+  private void enqueuePublic(SubscriberState state, Delivery delivery) {
+    if (state.queue.offer(delivery)) {
+      return;
+    }
+    state.queue.poll();
+    state.queue.offer(delivery);
+  }
+
+  private void enqueuePrivate(SubscriberState state, Delivery delivery) {
+    try {
+      while (!state.closed && !closed && !Thread.currentThread().isInterrupted()) {
+        if (stopRequested) {
+          return;
+        }
+        if (state.queue.offer(delivery, 100L, TimeUnit.MILLISECONDS)) {
+          return;
+        }
+      }
+    } catch (InterruptedException ex) {
+      Thread.currentThread().interrupt();
+      return;
+    }
+  }
+
+  private void failAllSubscribers(RuntimeException failure) {
+    synchronized (lock) {
+      for (SubscriberState state : subscribers.values()) {
+        state.closed = true;
+        state.queue.offer(Delivery.failure(state.lastSeq, failure));
+      }
+      subscribers.clear();
+      lastActivityMillis = System.currentTimeMillis();
+    }
+  }
+
+  private List<SubscriberState> snapshotSubscribers() {
+    synchronized (lock) {
+      if (subscribers.isEmpty()) {
+        return List.of();
+      }
+      return new ArrayList<>(subscribers.values());
+    }
+  }
+
+  private static String normalizeAccessMode(String value) {
+    String normalized = Strings.trimToNull(value);
+    if (normalized == null || "PRIVATE".equalsIgnoreCase(normalized)) {
+      return "PRIVATE";
+    }
+    if ("PUBLIC".equalsIgnoreCase(normalized)) {
+      return "PUBLIC";
+    }
+    throw new IllegalArgumentException("accessMode must be PUBLIC or PRIVATE");
+  }
+
+  public static final class SubscriberHandle implements AutoCloseable {
+    private final DatasetStreamHub hub;
+    private final String token;
+    private final BlockingQueue<Delivery> queue;
+    private final long startSeq;
+    private volatile boolean closed;
+
+    private SubscriberHandle(
+        DatasetStreamHub hub, String token, BlockingQueue<Delivery> queue, long startSeq) {
+      this.hub = hub;
+      this.token = token;
+      this.queue = queue;
+      this.startSeq = startSeq;
+    }
+
+    public Delivery poll(long timeoutMillis) throws InterruptedException {
+      return queue.poll(Math.max(1L, timeoutMillis), TimeUnit.MILLISECONDS);
+    }
+
+    public long startSeq() {
+      return startSeq;
+    }
+
+    @Override
+    public void close() {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      hub.removeSubscriber(token);
+    }
+  }
+
+  public record Delivery(long lastSeq, ByteBuffer ipc, RuntimeException failure, boolean terminal) {
+    static Delivery data(long lastSeq, ByteBuffer ipc) {
+      return new Delivery(lastSeq, ipc, null, false);
+    }
+
+    static Delivery failure(long lastSeq, RuntimeException failure) {
+      return new Delivery(lastSeq, null, failure, true);
+    }
+
+    static Delivery terminal(long lastSeq) {
+      return new Delivery(lastSeq, null, null, true);
+    }
+  }
+
+  private static final class SubscriberState {
+    private final String token;
+    private final StreamSubscriptionContext context;
+    private final BlockingQueue<Delivery> queue;
+    private long lastSeq;
+    private long pendingMaxSeq;
+    private long deadlineMillis;
+    private boolean closed;
+    private final LinkedHashSet<String> pendingKeys = new LinkedHashSet<>();
+
+    private SubscriberState(
+        String token, StreamSubscriptionContext context, BlockingQueue<Delivery> queue, long startSeq) {
+      this.token = token;
+      this.context = context;
+      this.queue = queue;
+      this.lastSeq = Math.max(0L, startSeq);
+      this.pendingMaxSeq = this.lastSeq;
     }
   }
 }
+
