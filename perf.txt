@@ -1,467 +1,485 @@
-package org.pronzato.fabric.api.data.manager;
+package org.pronzato.fabric.api.connectors.amps.factory;
 
-import org.pronzato.fabric.api.util.CloseSupport;
-import io.grpc.ManagedChannel;
-import java.util.List;
+import java.time.Duration;
+import java.util.Arrays;
+import java.util.Base64;
 import java.util.Objects;
-import java.util.Optional;
-import java.util.UUID;
-import java.util.concurrent.TimeUnit;
-import org.apache.arrow.flight.CallOption;
-import org.apache.arrow.flight.FlightCallHeaders;
-import org.apache.arrow.flight.FlightClient;
-import org.apache.arrow.flight.FlightGrpcUtils;
-import org.apache.arrow.flight.FlightRuntimeException;
-import org.apache.arrow.flight.FlightStatusCode;
-import org.apache.arrow.flight.HeaderCallOption;
-import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
-import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionService;
-import org.pronzato.fabric.api.control.status.service.ServiceHbCache;
-import org.pronzato.fabric.api.control.security.UserContext;
-import org.pronzato.fabric.api.control.security.UserPrincipal;
-import org.pronzato.fabric.api.control.security.headers.FabricRequestHeaders;
-import org.pronzato.fabric.api.control.security.identity.CallerAppIdentity;
-import org.pronzato.fabric.api.control.security.kerberos.KerberosConfig;
-import org.pronzato.fabric.api.control.security.kerberos.KerberosSpn;
-import org.pronzato.fabric.api.services.ServiceRunOptions;
-import org.pronzato.fabric.api.services.common.ServiceAdvertise;
-import org.pronzato.fabric.api.services.common.ServiceInstanceResolver;
-import org.pronzato.fabric.api.services.common.routing.ServiceRoutingContext;
-import org.pronzato.fabric.api.services.common.routing.ServiceRoutingMode;
-import org.pronzato.fabric.api.services.common.routing.ServiceRoutingState;
-import org.pronzato.fabric.api.services.flight.FlightClientChannelSupport;
-import org.pronzato.fabric.api.services.flight.FlightSqlRequestHeadersMiddleware;
+import java.util.function.Consumer;
+import org.pronzato.fabric.api.control.security.kerberos.KerberosClient;
 import org.pronzato.fabric.api.util.Strings;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
-final class RemoteFlightClientSupport {
-  private static final Logger LOGGER = LoggerFactory.getLogger(RemoteFlightClientSupport.class);
-  private static final long MAX_ALLOCATOR_BYTES = 64L * 1024L * 1024L;
-  private static final String KERBEROS_AUTH_FAILURE = "Kerberos authentication failed";
-  private static final String UNAUTHENTICATED = "UNAUTHENTICATED";
+public final class AmpsFactoryOptions {
+  private final Kerberos kerberos = new Kerberos();
+  private final Connection connection = new Connection();
 
-  private RemoteFlightClientSupport() {}
-
-  static String endpointSecurityContext(ServiceEndpoint endpoint) {
-    Objects.requireNonNull(endpoint, "endpoint");
-    return "serviceId="
-        + endpoint.serviceResourceId()
-        + ", endpoint="
-        + endpoint.connectHost()
-        + ":"
-        + endpoint.port()
-        + ", tlsEnabled="
-        + endpoint.tlsEnabled()
-        + ", kerberosEnabled="
-        + endpoint.kerberosEnabled();
+  public Kerberos kerberos() {
+    return kerberos;
   }
 
-  static ServiceEndpoint resolveArrowService(
-      DiscoveryCache DiscoveryCache,
-      String group,
-      String serviceName,
-      DefinitionService.ServiceType expectedType,
-      ServiceInstanceResolver endpointResolver) {
-    return resolveArrowService(
-        DiscoveryCache, group, serviceName, expectedType, endpointResolver, null, null);
+  public Connection connection() {
+    return connection;
   }
 
-  static ServiceEndpoint resolveArrowService(
-      DiscoveryCache DiscoveryCache,
-      String group,
-      String serviceName,
-      DefinitionService.ServiceType expectedType,
-      ServiceInstanceResolver endpointResolver,
-      ServiceRoutingContext routingContext,
-      ServiceRoutingState routingState) {
-    Objects.requireNonNull(DiscoveryCache, "DiscoveryCache");
-    String resolvedGroup = Strings.requireNonBlank(group, "service group");
-    String resolvedServiceName = Strings.requireNonBlank(serviceName, "service name");
-
-    Optional<DefinitionService> definition =
-        DiscoveryCache.get(DefinitionService.class, resolvedGroup, resolvedServiceName);
-    if (definition.isEmpty()) {
-      throw new IllegalArgumentException("Unknown service: " + resolvedServiceName);
-    }
-
-    DefinitionService service = definition.get();
-    DefinitionService.ServiceType actualType = service.serviceType();
-    if (actualType != null && actualType != expectedType) {
-      throw new IllegalArgumentException(
-          "Service is not "
-              + expectedType
-              + ": "
-              + resolvedServiceName
-              + " type="
-              + actualType);
-    }
-    DefinitionService.Arrow arrow = service.arrow();
-    if (arrow == null) {
-      throw new IllegalArgumentException(
-          "Arrow service config is required for service: " + resolvedServiceName);
-    }
-    String serviceResourceId =
-        Strings.requireNonBlank(service.resourceId(), "service.resourceId");
-    ServiceRoutingMode routingMode =
-        ServiceRoutingMode.requireSupported(
-            service.arrow() == null || service.arrow().routing() == null
-                ? null
-                : service.arrow().routing().mode(),
-            serviceResourceId,
-            "arrow.routing.mode",
-            "client");
-    boolean tlsEnabled = arrow.tls() != null && Boolean.TRUE.equals(arrow.tls().enabled());
-    boolean kerberosEnabled = arrow.kerberos() != null && arrow.kerberos().enabled();
-    String kerberosSpn = arrow.kerberos() == null ? null : Strings.trimToNull(arrow.kerberos().spn());
-
-    if (endpointResolver == null) {
-      throw new IllegalStateException(
-          "Arrow service endpoint resolver is not initialized for service: " + serviceResourceId);
-    }
-    ServiceHbCache.Target target =
-        routingMode == ServiceRoutingMode.ROUND_ROBIN
-            ? endpointResolver.chooseRoundRobin(
-                resolvedGroup, resolvedServiceName, serviceResourceId)
-            : endpointResolver.choose(
-                resolvedGroup,
-                resolvedServiceName,
-                serviceResourceId,
-                routingMode,
-                routingContext == null
-                    ? ServiceRoutingContext.minimal(serviceResourceId, transportName(expectedType))
-                    : new ServiceRoutingContext(
-                        serviceResourceId,
-                        Strings.firstNonBlank(routingContext.transport(), transportName(expectedType)),
-                        routingContext.effectiveSubject(),
-                        routingContext.callerAppSubject(),
-                        routingContext.routingKey(),
-                        routingContext.requestId(),
-                        routingContext.operation()),
-                routingState);
-    if (target == null) {
-      throw new IllegalStateException("No available instances for service: " + serviceResourceId);
-    }
-    if (LOGGER.isDebugEnabled()) {
-      LOGGER.debug(
-          "[RemoteFlightClient][routing] mode={} serviceId={} group={} service={} endpoint={} instance={} subject={} callerApp={} routingKey={} transport={}",
-          routingMode,
-          serviceResourceId,
-          resolvedGroup,
-          resolvedServiceName,
-          target.host + ":" + target.port,
-          target.instanceId,
-          routingContext == null ? null : routingContext.effectiveSubject(),
-          routingContext == null ? null : routingContext.callerAppSubject(),
-          routingContext == null ? null : routingContext.routingKey(),
-          transportName(expectedType));
-    }
-    String connectHost = ServiceAdvertise.requireRoutableHost(target.host, "grpc target host");
-    int port = target.port;
-    boolean resolvedTls = tlsEnabled || target.tls;
-    return new ServiceEndpoint(
-        resolvedGroup,
-        resolvedServiceName,
-        serviceResourceId,
-        service,
-        connectHost,
-        port,
-        resolvedTls,
-        kerberosEnabled,
-        kerberosSpn);
+  public AmpsFactoryOptions withKerberos(Consumer<Kerberos> customizer) {
+    Objects.requireNonNull(customizer, "customizer");
+    customizer.accept(kerberos);
+    return this;
   }
 
-  static ClientResources openClient(
-      ServiceEndpoint endpoint,
-      ServiceRunOptions runOptions,
-      String sessionKerberosPrincipal,
-      java.nio.file.Path sessionKerberosKeytab) {
-    Objects.requireNonNull(endpoint, "endpoint");
-    ServiceRunOptions options = runOptions == null ? ServiceRunOptions.defaults() : runOptions;
-
-    RootAllocator allocator = new RootAllocator(MAX_ALLOCATOR_BYTES);
-    ManagedChannel channel = null;
-    FlightClient client = null;
-    String derivedSpn = null;
-    String diagnostics = null;
-    try {
-      if (endpoint.kerberosEnabled()) {
-        derivedSpn = deriveClientSpn(endpoint, sessionKerberosPrincipal);
-      }
-      diagnostics = clientDiagnostics(endpoint, options, sessionKerberosPrincipal, sessionKerberosKeytab, derivedSpn);
-      channel =
-          FlightClientChannelSupport.createChannel(
-              endpoint.connectHost(),
-              endpoint.port(),
-              endpoint.tlsEnabled(),
-              endpoint.kerberosEnabled(),
-              endpoint.kerberosSpn(),
-              options,
-              sessionKerberosPrincipal,
-              sessionKerberosKeytab);
-      client = FlightGrpcUtils.createFlightClient(allocator, channel, List.of());
-      return new ClientResources(allocator, channel, client);
-    } catch (Exception ex) {
-      CloseSupport.closeQuietly(client);
-      shutdownQuietly(channel);
-      CloseSupport.closeQuietly(allocator);
-      throw new IllegalStateException(
-          "Failed to open Arrow Flight client for service "
-              + endpoint.serviceName()
-              + " at "
-              + endpoint.connectHost()
-              + ":"
-              + endpoint.port()
-              + " derivedSpn="
-              + derivedSpn
-              + " diagnostics="
-              + diagnostics,
-          ex);
-    }
+  public AmpsFactoryOptions withConnection(Consumer<Connection> customizer) {
+    Objects.requireNonNull(customizer, "customizer");
+    customizer.accept(connection);
+    return this;
   }
 
-  static CallOption[] buildCallOptions(
-      CallerAppIdentity callerApp,
-      String env,
-      String region,
-      String site,
-      ClientResources client,
-      String datasetId) {
-    return buildCallOptions(callerApp, env, region, site, client, datasetId, true);
+  public AmpsFactoryOptions copy() {
+    AmpsFactoryOptions copy = new AmpsFactoryOptions();
+    copy.kerberos.copyFrom(this.kerberos);
+    copy.connection.copyFrom(this.connection);
+    return copy;
   }
 
-  static CallOption[] buildCallOptions(
-      CallerAppIdentity callerApp,
-      String env,
-      String region,
-      String site,
-      ClientResources client,
-      String datasetId,
-      boolean includeDelegatedUser) {
-    Objects.requireNonNull(callerApp, "callerApp");
-    Objects.requireNonNull(client, "client");
-
-    FlightCallHeaders headers = new FlightCallHeaders();
-    UserPrincipal principal = UserContext.get().orElse(null);
-    String oboUser =
-        includeDelegatedUser && principal != null ? Strings.trimToNull(principal.username()) : null;
-    FabricRequestHeaders requestHeaders =
-        FabricRequestHeaders.outbound(
-            callerApp,
-            oboUser,
-            new FabricRequestHeaders.RequestMetadata(
-                FabricRequestHeaders.generateRequestId(),
-                UUID.randomUUID().toString(),
-                env,
-                region,
-                site));
-    requestHeaders.applyToFlightHeaders(headers);
-    if (Strings.isNotBlank(datasetId)) {
-      headers.insert(FlightSqlRequestHeadersMiddleware.HEADER_DATASET_ID, datasetId);
-    }
-    return new CallOption[] {new HeaderCallOption(headers)};
+  static AmpsFactoryOptions merge(AmpsFactoryOptions options) {
+    return options == null ? new AmpsFactoryOptions() : options;
   }
 
-  static String kerberosAuthFailureDetails(ServiceEndpoint endpoint, Throwable error) {
-    return kerberosAuthFailureDetails(endpoint, error, null);
-  }
-
-  static String kerberosAuthFailureDetails(
-      ServiceEndpoint endpoint, Throwable error, String sessionKerberosPrincipal) {
-    if (!isKerberosAuthFailure(error)) {
-      return null;
+  public static AmpsFactoryOptions fromSystemProperties() {
+    AmpsFactoryOptions options = new AmpsFactoryOptions();
+    Kerberos kerb = options.kerberos();
+    kerb.enabled = Boolean.parseBoolean(System.getProperty("amps.kerberos.enabled", "false"));
+    kerb.principal = System.getProperty("amps.kerberos.principal", kerb.principal);
+    kerb.keytab = System.getProperty("amps.kerberos.keytab", kerb.keytab);
+    kerb.realm = System.getProperty("amps.kerberos.realm", kerb.realm);
+    kerb.kdc = System.getProperty("amps.kerberos.kdc", kerb.kdc);
+    kerb.mechanism = System.getProperty("amps.kerberos.mechanism", kerb.mechanism);
+    kerb.service = System.getProperty("amps.kerberos.service", kerb.service);
+    kerb.saslHost = System.getProperty("amps.kerberos.saslHost", kerb.saslHost);
+    kerb.authorizationId =
+        System.getProperty("amps.kerberos.authorizationId", kerb.authorizationId);
+    kerb.qop = System.getProperty("amps.kerberos.qop", kerb.qop);
+    kerb.logonOptions = System.getProperty("amps.kerberos.logonOptions", kerb.logonOptions);
+    kerb.debug = Boolean.parseBoolean(System.getProperty("amps.kerberos.debug", "false"));
+    String autoRefreshProp = System.getProperty("amps.kerberos.autoRefresh");
+    if (autoRefreshProp != null) {
+      kerb.autoRefresh = Boolean.parseBoolean(autoRefreshProp);
     }
-    Objects.requireNonNull(endpoint, "endpoint");
-    String derivedSpn = null;
-    try {
-      derivedSpn = deriveClientSpn(endpoint, sessionKerberosPrincipal);
-    } catch (RuntimeException ignore) {
-      derivedSpn = Strings.trimToNull(endpoint.kerberosSpn());
+    String refreshPeriodProp = System.getProperty("amps.kerberos.refreshPeriod");
+    if (Strings.isNotBlank(refreshPeriodProp)) {
+      kerb.refreshPeriod = parseDuration(refreshPeriodProp, kerb.refreshPeriod);
     }
-    return "kerberosAuthContext{serviceId="
-        + endpoint.serviceResourceId()
-        + ",connectHost="
-        + endpoint.connectHost()
-        + ",port="
-        + endpoint.port()
-        + ",derivedSpn="
-        + derivedSpn
-        + "}";
-  }
-
-  static boolean isKerberosAuthFailure(Throwable error) {
-    Throwable cursor = error;
-    while (cursor != null) {
-      if (cursor instanceof FlightRuntimeException flightEx
-          && flightEx.status() != null
-          && flightEx.status().code() == FlightStatusCode.UNAUTHENTICATED
-          && containsIgnoreCase(flightEx.getMessage(), KERBEROS_AUTH_FAILURE)) {
-        return true;
-      }
-      String message = cursor.getMessage();
-      if (containsIgnoreCase(message, UNAUTHENTICATED)
-          && containsIgnoreCase(message, KERBEROS_AUTH_FAILURE)) {
-        return true;
-      }
-      cursor = cursor.getCause();
+    String krb5ConfPathProp = System.getProperty("amps.kerberos.krb5ConfPath");
+    if (Strings.isNotBlank(krb5ConfPathProp)) {
+      kerb.krb5ConfPath = krb5ConfPathProp;
     }
-    return false;
-  }
-
-  static String clientDiagnostics(
-      ServiceEndpoint endpoint,
-      ServiceRunOptions runOptions,
-      String sessionKerberosPrincipal,
-      java.nio.file.Path sessionKerberosKeytab,
-      String derivedSpn) {
-    Objects.requireNonNull(endpoint, "endpoint");
-    ServiceRunOptions options = runOptions == null ? ServiceRunOptions.defaults() : runOptions;
-    java.nio.file.Path trustCert =
-        options.tlsTrustCert() == null ? options.clientTrustCert() : options.tlsTrustCert();
-    return "client{"
-        + "serviceGroup="
-        + endpoint.group()
-        + ",serviceName="
-        + endpoint.serviceName()
-        + ",tlsEnabled="
-        + endpoint.tlsEnabled()
-        + ",trustCert="
-        + safePath(trustCert)
-        + ",trustCertExists="
-        + pathExists(trustCert)
-        + ",kerberosEnabled="
-        + endpoint.kerberosEnabled()
-        + ",kerberosSpn="
-        + Strings.trimToNull(endpoint.kerberosSpn())
-        + ",derivedSpn="
-        + Strings.trimToNull(derivedSpn)
-        + ",sessionPrincipal="
-        + Strings.trimToNull(sessionKerberosPrincipal)
-        + ",keytab="
-        + safePath(sessionKerberosKeytab)
-        + ",keytabExists="
-        + pathExists(sessionKerberosKeytab)
-        + "}";
-  }
-
-  static String summarizeThrowable(Throwable error) {
-    if (error == null) {
-      return "<none>";
-    }
-    StringBuilder summary = new StringBuilder();
-    Throwable cursor = error;
-    int depth = 0;
-    while (cursor != null && depth < 8) {
-      if (depth > 0) {
-        summary.append(" <- ");
-      }
-      summary
-          .append(cursor.getClass().getSimpleName())
-          .append(":")
-          .append(Strings.firstNonBlank(Strings.trimToNull(cursor.getMessage()), "<empty>"));
-      cursor = cursor.getCause();
-      depth++;
-    }
-    if (cursor != null) {
-      summary.append(" <- ...");
-    }
-    return summary.toString();
-  }
-
-  private static String safePath(java.nio.file.Path path) {
-    return path == null ? null : path.toAbsolutePath().normalize().toString();
-  }
-
-  private static boolean pathExists(java.nio.file.Path path) {
-    return path != null && java.nio.file.Files.exists(path);
-  }
-
-  private static boolean containsIgnoreCase(String value, String needle) {
-    if (value == null || needle == null) {
-      return false;
-    }
-    return value.toLowerCase(java.util.Locale.ROOT).contains(needle.toLowerCase(java.util.Locale.ROOT));
-  }
-
-  private static String deriveClientSpn(ServiceEndpoint endpoint, String sessionKerberosPrincipal) {
-    Objects.requireNonNull(endpoint, "endpoint");
-    String baseSpn = KerberosSpn.resolveSpn(endpoint.kerberosSpn(), endpoint.connectHost());
-    String realm = KerberosSpn.extractRealm(sessionKerberosPrincipal);
-    if (realm == null) {
-      realm = KerberosConfig.DEFAULT_REALM;
-    }
-    return KerberosSpn.normalizeSpnWithRealm(baseSpn, realm);
-  }
-
-  private static String transportName(DefinitionService.ServiceType expectedType) {
-    if (expectedType == DefinitionService.ServiceType.ARROW_FLIGHT_SQL) {
-      return "ARROW_FLIGHT_SQL";
-    }
-    if (expectedType == DefinitionService.ServiceType.ARROW_FLIGHT_INGEST) {
-      return "ARROW_FLIGHT";
-    }
-    return "ARROW";
-  }
-
-
-  private static void shutdownQuietly(ManagedChannel channel) {
-    if (channel == null) {
-      return;
-    }
-    try {
-      channel.shutdownNow();
-      channel.awaitTermination(250, TimeUnit.MILLISECONDS);
-    } catch (Exception ignore) {
-    }
-  }
-
-  record ServiceEndpoint(
-      String group,
-      String serviceName,
-      String serviceResourceId,
-      DefinitionService definition,
-      String connectHost,
-      int port,
-      boolean tlsEnabled,
-      boolean kerberosEnabled,
-      String kerberosSpn) {}
-
-  static final class ClientResources implements AutoCloseable {
-    private final BufferAllocator allocator;
-    private final ManagedChannel channel;
-    private final FlightClient flightClient;
-
-    ClientResources(BufferAllocator allocator, ManagedChannel channel, FlightClient flightClient) {
-      this.allocator = Objects.requireNonNull(allocator, "allocator");
-      this.channel = Objects.requireNonNull(channel, "channel");
-      this.flightClient = Objects.requireNonNull(flightClient, "flightClient");
-    }
-
-    BufferAllocator allocator() {
-      return allocator;
-    }
-
-    FlightClient flightClient() {
-      return flightClient;
-    }
-
-    @Override
-    public void close() {
+    String krb5ConfBase64Prop = System.getProperty("amps.kerberos.krb5ConfDataBase64");
+    if (Strings.isNotBlank(krb5ConfBase64Prop)) {
       try {
-        flightClient.close();
-      } catch (InterruptedException ex) {
-        Thread.currentThread().interrupt();
-      } catch (Exception ignore) {
+        kerb.krb5ConfData = Base64.getDecoder().decode(krb5ConfBase64Prop.trim());
+        kerb.krb5ConfPath = null;
+      } catch (IllegalArgumentException ex) {
+        throw new IllegalStateException("Invalid base64 for amps.kerberos.krb5ConfDataBase64", ex);
       }
-      shutdownQuietly(channel);
-      CloseSupport.closeQuietly(allocator);
     }
+    return options;
+  }
+
+  public static final class Connection {
+    private Duration connectTimeout = Duration.ofSeconds(5);
+    private Duration initialDelay = Duration.ofMillis(200);
+    private Duration maximumDelay = Duration.ofSeconds(2);
+    private Duration maximumRetryTime = Duration.ofSeconds(15);
+    private double backoffExponent = 2.0d;
+    private double jitter = 0.25d;
+
+    public Duration connectTimeout() {
+      return connectTimeout;
+    }
+
+    public Connection connectTimeout(Duration value) {
+      if (value != null && !value.isNegative() && !value.isZero()) {
+        connectTimeout = value;
+      }
+      return this;
+    }
+
+    public Duration initialDelay() {
+      return initialDelay;
+    }
+
+    public Connection initialDelay(Duration value) {
+      if (value != null && !value.isNegative()) {
+        initialDelay = value;
+      }
+      return this;
+    }
+
+    public Duration maximumDelay() {
+      return maximumDelay;
+    }
+
+    public Connection maximumDelay(Duration value) {
+      if (value != null && !value.isNegative() && !value.isZero()) {
+        maximumDelay = value;
+      }
+      return this;
+    }
+
+    public Duration maximumRetryTime() {
+      return maximumRetryTime;
+    }
+
+    public Connection maximumRetryTime(Duration value) {
+      if (value != null && !value.isNegative() && !value.isZero()) {
+        maximumRetryTime = value;
+      }
+      return this;
+    }
+
+    public double backoffExponent() {
+      return backoffExponent;
+    }
+
+    public Connection backoffExponent(double value) {
+      if (value > 1.0d) {
+        backoffExponent = value;
+      }
+      return this;
+    }
+
+    public double jitter() {
+      return jitter;
+    }
+
+    public Connection jitter(double value) {
+      if (value >= 0.0d && value <= 1.0d) {
+        jitter = value;
+      }
+      return this;
+    }
+
+    void copyFrom(Connection source) {
+      if (source == null) {
+        return;
+      }
+      this.connectTimeout = source.connectTimeout;
+      this.initialDelay = source.initialDelay;
+      this.maximumDelay = source.maximumDelay;
+      this.maximumRetryTime = source.maximumRetryTime;
+      this.backoffExponent = source.backoffExponent;
+      this.jitter = source.jitter;
+    }
+  }
+
+  public static final class Kerberos {
+    private boolean enabled;
+    private String principal;
+    private String keytab;
+    private byte[] keytabBytes;
+    private String realm;
+    private String kdc;
+    private String mechanism = "GSSAPI";
+    private String service = "AMPS";
+    private String saslHost;
+    private String authorizationId;
+    private String qop;
+    private String logonOptions;
+    private boolean debug;
+    private boolean autoRefresh = true;
+    private Duration refreshPeriod = Duration.ofHours(6);
+    private String krb5ConfPath;
+    private byte[] krb5ConfData;
+    private String cacheKeyPrefix;
+    private KerberosClient runtimeContext;
+
+    public Kerberos enabled(boolean value) {
+      enabled = value;
+      return this;
+    }
+
+    public Kerberos principal(String value) {
+      principal = value;
+      return this;
+    }
+
+    public Kerberos keytab(String value) {
+      keytab = value;
+      return this;
+    }
+
+    public Kerberos keytabBytes(byte[] data) {
+      keytabBytes = data == null ? null : data.clone();
+      keytab = null;
+      return this;
+    }
+
+    public Kerberos realm(String value) {
+      realm = value;
+      return this;
+    }
+
+    public Kerberos kdc(String value) {
+      kdc = value;
+      return this;
+    }
+
+    public Kerberos mechanism(String value) {
+      if (Strings.isNotBlank(value)) {
+        mechanism = value;
+      }
+      return this;
+    }
+
+    public Kerberos service(String value) {
+      if (Strings.isNotBlank(value)) {
+        service = value;
+      }
+      return this;
+    }
+
+    public Kerberos saslHost(String value) {
+      saslHost = Strings.isBlank(value) ? null : value;
+      return this;
+    }
+
+    public Kerberos authorizationId(String value) {
+      authorizationId = value;
+      return this;
+    }
+
+    public Kerberos qop(String value) {
+      qop = value;
+      return this;
+    }
+
+    public Kerberos logonOptions(String value) {
+      logonOptions = value;
+      return this;
+    }
+
+    public Kerberos debug(boolean value) {
+      debug = value;
+      return this;
+    }
+
+    public Kerberos autoRefresh(boolean value) {
+      autoRefresh = value;
+      return this;
+    }
+
+    public Kerberos refreshPeriod(Duration value) {
+      if (value != null && !value.isNegative() && !value.isZero()) {
+        refreshPeriod = value;
+      }
+      return this;
+    }
+
+    public Kerberos krb5ConfPath(String value) {
+      krb5ConfPath = value;
+      return this;
+    }
+
+    public Kerberos krb5ConfData(byte[] value) {
+      krb5ConfData = value == null ? null : value.clone();
+      return this;
+    }
+
+    public Kerberos cacheKeyPrefix(String value) {
+      cacheKeyPrefix = value;
+      return this;
+    }
+
+    public Kerberos runtimeContext(KerberosClient value) {
+      runtimeContext = value;
+      return this;
+    }
+
+    public boolean isEnabled() {
+      return enabled;
+    }
+
+    public String getPrincipal() {
+      return principal;
+    }
+
+    public String getKeytab() {
+      return keytab;
+    }
+
+    public byte[] getKeytabBytes() {
+      return keytabBytes == null ? null : keytabBytes.clone();
+    }
+
+    public String realm() {
+      return realm;
+    }
+
+    public String kdc() {
+      return kdc;
+    }
+
+    public String getKrb5ConfPath() {
+      return krb5ConfPath;
+    }
+
+    public byte[] getKrb5ConfData() {
+      return krb5ConfData == null ? null : krb5ConfData.clone();
+    }
+
+    public boolean debugEnabled() {
+      return debug;
+    }
+
+    public boolean hasKrb5Config() {
+      return Strings.isNotBlank(krb5ConfPath) || (krb5ConfData != null && krb5ConfData.length > 0);
+    }
+
+    public KerberosClient runtimeContext() {
+      return runtimeContext;
+    }
+
+    boolean enabled() {
+      return enabled;
+    }
+
+    String mechanism() {
+      return mechanism;
+    }
+
+    String service() {
+      return service;
+    }
+
+    String saslHost() {
+      return saslHost;
+    }
+
+    String authorizationId() {
+      return authorizationId;
+    }
+
+    String qop() {
+      return qop;
+    }
+
+    String logonOptions() {
+      return Strings.isBlank(logonOptions) ? null : logonOptions;
+    }
+
+    boolean debug() {
+      return debug;
+    }
+
+    boolean autoRefreshEnabled() {
+      return autoRefresh;
+    }
+
+    Duration refreshPeriod() {
+      return refreshPeriod;
+    }
+
+    String loginCacheKey() {
+      String base =
+          String.join(
+              "|",
+              valueOrEmpty(principal),
+              valueOrEmpty(keytab),
+              hashBytes(keytabBytes),
+              valueOrEmpty(realm),
+              valueOrEmpty(kdc),
+              valueOrEmpty(krb5ConfPath),
+              hashBytes(krb5ConfData));
+      String prefix = valueOrEmpty(cacheKeyPrefix);
+      if (prefix.isEmpty()) {
+        return base;
+      }
+      return prefix + "|" + base;
+    }
+
+    void validate() {
+      if (!enabled) {
+        return;
+      }
+      if (runtimeContext != null) {
+        return;
+      }
+      if (Strings.isBlank(principal)) {
+        throw new IllegalStateException(
+            "Kerberos principal must be provided when Kerberos is enabled.");
+      }
+      boolean hasPath = Strings.isNotBlank(keytab);
+      boolean hasBytes = keytabBytes != null && keytabBytes.length > 0;
+      if (hasPath == hasBytes) {
+        throw new IllegalStateException(
+            "Kerberos keytab is required when Kerberos is enabled. Configure exactly one of keytab(...) or keytabBytes(...).");
+      }
+    }
+
+    void copyFrom(Kerberos source) {
+      if (source == null) {
+        return;
+      }
+      this.enabled = source.enabled;
+      this.principal = source.principal;
+      this.keytab = source.keytab;
+      this.keytabBytes = source.keytabBytes == null ? null : source.keytabBytes.clone();
+      this.realm = source.realm;
+      this.kdc = source.kdc;
+      this.mechanism = source.mechanism;
+      this.service = source.service;
+      this.saslHost = source.saslHost;
+      this.authorizationId = source.authorizationId;
+      this.qop = source.qop;
+      this.logonOptions = source.logonOptions;
+      this.debug = source.debug;
+      this.autoRefresh = source.autoRefresh;
+      this.refreshPeriod = source.refreshPeriod;
+      this.krb5ConfPath = source.krb5ConfPath;
+      this.krb5ConfData = source.krb5ConfData == null ? null : source.krb5ConfData.clone();
+      this.cacheKeyPrefix = source.cacheKeyPrefix;
+      this.runtimeContext = source.runtimeContext;
+    }
+
+    private static String hashBytes(byte[] value) {
+      if (value == null || value.length == 0) {
+        return "";
+      }
+      return Integer.toString(Arrays.hashCode(value));
+    }
+  }
+
+  private static Duration parseDuration(String value, Duration fallback) {
+    if (value == null) {
+      return fallback;
+    }
+    String trimmed = value.trim();
+    if (trimmed.isEmpty()) {
+      return fallback;
+    }
+    try {
+      if (trimmed.startsWith("P")) {
+        return Duration.parse(trimmed);
+      }
+      char last = trimmed.charAt(trimmed.length() - 1);
+      if (Character.isLetter(last)) {
+        long amount = Long.parseLong(trimmed.substring(0, trimmed.length() - 1));
+        switch (Character.toUpperCase(last)) {
+          case 'H':
+            return Duration.ofHours(amount);
+          case 'M':
+            return Duration.ofMinutes(amount);
+          case 'S':
+            return Duration.ofSeconds(amount);
+          default:
+            return fallback;
+        }
+      }
+      return Duration.ofSeconds(Long.parseLong(trimmed));
+    } catch (Exception ex) {
+      return fallback;
+    }
+  }
+
+  private static String valueOrEmpty(String value) {
+    return value == null ? "" : value;
   }
 }
-
-
-
-
-
