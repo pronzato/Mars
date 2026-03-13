@@ -1,771 +1,794 @@
-package org.pronzato.fabric.api.data.ingest.model;
+package org.pronzato.fabric.api.schemas.manager;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
+import java.util.regex.Pattern;
 import java.util.Objects;
-import org.pronzato.fabric.api.connectors.amps.AmpsConnection;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConnection;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
+import java.util.Optional;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.function.Supplier;
+import org.pronzato.fabric.api.connections.ConnectionManager;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
+import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
+import org.pronzato.fabric.api.control.discovery.DeleteManager;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngest;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngestSource;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionSchema;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
-import org.pronzato.fabric.api.data.dataset.DatasetId;
-import org.pronzato.fabric.api.data.dataset.DatasetType;
-import org.pronzato.fabric.api.control.plugins.FabricPlugins;
-import org.pronzato.fabric.api.control.plugins.IngestSourceProvider;
-import org.pronzato.fabric.api.control.plugins.IngestSourceProviderContext;
-import org.pronzato.fabric.api.control.plugins.IngestTargetProvider;
-import org.pronzato.fabric.api.control.plugins.IngestTargetProviderContext;
+import org.pronzato.fabric.api.control.discovery.lifecycle.DeleteOutcome;
+import org.pronzato.fabric.api.control.discovery.lifecycle.DeleteResult;
+import org.pronzato.fabric.api.data.ingest.model.IngestFormat;
+import org.pronzato.fabric.api.data.schema.FormatSampler;
+import org.pronzato.fabric.api.data.schema.FormatSamplerJson;
+import org.pronzato.fabric.api.data.schema.FormatSamplerNvFix;
+import org.pronzato.fabric.api.data.schema.FormatSamplerOptions;
+import org.pronzato.fabric.api.data.schema.PayloadSample;
+import org.pronzato.fabric.api.data.schema.SampleSource;
+import org.pronzato.fabric.api.data.schema.SchemaInference;
+import org.pronzato.fabric.api.data.schema.client.InferredField;
+import org.pronzato.fabric.api.data.schema.client.SchemaSampleDiagnostics;
+import org.pronzato.fabric.api.data.schema.client.SchemaSampleOptions;
+import org.pronzato.fabric.api.data.schema.client.SchemaSampleResult;
+import org.pronzato.fabric.api.data.schema.FormatSampler.FormatSamplerResult;
+import org.pronzato.fabric.api.data.schema.sources.amps.SampleSourceAmps;
+import org.pronzato.fabric.api.schemas.SchemaManager;
 import org.pronzato.fabric.api.schemas.SchemaModel;
-import org.pronzato.fabric.api.util.DefinitionModelMapperSupport;
+import org.pronzato.fabric.api.schemas.SchemaType;
+import org.pronzato.fabric.api.schemas.manager.SchemaCompatibilityRules;
+import org.pronzato.fabric.api.schemas.manager.SchemaModelMapper;
+import org.pronzato.fabric.api.schemas.manager.SchemaViews;
+import org.pronzato.fabric.api.util.IdentityParsingSupport;
 import org.pronzato.fabric.api.util.Strings;
 
-public final class IngestModelMapper {
-  private static final String INPUT_TYPE_API_IPC = "API_IPC";
-  private static final String ODBC = "ODBC";
+public final class SchemaManagerImpl implements SchemaManager {
+  private static final String FORMAT_JSON = "JSON";
+  private static final String FORMAT_NVFIX = "NVFIX";
+  private static final String PAYLOADS_INGEST_NAME = "payloads";
+  private static final String SYSTEM_USER = "fabric-lite";
+  private static final String VERSION_SEPARATOR = "__v";
+  private static final Pattern VERSION_SUFFIX_PATTERN = Pattern.compile(".*__v\\d{4}$");
+  private static final ObjectMapper CANONICAL_MAPPER =
+      DiscoveryCodec.mapper().copy().configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
+  private static final Comparator<SchemaModel> SCHEMA_ORDER =
+      Comparator
+          .comparing(SchemaManagerImpl::schemaName, String.CASE_INSENSITIVE_ORDER)
+          .thenComparing(SchemaManagerImpl::schemaName)
+          .thenComparing(SchemaManagerImpl::schemaTypeName);
 
-  private final FabricPlugins plugins;
+  private final Supplier<DiscoveryCache> configCacheSupplier;
+  private final Supplier<String> sessionGroupSupplier;
+  private final Supplier<ConnectionManager> connectionManagerSupplier;
+  private final Supplier<DeleteManager> deleteManagerSupplier;
+  private final SampleSourceFactory sampleSourceFactory;
+  private final FormatSamplerFactory formatSamplerFactory;
 
-  public IngestModelMapper() {
-    this(FabricPlugins.system());
-  }
-
-  public IngestModelMapper(FabricPlugins plugins) {
-    this.plugins = Objects.requireNonNull(plugins, "plugins");
-  }
-
-  public DefinitionIngest toDefinition(
-      IngestModel model, String sessionGroup, String actor, String outputSchemaName) {
-    Objects.requireNonNull(model, "model");
-    String group = DefinitionModelMapperSupport.requireNonBlank(sessionGroup, "sessionGroup");
-    String ingestName = DefinitionModelMapperSupport.requireNonBlank(model.name(), "model.name");
-    String namespace =
-        DefinitionModelMapperSupport.requireNonBlank(model.namespace(), "model.namespace");
-    String resolvedSchemaName =
-        DefinitionModelMapperSupport.requireNonBlank(outputSchemaName, "outputSchemaName");
-    DatasetId datasetId = resolveDatasetId(group, namespace, model);
-    DefinitionEnvelope envelope =
-        DefinitionModelMapperSupport.envelopeNow(
-            group,
-            DefinitionType.INGEST,
-            ingestName,
-            Strings.firstNonBlank(
-                model.uuid(),
-                DefinitionModelMapperSupport.buildDefinitionId("ingest", group, ingestName)),
-            model.enabled(),
-            model.lifecycleStatus(),
-            actor);
-    return new DefinitionIngest(
-        envelope,
-        datasetId.toString(),
-        resolvedSchemaName,
-        new DefinitionIngest.Input(INPUT_TYPE_API_IPC),
-        toDefinitionSchemaMode(model.schemaMode()),
+  public SchemaManagerImpl(
+      Supplier<DiscoveryCache> configCacheSupplier,
+      Supplier<String> sessionGroupSupplier,
+      Supplier<ConnectionManager> connectionManagerSupplier) {
+    this(
+        configCacheSupplier,
+        sessionGroupSupplier,
+        connectionManagerSupplier,
+        null,
+        null,
         null);
   }
 
-  public DefinitionIngestSource toDefinition(
-      IngestSourceModel model, String sessionGroup, String actor) {
-    Objects.requireNonNull(model, "model");
-    String group = DefinitionModelMapperSupport.requireNonBlank(sessionGroup, "sessionGroup");
-    String ingestName =
-        DefinitionModelMapperSupport.requireNonBlank(model.ingestName(), "source.ingestName");
-    String namespace =
-        DefinitionModelMapperSupport.requireNonBlank(model.namespace(), "source.namespace");
-    DefinitionEnvelope envelope =
-        DefinitionModelMapperSupport.envelopeNow(
-            group,
-            DefinitionType.INGEST_SOURCE,
-            ingestName,
-            Strings.firstNonBlank(
-                model.uuid(),
-                DefinitionModelMapperSupport.buildDefinitionId(
-                    "ingest-source", group, ingestName)),
-            model.enabled() == null || model.enabled(),
-            model.lifecycleStatus(),
-            actor);
-    String format = toFormatToken(model.format());
-
-    if (model instanceof IngestSourceApiModel api) {
-      DefinitionIngestSource.JsonConfig json =
-          "JSON".equals(format)
-              ? new DefinitionIngestSource.JsonConfig("OBJECT_PER_MESSAGE", api.jsonRootField())
-              : null;
-      DefinitionIngestSource.NvFixConfig nvfix =
-          "NVFIX".equals(format)
-              ? new DefinitionIngestSource.NvFixConfig(
-                  normalizedNvFixPairDelimiter(api.nvFixPairDelimiter()),
-                  normalizedNvFixKvDelimiter(api.nvFixKvDelimiter()),
-                  normalizedNvFixTrim(api.nvFixTrimKeys()),
-                  normalizedNvFixTrim(api.nvFixTrimValues()))
-              : null;
-      return new DefinitionIngestSource(
-          envelope, namespace, ingestName, format, json, nvfix, null, null, null, null);
-    }
-
-    if (model instanceof IngestSourceAmpsModel amps) {
-      DefinitionIngestSource.JsonConfig json =
-          "JSON".equals(format)
-              ? new DefinitionIngestSource.JsonConfig("OBJECT_PER_MESSAGE", amps.jsonRootField())
-              : null;
-      DefinitionIngestSource.NvFixConfig nvfix =
-          "NVFIX".equals(format)
-              ? new DefinitionIngestSource.NvFixConfig(
-                  normalizedNvFixPairDelimiter(amps.nvFixPairDelimiter()),
-                  normalizedNvFixKvDelimiter(amps.nvFixKvDelimiter()),
-                  normalizedNvFixTrim(amps.nvFixTrimKeys()),
-                  normalizedNvFixTrim(amps.nvFixTrimValues()))
-              : null;
-      DefinitionIngestSource.Mode mode =
-          amps.mode() == IngestSourceAmpsModel.Mode.BATCH
-              ? DefinitionIngestSource.Mode.BATCH
-              : DefinitionIngestSource.Mode.STREAM;
-      DefinitionIngestSource.OofHandling definitionOofHandling = null;
-      if (amps.oofHandling() == IngestSourceAmpsModel.OofHandling.MARK_AS_DELETED) {
-        definitionOofHandling = DefinitionIngestSource.OofHandling.MARK_AS_DELETED;
-      } else if (hasSubscribeOption(amps.options(), "oof")) {
-        definitionOofHandling = DefinitionIngestSource.OofHandling.DELETE_EVENT;
-      }
-      DefinitionIngestSource.AmpsSource ampsSource =
-          new DefinitionIngestSource.AmpsSource(
-              Strings.requireNonBlank(amps.connectionName(), "source.amps.connectionName"),
-              Strings.requireNonBlank(amps.topic(), "source.amps.topic"),
-              amps.sow(),
-              amps.sowOnly(),
-              amps.options(),
-              amps.filter(),
-              mode,
-              definitionOofHandling,
-              amps.batchMaxMessages(),
-              amps.batchMaxBytes(),
-              amps.batchFlushMillis());
-      return new DefinitionIngestSource(
-          envelope, namespace, ingestName, format, json, nvfix, ampsSource, null, null, null);
-    }
-    if (model instanceof IngestSourceExternalModel externalModel) {
-      if (ODBC.equalsIgnoreCase(Strings.trimToNull(externalModel.providerId()))) {
-        return new DefinitionIngestSource(
-            envelope,
-            namespace,
-            ingestName,
-            format,
-            null,
-            null,
-            null,
-            null,
-            toDefinitionOdbcSource(externalModel),
-            null);
-      }
-      return new DefinitionIngestSource(
-          envelope,
-          namespace,
-          ingestName,
-          format,
-          null,
-          null,
-          null,
-          new DefinitionIngestSource.ExternalSource(
-              externalModel.providerId(), externalModel.reference(), externalModel.options()),
-          null,
-          null);
-    }
-    @SuppressWarnings("unchecked")
-    IngestSourceProvider provider =
-        plugins.findIngestSourceProviderForModel((Class<? extends IngestSourceModel>) model.getClass());
-    if (provider != null) {
-      try {
-        DefinitionIngestSource.ExternalSource external = provider.toExternalSource(model);
-        if (external == null) {
-          throw new IllegalStateException(
-              "Ingest source provider '" + provider.providerId() + "' returned null external mapping");
-        }
-        String externalType = Strings.firstNonBlank(external.sourceType(), provider.providerId());
-        return new DefinitionIngestSource(
-            envelope,
-            namespace,
-            ingestName,
-            format,
-            null,
-            null,
-            null,
-            new DefinitionIngestSource.ExternalSource(
-                externalType,
-                external.reference(),
-                external.options()),
-            null,
-            null);
-      } catch (RuntimeException ex) {
-        throw ex;
-      } catch (Exception ex) {
-        throw new IllegalStateException(
-            "Failed to map source model via provider '" + provider.providerId() + "'",
-            ex);
-      }
-    }
-    throw new IllegalArgumentException(
-        "Unsupported source model: " + model.getClass().getName());
+  public SchemaManagerImpl(
+      Supplier<DiscoveryCache> configCacheSupplier,
+      Supplier<String> sessionGroupSupplier,
+      Supplier<ConnectionManager> connectionManagerSupplier,
+      Supplier<DeleteManager> deleteManagerSupplier) {
+    this(
+        configCacheSupplier,
+        sessionGroupSupplier,
+        connectionManagerSupplier,
+        deleteManagerSupplier,
+        null,
+        null);
   }
 
-  public DefinitionDataset toDefinitionDataset(IngestModel model, String sessionGroup, String actor) {
-    return toDefinitionDataset(model, sessionGroup, actor, null);
+  SchemaManagerImpl(
+      Supplier<DiscoveryCache> configCacheSupplier,
+      Supplier<String> sessionGroupSupplier,
+      Supplier<ConnectionManager> connectionManagerSupplier,
+      SampleSourceFactory sampleSourceFactory,
+      FormatSamplerFactory formatSamplerFactory) {
+    this(
+        configCacheSupplier,
+        sessionGroupSupplier,
+        connectionManagerSupplier,
+        null,
+        sampleSourceFactory,
+        formatSamplerFactory);
   }
 
-  public DefinitionDataset toDefinitionDataset(
-      IngestModel model, String sessionGroup, String actor, String parquetUriOverride) {
-    Objects.requireNonNull(model, "model");
-    String group = DefinitionModelMapperSupport.requireNonBlank(sessionGroup, "sessionGroup");
-    String ingestName = DefinitionModelMapperSupport.requireNonBlank(model.name(), "model.name");
-    String namespace =
-        DefinitionModelMapperSupport.requireNonBlank(model.namespace(), "model.namespace");
-    DatasetId datasetId = resolveDatasetId(group, namespace, model);
-    IngestTargetModel target = model.target();
-    if (target == null) {
-      return null;
-    }
-    DefinitionDataset.Binding binding;
-    DatasetType type;
-    if (target instanceof IngestTargetParquetModel parquet) {
-      type = DatasetType.PARQUET;
-      String parquetUri = Strings.firstNonBlank(parquetUriOverride, parquet.parquetPath());
-      binding =
-          new DefinitionDataset.Binding(
-              null,
-              new DefinitionDataset.ParquetBinding(
-                  parquetUri,
-                  parquet.glob(),
-                  parquet.hivePartitioning(),
-                  null,
-                  parquet.partitionKey(),
-                  parquet.partitionValueField(),
-                  parquet.connectionName()),
-              null);
-    } else if (target instanceof IngestTargetDuckDbActiveModel duckdbActive) {
-      type = DatasetType.DUCKDB;
-      String relationName = Strings.firstNonBlank(duckdbActive.tableName(), datasetId.name());
-      binding =
-          new DefinitionDataset.Binding(
-              new DefinitionDataset.DuckdbBinding(
-                  relationName,
-                  IngestTargetType.DUCKDB_ACTIVE.name(),
-                  duckdbActive.primaryKey(),
-                  duckdbActive.memory(),
-                  duckdbActive.databasePath(),
-                  duckdbActive.parquetHistoryPath(),
-                  duckdbActive.persistOnStop(),
-                  duckdbActive.createIfMissing()),
-              null,
-              null);
-    } else if (target instanceof IngestTargetDuckDbModel duckdb) {
-      type = DatasetType.DUCKDB;
-      String relationName = Strings.firstNonBlank(duckdb.table(), datasetId.name());
-      binding =
-          new DefinitionDataset.Binding(
-              new DefinitionDataset.DuckdbBinding(
-                  relationName, IngestTargetType.DUCKDB.name(), List.of(), null, null, null, null, null),
-              null,
-              null);
-    } else if (target instanceof IngestTargetExternalModel external) {
-      type = DatasetType.EXTERNAL;
-      if (ODBC.equalsIgnoreCase(Strings.trimToNull(external.providerId()))) {
-        binding =
-            new DefinitionDataset.Binding(
-                null,
-                null,
-                null,
-                toDefinitionOdbcBinding(external));
-      } else {
-        binding =
-            new DefinitionDataset.Binding(
-                null,
-                null,
-                new DefinitionDataset.ExternalBinding(
-                    external.providerId(),
-                    external.reference(),
-                    external.options()),
-                null);
-      }
-    } else {
-      @SuppressWarnings("unchecked")
-      IngestTargetProvider provider =
-          plugins.findIngestTargetProviderForModel((Class<? extends IngestTargetModel>) target.getClass());
-      if (provider == null) {
-        throw new IllegalArgumentException("Unsupported target model: " + target.getClass().getName());
-      }
-      DefinitionDataset.ExternalBinding externalBinding;
-      try {
-        externalBinding = provider.toExternalBinding(target);
-      } catch (RuntimeException ex) {
-        throw ex;
-      } catch (Exception ex) {
-        throw new IllegalStateException(
-            "Failed to map target model via provider '" + provider.providerId() + "'",
-            ex);
-      }
-      if (externalBinding == null) {
-        throw new IllegalStateException(
-            "Ingest target provider '" + provider.providerId() + "' returned null external binding");
-      }
-      type = DatasetType.EXTERNAL;
-      binding =
-          new DefinitionDataset.Binding(
-              null,
-              null,
-              new DefinitionDataset.ExternalBinding(
-                  Strings.firstNonBlank(externalBinding.externalType(), provider.providerId()),
-                  externalBinding.reference(),
-                  externalBinding.options()),
-              null);
-    }
-    DefinitionEnvelope envelope =
-        DefinitionModelMapperSupport.envelopeNow(
-            group,
-            DefinitionType.DATASET,
-            DefinitionModelMapperSupport.buildScopedName(
-                datasetId.namespace(), datasetId.name(), "dataset.namespace", "dataset.name"),
-            DefinitionModelMapperSupport.buildDefinitionId(
-                "dataset",
-                group,
-                DefinitionModelMapperSupport.buildScopedName(
-                    datasetId.namespace(), datasetId.name(), "dataset.namespace", "dataset.name")),
-            model.enabled(),
-            model.lifecycleStatus(),
-            actor);
-    return new DefinitionDataset(envelope, type, datasetId.namespace(), binding);
+  SchemaManagerImpl(
+      Supplier<DiscoveryCache> configCacheSupplier,
+      Supplier<String> sessionGroupSupplier,
+      Supplier<ConnectionManager> connectionManagerSupplier,
+      Supplier<DeleteManager> deleteManagerSupplier,
+      SampleSourceFactory sampleSourceFactory,
+      FormatSamplerFactory formatSamplerFactory) {
+    this.configCacheSupplier = Objects.requireNonNull(configCacheSupplier, "configCacheSupplier");
+    this.sessionGroupSupplier = Objects.requireNonNull(sessionGroupSupplier, "sessionGroupSupplier");
+    this.connectionManagerSupplier =
+        Objects.requireNonNull(connectionManagerSupplier, "connectionManagerSupplier");
+    this.deleteManagerSupplier = deleteManagerSupplier == null ? () -> null : deleteManagerSupplier;
+    this.sampleSourceFactory =
+        sampleSourceFactory == null ? this::createDefaultSampleSource : sampleSourceFactory;
+    this.formatSamplerFactory =
+        formatSamplerFactory == null ? this::createDefaultFormatSampler : formatSamplerFactory;
   }
 
-  public IngestModel fromDefinitions(
-      DefinitionIngest ingest,
-      DefinitionIngestSource sourceOrNull,
-      SchemaModel schemaOrNull) {
-    Objects.requireNonNull(ingest, "ingest");
-    DefinitionEnvelope envelope = ingest.envelope();
-    String ingestName =
-        Strings.requireNonBlank(envelope == null ? null : envelope.name(), "ingest.envelope.name");
-    String namespace =
-        Strings.requireNonBlank(
-            Strings.firstNonBlank(
-                sourceOrNull == null ? null : sourceOrNull.namespace(),
-                parseNamespace(ingest.datasetId())),
-            "ingest.namespace");
-    IngestModel.Builder builder =
-        IngestModel.builder()
-            .withName(ingestName)
-            .withNamespace(namespace)
-            .withResolvedUuid(envelope == null ? null : envelope.uuid())
-            .withEnabled(envelope == null || !Boolean.FALSE.equals(envelope.enabled()))
-            .withResolvedLifecycleStatus(envelope == null ? null : envelope.lifecycleStatus())
-            .withSchemaMode(fromDefinitionSchemaMode(ingest.schemaMode()))
-            .withSchema(Objects.requireNonNull(schemaOrNull, "ingest schema is required"))
-            .withResolvedDatasetId(ingest.datasetId());
+  @Override
+  public SchemaSampleResult sample(String ingestName, SchemaSampleOptions options) {
+    String normalizedIngestName = Strings.requireNonBlank(ingestName, "ingestName");
+    SchemaSampleOptions resolvedOptions = options == null ? SchemaSampleOptions.defaults() : options;
+    DiscoveryCache DiscoveryCache = requireConfigCache();
+    String group = requireSessionGroup();
+    DiscoveryCache
+        .get(DefinitionIngest.class, group, normalizedIngestName)
+        .orElseThrow(
+            () ->
+                new IllegalArgumentException(
+                    "Unknown ingest: " + group + "/" + normalizedIngestName));
+    DefinitionIngestSource source =
+        DiscoveryCache
+            .get(DefinitionIngestSource.class, group, normalizedIngestName)
+            .orElseThrow(
+                () ->
+                    new IllegalStateException(
+                        "IngestSource not found for ingest: " + group + "/" + normalizedIngestName));
+    String resolvedFormat = resolveFormat(source, resolvedOptions);
+    String ingestId = group + "/" + normalizedIngestName;
 
-    if (sourceOrNull != null) {
-      builder.withSource(fromDefinitionSource(sourceOrNull));
-    } else {
-      builder.withSourceApi();
-    }
-    return builder.build();
-  }
-
-  public IngestSourceModel fromDefinitionSource(DefinitionIngestSource source) {
-    if (source == null) {
-      return null;
-    }
-    DefinitionEnvelope envelope = source.envelope();
-    String ingestName = Strings.trimToNull(envelope == null ? null : envelope.name());
-    String namespace = Strings.requireNonBlank(source.namespace(), "source.namespace");
-    IngestFormat format = IngestFormat.fromToken(Strings.requireNonBlank(source.format(), "source.format"));
-    if (source.external() != null) {
-      DefinitionIngestSource.ExternalSource external = source.external();
-      String sourceType = Strings.requireNonBlank(external.sourceType(), "source.external.sourceType");
-      IngestSourceProvider provider = plugins.findIngestSourceProvider(sourceType);
-      if (provider != null) {
-        try {
-          return provider.fromExternalSource(
-              new IngestSourceProviderContext(
-                  source,
-                  Strings.requireNonBlank(ingestName, "source.envelope.name"),
-                  namespace,
-                  envelope == null ? null : envelope.uuid(),
-                  envelope == null ? null : envelope.enabled(),
-                  envelope == null ? null : envelope.lifecycleStatus(),
-                  format,
-                  external));
-        } catch (RuntimeException ex) {
-          throw ex;
-        } catch (Exception ex) {
-          throw new IllegalStateException(
-              "Failed to rebuild source model via provider '" + provider.providerId() + "'",
-              ex);
-        }
-      }
-      return IngestSourceExternalModel.builder()
-          .withResolvedIngestName(ingestName)
-          .withNamespace(namespace)
-          .withUuid(envelope == null ? null : envelope.uuid())
-          .withEnabled(envelope == null ? null : envelope.enabled())
-          .withLifecycleStatus(envelope == null ? null : envelope.lifecycleStatus())
-          .withFormat(format)
-          .withProviderId(sourceType)
-          .withReference(external.reference())
-          .withOptions(external.options())
-          .build();
-    }
-    if (source.odbc() != null) {
-      DefinitionIngestSource.OdbcSource odbc = source.odbc();
-      return IngestSourceExternalModel.builder()
-          .withResolvedIngestName(ingestName)
-          .withNamespace(namespace)
-          .withUuid(envelope == null ? null : envelope.uuid())
-          .withEnabled(envelope == null ? null : envelope.enabled())
-          .withLifecycleStatus(envelope == null ? null : envelope.lifecycleStatus())
-          .withFormat(format)
-          .withProviderId(ODBC)
-          .withReference(odbc.connectionName())
-          .withOptions(toExternalOptions(odbc))
-          .build();
-    }
-    if (source.amps() == null) {
-      return IngestSourceApiModel.builder()
-          .withResolvedIngestName(ingestName)
-          .withNamespace(namespace)
-          .withUuid(envelope == null ? null : envelope.uuid())
-          .withEnabled(envelope == null ? null : envelope.enabled())
-          .withLifecycleStatus(envelope == null ? null : envelope.lifecycleStatus())
-          .withFormat(format)
-          .withJsonRootField(source.json() == null ? null : source.json().rootField())
-          .withNvFixPairDelimiter(source.nvfix() == null ? null : source.nvfix().pairDelimiter())
-          .withNvFixKvDelimiter(source.nvfix() == null ? null : source.nvfix().kvDelimiter())
-          .withNvFixTrimKeys(source.nvfix() == null ? null : source.nvfix().trimKeys())
-          .withNvFixTrimValues(source.nvfix() == null ? null : source.nvfix().trimValues())
-          .build();
-    }
-    DefinitionIngestSource.AmpsSource amps = source.amps();
-    IngestSourceAmpsModel.Builder builder =
-        IngestSourceAmpsModel.builder()
-        .withResolvedIngestName(ingestName)
-        .withNamespace(namespace)
-        .withUuid(envelope == null ? null : envelope.uuid())
-        .withEnabled(envelope == null ? null : envelope.enabled())
-        .withLifecycleStatus(envelope == null ? null : envelope.lifecycleStatus())
-        .withFormat(format)
-        .withConnectionName(amps.connectionName())
-        .withTopic(amps.topic())
-        .withSowSubscribe(amps.sow())
-        .withSow(amps.sowOnly())
-        .withOptions(amps.options())
-        .withFilter(amps.filter())
-        .withMode(
-            amps.mode() == DefinitionIngestSource.Mode.BATCH
-                ? IngestSourceAmpsModel.Mode.BATCH
-                : IngestSourceAmpsModel.Mode.STREAM)
-        .withBatchMaxMessages(amps.batchMaxMessages())
-        .withBatchMaxBytes(amps.batchMaxBytes())
-        .withBatchFlushMillis(amps.batchFlushMillis())
-        .withJsonRootField(source.json() == null ? null : source.json().rootField())
-        .withNvFixPairDelimiter(source.nvfix() == null ? null : source.nvfix().pairDelimiter())
-        .withNvFixKvDelimiter(source.nvfix() == null ? null : source.nvfix().kvDelimiter())
-        .withNvFixTrimKeys(source.nvfix() == null ? null : source.nvfix().trimKeys())
-        .withNvFixTrimValues(source.nvfix() == null ? null : source.nvfix().trimValues());
-    if (amps.oofHandling() != null) {
-      builder.withOofHandling(
-          amps.oofHandling() == DefinitionIngestSource.OofHandling.MARK_AS_DELETED
-              ? IngestSourceAmpsModel.OofHandling.MARK_AS_DELETED
-              : IngestSourceAmpsModel.OofHandling.DELETE_EVENT);
-    }
-    return builder.build();
-  }
-
-  public IngestTargetModel fromDefinitionDataset(DefinitionDataset dataset) {
-    if (dataset == null || dataset.binding() == null) {
-      return null;
-    }
-    if (dataset.type() == DatasetType.PARQUET && dataset.binding().parquet() != null) {
-      DefinitionDataset.ParquetBinding parquet = dataset.binding().parquet();
-      return IngestTargetParquetModel.builder()
-          .withParquetPath(parquet.uri())
-          .withGlob(parquet.glob())
-          .withHivePartitioning(parquet.hivePartitioning())
-          .withPartitionKey(parquet.partitionKey())
-          .withPartitionValueField(parquet.partitionValueField())
-          .withConnectionName(parquet.connectionName())
-          .build();
-    }
-    if (dataset.type() == DatasetType.DUCKDB && dataset.binding().duckdb() != null) {
-      DefinitionDataset.DuckdbBinding duckdb = dataset.binding().duckdb();
-      String targetTypeToken = Strings.trimToNull(duckdb.targetType());
-      if (IngestTargetType.DUCKDB_ACTIVE.name().equalsIgnoreCase(Strings.firstNonBlank(targetTypeToken, ""))) {
-        return IngestTargetDuckDbActiveModel.builder()
-            .withTableName(duckdb.relationName())
-            .withPrimaryKey(duckdb.primaryKey())
-            .withMemory(duckdb.memory())
-            .withDatabasePath(duckdb.databasePath())
-            .withParquetHistoryPath(duckdb.parquetHistoryPath())
-            .withPersistOnStop(duckdb.persistOnStop())
-            .withCreateIfMissing(duckdb.createIfMissing())
-            .build();
-      }
-      return IngestTargetDuckDbModel.builder()
-          .withType(IngestTargetDuckDbModel.Type.MEMORY)
-          .withTable(duckdb.relationName())
-          .build();
-    }
-    if (dataset.binding().external() != null
-        && (dataset.type() == DatasetType.EXTERNAL || dataset.type() == null)) {
-      DefinitionDataset.ExternalBinding external = dataset.binding().external();
-      String targetType = Strings.requireNonBlank(external.externalType(), "dataset.binding.external.externalType");
-      IngestTargetProvider provider = plugins.findIngestTargetProvider(targetType);
-      if (provider != null) {
-        try {
-          return provider.fromExternalBinding(
-              new IngestTargetProviderContext(dataset, toDatasetId(dataset), external));
-        } catch (RuntimeException ex) {
-          throw ex;
-        } catch (Exception ex) {
-          throw new IllegalStateException(
-              "Failed to rebuild target model via provider '" + provider.providerId() + "'",
-              ex);
-        }
-      }
-      return IngestTargetExternalModel.builder()
-          .withProviderId(targetType)
-          .withReference(external.reference())
-          .withOptions(external.options())
-          .build();
-    }
-    if (dataset.binding().odbc() != null
-        && (dataset.type() == DatasetType.EXTERNAL || dataset.type() == null)) {
-      DefinitionDataset.OdbcBinding odbc = dataset.binding().odbc();
-      return IngestTargetExternalModel.builder()
-          .withProviderId(ODBC)
-          .withReference(odbc.connectionName())
-          .withOptions(toExternalOptions(odbc))
-          .build();
-    }
-    return null;
-  }
-
-  public String deterministicSchemaName(String sessionGroup, String namespace, String ingestName) {
-    DefinitionModelMapperSupport.requireNonBlank(sessionGroup, "sessionGroup");
-    String normalizedNamespace =
-        DefinitionModelMapperSupport.requireNonBlank(namespace, "namespace");
-    String normalizedIngestName =
-        DefinitionModelMapperSupport.requireNonBlank(ingestName, "ingestName");
-    return "ingest:" + normalizedNamespace + "/" + normalizedIngestName;
-  }
-
-  public DatasetId resolveDatasetId(String group, String namespace, IngestModel model) {
-    String datasetCanonical = Strings.trimToNull(model.datasetId());
-    if (datasetCanonical != null) {
-      return DatasetId.parse(datasetCanonical);
-    }
-    String datasetName = defaultDatasetName(model);
-    return DatasetId.of(group, namespace, datasetName);
-  }
-
-  private static String defaultDatasetName(IngestModel model) {
-    IngestTargetModel target = model.target();
-    if (target instanceof IngestTargetDuckDbModel duckdb) {
-      return Strings.firstNonBlank(duckdb.table(), model.name());
-    }
-    if (target instanceof IngestTargetDuckDbActiveModel duckdbActive) {
-      return Strings.firstNonBlank(duckdbActive.tableName(), model.name());
-    }
-    return model.name();
-  }
-
-  private static String normalizedNvFixPairDelimiter(String configured) {
-    String value = Strings.trimToNull(configured);
-    return value == null ? String.valueOf(AmpsConnection.SOH) : value;
-  }
-
-  private static String normalizedNvFixKvDelimiter(String configured) {
-    String value = Strings.trimToNull(configured);
-    if (value == null) {
-      return "=";
-    }
-    if (value.isEmpty()) {
-      throw new IllegalArgumentException("nvFixKvDelimiter must not be empty");
-    }
-    return value;
-  }
-
-  private static Boolean normalizedNvFixTrim(Boolean configured) {
-    return configured == null || configured;
-  }
-
-  private static IngestSchemaMode fromDefinitionSchemaMode(DefinitionIngest.SchemaMode mode) {
-    if (mode == null) {
-      return IngestSchemaMode.STRICT;
-    }
-    return switch (mode) {
-      case STRICT -> IngestSchemaMode.STRICT;
-      case ADD_COLUMNS -> IngestSchemaMode.ADD_COLUMNS;
-      case RELAXED -> IngestSchemaMode.RELAXED;
-      case UNKNOWN ->
-          throw new IllegalArgumentException("Unsupported ingest schemaMode UNKNOWN");
-    };
-  }
-
-  private static DefinitionIngest.SchemaMode toDefinitionSchemaMode(IngestSchemaMode mode) {
-    IngestSchemaMode normalized = mode == null ? IngestSchemaMode.STRICT : mode;
-    return switch (normalized) {
-      case STRICT -> DefinitionIngest.SchemaMode.STRICT;
-      case ADD_COLUMNS -> DefinitionIngest.SchemaMode.ADD_COLUMNS;
-      case RELAXED -> DefinitionIngest.SchemaMode.RELAXED;
-    };
-  }
-
-  private static String toFormatToken(IngestFormat format) {
-    IngestFormat normalized = format == null ? IngestFormat.JSON : format;
-    return normalized.name().toUpperCase(Locale.ROOT);
-  }
-
-  private static String parseNamespace(String datasetIdCanonical) {
-    String datasetId = Strings.trimToNull(datasetIdCanonical);
-    if (datasetId == null) {
-      return null;
-    }
-    try {
-      return DatasetId.parse(datasetId).namespace();
+    List<PayloadSample> samples;
+    try (SampleSource sampleSource =
+        sampleSourceFactory.create(ingestId, source, resolvedOptions)) {
+      samples = collect(sampleSource, resolvedOptions.maxMessages(), resolvedOptions.maxBytes());
     } catch (RuntimeException ex) {
-      return null;
+      throw ex;
+    } catch (Exception ex) {
+      throw new IllegalStateException("Failed to close sample source ingest=" + ingestId, ex);
     }
+    if (samples.isEmpty()) {
+      throw new IllegalStateException("No payload samples were collected ingest=" + ingestId);
+    }
+
+    return inferFromSamples(
+        normalizedIngestName, ingestId, resolvedFormat, source, samples, resolvedOptions.allowNulls());
   }
 
-  private static DatasetId toDatasetId(DefinitionDataset dataset) {
-    DefinitionEnvelope envelope = dataset == null ? null : dataset.envelope();
-    String group =
-        DefinitionModelMapperSupport.requireNonBlank(
-            envelope == null ? null : envelope.group(), "dataset.envelope.group");
-    String namespace =
-        DefinitionModelMapperSupport.requireNonBlank(
-            dataset == null ? null : dataset.namespace(), "dataset.namespace");
-    String envelopeName = Strings.trimToNull(envelope == null ? null : envelope.name());
-    String datasetName = envelopeName;
-    if (datasetName != null && datasetName.contains("/")) {
-      int delimiter = datasetName.indexOf('/');
-      datasetName = datasetName.substring(delimiter + 1);
-    }
-    datasetName =
-        DefinitionModelMapperSupport.requireNonBlank(datasetName, "dataset.envelope.name");
-    return DatasetId.of(group, namespace, datasetName);
+  @Override
+  public SchemaSampleResult samplePayloads(
+      IngestFormat format, Iterable<String> payloads, SchemaSampleOptions options) {
+    IngestFormat resolvedFormat = Objects.requireNonNull(format, "format");
+    Objects.requireNonNull(payloads, "payloads");
+    SchemaSampleOptions resolvedOptions = options == null ? SchemaSampleOptions.defaults() : options;
+    String formatToken = normalizeFormat(resolvedFormat.name());
+    return samplePayloads(
+        PAYLOADS_INGEST_NAME,
+        new DefinitionIngestSource(null, null, PAYLOADS_INGEST_NAME, formatToken, null, null, null),
+        payloads,
+        resolvedOptions);
   }
 
-  private static boolean hasSubscribeOption(String options, String optionToken) {
-    String normalizedToken = Strings.trimToNull(optionToken);
-    String normalizedOptions = Strings.trimToNull(options);
-    if (normalizedToken == null || normalizedOptions == null) {
-      return false;
+  public SchemaSampleResult samplePayloadsConfigured(
+      String ingestName,
+      IngestFormat format,
+      String jsonMode,
+      String jsonRootField,
+      String nvFixPairDelimiter,
+      String nvFixKvDelimiter,
+      Boolean nvFixTrimKeys,
+      Boolean nvFixTrimValues,
+      Iterable<String> payloads,
+      SchemaSampleOptions options) {
+    String normalizedIngestName = Strings.requireNonBlank(ingestName, "ingestName");
+    IngestFormat resolvedFormat = Objects.requireNonNull(format, "format");
+    String formatToken = normalizeFormat(resolvedFormat.name());
+    DefinitionIngestSource.JsonConfig json =
+        resolvedFormat == IngestFormat.JSON
+            ? new DefinitionIngestSource.JsonConfig(jsonMode, jsonRootField)
+            : null;
+    DefinitionIngestSource.NvFixConfig nvfix =
+        resolvedFormat == IngestFormat.NVFIX
+            ? new DefinitionIngestSource.NvFixConfig(
+                nvFixPairDelimiter,
+                nvFixKvDelimiter,
+                nvFixTrimKeys,
+                nvFixTrimValues)
+            : null;
+    return samplePayloads(
+        normalizedIngestName,
+        new DefinitionIngestSource(
+            null,
+            null,
+            normalizedIngestName,
+            formatToken,
+            json,
+            nvfix,
+            null),
+        payloads,
+        options);
+  }
+
+  SchemaSampleResult samplePayloads(
+      String ingestName,
+      DefinitionIngestSource source,
+      Iterable<String> payloads,
+      SchemaSampleOptions options) {
+    String resolvedIngestName = Strings.requireNonBlank(ingestName, "ingestName");
+    Objects.requireNonNull(payloads, "payloads");
+    SchemaSampleOptions resolvedOptions = options == null ? SchemaSampleOptions.defaults() : options;
+    String formatToken = resolveFormat(source, resolvedOptions);
+    List<PayloadSample> samples = collect(payloads, resolvedOptions.maxMessages(), resolvedOptions.maxBytes());
+    if (samples.isEmpty()) {
+      throw new IllegalStateException("No payload samples were provided");
     }
-    for (String token : normalizedOptions.split(";")) {
-      String normalized = Strings.trimToNull(token);
-      if (normalized != null && normalizedToken.equalsIgnoreCase(normalized)) {
-        return true;
+    String ingestId = "inline/" + resolvedIngestName;
+    return inferFromSamples(
+        resolvedIngestName,
+        ingestId,
+        formatToken,
+        source,
+        samples,
+        resolvedOptions.allowNulls());
+  }
+
+  @Override
+  public SchemaModel registerTabular(String schemaName, SchemaModel schema) {
+    return register(schemaName, SchemaType.TABULAR, schema);
+  }
+
+  @Override
+  public SchemaModel register(String schemaName, SchemaType schemaType, SchemaModel schema) {
+    String group = requireSessionGroup();
+    return register(group, schemaName, schemaType, schema);
+  }
+
+  @Override
+  public Optional<SchemaModel> get(String schemaName) {
+    String group = requireSessionGroup();
+    return get(group, schemaName);
+  }
+
+  @Override
+  public Optional<SchemaModel> get(String group, String schemaName) {
+    String normalizedGroup = Strings.requireNonBlank(group, "group");
+    String normalizedName = Strings.requireNonBlank(schemaName, "schemaName");
+    DiscoveryCache cache = requireConfigCache();
+    return cache
+        .get(DefinitionSchema.class, normalizedGroup, normalizedName)
+        .map(SchemaModelMapper::fromDefinition);
+  }
+
+  @Override
+  public List<SchemaModel> listVersions(String schemaName) {
+    String group = requireSessionGroup();
+    return listVersions(group, schemaName);
+  }
+
+  @Override
+  public Optional<SchemaModel> getVersion(String schemaName, int versionNum) {
+    if (versionNum <= 0) {
+      throw new IllegalArgumentException("versionNum must be > 0");
+    }
+    for (SchemaModel version : listVersions(schemaName)) {
+      Integer candidate = version.getVersionNum();
+      if (candidate != null && candidate == versionNum) {
+        return Optional.of(version);
       }
     }
-    return false;
+    return Optional.empty();
   }
 
-  private static DefinitionIngestSource.OdbcSource toDefinitionOdbcSource(
-      IngestSourceExternalModel externalModel) {
-    String connectionName =
-        Strings.firstNonBlank(
-            Strings.trimToNull(externalModel.reference()),
-            optionValue(externalModel.options(), "connectionName"));
-    DefinitionConnection.Odbc.DatabaseType databaseType =
-        parseDatabaseType(optionValue(externalModel.options(), "databaseType"));
-    String tableName = optionValue(externalModel.options(), "tableName");
-    String querySql = optionValue(externalModel.options(), "querySql");
-    return new DefinitionIngestSource.OdbcSource(
-        connectionName,
-        databaseType,
-        tableName,
-        querySql,
-        copyOptions(externalModel.options()));
-  }
-
-  private static DefinitionDataset.OdbcBinding toDefinitionOdbcBinding(
-      IngestTargetExternalModel externalModel) {
-    if (!ODBC.equalsIgnoreCase(Strings.trimToNull(externalModel.providerId()))) {
-      return null;
+  @Override
+  public Optional<SchemaModel> getVersion(String schemaName, String versionToken) {
+    String normalizedToken = Strings.trimToNull(versionToken);
+    if (normalizedToken == null) {
+      return Optional.empty();
     }
-    String connectionName =
-        Strings.firstNonBlank(
-            Strings.trimToNull(externalModel.reference()),
-            optionValue(externalModel.options(), "connectionName"));
-    return new DefinitionDataset.OdbcBinding(
-        connectionName,
-        parseDatabaseType(optionValue(externalModel.options(), "databaseType")),
-        optionValue(externalModel.options(), "catalogName"),
-        optionValue(externalModel.options(), "schemaName"),
-        optionValue(externalModel.options(), "tableName"),
-        optionValue(externalModel.options(), "querySql"),
-        optionValue(externalModel.options(), "primaryKey"),
-        copyOptions(externalModel.options()));
-  }
-
-  private static Map<String, String> toExternalOptions(DefinitionIngestSource.OdbcSource odbc) {
-    java.util.LinkedHashMap<String, String> options = new java.util.LinkedHashMap<>();
-    putOption(options, "connectionName", odbc.connectionName());
-    putOption(options, "databaseType", odbc.databaseType() == null ? null : odbc.databaseType().name());
-    putOption(options, "tableName", odbc.tableName());
-    putOption(options, "querySql", odbc.querySql());
-    if (odbc.options() != null) {
-      options.putAll(odbc.options());
+    Integer parsedVersionNum = parseVersionToken(normalizedToken);
+    if (parsedVersionNum != null) {
+      return getVersion(schemaName, parsedVersionNum);
     }
-    return options.isEmpty() ? Map.of() : Map.copyOf(options);
-  }
-
-  private static Map<String, String> toExternalOptions(DefinitionDataset.OdbcBinding odbc) {
-    java.util.LinkedHashMap<String, String> options = new java.util.LinkedHashMap<>();
-    putOption(options, "connectionName", odbc.connectionName());
-    putOption(options, "databaseType", odbc.databaseType() == null ? null : odbc.databaseType().name());
-    putOption(options, "catalogName", odbc.catalogName());
-    putOption(options, "schemaName", odbc.schemaName());
-    putOption(options, "tableName", odbc.tableName());
-    putOption(options, "querySql", odbc.querySql());
-    putOption(options, "primaryKey", odbc.primaryKey());
-    if (odbc.options() != null) {
-      options.putAll(odbc.options());
+    for (SchemaModel version : listVersions(schemaName)) {
+      String name = Strings.trimToNull(version.getName());
+      if (normalizedToken.equals(name)) {
+        return Optional.of(version);
+      }
+      String versionName = Strings.trimToNull(version.getVersionName());
+      if (versionName != null && normalizedToken.equalsIgnoreCase(versionName)) {
+        return Optional.of(version);
+      }
     }
-    return options.isEmpty() ? Map.of() : Map.copyOf(options);
+    return Optional.empty();
   }
 
-  private static DefinitionConnection.Odbc.DatabaseType parseDatabaseType(String value) {
-    String normalized = Strings.trimToNull(value);
-    if (normalized == null) {
-      return null;
+  @Override
+  public List<SchemaModel> list() {
+    DiscoveryCache cache = requireConfigCache();
+    String group = requireSessionGroup();
+    return sortSchemas(filterCanonicalSchemas(mapSchemas(cache.listSchemas(group))));
+  }
+
+  @Override
+  public List<SchemaModel> list(SchemaType type) {
+    DiscoveryCache cache = requireConfigCache();
+    String group = requireSessionGroup();
+    SchemaType normalizedType = Objects.requireNonNull(type, "schemaType");
+    return sortSchemas(
+        filterCanonicalSchemas(
+            mapSchemas(cache.listSchemas(group, SchemaModelMapper.toDefinitionType(normalizedType)))));
+  }
+
+  @Override
+  public boolean exists(String schemaName) {
+    return get(schemaName).isPresent();
+  }
+
+  @Override
+  public void delete(String schemaName) {
+    delete(requireSessionGroup(), schemaName);
+  }
+
+  @Override
+  public void delete(String group, String schemaName) {
+    String normalizedGroup = Strings.requireNonBlank(group, "group");
+    String normalizedName = Strings.requireNonBlank(schemaName, "schemaName");
+    DiscoveryCache cache = requireConfigCache();
+    DeleteManager deleteManager = deleteManagerSupplier.get();
+    if (deleteManager == null) {
+      deleteManager =
+          new DeleteManager(
+              () -> new ArrayList<>(cache.allDefinitions()),
+              (type, definitionGroup, definitionName) ->
+                  cache.delete(type, definitionGroup, definitionName));
+    }
+    DeleteResult result =
+        deleteManager.delete(
+            "schema:" + normalizedGroup + "/" + normalizedName,
+            new org.pronzato.fabric.api.control.discovery.lifecycle.DeleteOptions(
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                List.of()));
+    if (result.outcome() == DeleteOutcome.BLOCKED) {
+      throw new IllegalStateException(
+          "Delete blocked for schema "
+              + normalizedGroup
+              + "/"
+              + normalizedName
+              + ": "
+              + result.blockers());
+    }
+    if (result.outcome() == DeleteOutcome.PARTIAL) {
+      throw new IllegalStateException(
+          "Delete partially completed for schema "
+              + normalizedGroup
+              + "/"
+              + normalizedName
+              + ": "
+              + result.warnings());
+    }
+  }
+
+  private SchemaModel register(
+      String group,
+      String schemaName,
+      SchemaType schemaType,
+      SchemaModel schema) {
+    String normalizedGroup = Strings.requireNonBlank(group, "group");
+    String normalizedName = Strings.requireNonBlank(schemaName, "schemaName");
+    SchemaType normalizedType = Objects.requireNonNull(schemaType, "schemaType");
+    Objects.requireNonNull(schema, "schema");
+    DiscoveryCache cache = requireConfigCache();
+    SchemaModel normalizedModel =
+        schema.toBuilder()
+            .withGroup(normalizedGroup)
+            .withName(normalizedName)
+            .withType(normalizedType)
+            .build();
+    Optional<DefinitionSchema> existing =
+        cache.get(DefinitionSchema.class, normalizedGroup, normalizedName);
+    SchemaModel existingModel = null;
+    DefinitionSchema existingDefinition = null;
+    if (existing.isPresent()) {
+      existingDefinition = existing.get();
+      existingModel = SchemaModelMapper.fromDefinition(existingDefinition);
+      enforceCompatibleUpdate(normalizedGroup, normalizedName, existingModel, normalizedModel);
+    }
+    SchemaModel modelToPersist = normalizedModel;
+    if (existingModel != null) {
+      int previousVersion = normalizedVersionNum(existingModel.getVersionNum());
+      int nextVersion = previousVersion + 1;
+      modelToPersist =
+          normalizedModel.toBuilder()
+              .withVersionNum(nextVersion)
+              .withVersionName(versionName(nextVersion))
+              .build();
+    }
+    String now = Instant.now().toString();
+    DefinitionSchema canonicalDefinition = SchemaModelMapper.toDefinition(modelToPersist, now, SYSTEM_USER);
+    if (existingDefinition != null
+        && Objects.equals(
+            Strings.trimToNull(existingDefinition.hash()),
+            Strings.trimToNull(canonicalDefinition.hash()))) {
+      return existingModel == null ? SchemaModelMapper.fromDefinition(existingDefinition) : existingModel;
+    }
+
+    DefinitionSchema versionedDefinition = null;
+    if (existingDefinition != null) {
+      String versionedName = nextVersionedSchemaName(cache, normalizedGroup, normalizedName);
+      versionedDefinition = SchemaModelMapper.toVersionedDefinition(existingDefinition, versionedName);
+    }
+    try (DiscoveryCache.ConfigCacheTx tx =
+        cache.beginTx("schema:" + normalizedGroup + "/" + normalizedName)) {
+      if (versionedDefinition != null) {
+        cache.upsertTx(tx, versionedDefinition);
+      }
+      cache.upsertTx(tx, canonicalDefinition);
+      cache.commitTx(tx);
+    }
+    return SchemaModelMapper.fromDefinition(canonicalDefinition);
+  }
+
+  private List<SchemaModel> listVersions(String group, String schemaName) {
+    String normalizedGroup = Strings.requireNonBlank(group, "group");
+    String normalizedSchemaName = Strings.requireNonBlank(schemaName, "schemaName");
+    DiscoveryCache cache = requireConfigCache();
+    List<SchemaModel> versions = new ArrayList<>();
+    for (SchemaModel model : mapSchemas(cache.listSchemas(normalizedGroup))) {
+      String candidateName = Strings.trimToNull(model == null ? null : model.getName());
+      if (!matchesVersionFamily(normalizedSchemaName, candidateName)) {
+        continue;
+      }
+      versions.add(model);
+    }
+    versions.sort(
+        Comparator.comparingInt((SchemaModel model) -> normalizedVersionNum(model.getVersionNum()))
+            .thenComparing(SchemaManagerImpl::schemaName, String.CASE_INSENSITIVE_ORDER)
+            .thenComparing(SchemaManagerImpl::schemaName));
+    return List.copyOf(versions);
+  }
+
+  private static void enforceCompatibleUpdate(
+      String group, String schemaName, SchemaModel existing, SchemaModel updated) {
+    if (existing == null || updated == null) {
+      return;
+    }
+    SchemaType existingType = existing.getType();
+    SchemaType updatedType = updated.getType();
+    if (existingType != null && updatedType != null && existingType != updatedType) {
+      throw schemaUpdateRejected(
+          group,
+          schemaName,
+          "SCHEMA_TYPE_CHANGE",
+          "_schema",
+          existingType.name(),
+          updatedType.name());
+    }
+    SchemaCompatibilityRules.requireCompatible(
+        "schemaName=" + schemaName + " schemaType=" + updatedType + " group=" + group,
+        updated.getCompatibility(),
+        SchemaViews.fromSchemaModel(existing),
+        SchemaViews.fromSchemaModel(updated));
+  }
+
+  private static IllegalArgumentException schemaUpdateRejected(
+      String group,
+      String schemaName,
+      String reason,
+      String field,
+      String from,
+      String to) {
+    return new IllegalArgumentException(
+        "Schema update rejected group="
+            + group
+            + " name="
+            + schemaName
+            + " reason="
+            + reason
+            + " field="
+            + field
+            + " from="
+            + from
+            + " to="
+            + to);
+  }
+
+  private List<PayloadSample> collect(SampleSource source, int maxMessages, int maxBytes) {
+    Objects.requireNonNull(source, "source");
+    Iterator<PayloadSample> iterator = source.iterator();
+    List<PayloadSample> result = new ArrayList<>();
+    int totalBytes = 0;
+    while (iterator != null && iterator.hasNext()) {
+      PayloadSample sample = iterator.next();
+      if (sample == null || sample.payload() == null) {
+        continue;
+      }
+      if (result.size() >= maxMessages) {
+        break;
+      }
+      int payloadBytes = sample.payload().getBytes(StandardCharsets.UTF_8).length;
+      if (totalBytes + payloadBytes > maxBytes) {
+        break;
+      }
+      totalBytes += payloadBytes;
+      result.add(sample);
+    }
+    return List.copyOf(result);
+  }
+
+  private List<PayloadSample> collect(Iterable<String> payloads, int maxMessages, int maxBytes) {
+    Objects.requireNonNull(payloads, "payloads");
+    List<PayloadSample> result = new ArrayList<>();
+    int totalBytes = 0;
+    long now = Instant.now().toEpochMilli();
+    int sampleIndex = 0;
+    for (String payload : payloads) {
+      if (result.size() >= maxMessages) {
+        break;
+      }
+      PayloadSample sample =
+          new PayloadSample(
+              PAYLOADS_INGEST_NAME,
+              payload,
+              now + sampleIndex);
+      int payloadBytes = sample.payload().getBytes(StandardCharsets.UTF_8).length;
+      if (totalBytes + payloadBytes > maxBytes) {
+        break;
+      }
+      totalBytes += payloadBytes;
+      result.add(sample);
+      sampleIndex++;
+    }
+    return List.copyOf(result);
+  }
+
+  private SchemaSampleResult inferFromSamples(
+      String ingestName,
+      String ingestId,
+      String format,
+      DefinitionIngestSource source,
+      List<PayloadSample> samples,
+      boolean allowNulls) {
+    FormatSampler sampler = formatSamplerFactory.create(format, source);
+    FormatSamplerResult parsed = sampler.parseSamples(samples, new FormatSamplerOptions(ingestId, allowNulls));
+    if (parsed.rows().isEmpty()) {
+      throw new IllegalStateException(
+          "Unable to parse sampled payloads ingest="
+              + ingestId
+              + " format="
+              + format
+              + " parseErrors="
+              + parsed.parseErrorCount());
+    }
+
+    SchemaInference.InferredSchema inferred = SchemaInference.infer(parsed.rows(), allowNulls);
+    SchemaSampleDiagnostics diagnostics = mergeDiagnostics(inferred, parsed);
+    String recommendedSchemaJson = recommendedSchemaJson(inferred.fields());
+
+    return new SchemaSampleResult(
+        ingestName,
+        format,
+        inferred.fields(),
+        recommendedSchemaJson,
+        diagnostics,
+        samples.size(),
+        sampledBytes(samples));
+  }
+
+  private SampleSource createDefaultSampleSource(
+      String ingestId, DefinitionIngestSource source, SchemaSampleOptions options) {
+    DefinitionIngestSource.AmpsSource amps = source == null ? null : source.amps();
+    if (amps == null) {
+      throw new IllegalArgumentException(
+          "Unsupported sample source transport ingest=" + ingestId + " transport=NONE");
+    }
+    ConnectionManager connectionManager = connectionManagerSupplier.get();
+    if (connectionManager == null) {
+      throw new IllegalStateException("Session ConnectionManager is not available");
+    }
+    return new SampleSourceAmps(connectionManager, ingestId, amps, options);
+  }
+
+  private FormatSampler createDefaultFormatSampler(String format, DefinitionIngestSource source) {
+    if (FORMAT_JSON.equals(format)) {
+      return new FormatSamplerJson(source == null ? null : source.json());
+    }
+    if (FORMAT_NVFIX.equals(format)) {
+      return new FormatSamplerNvFix(source == null ? null : source.nvfix());
+    }
+    throw new IllegalArgumentException("Unsupported ingest source format: " + format);
+  }
+
+  private static int sampledBytes(List<PayloadSample> samples) {
+    int total = 0;
+    if (samples == null) {
+      return 0;
+    }
+    for (PayloadSample sample : samples) {
+      if (sample == null || sample.payload() == null) {
+        continue;
+      }
+      total += sample.payload().getBytes(StandardCharsets.UTF_8).length;
+    }
+    return total;
+  }
+
+  private static String resolveFormat(
+      DefinitionIngestSource source, SchemaSampleOptions options) {
+    String requested = Strings.trimToNull(options == null ? null : options.overrideFormat());
+    String configured = Strings.trimToNull(source == null ? null : source.format());
+    String format = requested == null ? configured : requested;
+    if (format == null) {
+      throw new IllegalArgumentException("ingestSource.format is required");
+    }
+    return normalizeFormat(format);
+  }
+
+  private static String normalizeFormat(String format) {
+    String normalized = Strings.requireNonBlank(format, "format").toUpperCase(Locale.ROOT);
+    if (!FORMAT_JSON.equals(normalized) && !FORMAT_NVFIX.equals(normalized)) {
+      throw new IllegalArgumentException("Unsupported format: " + format);
+    }
+    return normalized;
+  }
+
+  private static SchemaSampleDiagnostics mergeDiagnostics(
+      SchemaInference.InferredSchema inferred, FormatSamplerResult parsed) {
+    Set<String> parseFailures = new TreeSet<>();
+    if (parsed != null) {
+      parseFailures.addAll(parsed.parseFailures());
+    }
+    if (inferred != null) {
+      parseFailures.addAll(inferred.parseFailures());
+    }
+    int parseErrorCount = parseFailures.size();
+    if (parsed != null && parsed.parseErrorCount() > parseErrorCount) {
+      parseErrorCount = parsed.parseErrorCount();
+    }
+    if (inferred != null && inferred.parseErrorCount() > parseErrorCount) {
+      parseErrorCount = inferred.parseErrorCount();
+    }
+    if (inferred == null) {
+      return new SchemaSampleDiagnostics(
+          List.of(), List.of(), List.of(), List.copyOf(parseFailures), parseErrorCount);
+    }
+    return new SchemaSampleDiagnostics(
+        sortedDistinct(inferred.missingKeysSeen()),
+        sortedDistinct(inferred.typeConflicts()),
+        sortedDistinct(inferred.widenedFields()),
+        List.copyOf(parseFailures),
+        parseErrorCount);
+  }
+
+  private static String recommendedSchemaJson(List<InferredField> fields) {
+    ObjectNode root = CANONICAL_MAPPER.createObjectNode();
+    ArrayNode fieldNodes = root.putArray("fields");
+    List<InferredField> ordered = fields == null ? List.of() : fields;
+    for (InferredField field : ordered) {
+      if (field == null) {
+        continue;
+      }
+      ObjectNode node = fieldNodes.addObject();
+      node.put("name", field.name());
+      node.put("type", field.arrowTypeToken());
+      node.put("nullable", field.nullable());
     }
     try {
-      return DefinitionConnection.Odbc.DatabaseType.valueOf(normalized.toUpperCase(Locale.ROOT));
-    } catch (IllegalArgumentException ex) {
-      return DefinitionConnection.Odbc.DatabaseType.OTHER;
+      return CANONICAL_MAPPER.writeValueAsString(root);
+    } catch (Exception ex) {
+      throw new IllegalStateException("Failed to render inferred schema JSON", ex);
     }
   }
 
-  private static String optionValue(Map<String, String> options, String key) {
-    if (options == null || options.isEmpty()) {
-      return null;
+  private static List<String> sortedDistinct(List<String> values) {
+    if (values == null || values.isEmpty()) {
+      return List.of();
     }
-    return Strings.trimToNull(options.get(key));
+    TreeSet<String> deduped = new TreeSet<>();
+    for (String value : values) {
+      String normalized = Strings.trimToNull(value);
+      if (normalized != null) {
+        deduped.add(normalized);
+      }
+    }
+    return List.copyOf(deduped);
   }
 
-  private static Map<String, String> copyOptions(Map<String, String> options) {
-    if (options == null || options.isEmpty()) {
-      return Map.of();
-    }
-    return Map.copyOf(options);
+  @FunctionalInterface
+  interface SampleSourceFactory {
+    SampleSource create(String ingestId, DefinitionIngestSource source, SchemaSampleOptions options);
   }
 
-  private static void putOption(Map<String, String> options, String key, String value) {
-    String normalized = Strings.trimToNull(value);
-    if (normalized != null) {
-      options.put(key, normalized);
-    }
+  @FunctionalInterface
+  interface FormatSamplerFactory {
+    FormatSampler create(String format, DefinitionIngestSource source);
   }
+
+  private DiscoveryCache requireConfigCache() {
+    return IdentityParsingSupport.requireNonNullRuntime(
+        configCacheSupplier.get(), "Session DiscoveryCache is not available");
+  }
+
+  private String requireSessionGroup() {
+    return IdentityParsingSupport.requireGroup(sessionGroupSupplier.get(), "session group");
+  }
+
+  private static List<SchemaModel> mapSchemas(List<DefinitionSchema> definitions) {
+    return SchemaManagerImplDefinition.mapSchemas(definitions);
+  }
+
+  private static List<SchemaModel> sortSchemas(List<SchemaModel> schemas) {
+    return SchemaManagerImplDefinition.sortSchemas(schemas, SCHEMA_ORDER);
+  }
+
+  private static String schemaName(SchemaModel schema) {
+    return SchemaManagerImplDefinition.schemaName(schema);
+  }
+
+  private static String schemaTypeName(SchemaModel schema) {
+    return SchemaManagerImplDefinition.schemaTypeName(schema);
+  }
+
+  private static List<SchemaModel> filterCanonicalSchemas(List<SchemaModel> schemas) {
+    return SchemaManagerImplDefinition.filterCanonicalSchemas(schemas, VERSION_SUFFIX_PATTERN);
+  }
+
+  private static String nextVersionedSchemaName(
+      DiscoveryCache cache, String group, String canonicalName) {
+    return SchemaManagerImplDefinition.nextVersionedSchemaName(
+        cache, group, canonicalName, VERSION_SEPARATOR);
+  }
+
+  private static boolean matchesVersionFamily(String canonicalName, String candidateName) {
+    return SchemaManagerImplDefinition.matchesVersionFamily(
+        canonicalName, candidateName, VERSION_SEPARATOR);
+  }
+
+  private static int normalizedVersionNum(Integer versionNum) {
+    return SchemaManagerImplDefinition.normalizedVersionNum(versionNum);
+  }
+
+  private static String versionName(int versionNum) {
+    return SchemaManagerImplDefinition.versionName(versionNum);
+  }
+
+  private static Integer parseVersionToken(String token) {
+    return SchemaManagerImplDefinition.parseVersionToken(token, VERSION_SEPARATOR);
+  }
+
+  private static Integer parseVersionSuffix(String value, String canonicalName) {
+    return SchemaManagerImplDefinition.parseVersionSuffix(value, canonicalName, VERSION_SEPARATOR);
+  }
+
+  private static boolean isVersionedSchemaName(String name) {
+    return SchemaManagerImplDefinition.isVersionedSchemaName(name, VERSION_SUFFIX_PATTERN);
+  }
+
 }
+
+
 
 
 
