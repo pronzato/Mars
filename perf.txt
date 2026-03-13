@@ -1,482 +1,909 @@
-package org.pronzato.fabric.api.connectors.s3;
+package org.pronzato.fabric.lite.config;
 
-import java.io.InputStream;
-import java.net.URI;
+import com.crankuptheamps.client.Command;
+import com.crankuptheamps.client.HAClient;
+import com.crankuptheamps.client.Message;
+import com.crankuptheamps.client.MessageStream;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Optional;
-import java.util.stream.Collectors;
-import org.pronzato.fabric.api.data.duckdb.DuckdbSession;
-import org.pronzato.fabric.api.util.Strings;
-import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
-import software.amazon.awssdk.auth.credentials.AwsCredentials;
-import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
-import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
-import software.amazon.awssdk.core.ResponseBytes;
-import software.amazon.awssdk.core.sync.RequestBody;
-import software.amazon.awssdk.core.sync.ResponseTransformer;
-import software.amazon.awssdk.regions.Region;
-import software.amazon.awssdk.services.s3.S3Client;
-import software.amazon.awssdk.services.s3.S3ClientBuilder;
-import software.amazon.awssdk.services.s3.model.Delete;
-import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
-import software.amazon.awssdk.services.s3.model.DeleteObjectsRequest;
-import software.amazon.awssdk.services.s3.model.DeleteObjectsResponse;
-import software.amazon.awssdk.services.s3.model.GetObjectRequest;
-import software.amazon.awssdk.services.s3.model.GetObjectResponse;
-import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
-import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
-import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
-import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
-import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
-import software.amazon.awssdk.services.s3.model.PutObjectRequest;
-import software.amazon.awssdk.services.s3.model.S3Exception;
-import software.amazon.awssdk.services.s3.model.S3Object;
+import java.util.stream.Stream;
+import org.pronzato.fabric.api.connectors.amps.factory.AmpsFactoryClient;
+import org.pronzato.fabric.api.connectors.amps.factory.AmpsFactoryOptions;
 
-/** Administrative/low-level S3 operations exposed behind {@link S3Connection#admin()}. */
-public final class S3Admin implements AutoCloseable {
-  private static final int DELETE_BATCH_LIMIT = 1000;
+public abstract class FabricConfig {
+  protected static final ObjectMapper MAPPER = new ObjectMapper();
+  protected static final String TOPIC = "/fabric/discovery";
 
-  private final String name;
-  private final String region;
-  private final String bucket;
-  private final String endpoint;
-  private final URI endpointUri;
-  private final boolean useSslForEndpoint;
-  private final boolean pathStyleAccess;
-  private final String basePrefix;
-  private final Map<String, String> attributes;
-  private final String accessKeyId;
-  private final String secretAccessKey;
-  private final String sessionToken;
-  private final S3Client client;
-  private volatile boolean httpfsConfigured;
+  private final String discovery;
+  private final String kerberosUsername;
+  private final String kerberosKeytab;
+  private final Path jsonRoot;
 
-  S3Admin(
-      String name,
-      String region,
-      String bucket,
-      String endpoint,
-      boolean pathStyleAccess,
-      String basePrefix,
-      Map<String, String> attributes,
-      String accessKeyId,
-      String secretAccessKey,
-      String sessionToken) {
-    this.name = Objects.requireNonNull(name, "name");
-    this.region = Strings.requireNonBlank(region, "s3.region");
-    this.bucket = Strings.requireNonBlank(bucket, "s3.bucket");
-    this.endpointUri = toEndpointUri(endpoint);
-    this.endpoint = endpointUri == null ? null : endpointUri.toString();
-    this.useSslForEndpoint =
-        endpointUri == null
-            || endpointUri.getScheme() == null
-            || !"http".equalsIgnoreCase(endpointUri.getScheme());
-    this.pathStyleAccess = pathStyleAccess;
-    this.basePrefix = normalizePrefix(basePrefix);
-    this.attributes = attributes == null ? Map.of() : Map.copyOf(attributes);
-    this.accessKeyId = Strings.requireNonBlank(accessKeyId, "s3.accessKeyId");
-    this.secretAccessKey = Strings.requireNonBlank(secretAccessKey, "s3.secretAccessKey");
-    this.sessionToken = Strings.trimToNull(sessionToken);
-    this.client = buildClient();
+  protected FabricConfig(
+      String discovery, String kerberosUsername, String kerberosKeytab, Path jsonRoot) {
+    this.discovery = requireNonBlank(discovery, "discovery");
+    this.kerberosUsername = requireNonBlank(kerberosUsername, "kerberosUsername");
+    this.kerberosKeytab = requireNonBlank(kerberosKeytab, "kerberosKeytab");
+    this.jsonRoot = jsonRoot == null ? Path.of("vault", "git", "dev") : jsonRoot;
   }
 
-  public S3ListResult listObjects(S3ListRequest request) {
-    Objects.requireNonNull(request, "request");
+  protected final HAClient connect(String clientName) throws Exception {
+    List<String> endpoints = parseDiscovery(discovery);
+    if (endpoints.isEmpty()) {
+      throw new IllegalArgumentException("No AMPS discovery endpoints configured.");
+    }
+
+    AmpsFactoryOptions options = new AmpsFactoryOptions();
+    options.withKerberos(
+        kerberos ->
+            kerberos
+                .enabled(true)
+                .principal(kerberosUsername)
+                .keytab(Path.of(kerberosKeytab).toAbsolutePath().toString()));
+
+    HAClient client = AmpsFactoryClient.create(clientName, options);
     try {
-      ListObjectsV2Request.Builder builder =
-          ListObjectsV2Request.builder().bucket(bucket).maxKeys(Math.max(1, request.maxKeys()));
-      String prefix =
-          request.prefix() == null
-              ? basePrefix
-              : applyBasePrefix(parseKeyOrUri(request.prefix(), true));
-      if (hasText(prefix)) {
-        builder.prefix(prefix);
-      }
-      if (hasText(request.continuationToken())) {
-        builder.continuationToken(request.continuationToken());
-      }
-      if (request.delimiter() != null) {
-        builder.delimiter(request.delimiter());
-      }
-      ListObjectsV2Response response = client.listObjectsV2(builder.build());
-      List<String> commonPrefixes =
-          Optional.ofNullable(response.commonPrefixes()).orElse(List.of()).stream()
-              .map(prefixResult -> prefixResult.prefix())
-              .filter(Objects::nonNull)
-              .collect(Collectors.toList());
-      List<S3ObjectSummary> objects =
-          Optional.ofNullable(response.contents()).orElse(List.of()).stream()
-              .map(S3Admin::toSummary)
-              .collect(Collectors.toList());
-      return new S3ListResult(
-          List.copyOf(commonPrefixes),
-          List.copyOf(objects),
-          response.isTruncated(),
-          response.continuationToken(),
-          response.nextContinuationToken());
-    } catch (S3Exception ex) {
-      throw toOperationException("ListObjectsV2", ex, null);
+      AmpsFactoryClient.connect(client, endpoints, options);
+      return client;
     } catch (Exception ex) {
-      throw new IllegalStateException("Failed to list S3 objects: " + ex.getMessage(), ex);
-    }
-  }
-
-  public S3ObjectMetadata headObject(String key) {
-    String resolved = resolveRequiredKey(key);
-    try {
-      HeadObjectResponse response =
-          client.headObject(HeadObjectRequest.builder().bucket(bucket).key(resolved).build());
-      return fromHead(resolved, response);
-    } catch (S3Exception ex) {
-      throw toOperationException("HeadObject", ex, resolved);
-    } catch (Exception ex) {
-      throw new IllegalStateException(
-          "Failed to read metadata for object '" + resolved + "': " + ex.getMessage(), ex);
-    }
-  }
-
-  public S3ObjectContent readObject(S3ReadObjectRequest request) {
-    Objects.requireNonNull(request, "request");
-    String resolved = resolveRequiredKey(request.key());
-    try {
-      GetObjectRequest.Builder builder = GetObjectRequest.builder().bucket(bucket).key(resolved);
-      String range = toRangeHeader(request.rangeStart(), request.rangeEnd());
-      if (range != null) {
-        builder.range(range);
-      }
-      ResponseBytes<GetObjectResponse> response =
-          client.getObject(builder.build(), ResponseTransformer.toBytes());
-      GetObjectResponse metadata = response.response();
-      return new S3ObjectContent(
-          response.asByteArray(), fromGet(resolved, metadata), metadata.contentType());
-    } catch (S3Exception ex) {
-      throw toOperationException("GetObject", ex, resolved);
-    } catch (Exception ex) {
-      throw new IllegalStateException(
-          "Failed to read S3 object '" + resolved + "': " + ex.getMessage(), ex);
-    }
-  }
-
-  public S3ObjectContent readObject(String key) {
-    return readObject(S3ReadObjectRequest.builder().withKey(key).build());
-  }
-
-  public void uploadObject(S3UploadRequest request) {
-    Objects.requireNonNull(request, "request");
-    String resolved = resolveRequiredKey(request.key());
-    try {
-      PutObjectRequest.Builder builder = PutObjectRequest.builder().bucket(bucket).key(resolved);
-      if (hasText(request.contentType())) {
-        builder.contentType(request.contentType());
-      }
-      if (!request.metadata().isEmpty()) {
-        builder.metadata(request.metadata());
-      }
-      PutObjectRequest putRequest = builder.build();
-      if (request.bytes() != null) {
-        client.putObject(putRequest, RequestBody.fromBytes(request.bytes()));
-      } else {
-        InputStream stream = Objects.requireNonNull(request.stream(), "stream");
-        long length = request.contentLength();
-        if (length < 0) {
-          throw new IllegalArgumentException("contentLength must be >= 0 for stream uploads");
-        }
-        try {
-          client.putObject(putRequest, RequestBody.fromInputStream(stream, length));
-        } finally {
-          if (request.closeStream()) {
-            try {
-              stream.close();
-            } catch (Exception ignore) {
-            }
-          }
-        }
-      }
-    } catch (S3Exception ex) {
-      throw toOperationException("PutObject", ex, resolved);
-    } catch (Exception ex) {
-      throw new IllegalStateException(
-          "Failed to upload S3 object '" + resolved + "': " + ex.getMessage(), ex);
-    }
-  }
-
-  public void deleteObject(String key) {
-    String resolved = resolveRequiredKey(key);
-    try {
-      client.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(resolved).build());
-    } catch (S3Exception ex) {
-      throw toOperationException("DeleteObject", ex, resolved);
-    } catch (Exception ex) {
-      throw new IllegalStateException(
-          "Failed to delete S3 object '" + resolved + "': " + ex.getMessage(), ex);
-    }
-  }
-
-  public S3DeleteResult deleteObjects(List<String> keys) {
-    if (Strings.isEmpty(keys)) {
-      return new S3DeleteResult(0, List.of());
-    }
-    List<ObjectIdentifier> identifiers =
-        keys.stream()
-            .filter(Objects::nonNull)
-            .map(this::resolveRequiredKey)
-            .map(key -> ObjectIdentifier.builder().key(key).build())
-            .collect(Collectors.toList());
-    if (identifiers.isEmpty()) {
-      return new S3DeleteResult(0, List.of());
-    }
-    List<String> failed = new ArrayList<>();
-    int deleted = 0;
-    try {
-      for (int offset = 0; offset < identifiers.size(); offset += DELETE_BATCH_LIMIT) {
-        int to = Math.min(offset + DELETE_BATCH_LIMIT, identifiers.size());
-        List<ObjectIdentifier> batch = identifiers.subList(offset, to);
-        DeleteObjectsResponse response =
-            client.deleteObjects(
-                DeleteObjectsRequest.builder()
-                    .bucket(bucket)
-                    .delete(Delete.builder().objects(batch).build())
-                    .build());
-        deleted += response.deleted() == null ? 0 : response.deleted().size();
-        if (response.errors() != null) {
-          response.errors().stream()
-              .map(error -> error.key())
-              .filter(Objects::nonNull)
-              .forEach(failed::add);
-        }
-      }
-      return new S3DeleteResult(deleted, List.copyOf(failed));
-    } catch (S3Exception ex) {
-      throw toOperationException("DeleteObjects", ex, null);
-    } catch (Exception ex) {
-      throw new IllegalStateException("Failed to delete S3 objects: " + ex.getMessage(), ex);
-    }
-  }
-
-  public String resolveKey(String key) {
-    String parsed = parseKeyOrUri(key, false);
-    if (parsed.isEmpty()) {
-      return basePrefix == null ? parsed : basePrefix;
-    }
-    return applyBasePrefix(parsed);
-  }
-
-  public synchronized void configureDuckdbSession(DuckdbSession session) {
-    Objects.requireNonNull(session, "session");
-    if (!httpfsConfigured) {
-      session.exec("INSTALL httpfs");
-      session.exec("LOAD httpfs");
-      httpfsConfigured = true;
-    }
-    session.exec("SET s3_region='" + escapeSql(region) + "'");
-    session.execSensitive("SET s3_access_key_id='" + escapeSql(accessKeyId) + "'");
-    session.execSensitive("SET s3_secret_access_key='" + escapeSql(secretAccessKey) + "'");
-    if (sessionToken != null) {
-      session.execSensitive("SET s3_session_token='" + escapeSql(sessionToken) + "'");
-    }
-    String configuredEndpoint =
-        endpoint == null ? "s3." + region.trim() + ".amazonaws.com" : endpoint;
-    session.exec("SET s3_endpoint='" + escapeSql(configuredEndpoint) + "'");
-    boolean usePathStyle = pathStyleAccess || endpoint == null;
-    session.exec("SET s3_url_style='" + (usePathStyle ? "path" : "virtual_host") + "'");
-    session.exec("SET s3_use_ssl=" + (useSslForEndpoint ? "true" : "false"));
-    execOptionalDuckdbSetting(
-        session, "SET s3_allow_unverified_ssl=" + (useSslForEndpoint ? "false" : "true"));
-  }
-
-  private static void execOptionalDuckdbSetting(DuckdbSession session, String sql) {
-    try {
-      session.exec(sql);
-    } catch (IllegalStateException ex) {
-      String message = Strings.trimToNull(ex.getMessage());
-      String normalized = message == null ? "" : message.toLowerCase(Locale.ROOT);
-      if (normalized.contains("unrecognized configuration parameter")) {
-        return;
+      try {
+        client.close();
+      } catch (Exception ignored) {
       }
       throw ex;
     }
   }
 
-  private S3Client buildClient() {
-    AwsCredentials credentials =
-        sessionToken == null
-            ? AwsBasicCredentials.create(accessKeyId, secretAccessKey)
-            : AwsSessionCredentials.create(accessKeyId, secretAccessKey, sessionToken);
-    S3ClientBuilder builder =
-        S3Client.builder()
-            .region(Region.of(region))
-            .credentialsProvider(StaticCredentialsProvider.create(credentials))
-            .forcePathStyle(pathStyleAccess);
-    if (endpointUri != null) {
-      builder.endpointOverride(endpointUri);
-    }
-    return builder.build();
-  }
-
-  private static String normalizePrefix(String value) {
-    String trimmed = Strings.trimToNull(value);
-    if (trimmed == null) {
-      return null;
-    }
-    String normalized = trimmed.replace('\\', '/');
-    while (normalized.startsWith("/")) {
-      normalized = normalized.substring(1);
-    }
-    while (normalized.endsWith("/")) {
-      normalized = normalized.substring(0, normalized.length() - 1);
-    }
-    return Strings.trimToNull(normalized);
-  }
-
-  private String resolveRequiredKey(String value) {
-    String resolved = resolveKey(value);
-    if (Strings.isBlank(resolved)) {
-      throw new IllegalArgumentException("object key is required");
-    }
-    return resolved;
-  }
-
-  private String parseKeyOrUri(String value, boolean allowEmpty) {
-    String trimmed = Strings.trimToNull(value);
-    if (trimmed == null) {
-      if (allowEmpty) {
-        return "";
+  protected final void clearTopic(HAClient client) throws Exception {
+    Command command = new Command("sow_delete");
+    command.setTopic(TOPIC);
+    command.setFilter("1=1");
+    try (MessageStream stream = client.execute(command)) {
+      for (Message ignored : stream) {
+        // consume stream to ensure command completes
       }
-      throw new IllegalArgumentException("object key is required");
     }
-    if (isS3Uri(trimmed)) {
-      URI uri;
-      try {
-        uri = URI.create(trimmed);
-      } catch (Exception ex) {
-        throw new IllegalArgumentException("Invalid S3 URI: " + value, ex);
-      }
-      String uriBucket = Strings.trimToNull(uri.getHost());
-      if (uriBucket == null) {
-        throw new IllegalArgumentException("S3 URI must include a bucket name: " + value);
-      }
-      if (!bucket.equals(uriBucket)) {
-        throw new IllegalArgumentException(
-            "S3 URI bucket mismatch: expected '" + bucket + "' but was '" + uriBucket + "'");
-      }
-      String path = Strings.trimToNull(uri.getPath());
-      if (path == null || "/".equals(path)) {
-        return "";
-      }
-      return path.startsWith("/") ? path.substring(1) : path;
-    }
-    String normalized = trimmed.replace('\\', '/');
-    while (normalized.startsWith("/")) {
-      normalized = normalized.substring(1);
-    }
-    return normalized;
   }
 
-  private String applyBasePrefix(String key) {
-    if (!hasText(basePrefix) || !hasText(key)) {
-      return key;
-    }
-    if (key.equals(basePrefix) || key.startsWith(basePrefix + "/")) {
-      return key;
-    }
-    return basePrefix + "/" + key;
+  protected final Path jsonRoot() {
+    return jsonRoot;
   }
 
-  private static S3ObjectSummary toSummary(S3Object object) {
-    return new S3ObjectSummary(
-        object.key(),
-        object.size(),
-        object.lastModified(),
-        object.eTag(),
-        object.storageClassAsString());
+  protected final List<Path> listJsonFiles() throws IOException {
+    if (Files.notExists(jsonRoot)) {
+      return List.of();
+    }
+    try (Stream<Path> stream = Files.walk(jsonRoot)) {
+      return stream
+          .filter(Files::isRegularFile)
+          .filter(path -> path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".json"))
+          .sorted(Comparator.comparing(Path::toString))
+          .toList();
+    }
   }
 
-  private static S3ObjectMetadata fromHead(String key, HeadObjectResponse response) {
-    return new S3ObjectMetadata(
-        key,
-        response.contentLength(),
-        response.lastModified(),
-        response.eTag(),
-        response.contentType(),
-        response.contentEncoding(),
-        response.contentLanguage(),
-        response.metadata() == null ? Map.of() : Map.copyOf(response.metadata()));
-  }
-
-  private static S3ObjectMetadata fromGet(String key, GetObjectResponse response) {
-    return new S3ObjectMetadata(
-        key,
-        response.contentLength(),
-        response.lastModified(),
-        response.eTag(),
-        response.contentType(),
-        response.contentEncoding(),
-        response.contentLanguage(),
-        response.metadata() == null ? Map.of() : Map.copyOf(response.metadata()));
-  }
-
-  private static String toRangeHeader(Long start, Long end) {
-    if (start == null && end == null) {
-      return null;
-    }
-    long resolvedStart = Optional.ofNullable(start).orElse(0L);
-    if (resolvedStart < 0) {
-      throw new IllegalArgumentException("range start must be >= 0");
-    }
-    if (end != null && end < resolvedStart) {
-      throw new IllegalArgumentException("range end must be >= range start");
-    }
-    StringBuilder builder = new StringBuilder("bytes=").append(resolvedStart).append('-');
-    if (end != null) {
-      builder.append(end);
-    }
-    return builder.toString();
-  }
-
-  private static S3OperationException toOperationException(
-      String operation, S3Exception ex, String key) {
-    String errorCode = ex.awsErrorDetails() == null ? null : ex.awsErrorDetails().errorCode();
-    String message =
-        ex.awsErrorDetails() == null ? ex.getMessage() : ex.awsErrorDetails().errorMessage();
-    return new S3OperationException(operation, key, ex.statusCode(), errorCode, message, ex);
-  }
-
-  private static URI toEndpointUri(String value) {
-    String trimmed = Strings.trimToNull(value);
-    if (trimmed == null) {
-      return null;
-    }
-    String normalized = trimmed.contains("://") ? trimmed : "https://" + trimmed;
+  protected final JsonNode parseOrThrow(String payload, String errorPrefix) {
     try {
-      return URI.create(normalized);
+      return MAPPER.readTree(payload);
     } catch (Exception ex) {
-      throw new IllegalArgumentException("Invalid s3.endpoint value: " + value, ex);
+      throw new IllegalStateException(errorPrefix + " message=" + trim(ex.getMessage()), ex);
     }
   }
 
-  private static boolean isS3Uri(String value) {
-    return value != null
-        && (value.regionMatches(true, 0, "s3://", 0, "s3://".length())
-            || value.regionMatches(true, 0, "s3a://", 0, "s3a://".length()));
+  protected final EnvelopeKey extractEnvelope(JsonNode node, String sowKey, String payload) {
+    String group = pointerText(node, "/envelope/group");
+    String type = pointerText(node, "/envelope/type");
+    String name = pointerText(node, "/envelope/name");
+
+    if (group != null && type != null && name != null) {
+      return new EnvelopeKey(group, type, name);
+    }
+
+    String[] parts = parseCompositeSowKey(sowKey);
+    if (parts != null) {
+      String fromSowGroup = group != null ? group : parts[0];
+      String fromSowType = type != null ? type : parts[1];
+      String fromSowName = name != null ? name : parts[2];
+      if (fromSowGroup != null && fromSowType != null && fromSowName != null) {
+        return new EnvelopeKey(fromSowGroup, fromSowType, fromSowName);
+      }
+    }
+
+    throw new IllegalStateException(
+        "Missing envelope.group/type/name and unable to infer from sowKey="
+            + trim(sowKey)
+            + " payloadPrefix="
+            + abbreviate(payload, 120));
   }
 
-  private static boolean hasText(String value) {
-    return !Strings.isBlank(value);
+  /**
+   * Default on-disk layout for legacy/other assets:
+   *   <root>/<group>/<type>/<name>.json
+   *
+   * DATASET / METASET folder layout is handled by Import/Export, not here.
+   */
+  protected final Path toFilePath(EnvelopeKey key) {
+    return jsonRoot
+        .resolve(safeDirectoryName(key.group()))
+        .resolve(safeDirectoryName(key.type()))
+        .resolve(safeFileName(key.name()) + ".json");
   }
 
-  @Override
-  public void close() {
+  protected static String trim(String value) {
+    if (value == null) {
+      return null;
+    }
+    String trimmed = value.trim();
+    return trimmed.isEmpty() ? null : trimmed;
+  }
+
+  protected static boolean isBlank(String value) {
+    return value == null || value.trim().isEmpty();
+  }
+
+  protected static String safeFileName(String value) {
+    String trimmed = trim(value);
+    if (trimmed == null) {
+      return "unknown";
+    }
+    StringBuilder builder = new StringBuilder(trimmed.length());
+    for (int index = 0; index < trimmed.length(); index++) {
+      char ch = trimmed.charAt(index);
+      if (isInvalidPathChar(ch)) {
+        builder.append('_');
+      } else {
+        builder.append(ch);
+      }
+    }
+    String normalized = trimTrailingDotsAndSpaces(builder.toString());
+    return normalized.isBlank() ? "unknown" : normalized;
+  }
+
+  protected static String safeDirectoryName(String value) {
+    return safeFileName(value).toLowerCase(Locale.ROOT);
+  }
+
+  private static List<String> parseDiscovery(String value) {
+    String raw = trim(value);
+    if (raw == null) {
+      return List.of();
+    }
+    String[] parts = raw.split(",");
+    List<String> endpoints = new ArrayList<>(parts.length);
+    for (String part : parts) {
+      String item = trim(part);
+      if (item != null) {
+        endpoints.add(normalizeEndpoint(item));
+      }
+    }
+    return List.copyOf(endpoints);
+  }
+
+  private static String normalizeEndpoint(String value) {
+    if (value.contains("://")) {
+      return value;
+    }
+    int index = value.lastIndexOf(':');
+    if (index <= 0 || index >= value.length() - 1) {
+      throw new IllegalArgumentException(
+          "Invalid discovery endpoint '" + value + "'. Expected host:port or full URI.");
+    }
+    String host = value.substring(0, index).trim();
+    String portPart = value.substring(index + 1).trim();
+    if (host.isEmpty()) {
+      throw new IllegalArgumentException("Discovery endpoint host is required: " + value);
+    }
     try {
-      client.close();
-    } catch (Exception ignore) {
+      Integer.parseInt(portPart);
+    } catch (NumberFormatException ex) {
+      throw new IllegalArgumentException("Discovery endpoint port is invalid: " + value, ex);
     }
+    return "tcp://" + host + ":" + portPart + "/amps/json";
   }
 
-  private static String escapeSql(String value) {
-    return value.replace("'", "''");
+  private static String pointerText(JsonNode node, String pointer) {
+    if (node == null) {
+      return null;
+    }
+    JsonNode value = node.at(pointer);
+    if (value == null || value.isMissingNode() || value.isNull()) {
+      return null;
+    }
+    return trim(value.asText(null));
+  }
+
+  /**
+   * Supports:
+   * - group|TYPE|name
+   * - group|DATASET|namespace|name
+   *
+   * Returns [group, type, name] for envelope inference.
+   */
+  private static String[] parseCompositeSowKey(String sowKey) {
+    String normalized = trim(sowKey);
+    if (normalized == null) {
+      return null;
+    }
+    String[] parts = normalized.split("\\|", -1);
+    if (parts.length < 3) {
+      return null;
+    }
+    String group = trim(parts[0]);
+    String type = trim(parts[1]);
+    if (group == null || type == null) {
+      return null;
+    }
+
+    String upper = type.toUpperCase(Locale.ROOT);
+    if ("DATASET".equals(upper) && parts.length >= 4) {
+      // group|DATASET|namespace|name
+      String name = trim(parts[3]);
+      if (name == null) {
+        return null;
+      }
+      return new String[] {group, type, name};
+    }
+
+    // group|TYPE|name
+    String name = trim(parts[2]);
+    if (name == null) {
+      return null;
+    }
+    return new String[] {group, type, name};
+  }
+
+  private static String abbreviate(String value, int max) {
+    if (value == null) {
+      return "";
+    }
+    String normalized = value.replace('\n', ' ').replace('\r', ' ');
+    if (normalized.length() <= max) {
+      return normalized;
+    }
+    return normalized.substring(0, Math.max(1, max)) + "...";
+  }
+
+  private static String requireNonBlank(String value, String field) {
+    String trimmed = trim(value);
+    if (trimmed == null) {
+      throw new IllegalArgumentException(field + " is required");
+    }
+    return trimmed;
+  }
+
+  protected record EnvelopeKey(String group, String type, String name) {}
+
+  private static boolean isInvalidPathChar(char ch) {
+    if (ch < 32) {
+      return true;
+    }
+    return switch (ch) {
+      case '/', '\\', '<', '>', ':', '"', '|', '?', '*' -> true;
+      default -> false;
+    };
+  }
+
+  private static String trimTrailingDotsAndSpaces(String value) {
+    if (value == null || value.isEmpty()) {
+      return value;
+    }
+    int end = value.length();
+    while (end > 0) {
+      char ch = value.charAt(end - 1);
+      if (ch == ' ' || ch == '.') {
+        end--;
+      } else {
+        break;
+      }
+    }
+    return end == value.length() ? value : value.substring(0, end);
   }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+package org.pronzato.fabric.lite.config;
+
+import org.pronzato.fabric.api.control.discovery.DiscoveryUrl;
+import com.crankuptheamps.client.Command;
+import com.crankuptheamps.client.HAClient;
+import com.crankuptheamps.client.Message;
+import com.crankuptheamps.client.MessageStream;
+import com.fasterxml.jackson.databind.JsonNode;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Objects;
+import java.util.Set;
+import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
+import org.pronzato.fabric.api.control.discovery.definitions.Definition;
+
+public final class FabricConfigImport extends FabricConfig {
+  private FabricConfigImport(
+      String discovery, String kerberosUsername, String kerberosKeytab, Path jsonRoot) {
+    super(discovery, kerberosUsername, kerberosKeytab, jsonRoot);
+  }
+
+  public static void main(String[] args) {
+    String discovery = DiscoveryUrl.URL;
+    String kerberosUsername = "dfabric";
+    String kerberosKeytab = "vault/kerberos/dfabric.keytab";
+    Path jsonRoot = Path.of("vault", "git", "dev");
+
+    boolean wipe = true;
+    String envOverride = null;
+    for (String arg : args == null ? new String[0] : args) {
+      if ("--wipe".equals(arg)) {
+        wipe = true;
+      } else if (arg.startsWith("--env=")) {
+        envOverride = trim(arg.substring("--env=".length()));
+      } else if ("--help".equals(arg) || "-h".equals(arg)) {
+        printUsage();
+        return;
+      } else {
+        System.err.println("[LITE_CONFIG_IMPORT][ERROR] Unknown argument: " + arg);
+        printUsage();
+        System.exit(2);
+      }
+    }
+
+    int code = 0;
+    try {
+      code = new FabricConfigImport(discovery, kerberosUsername, kerberosKeytab, jsonRoot).run(wipe, envOverride);
+    } catch (Exception ex) {
+      System.err.println("[LITE_CONFIG_IMPORT][ERROR] " + rootCauseMessage(ex));
+      code = 1;
+    }
+    if (code != 0) {
+      System.exit(code);
+    }
+  }
+
+  private int run(boolean wipe, String envOverride) throws Exception {
+    long started = System.nanoTime();
+    ScanResult scan = scanInputFiles();
+    List<Path> files = scan.files();
+    List<ImportEntry> validated = new ArrayList<>(files.size());
+    boolean hasValidationErrors = false;
+    int duplicateKeys = 0;
+    LinkedHashSet<String> seenKeys = new LinkedHashSet<>();
+
+    System.out.println(
+        "[LiteConfigImport][Scan] env="
+            + scan.env()
+            + " groups="
+            + scan.groups()
+            + " schemasFiles="
+            + scan.schemasFiles()
+            + " configFiles="
+            + scan.configFiles());
+    System.out.println(
+        "[LITE_CONFIG_IMPORT][SCAN] root="
+            + jsonRoot().toAbsolutePath().normalize()
+            + " discoveredFiles="
+            + files.size());
+
+    for (Path file : files) {
+      String rawPayload = Files.readString(file, StandardCharsets.UTF_8);
+      String payload = stripUtf8Bom(rawPayload);
+      if (!Objects.equals(rawPayload, payload)) {
+        System.out.println("[LiteConfigImport][Sanitize] file=" + file + " strippedBom=true");
+      }
+      try {
+        JsonNode node = MAPPER.readTree(payload);
+        EnvelopeKey envelope = extractEnvelope(node, null, payload);
+        String envelopeKey = toEnvelopeKey(envelope);
+        String normalizedPayload = normalizePayload(node);
+
+        boolean duplicate = !seenKeys.add(envelopeKey);
+        if (duplicate) {
+          duplicateKeys++;
+        }
+        validated.add(new ImportEntry(file, normalizedPayload, envelopeKey, duplicate));
+        System.out.println(
+            "[LiteConfigImport][Key] file="
+                + file
+                + " envelopeKey="
+                + envelopeKey
+                + " status="
+                + (duplicate ? "DUPLICATE" : "NEW"));
+      } catch (Exception ex) {
+        hasValidationErrors = true;
+        System.err.println(
+            "[LITE_CONFIG_IMPORT][ERROR] invalid-json path="
+                + file
+                + " message="
+                + rootCauseMessage(ex));
+      }
+    }
+
+    if (hasValidationErrors) {
+      System.err.println("[LITE_CONFIG_IMPORT][ABORT] JSON validation failed. Nothing published.");
+      return 2;
+    }
+
+    String env = isBlank(envOverride) ? scan.env() : envOverride;
+    System.out.println("[LITE_CONFIG_IMPORT][MODE] wipe=" + wipe + " topic=" + TOPIC + " env=" + env);
+    int published = 0;
+
+    LinkedHashSet<String> expectedEnvelopeKeys = new LinkedHashSet<>();
+    for (ImportEntry entry : validated) {
+      expectedEnvelopeKeys.add(entry.envelopeKey());
+    }
+
+    try (HAClient client = connect("fabric-lite-config-import")) {
+      if (wipe) {
+        System.out.println("[LITE_CONFIG_IMPORT][CLEAR] deleting all records from " + TOPIC);
+        clearTopic(client);
+      }
+
+      for (ImportEntry entry : validated) {
+        Command publish = new Command("publish");
+        publish.setTopic(TOPIC);
+        publish.setData(entry.payload());
+        client.execute(publish);
+        published++;
+      }
+
+      SowSnapshot sow = loadSowSnapshot(client);
+      LinkedHashSet<String> missing = new LinkedHashSet<>(expectedEnvelopeKeys);
+      missing.removeAll(sow.actualEnvelopeKeys());
+      LinkedHashSet<String> extra = new LinkedHashSet<>(sow.actualEnvelopeKeys());
+      extra.removeAll(expectedEnvelopeKeys);
+
+      System.out.println(
+          "[LITE_CONFIG_IMPORT][SOW] topic="
+              + TOPIC
+              + " sowRowCount="
+              + sow.sowRowCount()
+              + " envelopeKeysSample="
+              + firstN(sow.actualEnvelopeKeys(), 20));
+      System.out.println(
+          "[LITE_CONFIG_IMPORT][DIFF] expectedKeys="
+              + expectedEnvelopeKeys.size()
+              + " actualKeys="
+              + sow.actualEnvelopeKeys().size()
+              + " missingKeys="
+              + missing.size()
+              + " missingSample="
+              + firstN(missing, 20)
+              + " extraKeys="
+              + extra.size()
+              + " extraSample="
+              + firstN(extra, 20));
+    }
+
+    long durationMs = Duration.ofNanos(System.nanoTime() - started).toMillis();
+    System.out.println(
+        "[LITE_CONFIG_IMPORT][SUMMARY] files="
+            + files.size()
+            + " validJson="
+            + validated.size()
+            + " published="
+            + published
+            + " uniqueKeys="
+            + seenKeys.size()
+            + " duplicateKeys="
+            + duplicateKeys
+            + " wipe="
+            + wipe
+            + " durationMs="
+            + durationMs);
+    return 0;
+  }
+
+  private ScanResult scanInputFiles() throws Exception {
+    Path root = jsonRoot().toAbsolutePath().normalize();
+    if (Files.notExists(root)) {
+      return new ScanResult(
+          root.getFileName() == null ? "unknown" : root.getFileName().toString(),
+          List.of(),
+          0,
+          0,
+          List.of());
+    }
+    List<Path> groupDirs =
+        Files.list(root)
+            .filter(Files::isDirectory)
+            .sorted()
+            .toList();
+    List<String> groups = new ArrayList<>();
+    List<Path> files = new ArrayList<>();
+    int schemasFiles = 0;
+    int configFiles = 0;
+
+    for (Path groupDir : groupDirs) {
+      String group = groupDir.getFileName() == null ? null : groupDir.getFileName().toString();
+      if (group == null || group.isBlank()) {
+        continue;
+      }
+      groups.add(group);
+      try (var stream = Files.walk(groupDir)) {
+        List<Path> groupFiles =
+            stream
+                .filter(Files::isRegularFile)
+                .filter(
+                    path ->
+                        path.getFileName()
+                            .toString()
+                            .toLowerCase(Locale.ROOT)
+                            .endsWith(".json"))
+                .sorted()
+                .toList();
+        files.addAll(groupFiles);
+        for (Path file : groupFiles) {
+          Path relative = groupDir.relativize(file);
+          if (relative.getNameCount() > 1) {
+            String top = relative.getName(0).toString();
+            if ("schemas".equalsIgnoreCase(top)) {
+              schemasFiles++;
+            } else {
+              configFiles++;
+            }
+          }
+        }
+      }
+    }
+    files.sort((left, right) -> left.toString().compareTo(right.toString()));
+    String env = root.getFileName() == null ? "unknown" : root.getFileName().toString();
+    return new ScanResult(env, List.copyOf(groups), schemasFiles, configFiles, List.copyOf(files));
+  }
+
+  private SowSnapshot loadSowSnapshot(HAClient client) throws Exception {
+    LinkedHashSet<String> actualEnvelopeKeys = new LinkedHashSet<>();
+    int rows = 0;
+    try (MessageStream stream = client.sow(TOPIC)) {
+      for (Message message : stream) {
+        if (message == null || message.getCommand() != Message.Command.SOW) {
+          continue;
+        }
+        String payload = message.getData();
+        if (isBlank(payload)) {
+          continue;
+        }
+        payload = stripUtf8Bom(payload);
+        rows++;
+        JsonNode node =
+            parseOrThrow(payload, "SOW payload parse failed for key=" + trim(message.getSowKey()));
+        EnvelopeKey envelope = extractEnvelope(node, null, payload);
+        actualEnvelopeKeys.add(toEnvelopeKey(envelope));
+      }
+    }
+    return new SowSnapshot(rows, Set.copyOf(actualEnvelopeKeys));
+  }
+
+  private static String toEnvelopeKey(EnvelopeKey envelope) {
+    return envelope.group() + "|" + envelope.type() + "|" + envelope.name();
+  }
+
+  private static String rootCauseMessage(Throwable throwable) {
+    if (throwable == null) {
+      return "<unknown>";
+    }
+    Throwable root = throwable;
+    while (root.getCause() != null && root.getCause() != root) {
+      root = root.getCause();
+    }
+    String message = trim(root.getMessage());
+    return message == null
+        ? root.getClass().getSimpleName()
+        : root.getClass().getSimpleName() + ": " + message;
+  }
+
+  private static List<String> firstN(Iterable<String> values, int max) {
+    if (values == null || max <= 0) {
+      return List.of();
+    }
+    List<String> out = new ArrayList<>();
+    for (String value : values) {
+      if (value == null) {
+        continue;
+      }
+      out.add(value);
+      if (out.size() >= max) {
+        break;
+      }
+    }
+    return List.copyOf(out);
+  }
+
+  private static String stripUtf8Bom(String value) {
+    if (value == null || value.isEmpty()) {
+      return value;
+    }
+    return value.charAt(0) == '\uFEFF' ? value.substring(1) : value;
+  }
+
+  private static String normalizePayload(JsonNode node) throws Exception {
+    Definition decoded = DiscoveryCodec.decode(node);
+    if (decoded == null) {
+      return MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(node);
+    }
+    return DiscoveryCodec.mapper().writerWithDefaultPrettyPrinter().writeValueAsString(decoded);
+  }
+
+  private record ImportEntry(Path file, String payload, String envelopeKey, boolean duplicate) {}
+
+  private record ScanResult(
+      String env, List<String> groups, int schemasFiles, int configFiles, List<Path> files) {}
+
+  private record SowSnapshot(int sowRowCount, Set<String> actualEnvelopeKeys) {}
+
+  private static void printUsage() {
+    System.out.println("Usage: import [--wipe] [--env=<dev|uat|prod|...>]");
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+package org.pronzato.fabric.lite.config;
+
+import org.pronzato.fabric.api.control.discovery.DiscoveryUrl;
+import com.crankuptheamps.client.HAClient;
+import com.crankuptheamps.client.Message;
+import com.crankuptheamps.client.MessageStream;
+import com.fasterxml.jackson.databind.JsonNode;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.HashSet;
+import java.util.Set;
+import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
+import org.pronzato.fabric.api.control.discovery.definitions.Definition;
+
+public final class FabricConfigExport extends FabricConfig {
+  private FabricConfigExport(
+      String discovery, String kerberosUsername, String kerberosKeytab, Path jsonRoot) {
+    super(discovery, kerberosUsername, kerberosKeytab, jsonRoot);
+  }
+
+  public static void main(String[] args) {
+    String discovery = DiscoveryUrl.URL;
+    String kerberosUsername = "dfabric";
+    String kerberosKeytab = "vault/kerberos/dfabric.keytab";
+    Path jsonRoot = Path.of("vault", "git", "dev");
+
+    for (String arg : args == null ? new String[0] : args) {
+      if ("--help".equals(arg) || "-h".equals(arg)) {
+        printUsage();
+        return;
+      }
+      System.err.println("[LITE_CONFIG_EXPORT][ERROR] Unknown argument: " + arg);
+      printUsage();
+      System.exit(2);
+    }
+
+    int code = 0;
+    try {
+      code =
+          new FabricConfigExport(discovery, kerberosUsername, kerberosKeytab, jsonRoot).run();
+    } catch (Exception ex) {
+      System.err.println("[LITE_CONFIG_EXPORT][ERROR] " + ex.getMessage());
+      ex.printStackTrace(System.err);
+      code = 1;
+    }
+    if (code != 0) {
+      System.exit(code);
+    }
+  }
+
+  private int run() throws Exception {
+    if (Files.notExists(jsonRoot())) {
+      Files.createDirectories(jsonRoot());
+    }
+
+    Set<Path> exported = new HashSet<>();
+    int exportedCount = 0;
+
+    try (HAClient client = connect("fabric-lite-config-export");
+        MessageStream stream = client.sow(TOPIC)) {
+      for (Message message : stream) {
+        if (message == null || message.getCommand() != Message.Command.SOW) {
+          continue;
+        }
+        String payload = message.getData();
+        if (isBlank(payload)) {
+          continue;
+        }
+        JsonNode node = parseOrThrow(payload, "SOW payload parse failed for key=" + message.getSowKey());
+        EnvelopeKey key = extractEnvelope(node, null, payload);
+        String prettyPayload = normalizePayload(node);
+
+        Path target = toExportPath(key);
+        Files.createDirectories(target.getParent());
+        Files.writeString(
+            target,
+            prettyPayload,
+            StandardCharsets.UTF_8,
+            StandardOpenOption.CREATE,
+            StandardOpenOption.TRUNCATE_EXISTING,
+            StandardOpenOption.WRITE);
+
+        exported.add(target.normalize().toAbsolutePath());
+        exportedCount++;
+      }
+    }
+
+    int deletedCount = 0;
+    for (Path file : listJsonFiles()) {
+      Path normalized = file.normalize().toAbsolutePath();
+      if (!exported.contains(normalized)) {
+        Files.deleteIfExists(file);
+        deletedCount++;
+        System.out.println("[LITE_CONFIG_EXPORT][DELETE] path=" + file);
+      }
+    }
+
+    System.out.println(
+        "[LITE_CONFIG_EXPORT][SUMMARY] exported=" + exportedCount + " deleted=" + deletedCount);
+    return 0;
+  }
+
+  private static void printUsage() {
+    System.out.println("Usage: export");
+  }
+
+  private Path toExportPath(EnvelopeKey key) {
+    if (key == null) {
+      throw new IllegalArgumentException("envelope key is required");
+    }
+    String normalizedName = key.name();
+    if ("CONFIG".equalsIgnoreCase(key.type())) {
+      normalizedName = stripConfigFilePrefix(normalizedName);
+    }
+    normalizedName = normalizeExportName(key.type(), normalizedName);
+    EnvelopeKey normalizedKey = new EnvelopeKey(key.group(), key.type(), normalizedName);
+    return toFilePath(normalizedKey);
+  }
+
+  private static String stripConfigFilePrefix(String name) {
+    if (name == null) {
+      return null;
+    }
+    if (name.regionMatches(true, 0, "config__", 0, "config__".length())) {
+      return name.substring("config__".length());
+    }
+    return name;
+  }
+
+  private static String normalizeExportName(String type, String name) {
+    if (name == null) {
+      return null;
+    }
+    if (!"ENTITLEMENT".equalsIgnoreCase(type)) {
+      return name;
+    }
+    if (name.startsWith("overrides/services/")) {
+      return name.substring("overrides/".length());
+    }
+    if (name.startsWith("overrides/namespaces/")) {
+      return name.substring("overrides/".length());
+    }
+    return name;
+  }
+
+  private static String normalizePayload(JsonNode node) throws Exception {
+    Definition decoded = DiscoveryCodec.decode(node);
+    if (decoded == null) {
+      return MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(node);
+    }
+    return DiscoveryCodec.mapper().writerWithDefaultPrettyPrinter().writeValueAsString(decoded);
+  }
+}
+
+
+
+
+
+
+
+
+
+
+package org.pronzato.fabric.lite.config;
+
+import org.pronzato.fabric.api.control.discovery.DiscoveryUrl;
+import com.crankuptheamps.client.HAClient;
+import com.crankuptheamps.client.Message;
+import com.crankuptheamps.client.MessageStream;
+import com.fasterxml.jackson.databind.JsonNode;
+import java.nio.file.Path;
+
+public final class FabricConfigDump extends FabricConfig {
+  private FabricConfigDump(
+      String discovery, String kerberosUsername, String kerberosKeytab, Path jsonRoot) {
+    super(discovery, kerberosUsername, kerberosKeytab, jsonRoot);
+  }
+
+  public static void main(String[] args) {
+    String discovery = DiscoveryUrl.URL;
+    String kerberosUsername = "dfabric";
+    String kerberosKeytab = "vault/kerberos/dfabric.keytab";
+    Path jsonRoot = Path.of("vault", "git", "dev");
+
+    for (String arg : args == null ? new String[0] : args) {
+      if ("--help".equals(arg) || "-h".equals(arg)) {
+        printUsage();
+        return;
+      }
+      System.err.println("[LITE_CONFIG_DUMP][ERROR] Unknown argument: " + arg);
+      printUsage();
+      System.exit(2);
+    }
+
+    int code = 0;
+    try {
+      code = new FabricConfigDump(discovery, kerberosUsername, kerberosKeytab, jsonRoot).run();
+    } catch (Exception ex) {
+      System.err.println("[LITE_CONFIG_DUMP][ERROR] " + ex.getMessage());
+      ex.printStackTrace(System.err);
+      code = 1;
+    }
+    if (code != 0) {
+      System.exit(code);
+    }
+  }
+
+  private int run() throws Exception {
+    try (HAClient client = connect("fabric-lite-config-dump");
+        MessageStream stream = client.sow(TOPIC)) {
+      for (Message message : stream) {
+        if (message == null || message.getCommand() != Message.Command.SOW) {
+          continue;
+        }
+        String payload = message.getData();
+        if (isBlank(payload)) {
+          continue;
+        }
+        JsonNode node =
+            parseOrThrow(payload, "SOW payload parse failed for key=" + message.getSowKey());
+        EnvelopeKey key = extractEnvelope(node, message.getSowKey(), payload);
+        System.out.println("[DUMP] group=" + key.group() + " type=" + key.type() + " name=" + key.name());
+      }
+    }
+    return 0;
+  }
+
+  private static void printUsage() {
+    System.out.println("Usage: dump");
+  }
+}
+
+
+
+
+
+
