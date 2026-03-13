@@ -1,779 +1,723 @@
-package org.pronzato.fabric.api.configs.manager;
+package org.pronzato.fabric.api.control.status.app;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.SerializationFeature;
-import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.time.Instant;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
+import java.net.InetAddress;
+import java.time.Clock;
+import java.time.Duration;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
-import org.pronzato.fabric.api.control.discovery.CanonicalIds;
-import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import org.pronzato.fabric.api.control.ControlConnection;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryTopics;
 import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfigLayer;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionApp;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
-import org.pronzato.fabric.api.configs.model.ConfigLayerLink;
-import org.pronzato.fabric.api.configs.ConfigManager.ConfigLineage;
-import org.pronzato.fabric.api.configs.model.ConfigSummary;
-import org.pronzato.fabric.api.configs.model.ConfigResolved;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStatusApp;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
+import org.pronzato.fabric.api.control.session.SessionContext;
 import org.pronzato.fabric.api.util.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public final class ConfigResolver {
-  private static final Logger LOGGER = LoggerFactory.getLogger(ConfigResolver.class);
-  private static final String LAYER_BASE = "base";
-  private static final String HASH_VERSION = "v1";
-  private static final ObjectMapper HASH_MAPPER =
-      DiscoveryCodec.mapper().copy().configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
+public final class AppStatusPublisher implements AutoCloseable {
+  private static final Logger LOG = LoggerFactory.getLogger(AppStatusPublisher.class);
+  private static final int MAX_ATTEMPTS = 3;
+  private static final String DEFAULT_VERSION = "DEV";
+  private static final int DEFAULT_HEARTBEAT_SECONDS = 30;
 
-  private final DiscoveryCache discoveryCache;
+  private final ControlConnection control;
+  private final SessionContext context;
+  private final DefinitionApp appDefinition;
+  private final TickListener tickListener;
+  private final long heartbeatIntervalMs;
+  private final int heartbeatIntervalSeconds;
+  private final int heartbeatTimeoutSeconds;
+  private final String intervalSource;
+  private final String configuredUserTag;
+  private final Boolean otelEnabled;
+  private final Clock clock;
+  private final AppMetricsCollector metricsCollector;
+  private final ObjectMapper mapper = DiscoveryCodec.mapper();
+  private final ScheduledExecutorService executor;
+  private final boolean ownsExecutor;
+  private final AtomicBoolean running = new AtomicBoolean(false);
+  private final AtomicLong publishCount = new AtomicLong(0L);
 
-  public ConfigResolver(DiscoveryCache discoveryCache) {
-    this.discoveryCache = Objects.requireNonNull(discoveryCache, "discoveryCache");
+  private volatile DefinitionStatusApp current;
+  private volatile String lastPayload;
+  private volatile long lastPublishedEpochMs;
+  private volatile ScheduledFuture<?> heartbeatTask;
+
+  public AppStatusPublisher(
+      ControlConnection control, SessionContext context, DefinitionApp appDefinition) {
+    this(control, context, appDefinition, null, null, null);
   }
 
-  public List<ConfigSummary> list(String group) {
-    String normalizedGroup = required(group, "group");
-    List<LayerEntry> allEntries = groupEntries(normalizedGroup);
-    if (Strings.isEmpty(allEntries)) {
-      return List.of();
-    }
-    Map<String, LayerEntry> allByResourceId = indexByResourceId(allEntries);
-    Map<String, List<LayerEntry>> byConfigId = new LinkedHashMap<>();
-    for (LayerEntry entry : allEntries) {
-      byConfigId.computeIfAbsent(entry.identity().configId(), ignored -> new ArrayList<>()).add(entry);
-    }
-
-    List<String> configIds = new ArrayList<>(byConfigId.keySet());
-    configIds.sort(String::compareTo);
-    List<ConfigSummary> summaries = new ArrayList<>(configIds.size());
-    for (String configId : configIds) {
-      ConfigIndex index =
-          configIndex(normalizedGroup, configId, byConfigId.get(configId), allByResourceId, false);
-      List<String> sortedLayerIds = new ArrayList<>(index.byLayerId().keySet());
-      sortedLayerIds.sort(String::compareTo);
-      for (String layerId : sortedLayerIds) {
-        resolveChain(index, layerId);
-      }
-
-      String latestUpdated = null;
-      for (LayerEntry entry : index.scopedLayers()) {
-        latestUpdated = maxUpdatedUtc(latestUpdated, updatedUtc(entry.layer()));
-      }
-      summaries.add(
-          new ConfigSummary(
-              configId, sortedLayerIds.size(), List.copyOf(sortedLayerIds), latestUpdated));
-    }
-    return List.copyOf(summaries);
+  public AppStatusPublisher(
+      ControlConnection control,
+      SessionContext context,
+      DefinitionApp appDefinition,
+      TickListener tickListener) {
+    this(control, context, appDefinition, null, null, tickListener);
   }
 
-  public List<ConfigLayerLink> listLayers(String group, String configId) {
-    String normalizedGroup = required(group, "group");
-    String normalizedConfigId = required(configId, "configId");
-    ConfigIndex index = loadConfigIndex(normalizedGroup, normalizedConfigId, false);
-
-    List<String> sortedLayerIds = new ArrayList<>(index.byLayerId().keySet());
-    sortedLayerIds.sort(String::compareTo);
-    for (String layerId : sortedLayerIds) {
-      resolveChain(index, layerId);
-    }
-
-    List<ConfigLayerLink> links = new ArrayList<>(index.scopedLayers().size());
-    for (LayerEntry entry : index.scopedLayers()) {
-      String parentLayerId =
-          parseParentLayerId(
-              normalizedConfigId,
-              entry.identity().layerId(),
-              parentId(entry.layer()),
-              entry.identity().resourceId());
-      links.add(new ConfigLayerLink(entry.identity().layerId(), parentLayerId, layerShortName(entry.layer())));
-    }
-    links.sort(
-        Comparator.comparing(ConfigLayerLink::parentLayerId, Comparator.nullsFirst(String::compareTo))
-            .thenComparing(ConfigLayerLink::layerId));
-    return List.copyOf(links);
+  public AppStatusPublisher(
+      ControlConnection control,
+      SessionContext context,
+      DefinitionApp appDefinition,
+      ScheduledExecutorService scheduler,
+      TickListener tickListener) {
+    this(control, context, appDefinition, null, scheduler, tickListener);
   }
 
-  public ConfigResolved resolve(String group, String configId, String layerIdOrNull) {
-    return resolve(group, configId, layerIdOrNull, null);
+  public AppStatusPublisher(
+      ControlConnection control,
+      SessionContext context,
+      DefinitionApp appDefinition,
+      String configuredUserTag,
+      ScheduledExecutorService scheduler,
+      TickListener tickListener) {
+    this(control, context, appDefinition, configuredUserTag, null, scheduler, tickListener);
   }
 
-  public ConfigResolved resolve(String group, String configId, String layerIdOrNull, Instant asOfOrNull) {
-    String normalizedGroup = required(group, "group");
-    String normalizedConfigId = required(configId, "configId");
-    String targetLayerId = required(layerIdOrNull, "layer");
-    Instant asOf = asOfOrNull == null ? Instant.now() : asOfOrNull;
-
-    ConfigIndex index = loadConfigIndex(normalizedGroup, normalizedConfigId, true);
-    Chain chain = resolveChain(index, targetLayerId);
-
-    JsonNode merged = DiscoveryCodec.mapper().createObjectNode();
-    Map<String, String> sources = new LinkedHashMap<>();
-    List<ResolvedNode> resolvedNodes = new ArrayList<>(chain.entries().size());
-    String latestUpdated = null;
-    int activeChanges = 0;
-    int expiredChanges = 0;
-
-    for (LayerEntry layerEntry : chain.entries()) {
-      String layerId = layerEntry.identity().layerId();
-      DeclaredSelection declaredSelection = declaredPayload(layerEntry.layer(), asOf, layerId);
-      activeChanges += declaredSelection.activeChanges();
-      expiredChanges += declaredSelection.expiredChanges();
-      String payloadHash = hashJson(declaredSelection.declared());
-      resolvedNodes.add(new ResolvedNode(layerEntry, payloadHash));
-      latestUpdated = maxUpdatedUtc(latestUpdated, updatedUtc(layerEntry.layer()));
-      merged = merge(merged, declaredSelection.declared(), "", layerId, sources);
-    }
-
-    String payloadHash =
-        resolvedNodes.isEmpty() ? hashJson(DiscoveryCodec.mapper().createObjectNode()) : resolvedNodes.getLast().payloadHash();
-    ConfigLineage lineage = buildLineage(resolvedNodes, payloadHash, hashResolvedTree(resolvedNodes));
-
-    LOGGER.debug("[Config][ResolveAt] group={} configId={} layerId={} at={} activeChanges={} expiredChanges={} chainDepth={} hash={}", normalizedGroup, normalizedConfigId, targetLayerId, asOf, activeChanges, expiredChanges, lineage.chainDepth(), lineage.effectiveTreeHash());
-
-    return new ConfigResolved(
-        normalizedConfigId,
-        targetLayerId,
-        merged,
-        latestUpdated,
-        Collections.unmodifiableMap(new LinkedHashMap<>(sources)),
-        lineage);
-  }
-
-  private ConfigLineage buildLineage(
-      List<ResolvedNode> resolvedNodes, String payloadHash, String effectiveTreeHash) {
-    if (resolvedNodes == null || resolvedNodes.isEmpty()) {
-      return new ConfigLineage(
-          null,
-          0,
-          true,
-          List.of(),
-          List.of(),
-          payloadHash,
-          effectiveTreeHash,
-          HASH_VERSION);
-    }
-    List<String> resolvedNodeIds = new ArrayList<>(resolvedNodes.size());
-    List<String> resolvedLayers = new ArrayList<>(resolvedNodes.size());
-    for (ResolvedNode node : resolvedNodes) {
-      resolvedNodeIds.add(nodeId(node.entry()));
-      resolvedLayers.add(node.entry().identity().layerId());
-    }
-    String baseConfigId = resolvedNodeIds.getFirst();
-    return new ConfigLineage(
-        baseConfigId,
-        resolvedNodes.size(),
-        true,
-        List.copyOf(resolvedNodeIds),
-        List.copyOf(resolvedLayers),
-        payloadHash,
-        effectiveTreeHash,
-        HASH_VERSION);
-  }
-
-  private static String nodeId(LayerEntry entry) {
-    String configId = Strings.trimToNull(entry == null || entry.layer() == null ? null : entry.layer().configId());
-    return configId == null ? entry.identity().resourceId() : configId;
-  }
-
-  private static String hashResolvedTree(List<ResolvedNode> resolvedNodes) {
-    ObjectNode root = HASH_MAPPER.createObjectNode();
-    root.put("version", HASH_VERSION);
-    ArrayNode nodes = root.putArray("nodes");
-    if (resolvedNodes != null) {
-      for (ResolvedNode node : resolvedNodes) {
-        if (node == null) {
-          continue;
-        }
-        ObjectNode row = nodes.addObject();
-        LayerEntry entry = node.entry();
-        row.put("resourceId", entry.identity().resourceId());
-        row.put("layerId", entry.identity().layerId());
-        String configId = Strings.trimToNull(entry.layer() == null ? null : entry.layer().configId());
-        if (configId != null) {
-          row.put("configId", configId);
-        }
-        row.put("payloadHash", node.payloadHash());
-      }
-    }
-    return hashJson(root);
-  }
-
-  private static String hashJson(JsonNode node) {
-    try {
-      JsonNode canonical = canonicalize(node);
-      byte[] payload = HASH_MAPPER.writeValueAsBytes(canonical);
-      MessageDigest digest = MessageDigest.getInstance("SHA-256");
-      byte[] bytes = digest.digest(payload);
-      StringBuilder out = new StringBuilder(bytes.length * 2);
-      for (byte value : bytes) {
-        out.append(String.format("%02x", value & 0xff));
-      }
-      return out.toString();
-    } catch (Exception ex) {
-      throw new IllegalStateException("failed to hash config payload", ex);
+  public AppStatusPublisher(
+      ControlConnection control,
+      SessionContext context,
+      DefinitionApp appDefinition,
+      String configuredUserTag,
+      Boolean otelEnabled,
+      ScheduledExecutorService scheduler,
+      TickListener tickListener) {
+    this.control = Objects.requireNonNull(control, "control");
+    this.context = Objects.requireNonNull(context, "context");
+    this.appDefinition = appDefinition;
+    this.tickListener = tickListener;
+    this.configuredUserTag = Strings.trimToNull(configuredUserTag);
+    this.otelEnabled = otelEnabled;
+    this.clock = Clock.systemUTC();
+    this.metricsCollector = new AppMetricsCollector();
+    this.heartbeatIntervalSeconds = resolveHeartbeatIntervalSeconds(appDefinition);
+    this.heartbeatIntervalMs = Duration.ofSeconds(heartbeatIntervalSeconds).toMillis();
+    this.heartbeatTimeoutSeconds = (int) Math.max(heartbeatIntervalSeconds * 3L, 60L);
+    this.intervalSource = resolveIntervalSource(appDefinition);
+    if (scheduler == null) {
+      this.executor =
+          Executors.newSingleThreadScheduledExecutor(
+              runnable -> {
+                Thread thread = new Thread(runnable, "fabric-app-heartbeat");
+                thread.setDaemon(true);
+                return thread;
+              });
+      this.ownsExecutor = true;
+    } else {
+      this.executor = scheduler;
+      this.ownsExecutor = false;
     }
   }
 
-  private static JsonNode canonicalize(JsonNode node) {
-    if (node == null || node.isMissingNode()) {
-      return HASH_MAPPER.nullNode();
-    }
-    if (node.isObject()) {
-      ObjectNode sorted = HASH_MAPPER.createObjectNode();
-      List<String> keys = new ArrayList<>();
-      node.fieldNames().forEachRemaining(keys::add);
-      keys.sort(String::compareTo);
-      for (String key : keys) {
-        sorted.set(key, canonicalize(node.get(key)));
-      }
-      return sorted;
-    }
-    if (node.isArray()) {
-      ArrayNode array = HASH_MAPPER.createArrayNode();
-      for (JsonNode child : node) {
-        array.add(canonicalize(child));
-      }
-      return array;
-    }
-    return node.deepCopy();
-  }
-
-  private ConfigIndex loadConfigIndex(String group, String configId, boolean strictMissingParent) {
-    List<LayerEntry> allEntries = groupEntries(group);
-    Map<String, LayerEntry> allByResourceId = indexByResourceId(allEntries);
-    List<LayerEntry> scoped = new ArrayList<>();
-    for (LayerEntry entry : allEntries) {
-      if (configId.equals(entry.identity().configId())) {
-        scoped.add(entry);
-      }
-    }
-    return configIndex(group, configId, scoped, allByResourceId, strictMissingParent);
-  }
-
-  private static ConfigIndex configIndex(
-      String group,
-      String configId,
-      List<LayerEntry> scoped,
-      Map<String, LayerEntry> allByResourceId,
-      boolean strictMissingParent) {
-    if (Strings.isEmpty(scoped)) {
-      throw new IllegalArgumentException("config not found: " + configId);
-    }
-    requireSingleBaseLayer(scoped, configId);
-
-    Map<String, LayerEntry> byLayerId = new LinkedHashMap<>();
-    Map<String, LayerEntry> byResourceId = new LinkedHashMap<>();
-    for (LayerEntry entry : scoped) {
-      String layerId = entry.identity().layerId();
-      LayerEntry existingLayer = byLayerId.putIfAbsent(layerId, entry);
-      if (existingLayer != null) {
-        throw chainLayerInvalid(configId, layerId, existingLayer.identity().layerId());
-      }
-      LayerEntry existingResource = byResourceId.putIfAbsent(entry.identity().resourceId(), entry);
-      if (existingResource != null) {
-        throw chainLayerInvalid(configId, layerId, existingResource.identity().layerId());
-      }
-    }
-    return new ConfigIndex(
-        group,
-        configId,
-        List.copyOf(scoped),
-        Map.copyOf(byLayerId),
-        Map.copyOf(byResourceId),
-        allByResourceId == null ? Map.of() : Map.copyOf(allByResourceId),
-        strictMissingParent);
-  }
-
-  private List<LayerEntry> groupEntries(String group) {
-    List<DefinitionConfigLayer> layers = discoveryCache.list(DefinitionConfigLayer.class, group);
-    if (Strings.isEmpty(layers)) {
-      return List.of();
-    }
-    List<LayerEntry> entries = new ArrayList<>(layers.size());
-    for (DefinitionConfigLayer layer : layers) {
-      LayerIdentity identity = parseLayerIdentity(layer, group);
-      entries.add(new LayerEntry(layer, identity));
-    }
-    return List.copyOf(entries);
-  }
-
-  private static Map<String, LayerEntry> indexByResourceId(List<LayerEntry> allEntries) {
-    Map<String, LayerEntry> byResourceId = new LinkedHashMap<>();
-    if (allEntries == null) {
-      return byResourceId;
-    }
-    for (LayerEntry entry : allEntries) {
-      if (entry == null) {
-        continue;
-      }
-      LayerEntry existing = byResourceId.putIfAbsent(entry.identity().resourceId(), entry);
-      if (existing != null) {
-        throw new IllegalStateException("duplicate config resourceId: " + entry.identity().resourceId());
-      }
-    }
-    return byResourceId;
-  }
-
-  private Chain resolveChain(ConfigIndex index, String targetLayerId) {
-    LayerEntry current = index.byLayerId().get(targetLayerId);
-    if (current == null) {
-      throw new IllegalArgumentException(
-          "layer not found for config " + index.configId() + ": " + required(targetLayerId, "layer"));
-    }
-
-    List<LayerEntry> chain = new ArrayList<>();
-    Set<String> visitedResourceIds = new LinkedHashSet<>();
-    List<String> path = new ArrayList<>();
-
-    while (current != null) {
-      String resourceId = current.identity().resourceId();
-      String layerId = current.identity().layerId();
-      if (!visitedResourceIds.add(resourceId)) {
-        path.add(layerId);
-        throw chainCycle(index.configId(), path);
-      }
-      path.add(layerId);
-      chain.add(current);
-
-      String parentId = parentId(current.layer());
-      if (LAYER_BASE.equals(layerId) && parentId != null) {
-        throw chainLayerInvalid(index.configId(), layerId, parentLayerName(parentId));
-      }
-      if (parentId == null) {
-        break;
-      }
-
-      CanonicalIds.ParsedId parentParsed = parseParentCanonical(index.configId(), layerId, parentId);
-      if (!Objects.equals(index.group(), parentParsed.group())
-          || !Objects.equals(index.configId(), parentParsed.namespace())) {
-        throw chainBaseMismatch(index.configId(), parentId);
-      }
-
-      LayerEntry parent = index.byResourceId().get(parentId);
-      if (parent == null) {
-        LayerEntry crossConfig = index.allByResourceId().get(parentId);
-        if (crossConfig != null || index.strictMissingParent()) {
-          if (crossConfig != null) {
-            throw chainBaseMismatch(index.configId(), parentId);
-          }
-          throw chainParentMissing(index.configId(), parentId);
-        }
-        throw chainParentMissing(index.configId(), parentId);
-      }
-      if (Objects.equals(layerId, parent.identity().layerId())) {
-        throw chainLayerInvalid(index.configId(), layerId, parent.identity().layerId());
-      }
-      current = parent;
-    }
-
-    Collections.reverse(chain);
-    if (chain.isEmpty()) {
-      throw chainBaseMissing(index.configId());
-    }
-
-    LayerEntry base = chain.getFirst();
-    if (!LAYER_BASE.equals(base.identity().layerId())) {
-      throw chainBaseMissing(index.configId());
-    }
-    validateBaseCompatibility(index.configId(), base, chain.getLast());
-    validateLayerProgression(index.configId(), chain);
-    return new Chain(List.copyOf(chain));
-  }
-
-  private static void validateBaseCompatibility(String configId, LayerEntry base, LayerEntry leaf) {
-    DefinitionConfigLayer basePayload = configPayload(base.layer(), base.identity().layerId());
-    DefinitionConfigLayer leafPayload = configPayload(leaf.layer(), leaf.identity().layerId());
-    String baseConfigType = Strings.trimToNull(basePayload.configType());
-    String leafConfigType = Strings.trimToNull(leafPayload.configType());
-    String baseSchemaKey = Strings.trimToNull(basePayload.schemaKey());
-    String leafSchemaKey = Strings.trimToNull(leafPayload.schemaKey());
-    if (!Objects.equals(baseConfigType, leafConfigType)
-        || !Objects.equals(baseSchemaKey, leafSchemaKey)) {
-      throw chainBaseMismatch(configId, base.identity().resourceId());
-    }
-  }
-
-  private static void validateLayerProgression(String configId, List<LayerEntry> chain) {
-    if (chain == null || chain.size() <= 1) {
+  public void start() {
+    if (!running.compareAndSet(false, true)) {
       return;
     }
-    for (int i = 1; i < chain.size(); i++) {
-      LayerEntry parent = chain.get(i - 1);
-      LayerEntry child = chain.get(i);
-      String expectedParentId = parent.identity().resourceId();
-      String actualParentId = parentId(child.layer());
-      if (!Objects.equals(expectedParentId, actualParentId)) {
-        throw chainLayerInvalid(configId, child.identity().layerId(), parent.identity().layerId());
+    DefinitionStatusApp started = buildInitialStatus();
+    publish(started);
+    publish(transitionToRunning(started, clock.millis()));
+    heartbeatTask =
+        executor.scheduleAtFixedRate(
+        this::publishHeartbeatSafe, heartbeatIntervalMs, heartbeatIntervalMs, TimeUnit.MILLISECONDS);
+  }
+
+  public boolean started() {
+    return running.get();
+  }
+
+  public int publishIntervalSeconds() {
+    return heartbeatIntervalSeconds;
+  }
+
+  public String intervalSource() {
+    return intervalSource;
+  }
+
+  public String lastPublishedPayload() {
+    return lastPayload;
+  }
+
+  public long lastPublishedEpochMs() {
+    return lastPublishedEpochMs;
+  }
+
+  public long publishCount() {
+    return publishCount.get();
+  }
+
+  @Override
+  public void close() {
+    if (!running.getAndSet(false)) {
+      return;
+    }
+    ScheduledFuture<?> task = heartbeatTask;
+    heartbeatTask = null;
+    if (task != null) {
+      task.cancel(true);
+    }
+    publishStoppedSafe();
+    if (ownsExecutor) {
+      executor.shutdownNow();
+    }
+  }
+
+  public void stop() {
+    close();
+  }
+
+  private void publish(DefinitionStatusApp status) {
+    Objects.requireNonNull(status, "status");
+    DefinitionStatusApp normalized = normalizeStatus(status);
+    String group = Strings.trimToNull(normalized.group());
+    if (group == null) {
+      throw new IllegalStateException("STATUS_GROUP_MISSING: group is required");
+    }
+    current = normalized;
+    int attempt = 0;
+    while (attempt < MAX_ATTEMPTS) {
+      try {
+        publishOnce(normalized);
+        return;
+      } catch (Exception ex) {
+        attempt++;
+        if (attempt >= MAX_ATTEMPTS) {
+          LOG.warn(
+              "[AppStatusPublisher] failed to publish status for {}/{}/{} after {} attempts: {}",
+              normalized.group(),
+              normalized.name(),
+              normalized.instance(),
+              attempt,
+              ex.toString());
+        } else {
+          try {
+            Thread.sleep(50L * attempt);
+          } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return;
+          }
+        }
       }
     }
   }
 
-  private static CanonicalIds.ParsedId parseParentCanonical(
-      String configId, String layerId, String parentId) {
+  private void publishHeartbeatSafe() {
+    if (!running.get()) {
+      return;
+    }
     try {
-      CanonicalIds.ParsedId parent = CanonicalIds.parse(parentId);
-      if (!"config".equals(parent.type())) {
-        throw chainBaseMismatch(configId, parentId);
+      DefinitionStatusApp baseline = current;
+      if (baseline == null) {
+        return;
       }
-      return parent;
-    } catch (IllegalStateException ex) {
-      throw ex;
-    } catch (RuntimeException ex) {
-      throw chainLayerInvalid(configId, layerId, parentId);
+      long now = clock.millis();
+      DefinitionStatusApp heartbeat = withLastHeartbeatEpochMs(baseline, now);
+      publish(heartbeat);
+    } catch (Exception ex) {
+      LOG.warn("[AppStatusPublisher] heartbeat publish failed", ex);
     }
   }
 
-  private static String parentLayerName(String parentId) {
-    String normalized = Strings.trimToNull(parentId);
-    if (normalized == null) {
+  private void publishOnce(DefinitionStatusApp status) throws Exception {
+    if (status == null) {
+      return;
+    }
+    String payload = mapper.writeValueAsString(status);
+    control.amps().publish(DiscoveryTopics.STATUS, payload);
+
+    long publishedAt =
+        status.lastHeartbeatEpochMs() == null
+            ? clock.millis()
+            : Math.max(0L, status.lastHeartbeatEpochMs());
+    this.lastPayload = payload;
+    this.lastPublishedEpochMs = publishedAt;
+    this.publishCount.incrementAndGet();
+    if (tickListener != null) {
+      try {
+        tickListener.onPublished(publishedAt, status, payload);
+      } catch (Exception ignore) {
+      }
+    }
+  }
+
+  private DefinitionStatusApp buildInitialStatus() {
+    long now = clock.millis();
+    String group = requireField(context.getGroup(), "group");
+    String name = requireField(context.getAppName(), "name");
+    String instance = requireField(context.getInstance(), "instance");
+    String env = Strings.trimToNull(context.getEnv());
+    String appType = Strings.trimToNull(appDefinition == null ? null : appDefinition.appType());
+
+    Map<String, String> tags = buildTags(group, name, instance, appType, context, configuredUserTag);
+    String buildVersion = Strings.trimToNull(tags.get("buildVersion"));
+    String configVersion = Strings.trimToNull(tags.get("configVersion"));
+    String codeVersion = Strings.trimToNull(tags.get("codeVersion"));
+    String codeCommitId = Strings.trimToNull(tags.get("codeCommitId"));
+    String resolvedVersion = firstNonBlank(buildVersion, codeVersion, configVersion);
+    AppRuntimeType runtimeType = mapRuntimeType(appType);
+
+    DefinitionEnvelope envelope =
+        new DefinitionEnvelope(
+            group, DefinitionType.STATUS_APP, name, null, null, null, null, null, null, null);
+    return new DefinitionStatusApp(
+        envelope,
+        group,
+        DefinitionType.STATUS_APP,
+        name,
+        instance,
+        Strings.trimToNull(context.getSessionId()),
+        buildSessionKey(group, name, instance, context.getEnv(), context.getRegion(), context.getSite()),
+        runtimeType,
+        resolveHostname(),
+        resolvedVersion,
+        env,
+        appType,
+        DefinitionStatusApp.State.STARTED,
+        now,
+        now,
+        now,
+        now,
+        null,
+        1L,
+        buildVersion,
+        configVersion,
+        codeVersion,
+        codeCommitId,
+        null,
+        null,
+        heartbeatIntervalSeconds,
+        heartbeatTimeoutSeconds,
+        otelEnabled,
+        tags,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null);
+  }
+
+  private DefinitionStatusApp transitionToRunning(DefinitionStatusApp baseline, long now) {
+    if (baseline == null) {
       return null;
     }
+    long normalizedNow = Math.max(0L, now);
+    Long startedAt = baseline.startedAtEpochMs() == null ? normalizedNow : baseline.startedAtEpochMs();
+    Long lastStart = baseline.lastStartEpochMs() == null ? normalizedNow : baseline.lastStartEpochMs();
+    return new DefinitionStatusApp(
+        baseline.envelope(),
+        baseline.group(),
+        baseline.type(),
+        baseline.name(),
+        baseline.instance(),
+        baseline.sessionId(),
+        baseline.sessionKey(),
+        baseline.runtimeType(),
+        baseline.host(),
+        baseline.version(),
+        baseline.env(),
+        baseline.appType(),
+        DefinitionStatusApp.State.RUNNING,
+        startedAt,
+        normalizedNow,
+        normalizedNow,
+        lastStart,
+        baseline.lastStopEpochMs(),
+        baseline.runCount(),
+        baseline.buildVersion(),
+        baseline.configVersion(),
+        baseline.codeVersion(),
+        baseline.codeCommitId(),
+        baseline.lastExitCode(),
+        baseline.lastErrorMessage(),
+        baseline.heartbeatIntervalSeconds(),
+        baseline.heartbeatTimeoutSeconds(),
+        baseline.otel(),
+        baseline.tags(),
+        baseline.message(),
+        baseline.deployEnabled(),
+        baseline.deployStatus(),
+        baseline.deployAtEpochMs(),
+        baseline.deployMessage(),
+        baseline.deploySuccess(),
+        baseline.metrics());
+  }
+
+  private DefinitionStatusApp transitionToStopped(DefinitionStatusApp baseline, long now) {
+    if (baseline == null) {
+      return null;
+    }
+    long normalizedNow = Math.max(0L, now);
+    return new DefinitionStatusApp(
+        baseline.envelope(),
+        baseline.group(),
+        baseline.type(),
+        baseline.name(),
+        baseline.instance(),
+        baseline.sessionId(),
+        baseline.sessionKey(),
+        baseline.runtimeType(),
+        baseline.host(),
+        baseline.version(),
+        baseline.env(),
+        baseline.appType(),
+        DefinitionStatusApp.State.STOPPED,
+        baseline.startedAtEpochMs(),
+        normalizedNow,
+        normalizedNow,
+        baseline.lastStartEpochMs(),
+        normalizedNow,
+        baseline.runCount(),
+        baseline.buildVersion(),
+        baseline.configVersion(),
+        baseline.codeVersion(),
+        baseline.codeCommitId(),
+        baseline.lastExitCode(),
+        baseline.lastErrorMessage(),
+        baseline.heartbeatIntervalSeconds(),
+        baseline.heartbeatTimeoutSeconds(),
+        baseline.otel(),
+        baseline.tags(),
+        "graceful shutdown",
+        baseline.deployEnabled(),
+        baseline.deployStatus(),
+        baseline.deployAtEpochMs(),
+        baseline.deployMessage(),
+        baseline.deploySuccess(),
+        baseline.metrics());
+  }
+
+  private void publishStoppedSafe() {
     try {
-      CanonicalIds.ParsedId parsed = CanonicalIds.parse(normalized);
-      return Strings.trimToNull(parsed.name());
-    } catch (RuntimeException ignore) {
-      return normalized;
+      DefinitionStatusApp baseline = current;
+      if (baseline == null) {
+        return;
+      }
+      publish(transitionToStopped(baseline, clock.millis()));
+    } catch (Exception ex) {
+      LOG.warn("[AppStatusPublisher] stop publish failed", ex);
     }
   }
 
-  private static IllegalStateException chainParentMissing(String configId, String parentId) {
-    return new IllegalStateException(
-        "CONFIG_CHAIN_PARENT_MISSING configId=" + safe(configId) + " parentId=" + safe(parentId));
+  private DefinitionStatusApp normalizeStatus(DefinitionStatusApp status) {
+    if (status == null) {
+      return null;
+    }
+    long now = clock.millis();
+    String group = Strings.trimToNull(status.group());
+    String name = Strings.trimToNull(status.name());
+    String instance = Strings.trimToNull(status.instance());
+    if (group == null || name == null || instance == null) {
+      return null;
+    }
+    AppRuntimeType runtimeType = status.runtimeType() == null ? AppRuntimeType.UNKNOWN : status.runtimeType();
+    String host = Strings.firstNonBlank(status.host(), resolveHostname());
+    String version = resolveVersion(status.version());
+    Long startedAtEpochMs =
+        status.startedAtEpochMs() == null || status.startedAtEpochMs() <= 0L
+            ? now
+            : status.startedAtEpochMs();
+    Long lastHeartbeatEpochMs =
+        status.lastHeartbeatEpochMs() == null || status.lastHeartbeatEpochMs() <= 0L
+            ? now
+            : status.lastHeartbeatEpochMs();
+    Integer intervalSeconds =
+        status.heartbeatIntervalSeconds() == null
+            ? heartbeatIntervalSeconds
+            : status.heartbeatIntervalSeconds();
+    Integer timeoutSeconds =
+        status.heartbeatTimeoutSeconds() == null
+            ? heartbeatTimeoutSeconds
+            : status.heartbeatTimeoutSeconds();
+    Map<String, String> tags = status.tags() == null || status.tags().isEmpty() ? Map.of() : Map.copyOf(status.tags());
+    AppMetrics metrics = status.metrics();
+    if (metricsCollector != null) {
+      try {
+        AppMetrics collected = metricsCollector.collect();
+        if (collected != null) {
+          metrics = collected;
+        }
+      } catch (Exception ignore) {
+      }
+    }
+    DefinitionEnvelope envelope = status.envelope();
+    if (envelope == null) {
+      envelope =
+          new DefinitionEnvelope(
+              group, DefinitionType.STATUS_APP, name, null, null, null, null, null, null, null);
+    }
+    DefinitionStatusApp.State state =
+        status.state() == null ? DefinitionStatusApp.State.UNKNOWN : status.state();
+    return new DefinitionStatusApp(
+        envelope,
+        group,
+        DefinitionType.STATUS_APP,
+        name,
+        instance,
+        Strings.trimToNull(status.sessionId()),
+        Strings.trimToNull(status.sessionKey()),
+        runtimeType,
+        host,
+        version,
+        Strings.trimToNull(status.env()),
+        Strings.trimToNull(status.appType()),
+        state,
+        startedAtEpochMs,
+        lastHeartbeatEpochMs,
+        status.lastStateChangeEpochMs(),
+        status.lastStartEpochMs(),
+        status.lastStopEpochMs(),
+        status.runCount(),
+        Strings.trimToNull(status.buildVersion()),
+        Strings.trimToNull(status.configVersion()),
+        Strings.trimToNull(status.codeVersion()),
+        Strings.trimToNull(status.codeCommitId()),
+        status.lastExitCode(),
+        Strings.trimToNull(status.lastErrorMessage()),
+        intervalSeconds,
+        timeoutSeconds,
+        status.otel(),
+        tags,
+        Strings.trimToNull(status.message()),
+        status.deployEnabled(),
+        Strings.trimToNull(status.deployStatus()),
+        status.deployAtEpochMs(),
+        Strings.trimToNull(status.deployMessage()),
+        status.deploySuccess(),
+        metrics);
   }
 
-  private static IllegalStateException chainCycle(String configId, List<String> path) {
-    List<String> resolvedPath = path == null ? List.of() : List.copyOf(path);
-    return new IllegalStateException(
-        "CONFIG_CHAIN_CYCLE configId=" + safe(configId) + " path=" + resolvedPath);
+  private static DefinitionStatusApp withLastHeartbeatEpochMs(DefinitionStatusApp status, long lastHeartbeatEpochMs) {
+    if (status == null) {
+      return null;
+    }
+    long heartbeat = Math.max(0L, lastHeartbeatEpochMs);
+    return new DefinitionStatusApp(
+        status.envelope(),
+        status.group(),
+        status.type(),
+        status.name(),
+        status.instance(),
+        status.sessionId(),
+        status.sessionKey(),
+        status.runtimeType(),
+        status.host(),
+        status.version(),
+        status.env(),
+        status.appType(),
+        status.state(),
+        status.startedAtEpochMs(),
+        heartbeat,
+        status.lastStateChangeEpochMs(),
+        status.lastStartEpochMs(),
+        status.lastStopEpochMs(),
+        status.runCount(),
+        status.buildVersion(),
+        status.configVersion(),
+        status.codeVersion(),
+        status.codeCommitId(),
+        status.lastExitCode(),
+        status.lastErrorMessage(),
+        status.heartbeatIntervalSeconds(),
+        status.heartbeatTimeoutSeconds(),
+        status.otel(),
+        status.tags(),
+        status.message(),
+        status.deployEnabled(),
+        status.deployStatus(),
+        status.deployAtEpochMs(),
+        status.deployMessage(),
+        status.deploySuccess(),
+        status.metrics());
   }
 
-  private static IllegalStateException chainBaseMissing(String configId) {
-    return new IllegalStateException("CONFIG_CHAIN_BASE_MISSING configId=" + safe(configId));
+  private static int resolveHeartbeatIntervalSeconds(DefinitionApp appDefinition) {
+    Integer configured = null;
+    if (appDefinition != null
+        && appDefinition.runtimeControls() != null
+        && appDefinition.runtimeControls().status() != null) {
+      configured = appDefinition.runtimeControls().status().publishIntervalSeconds();
+    }
+    if (configured != null && configured > 0) {
+      return configured;
+    }
+    return DEFAULT_HEARTBEAT_SECONDS;
   }
 
-  private static IllegalStateException chainBaseMismatch(String configId, String baseId) {
-    return new IllegalStateException(
-        "CONFIG_CHAIN_BASE_MISMATCH configId=" + safe(configId) + " baseId=" + safe(baseId));
+  private static String resolveIntervalSource(DefinitionApp appDefinition) {
+    Integer configured = null;
+    if (appDefinition != null
+        && appDefinition.runtimeControls() != null
+        && appDefinition.runtimeControls().status() != null) {
+      configured = appDefinition.runtimeControls().status().publishIntervalSeconds();
+    }
+    if (configured != null && configured > 0) {
+      return "runtimeControls.status.publishIntervalSeconds";
+    }
+    return "default";
   }
 
-  private static IllegalStateException chainLayerInvalid(
-      String configId, String layer, String parentLayer) {
-    return new IllegalStateException(
-        "CONFIG_CHAIN_LAYER_INVALID configId="
-            + safe(configId)
-            + " layer="
-            + safe(layer)
-            + " parentLayer="
-            + safe(parentLayer));
+  private String resolveVersion(String provided) {
+    String trimmed = Strings.trimToNull(provided);
+    if (trimmed != null) {
+      return trimmed;
+    }
+    String manifestVersion = manifestVersion();
+    if (manifestVersion != null) {
+      return manifestVersion;
+    }
+    return DEFAULT_VERSION;
   }
 
-  private static String safe(String value) {
+  private static String manifestVersion() {
+    Package pkg = AppStatusPublisher.class.getPackage();
+    if (pkg == null) {
+      return null;
+    }
+    String impl = Strings.trimToNull(pkg.getImplementationVersion());
+    if (impl != null) {
+      return impl;
+    }
+    return Strings.trimToNull(pkg.getSpecificationVersion());
+  }
+
+  private static String resolveHostname() {
+    try {
+      return InetAddress.getLocalHost().getHostName();
+    } catch (Exception ex) {
+      return "localhost";
+    }
+  }
+
+  private static Map<String, String> buildTags(
+      String group,
+      String app,
+      String instance,
+      String appType,
+      SessionContext context,
+      String configuredUserTag) {
+    Map<String, String> tags = new LinkedHashMap<>();
+    putIfPresent(tags, "group", group);
+    putIfPresent(tags, "app", app);
+    putIfPresent(tags, "instance", instance);
+    putIfPresent(tags, "env", context == null ? null : context.getEnv());
+    putIfPresent(tags, "region", context == null ? null : context.getRegion());
+    putIfPresent(tags, "site", context == null ? null : context.getSite());
+    putIfPresent(tags, "appType", appType);
+    putIfPresent(tags, "pid", Long.toString(ProcessHandle.current().pid()));
+    putIfPresent(tags, "user", firstNonBlank(configuredUserTag, resolveRuntimeUser()));
+    return tags.isEmpty() ? Map.of() : Map.copyOf(tags);
+  }
+
+  private static String resolveRuntimeUser() {
+    try {
+      return ProcessHandle.current().info().user().orElse(null);
+    } catch (Exception ex) {
+      return null;
+    }
+  }
+
+  private static void putIfPresent(Map<String, String> tags, String key, String value) {
+    if (tags == null || key == null) {
+      return;
+    }
     String normalized = Strings.trimToNull(value);
-    return normalized == null ? "<n/a>" : normalized;
+    if (normalized != null) {
+      tags.put(key, normalized);
+    }
   }
 
-  private static String required(String value, String field) {
+  private static String buildSessionKey(
+      String group, String appName, String instance, String environment, String region, String site) {
+    String resolvedGroup = Strings.trimToNull(group);
+    String resolvedApp = Strings.trimToNull(appName);
+    if (resolvedGroup == null || resolvedApp == null) {
+      return null;
+    }
+    String resolvedInstance = Strings.trimToNull(instance);
+    if (resolvedInstance == null) {
+      resolvedInstance = "unknown";
+    }
+    StringBuilder builder =
+        new StringBuilder("app:")
+            .append(resolvedGroup)
+            .append('/')
+            .append(resolvedApp)
+            .append('|')
+            .append(resolvedInstance);
+    appendPlacement(builder, "env", environment);
+    appendPlacement(builder, "region", region);
+    appendPlacement(builder, "site", site);
+    return builder.toString();
+  }
+
+  private static void appendPlacement(StringBuilder builder, String label, String value) {
+    String normalized = Strings.trimToNull(value);
+    if (normalized == null || "UNKNOWN".equalsIgnoreCase(normalized)) {
+      return;
+    }
+    builder.append('|').append(label).append('=').append(normalized);
+  }
+
+  private static AppRuntimeType mapRuntimeType(String appType) {
+    String normalized = Strings.trimToNull(appType);
+    if (normalized == null) {
+      return AppRuntimeType.UNKNOWN;
+    }
+    String upper = normalized.toUpperCase();
+    if (upper.contains("JAVA")) {
+      return AppRuntimeType.JAVA;
+    }
+    if (upper.contains("PYTHON")) {
+      return AppRuntimeType.PYTHON;
+    }
+    if (upper.contains("SCRIPT") || upper.contains("SHELL")) {
+      return AppRuntimeType.SCRIPT;
+    }
+    return AppRuntimeType.UNKNOWN;
+  }
+
+  private static String requireField(String value, String fieldName) {
     String normalized = Strings.trimToNull(value);
     if (normalized == null) {
-      throw new IllegalArgumentException(field + " is required");
+      throw new IllegalStateException("status publish " + fieldName + " is required");
     }
     return normalized;
   }
 
-  private static LayerIdentity parseLayerIdentity(DefinitionConfigLayer layer, String expectedGroup) {
-    String resourceId = layerResourceId(layer);
-    if (resourceId == null) {
-      throw new IllegalStateException("config resourceId is required");
-    }
-    CanonicalIds.ParsedId parsed = CanonicalIds.parse(resourceId);
-    if (!"config".equals(parsed.type())) {
-      throw new IllegalStateException("config resourceId must be config");
-    }
-    if (!Objects.equals(expectedGroup, parsed.group())) {
-      throw new IllegalStateException(
-          "config resourceId group mismatch: expected " + expectedGroup + " but got " + parsed.group());
-    }
-    if (parsed.namespace() == null || parsed.name() == null) {
-      throw new IllegalStateException("config resourceId is incomplete: " + resourceId);
-    }
-    return new LayerIdentity(resourceId, parsed.namespace(), parsed.name());
-  }
-
-  private static void requireSingleBaseLayer(List<LayerEntry> layers, String configId) {
-    int baseCount = 0;
-    for (LayerEntry entry : layers) {
-      if (LAYER_BASE.equals(entry.identity().layerId())) {
-        baseCount++;
-      }
-    }
-    if (baseCount != 1) {
-      throw new IllegalStateException("config " + configId + " must define exactly one base layer");
-    }
-  }
-
-  private static String parseParentLayerId(
-      String configId, String layerId, String parentId, String layerResourceId) {
-    if (parentId == null) {
+  private static String firstNonBlank(String... values) {
+    if (values == null) {
       return null;
     }
-    try {
-      CanonicalIds.ParsedId parent = CanonicalIds.parse(parentId);
-      if (!"config".equals(parent.type())) {
-        throw chainLayerInvalid(configId, layerId, parentId);
-      }
-      if (!Objects.equals(parent.namespace(), configId)) {
-        throw chainBaseMismatch(configId, parentId);
-      }
-      return parent.name();
-    } catch (IllegalStateException ex) {
-      throw ex;
-    } catch (RuntimeException ex) {
-      throw new IllegalStateException(
-          "invalid parentId for layer "
-              + safe(layerId)
-              + " resourceId="
-              + safe(layerResourceId)
-              + " parentId="
-              + safe(parentId),
-          ex);
-    }
-  }
-
-  private static String layerResourceId(DefinitionConfigLayer layer) {
-    if (layer == null) {
-      return null;
-    }
-    return Strings.trimToNull(layer.resourceId());
-  }
-
-  private static String parentId(DefinitionConfigLayer layer) {
-    if (layer == null) {
-      return null;
-    }
-    return Strings.trimToNull(layer.parentId());
-  }
-
-  private static String layerShortName(DefinitionConfigLayer layer) {
-    if (layer == null) {
-      return null;
-    }
-    return Strings.trimToNull(layer.shortName());
-  }
-
-  private static DefinitionConfigLayer configPayload(DefinitionConfigLayer layer, String layerId) {
-    if (layer == null) {
-      throw new IllegalStateException("config payload is required for layer " + safe(layerId));
-    }
-    return layer;
-  }
-
-  private static JsonNode declaredPayload(DefinitionConfigLayer layer) {
-    DefinitionConfigLayer payload = configPayload(layer, "<unknown>");
-    JsonNode declared = payload.declared();
-    if (declared == null || declared.isNull() || declared.isMissingNode()) {
-      throw new IllegalStateException("declared payload is required");
-    }
-    requireObject(declared, "declared payload", "<unknown>");
-    return declared;
-  }
-
-  private static DeclaredSelection declaredPayload(DefinitionConfigLayer layer, Instant asOf, String layerId) {
-    JsonNode baseDeclared = declaredPayload(layer);
-    requireObject(baseDeclared, "base declared", layerId);
-    if (layer == null) {
-      return new DeclaredSelection(baseDeclared, 0, 0);
-    }
-    List<DefinitionConfigLayer.Effective> schedule = layer.effective();
-    if (Strings.isEmpty(schedule)) {
-      return new DeclaredSelection(baseDeclared, 0, 0);
-    }
-    DefinitionConfigLayer.Effective winner = null;
-    Instant winnerInstant = null;
-    int activeChanges = 0;
-    int expiredChanges = 0;
-    for (DefinitionConfigLayer.Effective entry : schedule) {
-      if (entry == null) {
-        throw new IllegalArgumentException("effective entry is required for layer " + layerId);
-      }
-      String effectiveTimeUtc = entry.effectiveTimeUtc();
-      if (effectiveTimeUtc == null) {
-        throw new IllegalArgumentException("effectiveTimeUtc is required for layer " + layerId);
-      }
-      Instant effectiveInstant;
-      try {
-        effectiveInstant = Instant.parse(effectiveTimeUtc);
-      } catch (Exception ex) {
-        throw new IllegalArgumentException(
-            "invalid effectiveTimeUtc for layer " + layerId + ": " + effectiveTimeUtc, ex);
-      }
-      JsonNode declared = entry.declared();
-      if (declared == null || declared.isNull() || declared.isMissingNode()) {
-        throw new IllegalArgumentException("effective declared is required for layer " + layerId);
-      }
-      requireObject(declared, "effective declared", layerId);
-      Instant expiresAt = parseExpiresAtUtc(entry.expiresAtUtc(), layerId);
-      if (expiresAt != null && !expiresAt.isAfter(effectiveInstant)) {
-        expiredChanges++;
-        continue;
-      }
-      if (expiresAt != null && !asOf.isBefore(expiresAt)) {
-        expiredChanges++;
-        continue;
-      }
-      if (!effectiveInstant.isAfter(asOf)) {
-        activeChanges++;
-      }
-      if (!effectiveInstant.isAfter(asOf)
-          && (winnerInstant == null
-              || effectiveInstant.isAfter(winnerInstant)
-              || effectiveInstant.equals(winnerInstant))) {
-        winner = entry;
-        winnerInstant = effectiveInstant;
+    for (String value : values) {
+      String normalized = Strings.trimToNull(value);
+      if (normalized != null) {
+        return normalized;
       }
     }
-    return new DeclaredSelection(
-        winner == null ? baseDeclared : winner.declared(), activeChanges, expiredChanges);
+    return null;
   }
 
-  private static Instant parseExpiresAtUtc(String expiresAtUtc, String layerId) {
-    String normalized = Strings.trimToNull(expiresAtUtc);
-    if (normalized == null) {
-      return null;
-    }
-    try {
-      return Instant.parse(normalized);
-    } catch (Exception ex) {
-      throw new IllegalArgumentException(
-          "invalid expiresAtUtc for layer " + layerId + ": " + expiresAtUtc, ex);
-    }
+  @FunctionalInterface
+  public interface TickListener {
+    void onPublished(long publishEpochMs, DefinitionStatusApp status, String payload);
   }
-
-  private static void requireObject(JsonNode value, String label, String layerId) {
-    if (value == null || !value.isObject()) {
-      throw new IllegalArgumentException(label + " must be a JSON object for layer " + layerId);
-    }
-  }
-
-  private static String updatedUtc(DefinitionConfigLayer layer) {
-    DefinitionEnvelope envelope = layer == null ? null : layer.envelope();
-    return envelope == null ? null : Strings.trimToNull(envelope.updatedTimeUtc());
-  }
-
-  private static String maxUpdatedUtc(String left, String right) {
-    if (Strings.trimToNull(left) == null) {
-      return Strings.trimToNull(right);
-    }
-    if (Strings.trimToNull(right) == null) {
-      return Strings.trimToNull(left);
-    }
-    long leftEpoch = parseEpochMillis(left);
-    long rightEpoch = parseEpochMillis(right);
-    if (rightEpoch > leftEpoch) {
-      return right;
-    }
-    if (rightEpoch < leftEpoch) {
-      return left;
-    }
-    return Comparator.nullsLast(String::compareTo).compare(right, left) > 0 ? right : left;
-  }
-
-  private static long parseEpochMillis(String value) {
-    String normalized = Strings.trimToNull(value);
-    if (normalized == null) {
-      return 0L;
-    }
-    try {
-      return Instant.parse(normalized).toEpochMilli();
-    } catch (Exception ignore) {
-      return 0L;
-    }
-  }
-
-  private static JsonNode merge(
-      JsonNode base,
-      JsonNode override,
-      String path,
-      String sourceLayerId,
-      Map<String, String> sources) {
-    if (override == null || override.isNull() || override.isMissingNode()) {
-      return copy(base);
-    }
-    if (base == null || base.isNull() || base.isMissingNode()) {
-      if (Strings.trimToNull(path) != null) {
-        sources.put(path, sourceLayerId);
-      }
-      return copy(override);
-    }
-    if (base.isObject() && override.isObject()) {
-      ObjectNode merged = ((ObjectNode) base).deepCopy();
-      override
-          .fields()
-          .forEachRemaining(
-              entry -> {
-                String field = entry.getKey();
-                JsonNode overrideValue = entry.getValue();
-                JsonNode baseValue = merged.get(field);
-                String childPath = appendPath(path, field);
-                if (baseValue != null
-                    && baseValue.isObject()
-                    && overrideValue != null
-                    && overrideValue.isObject()) {
-                  sources.put(childPath, sourceLayerId);
-                  merged.set(field, merge(baseValue, overrideValue, childPath, sourceLayerId, sources));
-                } else {
-                  merged.set(field, copy(overrideValue));
-                  sources.put(childPath, sourceLayerId);
-                }
-              });
-      return merged;
-    }
-    if (Strings.trimToNull(path) != null) {
-      sources.put(path, sourceLayerId);
-    }
-    return copy(override);
-  }
-
-  private static String appendPath(String path, String field) {
-    String normalizedField = Strings.trimToEmpty(field);
-    if (Strings.trimToNull(path) == null) {
-      return normalizedField;
-    }
-    return path + "." + normalizedField;
-  }
-
-  private static JsonNode copy(JsonNode node) {
-    return node == null ? null : node.deepCopy();
-  }
-
-  private record LayerIdentity(String resourceId, String configId, String layerId) {}
-
-  private record LayerEntry(DefinitionConfigLayer layer, LayerIdentity identity) {}
-
-  private record DeclaredSelection(JsonNode declared, int activeChanges, int expiredChanges) {}
-
-  private record ResolvedNode(LayerEntry entry, String payloadHash) {}
-
-  private record Chain(List<LayerEntry> entries) {}
-
-  private record ConfigIndex(
-      String group,
-      String configId,
-      List<LayerEntry> scopedLayers,
-      Map<String, LayerEntry> byLayerId,
-      Map<String, LayerEntry> byResourceId,
-      Map<String, LayerEntry> allByResourceId,
-      boolean strictMissingParent) {}
 }
+
+
+
+
+
 
