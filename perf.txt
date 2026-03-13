@@ -1,1195 +1,1224 @@
-package org.pronzato.fabric.api.catalog.manager;
+package org.pronzato.fabric.api.configs.manager;
 
-import java.util.ArrayDeque;
+import org.pronzato.fabric.api.util.CloseSupport;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.databind.node.NullNode;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.EnumMap;
-import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Optional;
+import java.util.Objects;
 import java.util.Set;
-import java.util.function.Supplier;
-import org.pronzato.fabric.api.catalog.CatalogManager.CatalogAccessContext;
-import org.pronzato.fabric.api.catalog.CatalogManager;
-import org.pronzato.fabric.api.catalog.CatalogManager.CatalogDetails;
-import org.pronzato.fabric.api.catalog.CatalogManager.CatalogRelationshipView;
-import org.pronzato.fabric.api.catalog.CatalogManager.CatalogSearchFacet;
-import org.pronzato.fabric.api.catalog.CatalogManager.CatalogSearchQuery;
-import org.pronzato.fabric.api.catalog.CatalogManager.CatalogSearchResult;
-import org.pronzato.fabric.api.catalog.CatalogManager.CatalogSummary;
-import org.pronzato.fabric.api.catalog.CatalogManager.CatalogRelationshipDirection;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiConsumer;
+import org.pronzato.fabric.api.control.ControlConnection;
 import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
+import org.pronzato.fabric.api.control.discovery.CanonicalIds;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryTopics;
+import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
 import org.pronzato.fabric.api.control.discovery.definitions.Definition;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfig;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfigLayer;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngest;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngestSource;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfigLayer;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvironment;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionSchema;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionService;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStream;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
-import org.pronzato.fabric.api.control.discovery.lifecycle.AssetLifecycleEdge;
-import org.pronzato.fabric.api.control.discovery.lifecycle.AssetLifecycleGraph;
-import org.pronzato.fabric.api.control.discovery.lifecycle.AssetLifecycleGraphBuilder;
-import org.pronzato.fabric.api.control.discovery.lifecycle.AssetLifecycleNode;
-import org.pronzato.fabric.api.control.discovery.lifecycle.RelationshipType;
-import org.pronzato.fabric.api.catalog.semantics.SemanticAssetAudit;
-import org.pronzato.fabric.api.control.discovery.definitions.common.Semantic.Certification;
-import org.pronzato.fabric.api.catalog.semantics.SemanticCompletenessAuditor;
-import org.pronzato.fabric.api.catalog.semantics.SemanticCompletenessAuditor.AuditInput;
-import org.pronzato.fabric.api.catalog.semantics.SemanticCompletenessClass;
-import org.pronzato.fabric.api.control.discovery.definitions.common.Semantic.DataShape;
-import org.pronzato.fabric.api.control.discovery.definitions.common.Semantic.Freshness;
-import org.pronzato.fabric.api.control.discovery.definitions.common.Semantic;
-import org.pronzato.fabric.api.catalog.semantics.SemanticMetadataValidator;
-import org.pronzato.fabric.api.control.discovery.definitions.common.Semantic.Ownership;
-import org.pronzato.fabric.api.control.discovery.definitions.common.Semantic.QualityStatus;
-import org.pronzato.fabric.api.control.discovery.definitions.common.Semantic.ToolHints;
-import org.pronzato.fabric.api.control.discovery.definitions.common.Semantic.Trust;
-import org.pronzato.fabric.api.control.discovery.definitions.common.Semantic.Type;
-import org.pronzato.fabric.api.control.discovery.definitions.common.Semantic.Usage;
-import org.pronzato.fabric.api.catalog.semantics.SemanticValidationPolicy;
-import org.pronzato.fabric.api.control.entitlements.core.data.DataEntitlements;
-import org.pronzato.fabric.api.control.entitlements.core.services.ServiceEntitlements;
-import org.pronzato.fabric.api.control.entitlements.noop.data.DataEntitlementsNoop;
-import org.pronzato.fabric.api.control.entitlements.noop.services.ServiceEntitlementsNoop;
+import org.pronzato.fabric.api.configs.ConfigManager.ConfigAdmin;
+import org.pronzato.fabric.api.configs.ConfigManager.ConfigCodegen;
+import org.pronzato.fabric.api.configs.ConfigDecoder;
+import org.pronzato.fabric.api.configs.ConfigManager.ConfigInfo;
+import org.pronzato.fabric.api.configs.audit.ConfigEventEnvelope;
+import org.pronzato.fabric.api.configs.audit.ConfigEventType;
+import org.pronzato.fabric.api.configs.audit.ConfigEventGenerated;
+import org.pronzato.fabric.api.configs.audit.ConfigEventResolved;
+import org.pronzato.fabric.api.configs.audit.ConfigEventSubscribed;
+import org.pronzato.fabric.api.configs.audit.ConfigEventUnsubscribed;
+import org.pronzato.fabric.api.configs.audit.ConfigEventUpdateCallback;
+import org.pronzato.fabric.api.configs.audit.ConfigEvent;
+import org.pronzato.fabric.api.configs.audit.ConfigPublisher;
+import org.pronzato.fabric.api.configs.audit.ConfigPublisherAmp;
+import org.pronzato.fabric.api.configs.audit.ConfigPublisherNoop;
+import org.pronzato.fabric.api.configs.admin.ConfigAdminImpl;
+import org.pronzato.fabric.api.configs.model.ConfigLayerLink;
+import org.pronzato.fabric.api.configs.ConfigManager.ConfigLineage;
+import org.pronzato.fabric.api.configs.ConfigManager;
+import org.pronzato.fabric.api.configs.ConfigManager.ConfigSubscription;
+import org.pronzato.fabric.api.configs.model.ConfigSummary;
+import org.pronzato.fabric.api.configs.ConfigManager.ConfigUpdate;
+import org.pronzato.fabric.api.configs.ConfigManager.ConfigUpdateListener;
+import org.pronzato.fabric.api.configs.model.ConfigResolved;
+import org.pronzato.fabric.api.configs.presentation.ConfigCodegenService;
+import org.pronzato.fabric.api.configs.presentation.ConfigPresentation;
+import org.pronzato.fabric.api.configs.presentation.ConfigSchemaCodec;
+import org.pronzato.fabric.api.configs.presentation.ConfigSchemaDoc;
+import org.pronzato.fabric.api.configs.workflow.ConfigAdminService;
+import org.pronzato.fabric.api.configs.workflow.ConfigHistoryEntry;
+import org.pronzato.fabric.api.configs.workflow.ConfigHistoryUtil;
+import org.pronzato.fabric.api.configs.workflow.ConfigRollbackRequest;
+import org.pronzato.fabric.api.configs.workflow.ConfigSnapshot;
+import org.pronzato.fabric.api.configs.workflow.ConfigWorkflowService;
+import org.pronzato.fabric.api.control.security.UserContext;
+import org.pronzato.fabric.api.control.security.identity.CallerAppContext;
 import org.pronzato.fabric.api.util.Strings;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-public final class CatalogServiceImpl implements CatalogManager {
-  private static final Set<DefinitionType> PRIMARY_ENTITLED_TYPES =
-      Set.of(DefinitionType.DATASET, DefinitionType.SERVICE, DefinitionType.CONFIG_LAYER);
+public final class ConfigManagerImpl implements ConfigManager, ConfigAdminService, AutoCloseable {
+  static final Logger LOGGER = LoggerFactory.getLogger(ConfigManagerImpl.class);
+  private static final String LAYER_BASE = "base";
+  static final String HASH_VERSION = "v1";
+  static final ObjectMapper HASH_MAPPER =
+      DiscoveryCodec.mapper().copy().configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
+  private static final AtomicInteger EXECUTOR_ID = new AtomicInteger(0);
+  private static final AtomicInteger SCHEDULER_ID = new AtomicInteger(0);
+  static final AtomicLong SUBSCRIPTION_ID = new AtomicLong(0L);
+  static final String CALLBACK_REASON_INITIAL = "INITIAL_SUBSCRIPTION";
+  static final String CALLBACK_REASON_UPSERT = "UPSERT";
+  static final String CALLBACK_REASON_RESOLVED_CHAIN_CHANGE = "RESOLVED_CHAIN_CHANGE";
+  static final String CALLBACK_REASON_SCHEDULED = "EFFECTIVE_OR_EXPIRE_TRANSITION";
+  private static final String DISCOVERY_CONNECTION_NAME = "amps-fabric-discovery";
 
-  private final Supplier<List<Definition>> definitionsSupplier;
-  private final ServiceEntitlements serviceEntitlements;
-  private final DataEntitlements dataEntitlements;
-  private final String defaultSubject;
-  private final String defaultDelegatedSubject;
-  private final String defaultLane;
+  final ConfigView configView;
+  private final String defaultGroup;
+  final ObjectMapper mapper;
+  final ConfigResolver resolver;
+  private final ConfigWorkflowService workflowService;
+  private final ConfigCodegenService codegenService = new ConfigCodegenService();
+  private final String callerAppName;
+  private final String callerAppInstance;
+  private final String sessionId;
+  private final ConfigPublisher auditPublisher;
+  private final AtomicLong auditRequestSequence = new AtomicLong(0L);
+  final ExecutorService callbackExecutor;
+  final ScheduledExecutorService scheduleExecutor;
+  private volatile ConfigAdmin configAdmin;
+  final AtomicBoolean closed = new AtomicBoolean(false);
+  final CopyOnWriteArrayList<SubscriptionImpl> subscriptions = new CopyOnWriteArrayList<>();
 
-  public CatalogServiceImpl(
-      DiscoveryCache discoveryCache,
-      ServiceEntitlements serviceEntitlements,
-      DataEntitlements dataEntitlements,
-      String defaultSubject,
-      String defaultDelegatedSubject,
-      String defaultLane) {
+  public ConfigManagerImpl(DiscoveryCache DiscoveryCache) {
     this(
-        () -> discoveryCache == null ? List.of() : discoveryCache.allDefinitions(),
-        serviceEntitlements,
-        dataEntitlements,
-        defaultSubject,
-        defaultDelegatedSubject,
-        defaultLane);
+        new ConfigCacheView(Objects.requireNonNull(DiscoveryCache, "DiscoveryCache")),
+        null,
+        DiscoveryCodec.mapper(),
+        newExecutor(),
+        newScheduler(),
+        new ConfigResolver(DiscoveryCache),
+        null,
+        null,
+        null,
+        ConfigPublisherNoop.INSTANCE);
   }
 
-  public CatalogServiceImpl(
-      List<Definition> definitions,
-      ServiceEntitlements serviceEntitlements,
-      DataEntitlements dataEntitlements,
-      String defaultSubject,
-      String defaultDelegatedSubject,
-      String defaultLane) {
-    List<Definition> snapshot = definitions == null ? List.of() : List.copyOf(definitions);
-    this.definitionsSupplier = () -> snapshot;
-    this.serviceEntitlements =
-        serviceEntitlements == null ? ServiceEntitlements.Noop.INSTANCE : serviceEntitlements;
-    this.dataEntitlements = dataEntitlements == null ? DataEntitlementsNoop.INSTANCE : dataEntitlements;
-    this.defaultSubject = normalize(defaultSubject);
-    this.defaultDelegatedSubject = normalize(defaultDelegatedSubject);
-    this.defaultLane = normalize(defaultLane);
+  public ConfigManagerImpl(DiscoveryCache DiscoveryCache, String defaultGroup) {
+    this(
+        new ConfigCacheView(Objects.requireNonNull(DiscoveryCache, "DiscoveryCache")),
+        defaultGroup,
+        DiscoveryCodec.mapper(),
+        newExecutor(),
+        newScheduler(),
+        new ConfigResolver(DiscoveryCache),
+        null,
+        null,
+        null,
+        ConfigPublisherNoop.INSTANCE);
   }
 
-  private CatalogServiceImpl(
-      Supplier<List<Definition>> definitionsSupplier,
-      ServiceEntitlements serviceEntitlements,
-      DataEntitlements dataEntitlements,
-      String defaultSubject,
-      String defaultDelegatedSubject,
-      String defaultLane) {
-    this.definitionsSupplier = definitionsSupplier == null ? List::of : definitionsSupplier;
-    this.serviceEntitlements =
-        serviceEntitlements == null ? new ServiceEntitlementsNoop(false) : serviceEntitlements;
-    this.dataEntitlements = dataEntitlements == null ? DataEntitlementsNoop.INSTANCE : dataEntitlements;
-    this.defaultSubject = normalize(defaultSubject);
-    this.defaultDelegatedSubject = normalize(defaultDelegatedSubject);
-    this.defaultLane = normalize(defaultLane);
+  public ConfigManagerImpl(
+      DiscoveryCache DiscoveryCache,
+      String defaultGroup,
+      String callerAppName,
+      String callerAppInstance,
+      String sessionId,
+      ConfigPublisher auditPublisher) {
+    this(
+        new ConfigCacheView(Objects.requireNonNull(DiscoveryCache, "DiscoveryCache")),
+        defaultGroup,
+        DiscoveryCodec.mapper(),
+        newExecutor(),
+        newScheduler(),
+        new ConfigResolver(DiscoveryCache),
+        callerAppName,
+        callerAppInstance,
+        sessionId,
+        auditPublisher);
   }
 
-  @Override
-  public CatalogSearchResult search(CatalogSearchQuery query) {
-    return search(query, null);
+  public ConfigManagerImpl(
+      DiscoveryCache DiscoveryCache,
+      String defaultGroup,
+      String callerAppName,
+      String callerAppInstance,
+      String sessionId,
+      ControlConnection controlConnection,
+      DefinitionEnvironment environmentDefinition) {
+    this(
+        new ConfigCacheView(Objects.requireNonNull(DiscoveryCache, "DiscoveryCache")),
+        defaultGroup,
+        DiscoveryCodec.mapper(),
+        newExecutor(),
+        newScheduler(),
+        new ConfigResolver(DiscoveryCache),
+        callerAppName,
+        callerAppInstance,
+        sessionId,
+        createAuditPublisher(controlConnection, environmentDefinition));
   }
 
-  @Override
-  public CatalogSearchResult search(CatalogSearchQuery query, CatalogAccessContext accessContext) {
-    CatalogSearchQuery effectiveQuery = query == null ? CatalogSearchQuery.defaults() : query;
-    CatalogAccessContext effectiveAccess = resolveAccessContext(accessContext, effectiveQuery.seedAssetId());
-    CatalogSnapshot snapshot = loadSnapshot(effectiveAccess.lane());
-    Map<String, Boolean> visibility = resolveVisibility(snapshot, effectiveAccess);
+  ConfigManagerImpl(
+      ConfigView configView,
+      String defaultGroup,
+      ObjectMapper mapper,
+      ExecutorService callbackExecutor,
+      ScheduledExecutorService scheduleExecutor,
+      ConfigResolver resolver) {
+    this(
+        configView,
+        defaultGroup,
+        mapper,
+        callbackExecutor,
+        scheduleExecutor,
+        resolver,
+        null,
+        null,
+        null,
+        ConfigPublisherNoop.INSTANCE);
+  }
 
-    List<ScoredAsset> scored = new ArrayList<>();
-    for (AssetRecord record : snapshot.records().values()) {
-      if (!visibility.getOrDefault(record.node().assetId(), false)) {
-        continue;
+  ConfigManagerImpl(
+      ConfigView configView,
+      String defaultGroup,
+      ObjectMapper mapper,
+      ExecutorService callbackExecutor,
+      ScheduledExecutorService scheduleExecutor,
+      ConfigResolver resolver,
+      String callerAppName,
+      String callerAppInstance,
+      String sessionId,
+      ConfigPublisher auditPublisher) {
+    this.configView = Objects.requireNonNull(configView, "configView");
+    this.defaultGroup = Strings.trimToNull(defaultGroup);
+    Objects.requireNonNull(mapper, "mapper");
+    this.mapper = DiscoveryCodec.mapper();
+    this.resolver = resolver;
+    this.callerAppName = Strings.trimToNull(callerAppName);
+    this.callerAppInstance = Strings.trimToNull(callerAppInstance);
+    this.sessionId =
+        ConfigManagerImplAudit.resolveAuditSessionId(
+            sessionId, this.callerAppName, this.callerAppInstance);
+    if (Strings.trimToNull(sessionId) == null) {
+      LOGGER.warn("[ConfigUsageAudit] missing sessionId; generated fallback sessionId={} app={} instance={}", this.sessionId, this.callerAppName, this.callerAppInstance);
+    }
+    this.auditPublisher =
+        auditPublisher == null ? ConfigPublisherNoop.INSTANCE : auditPublisher;
+    this.workflowService =
+        new ConfigWorkflowService(
+            new ConfigWorkflowService.Store() {
+              @Override
+              public List<DefinitionConfigLayer> listConfigLayers(String group) {
+                return ConfigManagerImpl.this.configView.listConfigLayers(group);
+              }
+
+              @Override
+              public Definition get(DefinitionType type, String group, String name) {
+                return ConfigManagerImpl.this.configView.get(type, group, name);
+              }
+
+              @Override
+              public void upsert(Definition definition) {
+                ConfigManagerImpl.this.configView.upsert(definition);
+              }
+            });
+    this.callbackExecutor = Objects.requireNonNull(callbackExecutor, "callbackExecutor");
+    this.scheduleExecutor = Objects.requireNonNull(scheduleExecutor, "scheduleExecutor");
+  }
+
+  ConfigManagerImpl(ConfigView configView, ObjectMapper mapper, ExecutorService callbackExecutor) {
+    this(
+        configView,
+        null,
+        mapper,
+        callbackExecutor,
+        newScheduler(),
+        null,
+        null,
+        null,
+        null,
+        ConfigPublisherNoop.INSTANCE);
+  }
+
+  private static ConfigPublisher createAuditPublisher(
+      ControlConnection controlConnection, DefinitionEnvironment environmentDefinition) {
+    ConfigUsageEventsSettings settings = ConfigUsageEventsSettings.fromEnvironment(environmentDefinition);
+    if (!settings.enabled() || settings.transport() == ConfigUsageEventsTransport.NOOP) {
+      return ConfigPublisherNoop.INSTANCE;
+    }
+    if (settings.transport() == ConfigUsageEventsTransport.S3) {
+      LOGGER.warn("[ConfigUsageAudit] transport=S3 is not implemented; using NOOP");
+      return ConfigPublisherNoop.INSTANCE;
+    }
+    if (settings.transport() != ConfigUsageEventsTransport.AMPS) {
+      LOGGER.warn("[ConfigUsageAudit] unsupported transport={} ; using NOOP", settings.transport());
+      return ConfigPublisherNoop.INSTANCE;
+    }
+    String connection = Strings.firstNonBlank(settings.connection(), DISCOVERY_CONNECTION_NAME);
+    if (!DISCOVERY_CONNECTION_NAME.equalsIgnoreCase(connection)) {
+      LOGGER.warn("[ConfigUsageAudit] unsupported AMPS connection={} expected={} ; using NOOP", connection, DISCOVERY_CONNECTION_NAME);
+      return ConfigPublisherNoop.INSTANCE;
+    }
+    if (controlConnection == null) {
+      LOGGER.warn("[ConfigUsageAudit] AMPS requested but ControlConnection is null; using NOOP");
+      return ConfigPublisherNoop.INSTANCE;
+    }
+    return new ConfigPublisherAmp(
+        controlConnection,
+        new ConfigPublisherAmp.Settings(
+            connection,
+            settings.topic(),
+            settings.maxRetries(),
+            settings.initialBackoffMillis(),
+            settings.maxBackoffMillis(),
+            settings.backoffMultiplier()));
+  }
+
+  private enum ConfigUsageEventsTransport {
+    NOOP,
+    AMPS,
+    S3;
+
+    static ConfigUsageEventsTransport fromWire(String raw) {
+      String normalized = Strings.trimToNull(raw);
+      if (normalized == null) {
+        return NOOP;
       }
-      if (!matchesFilters(record, effectiveQuery)) {
-        continue;
+      return switch (normalized.toUpperCase(Locale.ROOT)) {
+        case "NOOP", "NONE" -> NOOP;
+        case "AMPS" -> AMPS;
+        case "S3" -> S3;
+        default -> NOOP;
+      };
+    }
+  }
+
+  private record ConfigUsageEventsSettings(
+      boolean enabled,
+      ConfigUsageEventsTransport transport,
+      String connection,
+      String topic,
+      int maxRetries,
+      long initialBackoffMillis,
+      long maxBackoffMillis,
+      double backoffMultiplier) {
+
+    static ConfigUsageEventsSettings fromEnvironment(DefinitionEnvironment environmentDefinition) {
+      DefinitionEnvironment.Configs configs =
+          environmentDefinition == null ? null : environmentDefinition.configs();
+      return fromModel(configs == null ? null : configs.events());
+    }
+
+    static ConfigUsageEventsSettings fromModel(DefinitionEnvironment.Events events) {
+      if (events == null || !Boolean.TRUE.equals(events.enabled())) {
+        return disabled();
       }
-      Score score = scoreAsset(record, effectiveQuery, snapshot);
-      if (score == null) {
-        continue;
-      }
-      scored.add(new ScoredAsset(record, score.total()));
-    }
-
-    scored.sort(
-        Comparator.comparingDouble(ScoredAsset::score)
-            .reversed()
-            .thenComparing(scoredAsset -> scoredAsset.record().node().assetId()));
-
-    int limit = effectiveQuery.limit() == null ? CatalogSearchQuery.DEFAULT_LIMIT : effectiveQuery.limit();
-    int boundedLimit = Math.max(1, Math.min(CatalogSearchQuery.MAX_LIMIT, limit));
-    List<CatalogSummary> results = new ArrayList<>();
-    for (int index = 0; index < scored.size() && index < boundedLimit; index++) {
-      results.add(toSummary(scored.get(index), snapshot));
-    }
-
-    return new CatalogSearchResult(results, buildFacets(scored), scored.size());
-  }
-
-  @Override
-  public Optional<CatalogDetails> getAsset(String assetId) {
-    return getAsset(assetId, null);
-  }
-
-  @Override
-  public Optional<CatalogDetails> getAsset(String assetId, CatalogAccessContext accessContext) {
-    String requested = normalize(assetId);
-    if (requested == null) {
-      return Optional.empty();
-    }
-    CatalogAccessContext effectiveAccess = resolveAccessContext(accessContext, null);
-    CatalogSnapshot snapshot = loadSnapshot(effectiveAccess.lane());
-    String resolved = snapshot.graph().resolveAssetId(requested);
-    if (resolved == null) {
-      resolved = snapshot.records().containsKey(requested) ? requested : null;
-    }
-    if (resolved == null) {
-      return Optional.empty();
-    }
-
-    Map<String, Boolean> visibility = resolveVisibility(snapshot, effectiveAccess);
-    if (!visibility.getOrDefault(resolved, false)) {
-      return Optional.empty();
-    }
-    AssetRecord record = snapshot.records().get(resolved);
-    if (record == null) {
-      return Optional.empty();
-    }
-
-    Map<RelationshipType, List<CatalogRelationshipView>> relationshipsByType =
-        buildRelationshipGroups(resolved, snapshot, visibility);
-    Map<RelationshipType, Integer> relationshipCounts = relationshipCounts(relationshipsByType);
-    CatalogSummary summary = toSummary(new ScoredAsset(record, 0d), snapshot);
-    return Optional.of(
-        new CatalogDetails(
-            summary,
-            record.semantic().businessMeaning(),
-            record.semantic().aliases(),
-            record.semantic().keywords(),
-            record.semantic().ownership(),
-            record.semantic().dataShape(),
-            record.semantic().freshness(),
-            record.semantic().trust(),
-            record.semantic().usage(),
-            record.semantic().toolHints(),
-            record.completenessClass(),
-            record.completenessScore(),
-            relationshipsByType,
-            relationshipCounts));
-  }
-
-  @Override
-  public Map<RelationshipType, List<CatalogRelationshipView>> getRelatedAssets(String assetId) {
-    return getRelatedAssets(assetId, null);
-  }
-
-  @Override
-  public Map<RelationshipType, List<CatalogRelationshipView>> getRelatedAssets(
-      String assetId, CatalogAccessContext accessContext) {
-    String requested = normalize(assetId);
-    if (requested == null) {
-      return Map.of();
-    }
-    CatalogAccessContext effectiveAccess = resolveAccessContext(accessContext, null);
-    CatalogSnapshot snapshot = loadSnapshot(effectiveAccess.lane());
-    String resolved = snapshot.graph().resolveAssetId(requested);
-    if (resolved == null) {
-      resolved = snapshot.records().containsKey(requested) ? requested : null;
-    }
-    if (resolved == null) {
-      return Map.of();
-    }
-
-    Map<String, Boolean> visibility = resolveVisibility(snapshot, effectiveAccess);
-    if (!visibility.getOrDefault(resolved, false)) {
-      return Map.of();
-    }
-    return buildRelationshipGroups(resolved, snapshot, visibility);
-  }
-
-  private CatalogAccessContext resolveAccessContext(CatalogAccessContext context, String seedAssetId) {
-    String subject =
-        Strings.firstNonBlank(
-            normalize(context == null ? null : context.subject()), defaultSubject, "app:catalog/system");
-    String delegated =
-        Strings.firstNonBlank(
-            normalize(context == null ? null : context.delegatedSubject()),
-            defaultDelegatedSubject);
-    String lane =
-        Strings.firstNonBlank(
-            normalize(context == null ? null : context.lane()), defaultLane, "dev");
-    String seed =
-        Strings.firstNonBlank(
-            normalize(context == null ? null : context.seedAssetId()),
-            normalize(seedAssetId));
-    return new CatalogAccessContext(subject, delegated, lane, seed);
-  }
-
-  private CatalogSnapshot loadSnapshot(String lane) {
-    List<Definition> definitions = safeDefinitions();
-    Map<String, Semantic> configSemanticByKey = indexConfigSemantic(definitions);
-    AssetLifecycleGraph graph = AssetLifecycleGraphBuilder.build(definitions);
-    Map<String, Definition> definitionByAssetId = mapDefinitionsToAssetIds(graph, definitions);
-    Map<String, SemanticAssetAudit> auditsByAssetId =
-        buildSemanticAuditMap(definitionByAssetId, SemanticValidationPolicy.fromTier(lane));
-
-    List<String> sortedAssetIds = new ArrayList<>(graph.nodes().keySet());
-    sortedAssetIds.sort(String::compareTo);
-    LinkedHashMap<String, AssetRecord> records = new LinkedHashMap<>();
-    for (String assetId : sortedAssetIds) {
-      AssetLifecycleNode node = graph.nodes().get(assetId);
-      Definition definition = definitionByAssetId.get(assetId);
-      Semantic semantic = semantic(definition, configSemanticByKey);
-      if (semantic == null) {
-        semantic = syntheticSemantic(node);
-      }
-      SemanticAssetAudit audit = auditsByAssetId.get(assetId);
-      SemanticCompletenessClass completenessClass =
-          audit == null ? SemanticCompletenessClass.WEAK : audit.classification();
-      int completenessScore = audit == null ? 0 : audit.score();
-      records.put(assetId, new AssetRecord(node, definition, semantic, completenessClass, completenessScore));
-    }
-    return new CatalogSnapshot(graph, records);
-  }
-
-  private static Map<String, SemanticAssetAudit> buildSemanticAuditMap(
-      Map<String, Definition> definitionByAssetId, SemanticValidationPolicy policy) {
-    if (definitionByAssetId.isEmpty()) {
-      return Map.of();
-    }
-    List<AuditInput> inputs = new ArrayList<>();
-    for (Map.Entry<String, Definition> entry : definitionByAssetId.entrySet()) {
-      if (entry.getValue() != null) {
-        inputs.add(new AuditInput(entry.getKey(), entry.getValue()));
-      }
-    }
-    if (inputs.isEmpty()) {
-      return Map.of();
-    }
-    Map<String, SemanticAssetAudit> auditsByAssetId = new LinkedHashMap<>();
-    for (SemanticAssetAudit assetAudit : SemanticCompletenessAuditor.auditAssets(inputs, policy).assets()) {
-      if (assetAudit == null || normalize(assetAudit.source()) == null) {
-        continue;
-      }
-      auditsByAssetId.put(assetAudit.source().trim(), assetAudit);
-    }
-    return Map.copyOf(auditsByAssetId);
-  }
-
-  private static Map<String, Definition> mapDefinitionsToAssetIds(
-      AssetLifecycleGraph graph, List<Definition> definitions) {
-    if (graph == null || graph.nodes().isEmpty() || definitions == null || definitions.isEmpty()) {
-      return Map.of();
-    }
-    Map<String, List<Definition>> indexed = indexDefinitions(definitions);
-    LinkedHashMap<String, Definition> resolved = new LinkedHashMap<>();
-    for (AssetLifecycleNode node : graph.nodes().values()) {
-      if (node == null) {
-        continue;
-      }
-      Definition definition = resolveDefinition(node, indexed);
-      if (definition != null) {
-        resolved.put(node.assetId(), definition);
-      }
-    }
-    return Map.copyOf(resolved);
-  }
-
-  private static Map<String, List<Definition>> indexDefinitions(List<Definition> definitions) {
-    LinkedHashMap<String, List<Definition>> indexed = new LinkedHashMap<>();
-    for (Definition definition : definitions) {
-      DefinitionEnvelope envelope = definition == null ? null : definition.envelope();
-      if (envelope == null || envelope.type() == null) {
-        continue;
-      }
-      String key = definitionKey(envelope.type(), envelope.group(), envelope.name());
-      indexed.computeIfAbsent(key, ignored -> new ArrayList<>()).add(definition);
-    }
-    return indexed;
-  }
-
-  private static Definition resolveDefinition(AssetLifecycleNode node, Map<String, List<Definition>> indexed) {
-    List<Definition> candidates =
-        indexed.get(definitionKey(node.type(), node.group(), node.name()));
-    if (candidates == null || candidates.isEmpty()) {
-      return null;
-    }
-    if (candidates.size() == 1) {
-      return candidates.getFirst();
-    }
-    String nodeNamespace = normalize(node.namespace());
-    if (nodeNamespace == null) {
-      return candidates.getFirst();
-    }
-    for (Definition candidate : candidates) {
-      if (nodeNamespace.equalsIgnoreCase(defaultNamespace(candidate))) {
-        return candidate;
-      }
-    }
-    return candidates.getFirst();
-  }
-
-  private static String definitionKey(DefinitionType type, String group, String name) {
-    return CatalogServiceImplIds.definitionKey(type, group, name);
-  }
-
-  private static String defaultNamespace(Definition definition) {
-    return CatalogServiceImplIds.defaultNamespace(definition);
-  }
-
-  private Map<String, Boolean> resolveVisibility(
-      CatalogSnapshot snapshot, CatalogAccessContext accessContext) {
-    LinkedHashMap<String, Boolean> visibility = new LinkedHashMap<>();
-    for (AssetRecord record : snapshot.records().values()) {
-      String assetId = record.node().assetId();
-      if (PRIMARY_ENTITLED_TYPES.contains(record.node().type())) {
-        visibility.put(assetId, authorizePrimary(record, accessContext));
-      }
-    }
-
-    for (AssetRecord record : snapshot.records().values()) {
-      String assetId = record.node().assetId();
-      if (visibility.containsKey(assetId)) {
-        continue;
-      }
-      Set<String> linkedPrimaryAssets = linkedPrimaryAssets(snapshot, assetId);
-      if (linkedPrimaryAssets.isEmpty()) {
-        visibility.put(assetId, true);
-        continue;
-      }
-      boolean allowed = false;
-      for (String linkedPrimary : linkedPrimaryAssets) {
-        if (visibility.getOrDefault(linkedPrimary, false)) {
-          allowed = true;
-          break;
-        }
-      }
-      visibility.put(assetId, allowed);
-    }
-    return Map.copyOf(visibility);
-  }
-
-  private Set<String> linkedPrimaryAssets(CatalogSnapshot snapshot, String assetId) {
-    LinkedHashSet<String> linked = new LinkedHashSet<>();
-    for (AssetLifecycleEdge edge : snapshot.graph().outgoing(assetId)) {
-      AssetRecord related = snapshot.records().get(edge.toAssetId());
-      if (related != null && PRIMARY_ENTITLED_TYPES.contains(related.node().type())) {
-        linked.add(edge.toAssetId());
-      }
-    }
-    for (AssetLifecycleEdge edge : snapshot.graph().incoming(assetId)) {
-      AssetRecord related = snapshot.records().get(edge.fromAssetId());
-      if (related != null && PRIMARY_ENTITLED_TYPES.contains(related.node().type())) {
-        linked.add(edge.fromAssetId());
-      }
-    }
-    return Set.copyOf(linked);
-  }
-
-  private boolean authorizePrimary(AssetRecord record, CatalogAccessContext accessContext) {
-    return switch (record.node().type()) {
-      case DATASET -> authorizeDataset(record, accessContext);
-      case SERVICE -> authorizeService(record, accessContext);
-      case CONFIG_LAYER -> authorizeConfig(record, accessContext);
-      default -> true;
-    };
-  }
-
-  private boolean authorizeDataset(AssetRecord record, CatalogAccessContext accessContext) {
-    String datasetId = normalize(record.node().assetId());
-    if (datasetId == null || !datasetId.startsWith("dataset:")) {
-      return false;
-    }
-    try {
-      DataEntitlements.Decision decision =
-          dataEntitlements.authorizeRead(
-              new DataEntitlements.Identity(accessContext.subject(), accessContext.delegatedSubject()),
-              datasetId);
-      return decision != null && decision.allowed();
-    } catch (RuntimeException ex) {
-      return false;
-    }
-  }
-
-  private boolean authorizeService(AssetRecord record, CatalogAccessContext accessContext) {
-    String serviceResourceId = null;
-    if (record.definition() instanceof DefinitionService service
-        && Strings.isNotBlank(service.resourceId())) {
-      serviceResourceId = normalize(service.resourceId());
-    }
-    if (serviceResourceId == null) {
-      serviceResourceId = normalize(record.node().assetId());
-    }
-    if (serviceResourceId == null) {
-      return false;
-    }
-    try {
-      serviceResourceId = ServiceEntitlements.requireServiceResourceId(serviceResourceId);
-      ServiceEntitlements.Decision decision =
-          serviceEntitlements.authorize(
-              new ServiceEntitlements.Identity(accessContext.subject(), accessContext.delegatedSubject()),
-              new ServiceEntitlements.Request(
-                  ServiceEntitlements.Transport.GRPC,
-                  ServiceEntitlements.Action.READ,
-                  serviceResourceId,
-                  "catalog.read",
-                  null,
-                  null,
-                  Map.of(),
-                  Map.of("surface", "semantic-catalog")));
-      return decision != null && decision.allowed();
-    } catch (RuntimeException ex) {
-      return false;
-    }
-  }
-
-  private boolean authorizeConfig(AssetRecord record, CatalogAccessContext accessContext) {
-    String configResourceId = configResourceId(record);
-    if (configResourceId == null) {
-      return false;
-    }
-    try {
-      configResourceId = ServiceEntitlements.requireConfigResourceId(configResourceId);
-      ServiceEntitlements.Decision decision =
-          serviceEntitlements.authorize(
-              new ServiceEntitlements.Identity(accessContext.subject(), accessContext.delegatedSubject()),
-              new ServiceEntitlements.Request(
-                  ServiceEntitlements.Transport.GRPC,
-                  ServiceEntitlements.Action.READ,
-                  configResourceId,
-                  "catalog.read.config",
-                  null,
-                  null,
-                  Map.of(),
-                  Map.of("surface", "semantic-catalog")));
-      return decision != null && decision.allowed();
-    } catch (RuntimeException ex) {
-      return false;
-    }
-  }
-
-  private static String configResourceId(AssetRecord record) {
-    if (record == null || record.node() == null) {
-      return null;
-    }
-    String assetId = normalize(record.node().assetId());
-    if (assetId != null && assetId.startsWith("config:")) {
-      return assetId;
-    }
-    if (record.definition() instanceof DefinitionConfigLayer config) {
-      String resourceId = normalize(config.resourceId());
-      if (resourceId != null && resourceId.startsWith("config:")) {
-        return resourceId;
-      }
-      String configId = normalize(config.configId());
-      if (configId != null && configId.startsWith("config:")) {
-        return configId;
-      }
-      String group = normalize(config.envelope() == null ? null : config.envelope().group());
-      String logicalId = normalize(config.configId());
-      if (group != null && logicalId != null) {
-        return ServiceEntitlements.canonicalConfigResourceId(group, logicalId);
-      }
-    }
-    return null;
-  }
-
-  private static boolean matchesFilters(AssetRecord record, CatalogSearchQuery query) {
-    if (record == null || query == null) {
-      return false;
-    }
-    Semantic semantic = record.semantic();
-    if (!matchesType(record, query.type())) {
-      return false;
-    }
-    if (query.domain() != null && !query.domain().equalsIgnoreCase(normalize(semantic.domain()))) {
-      return false;
-    }
-    if (query.owner() != null) {
-      String ownerId = semantic.ownership() == null ? null : normalize(semantic.ownership().ownerId());
-      if (!query.owner().equalsIgnoreCase(ownerId)) {
-        return false;
-      }
-    }
-    if (query.trust() != null && !matchesTrustFilter(semantic.trust(), query.trust())) {
-      return false;
-    }
-    if (query.freshness() != null && !matchesFreshnessFilter(semantic.freshness(), query.freshness())) {
-      return false;
-    }
-    if (!query.tags().isEmpty() && !matchesTagsFilter(semantic.tags(), query.tags())) {
-      return false;
-    }
-    return true;
-  }
-
-  private static boolean matchesType(AssetRecord record, String typeFilter) {
-    if (typeFilter == null) {
-      return true;
-    }
-    return typeFilter.equalsIgnoreCase(record.node().type().name());
-  }
-
-  private static boolean matchesTagsFilter(List<String> assetTags, List<String> filterTags) {
-    if (filterTags == null || filterTags.isEmpty()) {
-      return true;
-    }
-    Set<String> normalizedAssetTags = toNormalizedSet(assetTags);
-    for (String filterTag : filterTags) {
-      if (!normalizedAssetTags.contains(normalize(filterTag))) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  private static boolean matchesTrustFilter(Semantic.Trust trust, String trustFilter) {
-    if (trustFilter == null) {
-      return true;
-    }
-    if (trust == null) {
-      return false;
-    }
-    String normalizedFilter = trustFilter.toLowerCase(Locale.ROOT);
-    String certification = trust.certification() == null ? "" : trust.certification().name().toLowerCase(Locale.ROOT);
-    String quality = trust.qualityStatus() == null ? "" : trust.qualityStatus().name().toLowerCase(Locale.ROOT);
-    return certification.contains(normalizedFilter) || quality.contains(normalizedFilter);
-  }
-
-  private static boolean matchesFreshnessFilter(Semantic.Freshness freshness, String freshnessFilter) {
-    if (freshnessFilter == null) {
-      return true;
-    }
-    if (freshness == null) {
-      return false;
-    }
-    String normalizedFilter = freshnessFilter.toLowerCase(Locale.ROOT);
-    String updateCadence = normalize(freshness.updateCadence());
-    String freshnessSla = normalize(freshness.freshnessSla());
-    String latencyClass = normalize(freshness.latencyClass());
-    return (updateCadence != null && updateCadence.toLowerCase(Locale.ROOT).contains(normalizedFilter))
-        || (freshnessSla != null && freshnessSla.toLowerCase(Locale.ROOT).contains(normalizedFilter))
-        || (latencyClass != null && latencyClass.toLowerCase(Locale.ROOT).contains(normalizedFilter));
-  }
-
-  private Score scoreAsset(AssetRecord record, CatalogSearchQuery query, CatalogSnapshot snapshot) {
-    List<String> tokens = tokenize(query.query());
-    double textScore = textScore(record, tokens);
-    if (!tokens.isEmpty() && textScore <= 0d) {
-      return null;
-    }
-    double completenessScore = record.completenessScore() / 100d;
-    double trustScore = trustScore(record.semantic().trust());
-    double freshnessScore = freshnessScore(record.semantic().freshness());
-    double domainRelevance = domainRelevance(record.semantic(), query.domain());
-    double proximityScore = proximityScore(query.seedAssetId(), record.node().assetId(), snapshot.graph());
-    double relationshipImportance = relationshipImportance(record.node().assetId(), snapshot.graph());
-
-    double total =
-        (textScore * 0.45d)
-            + (completenessScore * 0.20d)
-            + (trustScore * 0.15d)
-            + (freshnessScore * 0.10d)
-            + (domainRelevance * 0.05d)
-            + (proximityScore * 0.03d)
-            + (relationshipImportance * 0.02d);
-    return new Score(round(total * 100d));
-  }
-
-  private static double textScore(AssetRecord record, List<String> tokens) {
-    if (tokens == null || tokens.isEmpty()) {
-      return 0.20d;
-    }
-    Semantic semantic = record.semantic();
-    double total = 0d;
-    for (String token : tokens) {
-      double best = 0d;
-      best = Math.max(best, containsScore(semantic.title(), token, 1.00d));
-      best = Math.max(best, containsScore(semantic.description(), token, 0.75d));
-      best = Math.max(best, containsScore(semantic.businessMeaning(), token, 0.75d));
-      best = Math.max(best, containsScore(semantic.domain(), token, 0.60d));
-      best = Math.max(best, containsScore(semantic.subdomain(), token, 0.60d));
-      best = Math.max(best, containsScore(record.node().assetId(), token, 0.60d));
-      best = Math.max(best, containsScore(record.node().name(), token, 0.60d));
-      best = Math.max(best, listContainsScore(semantic.tags(), token, 0.85d));
-      best = Math.max(best, listContainsScore(semantic.aliases(), token, 0.85d));
-      best = Math.max(best, listContainsScore(semantic.keywords(), token, 0.85d));
-      total += best;
-    }
-    return Math.max(0d, Math.min(1d, total / tokens.size()));
-  }
-
-  private static double containsScore(String value, String token, double score) {
-    String normalizedValue = normalize(value);
-    if (normalizedValue == null || token == null) {
-      return 0d;
-    }
-    return normalizedValue.toLowerCase(Locale.ROOT).contains(token) ? score : 0d;
-  }
-
-  private static double listContainsScore(List<String> values, String token, double score) {
-    if (values == null || values.isEmpty()) {
-      return 0d;
-    }
-    for (String value : values) {
-      if (containsScore(value, token, score) > 0d) {
-        return score;
-      }
-    }
-    return 0d;
-  }
-
-  private static double trustScore(Semantic.Trust trust) {
-    if (trust == null) {
-      return 0.35d;
-    }
-    double certificationScore =
-        switch (trust.certification() == null ? Semantic.Certification.NONE : trust.certification()) {
-          case CERTIFIED -> 1.00d;
-          case CANDIDATE -> 0.80d;
-          case NONE -> 0.40d;
-          case DEPRECATED -> 0.20d;
-        };
-    double qualityScore =
-        switch (trust.qualityStatus() == null ? Semantic.QualityStatus.UNKNOWN : trust.qualityStatus()) {
-          case GOOD -> 1.00d;
-          case WARNING -> 0.60d;
-          case BAD -> 0.20d;
-          case UNKNOWN -> 0.40d;
-        };
-    return (certificationScore + qualityScore) / 2d;
-  }
-
-  private static double freshnessScore(Semantic.Freshness freshness) {
-    if (freshness == null) {
-      return 0.35d;
-    }
-    double score = 0d;
-    if (!SemanticMetadataValidator.isPlaceholderText(freshness.updateCadence())) {
-      score += 0.45d;
-    }
-    if (!SemanticMetadataValidator.isPlaceholderText(freshness.freshnessSla())) {
-      score += 0.35d;
-    }
-    if (!SemanticMetadataValidator.isPlaceholderText(freshness.latencyClass())) {
-      score += 0.20d;
-    }
-    return Math.max(0d, Math.min(1d, score));
-  }
-
-  private static double domainRelevance(Semantic semantic, String domainFilter) {
-    if (semantic == null) {
-      return 0.25d;
-    }
-    if (domainFilter == null) {
-      return 0.50d;
-    }
-    String domain = normalize(semantic.domain());
-    if (domain != null && domainFilter.equalsIgnoreCase(domain)) {
-      return 1.00d;
-    }
-    String subdomain = normalize(semantic.subdomain());
-    if (subdomain != null && domainFilter.equalsIgnoreCase(subdomain)) {
-      return 0.80d;
-    }
-    return 0.10d;
-  }
-
-  private static double proximityScore(String seedAssetId, String targetAssetId, AssetLifecycleGraph graph) {
-    String seed = normalize(seedAssetId);
-    String target = normalize(targetAssetId);
-    if (seed == null || target == null || graph == null) {
-      return 0d;
-    }
-    String resolvedSeed = graph.resolveAssetId(seed);
-    if (resolvedSeed == null) {
-      resolvedSeed = seed;
-    }
-    if (resolvedSeed.equals(target)) {
-      return 1.00d;
-    }
-    if (isDirectlyRelated(resolvedSeed, target, graph)) {
-      return 0.85d;
-    }
-    if (isWithinTwoHops(resolvedSeed, target, graph)) {
-      return 0.45d;
-    }
-    return 0d;
-  }
-
-  private static boolean isDirectlyRelated(String source, String target, AssetLifecycleGraph graph) {
-    for (AssetLifecycleEdge edge : graph.outgoing(source)) {
-      if (target.equals(edge.toAssetId())) {
-        return true;
-      }
-    }
-    for (AssetLifecycleEdge edge : graph.incoming(source)) {
-      if (target.equals(edge.fromAssetId())) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private static boolean isWithinTwoHops(String source, String target, AssetLifecycleGraph graph) {
-    ArrayDeque<String> queue = new ArrayDeque<>();
-    Map<String, Integer> depth = new LinkedHashMap<>();
-    queue.add(source);
-    depth.put(source, 0);
-    while (!queue.isEmpty()) {
-      String current = queue.removeFirst();
-      int currentDepth = depth.getOrDefault(current, 0);
-      if (currentDepth >= 2) {
-        continue;
-      }
-      for (String next : neighbors(current, graph)) {
-        if (depth.containsKey(next)) {
-          continue;
-        }
-        int nextDepth = currentDepth + 1;
-        if (next.equals(target) && nextDepth <= 2) {
-          return true;
-        }
-        depth.put(next, nextDepth);
-        queue.addLast(next);
-      }
-    }
-    return false;
-  }
-
-  private static Set<String> neighbors(String assetId, AssetLifecycleGraph graph) {
-    LinkedHashSet<String> neighbors = new LinkedHashSet<>();
-    for (AssetLifecycleEdge edge : graph.outgoing(assetId)) {
-      neighbors.add(edge.toAssetId());
-    }
-    for (AssetLifecycleEdge edge : graph.incoming(assetId)) {
-      neighbors.add(edge.fromAssetId());
-    }
-    return Set.copyOf(neighbors);
-  }
-
-  private static double relationshipImportance(String assetId, AssetLifecycleGraph graph) {
-    int relationshipCount = graph.outgoing(assetId).size() + graph.incoming(assetId).size();
-    if (relationshipCount <= 0) {
-      return 0d;
-    }
-    return Math.min(1d, relationshipCount / 10d);
-  }
-
-  private static CatalogSearchFacet buildFacets(List<ScoredAsset> scoredAssets) {
-    if (scoredAssets == null || scoredAssets.isEmpty()) {
-      return CatalogSearchFacet.empty();
-    }
-    LinkedHashMap<String, Integer> typeCounts = new LinkedHashMap<>();
-    LinkedHashMap<String, Integer> domainCounts = new LinkedHashMap<>();
-    LinkedHashMap<String, Integer> tagCounts = new LinkedHashMap<>();
-    LinkedHashMap<String, Integer> ownerCounts = new LinkedHashMap<>();
-    LinkedHashMap<String, Integer> trustCounts = new LinkedHashMap<>();
-    LinkedHashMap<String, Integer> freshnessCounts = new LinkedHashMap<>();
-
-    for (ScoredAsset scored : scoredAssets) {
-      AssetRecord record = scored.record();
-      Semantic semantic = record.semantic();
-      increment(typeCounts, record.node().type().name());
-      increment(domainCounts, semantic.domain());
-      for (String tag : semantic.tags()) {
-        increment(tagCounts, tag);
-      }
-      if (semantic.ownership() != null) {
-        increment(ownerCounts, semantic.ownership().ownerId());
-      }
-      if (semantic.trust() != null && semantic.trust().certification() != null) {
-        increment(trustCounts, semantic.trust().certification().name());
-      }
-      if (semantic.freshness() != null) {
-        increment(freshnessCounts, semantic.freshness().updateCadence());
-      }
-    }
-    return new CatalogSearchFacet(
-        typeCounts, domainCounts, tagCounts, ownerCounts, trustCounts, freshnessCounts);
-  }
-
-  private CatalogSummary toSummary(ScoredAsset scoredAsset, CatalogSnapshot snapshot) {
-    AssetRecord record = scoredAsset.record();
-    Semantic semantic = record.semantic();
-    int relationshipCount =
-        snapshot.graph().outgoing(record.node().assetId()).size()
-            + snapshot.graph().incoming(record.node().assetId()).size();
-    Semantic.Ownership ownership = semantic.ownership();
-    Semantic.Trust trust = semantic.trust();
-    Semantic.Freshness freshness = semantic.freshness();
-    return new CatalogSummary(
-        record.node().assetId(),
-        record.node().type(),
-        record.node().group(),
-        record.node().name(),
-        record.node().namespace(),
-        semantic.title(),
-        semantic.description(),
-        semantic.domain(),
-        semantic.subdomain(),
-        semantic.tags(),
-        ownership == null ? null : ownership.ownerId(),
-        trust == null ? Semantic.Certification.NONE : trust.certification(),
-        trust == null ? Semantic.QualityStatus.UNKNOWN : trust.qualityStatus(),
-        freshness == null ? null : freshness.updateCadence(),
-        record.completenessClass(),
-        record.completenessScore(),
-        relationshipCount,
-        scoredAsset.score());
-  }
-
-  private Map<RelationshipType, List<CatalogRelationshipView>> buildRelationshipGroups(
-      String rootAssetId, CatalogSnapshot snapshot, Map<String, Boolean> visibility) {
-    LinkedHashMap<RelationshipType, List<CatalogRelationshipView>> grouped = new LinkedHashMap<>();
-    for (AssetLifecycleEdge edge : snapshot.graph().outgoing(rootAssetId)) {
-      if (!isVisible(visibility, edge.toAssetId())) {
-        continue;
-      }
-      CatalogRelationshipView relationship = toRelationshipView(edge, CatalogRelationshipDirection.OUTGOING, snapshot);
-      grouped.computeIfAbsent(relationship.relationshipType(), ignored -> new ArrayList<>()).add(relationship);
-    }
-    for (AssetLifecycleEdge edge : snapshot.graph().incoming(rootAssetId)) {
-      if (!isVisible(visibility, edge.fromAssetId())) {
-        continue;
-      }
-      CatalogRelationshipView relationship = toRelationshipView(edge, CatalogRelationshipDirection.INCOMING, snapshot);
-      grouped.computeIfAbsent(relationship.relationshipType(), ignored -> new ArrayList<>()).add(relationship);
-    }
-
-    LinkedHashMap<RelationshipType, List<CatalogRelationshipView>> sorted = new LinkedHashMap<>();
-    for (RelationshipType type : RelationshipType.values()) {
-      List<CatalogRelationshipView> values = grouped.get(type);
-      if (values == null || values.isEmpty()) {
-        continue;
-      }
-      values.sort(
-          Comparator.comparing(CatalogRelationshipView::direction)
-              .thenComparing(CatalogRelationshipView::fromAssetId)
-              .thenComparing(CatalogRelationshipView::toAssetId));
-      sorted.put(type, List.copyOf(values));
-    }
-    return Map.copyOf(sorted);
-  }
-
-  private static Map<RelationshipType, Integer> relationshipCounts(
-      Map<RelationshipType, List<CatalogRelationshipView>> grouped) {
-    if (grouped == null || grouped.isEmpty()) {
-      return Map.of();
-    }
-    EnumMap<RelationshipType, Integer> counts = new EnumMap<>(RelationshipType.class);
-    for (Map.Entry<RelationshipType, List<CatalogRelationshipView>> entry : grouped.entrySet()) {
-      counts.put(entry.getKey(), entry.getValue() == null ? 0 : entry.getValue().size());
-    }
-    return Map.copyOf(counts);
-  }
-
-  private CatalogRelationshipView toRelationshipView(
-      AssetLifecycleEdge edge, CatalogRelationshipDirection direction, CatalogSnapshot snapshot) {
-    String relatedAssetId =
-        direction == CatalogRelationshipDirection.OUTGOING ? edge.toAssetId() : edge.fromAssetId();
-    AssetLifecycleNode relatedNode = snapshot.graph().nodes().get(relatedAssetId);
-    ParsedAssetId parsed = relatedNode == null ? parseAssetId(relatedAssetId) : null;
-    DefinitionType relatedType = relatedNode == null ? parsed.type() : relatedNode.type();
-    String relatedGroup = relatedNode == null ? parsed.group() : relatedNode.group();
-    String relatedName = relatedNode == null ? parsed.name() : relatedNode.name();
-    String relatedNamespace = relatedNode == null ? parsed.namespace() : relatedNode.namespace();
-
-    return new CatalogRelationshipView(
-        edge.fromAssetId(),
-        edge.toAssetId(),
-        direction,
-        edge.relationshipType(),
-        edge.ownershipType(),
-        edge.promotionBehavior(),
-        edge.deleteBehavior(),
-        edge.required(),
-        edge.shared(),
-        edge.notes(),
-        edge.targetLocator(),
-        relatedType,
-        relatedGroup,
-        relatedName,
-        relatedNamespace);
-  }
-
-  private static boolean isVisible(Map<String, Boolean> visibility, String assetId) {
-    if (visibility == null || visibility.isEmpty()) {
-      return true;
-    }
-    if (!visibility.containsKey(assetId)) {
-      return true;
-    }
-    return visibility.getOrDefault(assetId, false);
-  }
-
-  private static ParsedAssetId parseAssetId(String assetId) {
-    CatalogServiceImplIds.ParsedAssetId parsed = CatalogServiceImplIds.parseAssetId(assetId);
-    return new ParsedAssetId(parsed.type(), parsed.group(), parsed.name(), parsed.namespace());
-  }
-
-  private static List<Definition> safeDefinitionsCopy(List<Definition> value) {
-    if (value == null || value.isEmpty()) {
-      return List.of();
-    }
-    List<Definition> copy = new ArrayList<>();
-    for (Definition definition : value) {
-      if (definition != null) {
-        copy.add(definition);
-      }
-    }
-    return List.copyOf(copy);
-  }
-
-  private List<Definition> safeDefinitions() {
-    try {
-      return safeDefinitionsCopy(definitionsSupplier.get());
-    } catch (RuntimeException ex) {
-      return List.of();
-    }
-  }
-
-  private static Map<String, Semantic> indexConfigSemantic(List<Definition> definitions) {
-    if (definitions == null || definitions.isEmpty()) {
-      return Map.of();
-    }
-    LinkedHashMap<String, Semantic> indexed = new LinkedHashMap<>();
-    for (Definition definition : definitions) {
-      if (!(definition instanceof DefinitionConfig configMeta)
-          || configMeta.semantic() == null) {
-        continue;
-      }
-      String group =
+      ConfigUsageEventsTransport transport = ConfigUsageEventsTransport.fromWire(events.transport());
+      DefinitionEnvironment.EventsAmps amps = events.amps();
+      String connection =
           Strings.firstNonBlank(
-              normalize(configMeta.envelope() == null ? null : configMeta.envelope().group()),
-              normalize(configMeta.group()));
-      String configSetId = normalizeConfigSetId(configMeta.configId());
-      if (group == null || configSetId == null) {
-        continue;
+              amps == null ? null : Strings.trimToNull(amps.connection()),
+              DISCOVERY_CONNECTION_NAME);
+      String topic =
+          Strings.firstNonBlank(
+              amps == null ? null : Strings.trimToNull(amps.topic()),
+              DiscoveryTopics.EVENTS_CONFIG);
+      int maxRetries = amps == null || amps.maxRetries() == null ? 3 : Math.max(0, amps.maxRetries());
+      long initialBackoffMillis =
+          amps == null || amps.initialBackoffMillis() == null
+              ? 100L
+              : Math.max(1L, amps.initialBackoffMillis());
+      long maxBackoffMillis =
+          amps == null || amps.maxBackoffMillis() == null
+              ? 2_000L
+              : Math.max(initialBackoffMillis, amps.maxBackoffMillis());
+      double backoffMultiplier =
+          amps == null || amps.backoffMultiplier() == null
+              ? 2.0d
+              : amps.backoffMultiplier() <= 1.0d ? 2.0d : amps.backoffMultiplier();
+      return new ConfigUsageEventsSettings(
+          true,
+          transport,
+          connection,
+          topic,
+          maxRetries,
+          initialBackoffMillis,
+          maxBackoffMillis,
+          backoffMultiplier);
+    }
+
+    static ConfigUsageEventsSettings disabled() {
+      return new ConfigUsageEventsSettings(
+          false,
+          ConfigUsageEventsTransport.NOOP,
+          DISCOVERY_CONNECTION_NAME,
+          DiscoveryTopics.EVENTS_CONFIG,
+          0,
+          100L,
+          2_000L,
+          2.0d);
+    }
+  }
+
+  public List<ConfigSummary> list(String group) {
+    return ConfigManagerImplCrud.list(this, group);
+  }
+
+  public List<ConfigLayerLink> listLayerLinks(String group, String configId) {
+    return ConfigManagerImplCrud.listLayerLinks(this, group, configId);
+  }
+
+  public ConfigResolved resolve(String group, String configId, String layerIdOrNull) {
+    return ConfigManagerImplCrud.resolve(this, group, configId, layerIdOrNull);
+  }
+
+  public ConfigResolved resolve(
+      String group, String configId, String layerIdOrNull, Instant asOfOrNull) {
+    return ConfigManagerImplCrud.resolve(this, group, configId, layerIdOrNull, asOfOrNull);
+  }
+
+  @Override
+  public ConfigAdmin admin() {
+    ensureOpen();
+    ConfigAdmin local = configAdmin;
+    if (local != null) {
+      return local;
+    }
+    synchronized (this) {
+      local = configAdmin;
+      if (local == null) {
+        local = new ConfigAdminImpl(requiredSessionGroup(), this, this);
+        configAdmin = local;
       }
-      indexed.put(configSemanticKey(group, configSetId), configMeta.semantic());
+      return local;
     }
-    return indexed.isEmpty() ? Map.of() : Map.copyOf(indexed);
   }
 
-  private static Semantic semantic(
-      Definition definition, Map<String, Semantic> configSemanticByKey) {
-    if (definition instanceof DefinitionDataset dataset) {
-      return dataset.semantic();
-    }
-    if (definition instanceof DefinitionService service) {
-      return service.semantic();
-    }
-    if (definition instanceof DefinitionStream stream) {
-      return stream.semantic();
-    }
-    if (definition instanceof DefinitionIngest ingest) {
-      return ingest.semantic();
-    }
-    if (definition instanceof DefinitionIngestSource ingestSource) {
-      return ingestSource.semantic();
-    }
-    if (definition instanceof DefinitionSchema schema) {
-      return schema.semantic();
-    }
-    if (definition instanceof DefinitionConfigLayer config) {
-      String group = normalize(config.envelope() == null ? null : config.envelope().group());
-      String configSetId = normalizeConfigSetId(config.configId());
-      if (group != null && configSetId != null && configSemanticByKey != null) {
-        Semantic fromMeta = configSemanticByKey.get(configSemanticKey(group, configSetId));
-        if (fromMeta != null) {
-          return fromMeta;
-        }
-      }
-      return null;
-    }
-    return null;
+  @Override
+  public List<ConfigInfo> listConfigs() {
+    return ConfigManagerImplCrud.listConfigs(this);
   }
 
-  private static String configSemanticKey(String group, String configSetId) {
-    return group + "|" + configSetId;
+  @Override
+  public List<String> listLayers(String configId) {
+    return ConfigManagerImplCrud.listLayers(this, configId);
   }
 
-  private static String normalizeConfigSetId(String value) {
-    String normalized = normalize(value);
-    if (normalized == null) {
-      return null;
-    }
-    if (!normalized.startsWith("config:")) {
-      return normalized;
-    }
-    String payload = normalized.substring("config:".length());
-    String[] parts = payload.split("/");
-    if (parts.length < 2) {
-      return null;
-    }
-    return normalize(parts[1]);
+  public JsonNode resolveDeclared(String group, String configId, String layerId) {
+    return ConfigManagerImplCrud.resolveDeclared(this, group, configId, layerId);
   }
 
-  private static Semantic syntheticSemantic(AssetLifecycleNode node) {
-    String title = Strings.firstNonBlank(node == null ? null : normalize(node.name()), "asset");
-    String domain =
-        node != null && node.type() == DefinitionType.CONNECTION ? "platform" : "discovery";
-    String subdomain = node == null ? "asset" : node.type().name().toLowerCase(Locale.ROOT);
-    String group = node == null ? "platform" : Strings.firstNonBlank(normalize(node.group()), "platform");
-    return new Semantic(
-        title,
-        "Discovery asset " + (node == null ? "UNKNOWN" : node.type()) + " " + (node == null ? "" : node.assetId()),
-        "Operational discovery record for " + title,
-        domain,
-        subdomain,
-        List.of("discovery", subdomain),
-        List.of(),
-        List.of(title, subdomain),
-        new Semantic.Ownership("group:" + group, "group:" + group, "group:" + group, List.of("group:" + group)),
-        new Semantic.DataShape(
-            toSemanticType(node == null ? DefinitionType.UNKNOWN : node.type()),
-            "one record per discovery asset",
-            List.of("assetId"),
-            List.of(),
-            List.of(),
-            List.of("group", "name"),
-            List.of()),
-        new Semantic.Freshness("on-change", "PT24H", "batch"),
-        new Semantic.Trust(
-            Semantic.Certification.CANDIDATE,
-            Semantic.QualityStatus.UNKNOWN,
-            "Discovery cache",
-            "Internal platform usage"),
-        new Semantic.Usage(
-            List.of("Which assets depend on this asset?"),
-            List.of("catalog.related(\"" + (node == null ? "asset" : node.assetId()) + "\")"),
-            List.of("Use relationship traversal for lifecycle planning context."),
-            List.of("Some relationship edges may resolve to external assets.")),
-        new Semantic.ToolHints(null, true, true, 100, "PT10S", "LOW"),
-        List.of());
+  public JsonNode resolveDeclaredAt(String group, String configId, String layerId, Instant at) {
+    return ConfigManagerImplCrud.resolveDeclaredAt(this, group, configId, layerId, at);
   }
 
-  private static Semantic.Type toSemanticType(DefinitionType definitionType) {
-    return switch (definitionType) {
-      case DATASET -> Semantic.Type.DATASET;
-      case SERVICE -> Semantic.Type.SERVICE;
-      case STREAM -> Semantic.Type.STREAM;
-      case INGEST -> Semantic.Type.INGEST;
-      case INGEST_SOURCE -> Semantic.Type.INGEST_SOURCE;
-      case SCHEMA -> Semantic.Type.SCHEMA;
-      case CONFIG_LAYER -> Semantic.Type.CONFIG;
-      default -> Semantic.Type.DOCUMENT;
-    };
+  @Override
+  public ConfigLineage lineage(String configId, String layerId) {
+    return ConfigManagerImplCrud.lineage(this, configId, layerId);
   }
 
-  private static Set<String> toNormalizedSet(List<String> values) {
-    if (values == null || values.isEmpty()) {
-      return Set.of();
-    }
-    LinkedHashSet<String> normalized = new LinkedHashSet<>();
-    for (String value : values) {
-      String cleaned = normalize(value);
-      if (cleaned != null) {
-        normalized.add(cleaned);
-      }
-    }
-    return Set.copyOf(normalized);
+  @Override
+  public ConfigLineage lineageAt(String configId, String layerId, Instant at) {
+    return ConfigManagerImplCrud.lineageAt(this, configId, layerId, at);
   }
 
-  private static List<String> tokenize(String text) {
-    String normalized = normalize(text);
-    if (normalized == null) {
-      return List.of();
-    }
-    LinkedHashSet<String> tokens = new LinkedHashSet<>();
-    for (String token : normalized.toLowerCase(Locale.ROOT).split("[^a-z0-9:_./-]+")) {
-      if (!token.isBlank()) {
-        tokens.add(token);
-      }
-    }
-    if (tokens.isEmpty()) {
-      return List.of();
-    }
-    return List.copyOf(tokens);
+  @Override
+  public <T> T resolve(String configId, String layerId, ConfigDecoder<T> decoder) {
+    return ConfigManagerImplCrud.resolve(this, configId, layerId, decoder);
   }
 
-  private static void increment(Map<String, Integer> map, String value) {
-    String normalized = normalize(value);
-    if (normalized == null) {
+  @Override
+  public <T> T resolveAt(String configId, String layerId, Instant at, ConfigDecoder<T> decoder) {
+    return ConfigManagerImplCrud.resolveAt(this, configId, layerId, at, decoder);
+  }
+
+  public ConfigResolved resolveWithMetadata(String configId, String layerId) {
+    return ConfigManagerImplCrud.resolveWithMetadata(this, configId, layerId);
+  }
+
+  public ConfigResolved resolveWithMetadataAt(String configId, String layerId, Instant at) {
+    return ConfigManagerImplCrud.resolveWithMetadataAt(this, configId, layerId, at);
+  }
+
+  <T> T decode(
+      Resolution id,
+      LayerEntry layer,
+      JsonNode resolved,
+      Instant resolvedAtUtc,
+      Instant effectiveAtUtc,
+      ConfigDecoder<T> decoder) {
+    JsonNode payload = resolved == null ? NullNode.getInstance() : resolved;
+    payload = groupedPresentation(id, layer, payload, resolvedAtUtc, effectiveAtUtc);
+    try {
+      return decoder.decode(mapper, payload);
+    } catch (Exception ex) {
+      throw new IllegalArgumentException(
+          "Failed to decode payload for config "
+              + id.group()
+              + "/"
+              + id.configId()
+              + "/"
+              + id.layerId(),
+          ex);
+    }
+  }
+
+  private JsonNode groupedPresentation(
+      Resolution id,
+      LayerEntry layer,
+      JsonNode resolvedPayload,
+      Instant resolvedAtUtc,
+      Instant effectiveAtUtc) {
+    DefinitionConfigLayer definition = layer == null ? null : layer.definition();
+    DefinitionConfigLayer payload = definition;
+    String schemaKey = required(payload == null ? null : payload.schemaKey(), "schemaKey");
+    ConfigSchemaDoc schemaDoc = resolveSchemaDoc(id.group(), schemaKey);
+    ConfigPresentation.FabricMetadata fabric =
+        ConfigPresentation.fabricMetadata(
+            id.group(),
+            id.configId(),
+            id.layerId(),
+            schemaKey,
+            resolvedAtUtc,
+            effectiveAtUtc,
+            payload == null ? null : payload.effective(),
+            Strings.trimToNull(definition == null ? null : definition.configId()),
+            Strings.trimToNull(definition == null ? null : definition.effectiveConfigId()));
+    return ConfigPresentation.grouped(
+        schemaDoc, resolvedPayload, fabric, ConfigPresentation.Options.defaults());
+  }
+
+  @Override
+  public ConfigCodegen generate(
+      String configId, ConfigManager.Language language, String basePackageOrModule) {
+    return ConfigManagerImplCrud.generate(this, configId, language, basePackageOrModule);
+  }
+
+  @Override
+  public ConfigCodegen generate(
+      String configId, String layerId, ConfigManager.Language language, String basePackageOrModule) {
+    return ConfigManagerImplCrud.generate(this, configId, layerId, language, basePackageOrModule);
+  }
+
+  ConfigCodegen generateForLayer(
+      Resolution resolvedId,
+      LayerEntry layer,
+      ConfigManager.Language language,
+      String basePackageOrModule) {
+    AuditContext auditContext = captureAuditContext();
+    DefinitionConfigLayer payload = layer == null ? null : layer.definition();
+    String schemaName = required(payload == null ? null : payload.schemaKey(), "schemaName");
+    ConfigManager.Language requiredLanguage = Objects.requireNonNull(language, "language");
+    ConfigCodegen generated =
+        generateCodeZip(
+        resolvedId.group(), schemaName, requiredLanguage, Strings.trimToNull(basePackageOrModule));
+    ConfigResolved resolved =
+        resolver != null
+            ? resolver.resolve(
+                resolvedId.group(), resolvedId.configId(), resolvedId.layerId(), Instant.now())
+            : fallbackResolved(
+                resolvedId,
+                layer,
+                deepCopy(resolveDeclaredAt(layer.definition(), Instant.now())),
+                Instant.now());
+    publishAudit(
+        new ConfigEventGenerated(
+            envelope(
+                ConfigEventType.CONFIG_GENERATED,
+                resolvedId.group(),
+                resolvedId.configId(),
+                resolvedId.layerId(),
+                schemaName,
+                auditContext,
+                Instant.now()),
+            requiredLanguage.name().toLowerCase(),
+            Strings.trimToNull(basePackageOrModule),
+            generated.filename(),
+            generated.stats(),
+            resolved == null ? null : resolved.lineage()));
+    return generated;
+  }
+
+  @Override
+  public List<ConfigHistoryEntry> listHistory(
+      String group, String configId, String layerId, int limit) {
+    return ConfigManagerImplCrud.listHistory(this, group, configId, layerId, limit);
+  }
+
+  @Override
+  public ConfigSnapshot getSnapshot(
+      String group, String configId, String layerId, String snapshotConfigId) {
+    return ConfigManagerImplCrud.getSnapshot(this, group, configId, layerId, snapshotConfigId);
+  }
+
+  @Override
+  public ConfigUpdate rollback(ConfigRollbackRequest request) {
+    return ConfigManagerImplCrud.rollback(this, request);
+  }
+
+  @Override
+  public ConfigSubscription subscribe(String configId, String layerId, ConfigUpdateListener listener) {
+    return ConfigManagerImplSubscription.subscribe(this, configId, layerId, listener);
+  }
+
+  @Override
+  public ConfigAdminService.Workflow workflow() {
+    ensureOpen();
+    return workflowService;
+  }
+
+  @Override
+  public void close() {
+    if (!closed.compareAndSet(false, true)) {
       return;
     }
-    map.merge(normalized, 1, Integer::sum);
+    for (SubscriptionImpl subscription : subscriptions) {
+      try {
+        subscription.close();
+      } catch (Exception ignore) {
+      }
+    }
+    callbackExecutor.shutdownNow();
+    scheduleExecutor.shutdownNow();
+    CloseSupport.closeQuietly(auditPublisher);
   }
 
-  private static String normalize(String value) {
-    if (value == null) {
+  ConfigUpdate toUpdateAt(
+      DefinitionConfigLayer definition, ParsedLayerIdentity identity, Instant asOfUtc) {
+    return toUpdateSnapshotAt(definition, identity, asOfUtc).update();
+  }
+
+  UpdateSnapshot toUpdateSnapshotAt(
+      DefinitionConfigLayer definition, ParsedLayerIdentity identity, Instant asOfUtc) {
+    DefinitionEnvelope envelope = definition == null ? null : definition.envelope();
+    DefinitionConfigLayer payload = definition;
+    List<DefinitionConfigLayer.Effective> copiedEffective = copyEffective(payload == null ? null : payload.effective());
+    Instant resolvedAt = asOfUtc == null ? Instant.now() : asOfUtc;
+    JsonNode changedPayload =
+        definition == null ? null : deepCopy(resolveDeclaredAt(definition, resolvedAt));
+    JsonNode declared;
+    ConfigLineage lineage;
+    if (resolver != null) {
+      ConfigResolved resolvedConfig =
+          resolver.resolve(identity.group(), identity.configId(), identity.layerId(), resolvedAt);
+      declared = deepCopy(resolvedPayloadAsJsonNode(resolvedConfig.payload()));
+      lineage = resolvedConfig == null ? null : resolvedConfig.lineage();
+    } else {
+      declared = deepCopy(resolveDeclaredAt(definition, resolvedAt));
+      lineage = fallbackLineage(definition, identity.layerId(), declared);
+    }
+    return new UpdateSnapshot(
+        new ConfigUpdate(
+            identity.group(),
+            identity.configId(),
+            identity.layerId(),
+            Strings.trimToNull(payload == null ? null : payload.schemaKey()),
+            Strings.trimToNull(definition == null ? null : definition.configId()),
+            Strings.trimToNull(definition == null ? null : definition.effectiveConfigId()),
+            Strings.trimToNull(envelope == null ? null : envelope.uuid()),
+            Strings.trimToNull(envelope == null ? null : envelope.updatedTimeUtc()),
+            declared,
+            copiedEffective),
+        lineage,
+        changedPayload);
+  }
+
+  ConfigResolved fallbackResolved(
+      Resolution resolvedId, LayerEntry layer, JsonNode declared, Instant resolvedAt) {
+    if (resolvedId == null) {
       return null;
     }
-    String trimmed = value.trim();
-    return trimmed.isEmpty() ? null : trimmed;
+    DefinitionConfigLayer definition = layer == null ? null : layer.definition();
+    return new ConfigResolved(
+        resolvedId.configId(),
+        resolvedId.layerId(),
+        deepCopy(declared),
+        Strings.trimToNull(
+            definition == null || definition.envelope() == null
+                ? null
+                : definition.envelope().updatedTimeUtc()),
+        Map.of(),
+        fallbackLineage(definition, resolvedId.layerId(), declared));
   }
 
-  private static double round(double value) {
-    return Math.round(value * 100d) / 100d;
+  ConfigLineage fallbackLineage(DefinitionConfigLayer definition, String layerId, JsonNode declared) {
+    String configVersionId = Strings.trimToNull(definition == null ? null : definition.configId());
+    String payloadHash = ConfigManagerImplAudit.hashJson(HASH_MAPPER, declared);
+    return new ConfigLineage(
+        configVersionId,
+        1,
+        true,
+        configVersionId == null ? List.of() : List.of(configVersionId),
+        layerId == null ? List.of() : List.of(layerId),
+        payloadHash,
+        payloadHash,
+        HASH_VERSION);
   }
 
-  private record CatalogSnapshot(AssetLifecycleGraph graph, Map<String, AssetRecord> records) {}
+  String schemaKey(DefinitionConfigLayer definition) {
+    DefinitionConfigLayer payload = definition;
+    return Strings.trimToNull(payload == null ? null : payload.schemaKey());
+  }
 
-  private record AssetRecord(
-      AssetLifecycleNode node,
-      Definition definition,
-      Semantic semantic,
-      SemanticCompletenessClass completenessClass,
-      int completenessScore) {}
-
-  private record ScoredAsset(AssetRecord record, double score) {}
-
-  private record Score(double total) {}
-
-  private record ParsedAssetId(
-      DefinitionType type,
-      String group,
-      String name,
-      String namespace) {
-    private ParsedAssetId {
-      type = type == null ? DefinitionType.UNKNOWN : type;
-      group = normalize(group);
-      name = Strings.requireNonBlank(name, "assetId.name");
-      namespace = normalize(namespace);
+  ConfigLineage resolveLineage(String group, String configId, String layerId, Instant at) {
+    if (resolver == null
+        || Strings.isBlank(group)
+        || Strings.isBlank(configId)
+        || Strings.isBlank(layerId)
+        || at == null) {
+      return null;
+    }
+    try {
+      ConfigResolved resolved = resolver.resolve(group, configId, layerId, at);
+      return resolved == null ? null : resolved.lineage();
+    } catch (Exception ex) {
+      LOGGER.debug("[ConfigUsageAudit] resolve-lineage ignored group={} configId={} layerId={} message={}", group, configId, layerId, ex.toString());
+      return null;
     }
   }
+
+  AuditContext captureAuditContext() {
+    CallerAppContext.ContextValue caller = CallerAppContext.get().orElse(null);
+    String subject = Strings.trimToNull(UserContext.getUsernameOrDefault(null));
+    String delegatedUser =
+        ConfigManagerImplAudit.resolveDelegatedUser(UserContext.getAttributesOrEmpty());
+    String requestId = caller == null ? nextAuditRequestId() : caller.requestId();
+    return new AuditContext(
+        requestId,
+        caller == null ? null : caller.traceId(),
+        caller == null ? null : caller.callerAppSubject(),
+        subject,
+        delegatedUser);
+  }
+
+  private String nextAuditRequestId() {
+    return ConfigManagerImplAudit.nextAuditRequestId(auditRequestSequence, sessionId);
+  }
+
+  ConfigEventEnvelope envelope(
+      ConfigEventType eventType,
+      String group,
+      String configId,
+      String layerId,
+      String schemaKey,
+      AuditContext auditContext,
+      Instant eventTimeUtc) {
+    AuditContext resolved = auditContext == null ? captureAuditContext() : auditContext;
+    return new ConfigEventEnvelope(
+        ConfigEventEnvelope.SCHEMA_VERSION,
+        eventType,
+        (eventTimeUtc == null ? Instant.now() : eventTimeUtc).toString(),
+        resolved == null ? nextAuditRequestId() : resolved.requestId(),
+        resolved == null ? null : resolved.traceId(),
+        sessionId,
+        group,
+        callerAppName,
+        callerAppInstance,
+        resolved == null ? null : resolved.callerAppSubject(),
+        resolved == null ? null : resolved.subject(),
+        resolved == null ? null : resolved.delegatedUser(),
+        configId,
+        layerId,
+        schemaKey);
+  }
+
+  void publishAudit(ConfigEvent event) {
+    ConfigManagerImplAudit.publishAudit(auditPublisher, LOGGER, event);
+  }
+
+  LayerEntry requireLayer(String group, String configId, String layerId) {
+    String requiredGroup = required(group, "group");
+    String requiredconfigId = required(configId, "configId");
+    String requiredLayerId = required(layerId, "layerId");
+    List<LayerEntry> layers = findConfigLayers(requiredGroup, requiredconfigId);
+    for (LayerEntry layer : layers) {
+      if (requiredLayerId.equals(layer.identity().layerId())) {
+        return layer;
+      }
+    }
+    throw new IllegalArgumentException(
+        "layer not found for config " + requiredconfigId + ": " + requiredLayerId);
+  }
+
+  List<LayerEntry> findConfigLayers(String group, String configId) {
+    List<LayerEntry> results = findConfigLayersOrEmpty(group, configId);
+    if (results.isEmpty()) {
+      throw new IllegalArgumentException("config not found: " + configId);
+    }
+    return results;
+  }
+
+  List<LayerEntry> findConfigLayersOrEmpty(String group, String configId) {
+    List<DefinitionConfigLayer> all = configView.listConfigLayers(group);
+    List<LayerEntry> results = new ArrayList<>();
+    for (DefinitionConfigLayer definition : all) {
+      ParsedLayerIdentity identity = parseLayerIdentity(definition, group);
+      if (identity == null) {
+        LOGGER.debug("[ConfigManager][Ignored] reason=identity-parse definition={}", definition);
+        continue;
+      }
+      if (!group.equals(identity.group()) || !configId.equals(identity.configId())) {
+        continue;
+      }
+      results.add(new LayerEntry(definition, identity));
+    }
+    return List.copyOf(results);
+  }
+
+  Map<String, List<LayerEntry>> groupByConfig(String group) {
+    List<DefinitionConfigLayer> all = configView.listConfigLayers(group);
+    Map<String, List<LayerEntry>> grouped = new LinkedHashMap<>();
+    for (DefinitionConfigLayer definition : all) {
+      ParsedLayerIdentity identity = parseLayerIdentity(definition, group);
+      if (identity == null || !group.equals(identity.group())) {
+        continue;
+      }
+      grouped.computeIfAbsent(identity.configId(), ignored -> new ArrayList<>())
+          .add(new LayerEntry(definition, identity));
+    }
+    return grouped;
+  }
+
+  static LayerEntry representativeLayer(List<LayerEntry> layers) {
+    if (layers == null || layers.isEmpty()) {
+      return null;
+    }
+    for (LayerEntry layer : layers) {
+      if (LAYER_BASE.equals(layer.identity().layerId())) {
+        return layer;
+      }
+    }
+    return layers.get(0);
+  }
+
+  static List<LayerEntry> sortLayers(List<LayerEntry> layers) {
+    List<LayerEntry> sorted = new ArrayList<>(layers == null ? List.of() : layers);
+    sorted.sort(
+        Comparator.comparing((LayerEntry entry) -> !LAYER_BASE.equals(entry.identity().layerId()))
+            .thenComparing(entry -> entry.identity().layerId(), Comparator.nullsLast(String::compareTo)));
+    return List.copyOf(sorted);
+  }
+
+  JsonNode resolveLiveDeclared(DefinitionConfigLayer definition) {
+    DefinitionConfigLayer payload = definition;
+    JsonNode declared = payload == null ? null : payload.declared();
+    if (declared == null || !declared.isObject()) {
+      throw new IllegalStateException("declared payload must be a JSON object");
+    }
+    return declared.deepCopy();
+  }
+
+  JsonNode resolveDeclaredAt(DefinitionConfigLayer definition, Instant at) {
+    JsonNode liveDeclared = resolveLiveDeclared(definition);
+    DefinitionConfigLayer payload = definition;
+    List<DefinitionConfigLayer.Effective> effectiveEntries = payload == null ? null : payload.effective();
+    if (effectiveEntries == null || effectiveEntries.isEmpty()) {
+      return liveDeclared;
+    }
+    List<TimedEffective> sorted = new ArrayList<>(effectiveEntries.size());
+    for (DefinitionConfigLayer.Effective entry : effectiveEntries) {
+      if (entry == null || Strings.trimToNull(entry.effectiveTimeUtc()) == null) {
+        continue;
+      }
+      JsonNode declared = entry.declared();
+      if (declared == null || !declared.isObject()) {
+        throw new IllegalStateException("effective declared payload must be a JSON object");
+      }
+      Instant expiresAt = null;
+      if (Strings.trimToNull(entry.expiresAtUtc()) != null) {
+        try {
+          expiresAt = Instant.parse(entry.expiresAtUtc());
+        } catch (Exception ex) {
+          throw new IllegalStateException("invalid expiresAtUtc: " + entry.expiresAtUtc(), ex);
+        }
+      }
+      Instant effectiveAt;
+      try {
+        effectiveAt = Instant.parse(entry.effectiveTimeUtc());
+      } catch (Exception ex) {
+        throw new IllegalStateException("invalid effectiveTimeUtc: " + entry.effectiveTimeUtc(), ex);
+      }
+      if (expiresAt != null && !expiresAt.isAfter(effectiveAt)) {
+        continue;
+      }
+      sorted.add(new TimedEffective(effectiveAt, expiresAt, entry));
+    }
+    sorted.sort(Comparator.comparing(TimedEffective::effectiveTime));
+    DefinitionConfigLayer.Effective winner = null;
+    for (TimedEffective timed : sorted) {
+      if (timed.effectiveTime().isAfter(at)) {
+        break;
+      }
+      if (timed.expiresAt() != null && !at.isBefore(timed.expiresAt())) {
+        continue;
+      }
+      winner = timed.entry();
+    }
+    if (winner == null) {
+      return liveDeclared;
+    }
+    return winner.declared().deepCopy();
+  }
+
+  List<DefinitionConfigLayer.Effective> copyEffective(List<DefinitionConfigLayer.Effective> values) {
+    if (values == null || values.isEmpty()) {
+      return List.of();
+    }
+    List<DefinitionConfigLayer.Effective> copied = new ArrayList<>(values.size());
+    for (DefinitionConfigLayer.Effective value : values) {
+      if (value == null) {
+        continue;
+      }
+      copied.add(
+          new DefinitionConfigLayer.Effective(
+              value.effectiveTimeUtc(), value.expiresAtUtc(), deepCopy(value.declared())));
+    }
+    return List.copyOf(copied);
+  }
+
+  static List<DefinitionConfigLayer.Effective> upsertScheduledEffective(
+      List<DefinitionConfigLayer.Effective> baseline,
+      Instant effectiveAt,
+      Instant expiresAt,
+      JsonNode declaredPayload) {
+    String effectiveUtc = effectiveAt.toString();
+    String expiresUtc = expiresAt == null ? null : expiresAt.toString();
+    List<DefinitionConfigLayer.Effective> rewritten = new ArrayList<>();
+    if (baseline != null) {
+      for (DefinitionConfigLayer.Effective entry : baseline) {
+        if (entry == null) {
+          continue;
+        }
+        if (!effectiveUtc.equals(entry.effectiveTimeUtc())) {
+          rewritten.add(entry);
+        }
+      }
+    }
+    rewritten.add(new DefinitionConfigLayer.Effective(effectiveUtc, expiresUtc, declaredPayload.deepCopy()));
+    rewritten.sort(Comparator.comparing(entry -> Instant.parse(entry.effectiveTimeUtc())));
+    return List.copyOf(rewritten);
+  }
+
+  static DefinitionConfigLayer.History findHistorySnapshot(
+      List<DefinitionConfigLayer.History> history, String configId) {
+    if (history == null || history.isEmpty() || configId == null) {
+      return null;
+    }
+    for (DefinitionConfigLayer.History snapshot : history) {
+      if (snapshot == null) {
+        continue;
+      }
+      if (configId.equals(Strings.trimToNull(snapshot.configId()))) {
+        return snapshot;
+      }
+    }
+    return null;
+  }
+
+  static List<String> topLevelKeys(JsonNode declared) {
+    if (declared == null || !declared.isObject()) {
+      return List.of();
+    }
+    List<String> keys = new ArrayList<>();
+    declared.fieldNames().forEachRemaining(keys::add);
+    keys.sort(String::compareTo);
+    return List.copyOf(keys);
+  }
+
+  ParsedLayerIdentity parseLayerIdentity(DefinitionConfigLayer definition, String fallbackGroup) {
+    if (definition == null) {
+      return null;
+    }
+    DefinitionEnvelope envelope = definition.envelope();
+    String group = Strings.trimToNull(envelope == null ? null : envelope.group());
+    if (group == null) {
+      group = Strings.trimToNull(fallbackGroup);
+    }
+
+    String resourceId = Strings.trimToNull(definition.resourceId());
+    if (resourceId != null) {
+      try {
+        CanonicalIds.ParsedId parsed = CanonicalIds.parse(resourceId);
+        if ("config".equals(parsed.type())) {
+          String parsedGroup = Strings.trimToNull(parsed.group());
+          if (parsedGroup != null) {
+            group = parsedGroup;
+          }
+          String configId = Strings.trimToNull(parsed.namespace());
+          String layerId = Strings.trimToNull(parsed.name());
+          if (group != null && configId != null && layerId != null) {
+            return new ParsedLayerIdentity(group, configId, layerId, resourceId);
+          }
+        }
+      } catch (RuntimeException ex) {
+        LOGGER.debug("[ConfigManager][Ignored] reason=invalid-resource-id value={}", resourceId);
+      }
+    }
+    return null;
+  }
+
+  JsonNode deepCopy(JsonNode value) {
+    return value == null ? null : value.deepCopy();
+  }
+
+  JsonNode redactSensitiveAuditPayload(JsonNode payload) {
+    return ConfigManagerImplAudit.redactSensitiveAuditPayload(mapper, payload);
+  }
+
+  JsonNode resolvedPayloadAsJsonNode(Object payload) {
+    return ConfigManagerImplAudit.resolvedPayloadAsJsonNode(mapper, payload);
+  }
+
+  void ensureOpen() {
+    if (closed.get()) {
+      throw new IllegalStateException("ConfigManager is closed");
+    }
+  }
+
+  Resolution resolveId(String configId, String layerId) {
+    String group = requiredSessionGroup();
+    String requiredConfigId = required(configId, "configId");
+    String requiredLayerId = required(layerId, "layerId");
+    return new Resolution(group, requiredConfigId, requiredLayerId);
+  }
+
+  String requiredSessionGroup() {
+    String group = Strings.trimToNull(defaultGroup);
+    if (group == null) {
+      throw new IllegalStateException("Session group is required");
+    }
+    return group;
+  }
+
+  ConfigResolver resolver() {
+    if (resolver == null) {
+      throw new IllegalStateException("Config resolver is unavailable");
+    }
+    return resolver;
+  }
+
+  static String required(String value, String field) {
+    String normalized = Strings.trimToNull(value);
+    if (normalized == null) {
+      throw new IllegalArgumentException(field + " is required");
+    }
+    return normalized;
+  }
+
+  private static ExecutorService newExecutor() {
+    return Executors.newSingleThreadExecutor(
+        runnable -> {
+          Thread thread = new Thread(runnable, "config-client-" + EXECUTOR_ID.incrementAndGet());
+          thread.setDaemon(true);
+          return thread;
+        });
+  }
+
+  private static ScheduledExecutorService newScheduler() {
+    return Executors.newSingleThreadScheduledExecutor(
+        runnable -> {
+          Thread thread =
+              new Thread(runnable, "config-client-scheduler-" + SCHEDULER_ID.incrementAndGet());
+          thread.setDaemon(true);
+          return thread;
+        });
+  }
+
+  ConfigCodegen generateCodeZip(
+      String group,
+      String schemaName,
+      ConfigManager.Language language,
+      String basePackageOrModule) {
+    ensureOpen();
+    String requiredGroup = required(group, "group");
+    String requiredSchemaName = required(schemaName, "schemaName");
+    ConfigSchemaDoc schemaDoc = resolveSchemaDoc(requiredGroup, requiredSchemaName);
+    return codegenService.generate(
+        schemaDoc,
+        requiredGroup,
+        requiredSchemaName,
+        Objects.requireNonNull(language, "language"),
+        Strings.trimToNull(basePackageOrModule));
+  }
+
+  ConfigSchemaDoc resolveSchemaDoc(String group, String schemaName) {
+    String requiredGroup = required(group, "group");
+    String requiredSchemaName = required(schemaName, "schemaName");
+    Definition schemaDefinition = configView.get(DefinitionType.SCHEMA, requiredGroup, requiredSchemaName);
+    if (!(schemaDefinition instanceof DefinitionSchema resolved)) {
+      throw new IllegalArgumentException(
+          "schema not found for group='" + requiredGroup + "' name='" + requiredSchemaName + "'");
+    }
+    String schemaJson = Strings.trimToNull(resolved.schema());
+    if (schemaJson == null) {
+      throw new IllegalStateException("schema text is required");
+    }
+    return ConfigSchemaCodec.parse(schemaJson);
+  }
+
+  interface ConfigView {
+    List<DefinitionConfigLayer> listConfigLayers(String group);
+
+    Definition get(DefinitionType type, String group, String name);
+
+    void upsert(Definition definition);
+
+    AutoCloseable onUpsert(
+        DefinitionType type, BiConsumer<DiscoveryCache.ConfigKey, Definition> listener);
+  }
+
+  private static final class ConfigCacheView implements ConfigView {
+    private final DiscoveryCache cache;
+
+    private ConfigCacheView(DiscoveryCache cache) {
+      this.cache = Objects.requireNonNull(cache, "cache");
+    }
+
+    @Override
+    public List<DefinitionConfigLayer> listConfigLayers(String group) {
+      return cache.list(DefinitionConfigLayer.class, group);
+    }
+
+    @Override
+    public Definition get(DefinitionType type, String group, String name) {
+      return cache.get(type, group, name);
+    }
+
+    @Override
+    public void upsert(Definition definition) {
+      cache.upsert(definition);
+    }
+
+    @Override
+    public AutoCloseable onUpsert(
+        DefinitionType type, BiConsumer<DiscoveryCache.ConfigKey, Definition> listener) {
+      return cache.registerListener(type, listener);
+    }
+  }
+
+  static final class SubscriptionImpl implements ConfigSubscription {
+    final ConfigManagerImpl manager;
+    final String subscriptionId;
+    final String group;
+    final String configId;
+    final String layerId;
+    final ConfigUpdateListener listener;
+    final AuditContext auditContext;
+    final AtomicLong callbackCount = new AtomicLong(0L);
+    final AtomicBoolean closed = new AtomicBoolean(false);
+    final ConcurrentHashMap<String, String> lastSeenByLayer = new ConcurrentHashMap<>();
+    final ConcurrentHashMap<String, CopyOnWriteArrayList<ScheduledFuture<?>>> scheduledByLayer =
+        new ConcurrentHashMap<>();
+    volatile AutoCloseable cacheHandle;
+
+    SubscriptionImpl(
+        ConfigManagerImpl manager,
+        String subscriptionId,
+        String group,
+        String configId,
+        String layerId,
+        ConfigUpdateListener listener,
+        AuditContext auditContext) {
+      this.manager = Objects.requireNonNull(manager, "manager");
+      this.subscriptionId = Strings.requireNonBlank(subscriptionId, "subscriptionId");
+      this.group = group;
+      this.configId = configId;
+      this.layerId = layerId;
+      this.listener = listener;
+      this.auditContext = auditContext;
+    }
+
+    @Override
+    public void close() {
+      ConfigManagerImplSubscription.closeSubscription(this);
+    }
+
+    void addScheduled(String layer, ScheduledFuture<?> future) {
+      if (future == null) {
+        return;
+      }
+      String key = required(layer, "layerId");
+      if (closed.get()) {
+        future.cancel(false);
+        return;
+      }
+      scheduledByLayer.computeIfAbsent(key, ignored -> new CopyOnWriteArrayList<>()).add(future);
+    }
+
+    void cancelScheduled(String layer) {
+      if (layer == null) {
+        return;
+      }
+      CopyOnWriteArrayList<ScheduledFuture<?>> futures = scheduledByLayer.remove(layer);
+      if (futures == null) {
+        return;
+      }
+      for (ScheduledFuture<?> future : futures) {
+        if (future != null) {
+          future.cancel(false);
+        }
+      }
+    }
+
+    void pruneScheduled(String layer) {
+      if (layer == null) {
+        return;
+      }
+      CopyOnWriteArrayList<ScheduledFuture<?>> futures = scheduledByLayer.get(layer);
+      if (futures == null) {
+        return;
+      }
+      futures.removeIf(future -> future == null || future.isDone() || future.isCancelled());
+      if (futures.isEmpty()) {
+        scheduledByLayer.remove(layer, futures);
+      }
+    }
+  }
+
+  record ParsedLayerIdentity(String group, String configId, String layerId, String resourceId) {}
+
+  record LayerEntry(DefinitionConfigLayer definition, ParsedLayerIdentity identity) {}
+
+  record Resolution(String group, String configId, String layerId) {}
+
+  record UpdateSnapshot(ConfigUpdate update, ConfigLineage lineage, JsonNode changedPayload) {}
+
+  record AuditContext(
+      String requestId, String traceId, String callerAppSubject, String subject, String delegatedUser) {}
+
+  record TimedEffective(
+      Instant effectiveTime, Instant expiresAt, DefinitionConfigLayer.Effective entry) {}
 }
+
+
+
+
+
+
+
+
+
+
 
 
