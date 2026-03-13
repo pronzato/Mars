@@ -1,599 +1,609 @@
-package org.pronzato.fabric.api.services.flight.streaming;
+package org.pronzato.fabric.api.connectors.amps;
 
-import java.nio.ByteBuffer;
-import java.time.Instant;
+import com.crankuptheamps.client.Command;
+import com.crankuptheamps.client.CommandId;
+import com.crankuptheamps.client.HAClient;
+import com.crankuptheamps.client.Message;
+import com.crankuptheamps.client.MessageStream;
+import com.crankuptheamps.client.fields.Field;
+import java.util.Arrays;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
-import org.apache.arrow.flight.CallStatus;
-import org.apache.arrow.flight.FlightProducer;
-import org.apache.arrow.flight.FlightRuntimeException;
-import org.apache.arrow.flight.Ticket;
-import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.vector.VectorLoader;
-import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.VectorUnloader;
-import org.apache.arrow.vector.ipc.ArrowStreamReader;
-import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
-import org.apache.arrow.vector.types.pojo.Schema;
-import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
-import org.pronzato.fabric.api.data.checkpoints.CheckpointKey;
-import org.pronzato.fabric.api.data.checkpoints.CheckpointRecord;
-import org.pronzato.fabric.api.data.checkpoints.CheckpointStore;
-import org.pronzato.fabric.api.data.checkpoints.CheckpointType;
-import org.pronzato.fabric.api.util.Bytes;
-import org.pronzato.fabric.api.data.TabularManager;
-import org.pronzato.fabric.api.data.dataset.DatasetId;
-import org.pronzato.fabric.api.data.manager.DuckdbActiveChangeLog;
-import org.pronzato.fabric.api.data.manager.RowManagerImpl;
-import org.pronzato.fabric.api.data.manager.TabularManagerImpl;
-import org.pronzato.fabric.api.data.duckdb.DuckdbNotifier;
-import org.pronzato.fabric.api.control.entitlements.core.data.DataEntitlements;
-import org.pronzato.fabric.api.control.entitlements.core.services.ServiceEntitlements;
-import org.pronzato.fabric.api.control.security.headers.FabricRequestHeaders;
-import org.pronzato.fabric.api.control.security.identity.RequestIdentity;
-import org.pronzato.fabric.api.services.flight.FlightDatasetStreamTicket;
-import org.pronzato.fabric.api.services.flight.FlightDatasetStreamTicketCodec;
-import org.pronzato.fabric.api.services.flight.StreamFilterSqlValidator;
+import java.util.function.Consumer;
 import org.pronzato.fabric.api.util.Strings;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
-public final class FlightDatasetStreamProducer {
-  private static final Logger LOGGER = LoggerFactory.getLogger(FlightDatasetStreamProducer.class);
-  private static final long IPC_READ_ALLOCATOR_BYTES = 64L * 1024L * 1024L;
-  private static final String OPERATION_DATASET_STREAM_SUBSCRIBE = "flight.dataset.stream.subscribe";
-  private static final long STREAM_QUEUE_POLL_MILLIS = 100L;
-  private static volatile DiagnosticsHook diagnosticsHook = DiagnosticsHook.NO_OP;
+public final class AmpsConnection implements AutoCloseable {
+  public static final char SOH = '\u0001';
+  public static final int DEFAULT_BATCH_MAX_MESSAGES = 100;
+  public static final int DEFAULT_BATCH_MAX_BYTES = 1_000_000;
+  public static final long DEFAULT_BATCH_FLUSH_MILLIS = 1_000L;
 
-  private final TabularManager tabularManager;
-  private final ServiceEntitlements serviceEntitlements;
-  private final String serviceResourceId;
-  private final DiscoveryCache discoveryCache;
-  private final CheckpointStore checkpointStore;
-  private final DuckdbNotifier changeNotifier;
-  private final RootAllocator ipcReadAllocator = new RootAllocator(IPC_READ_ALLOCATOR_BYTES);
-  private final DatasetStreamHubRegistry hubRegistry;
-  private final ArrowBatchPublisher batchPublisher;
-  private final Set<DatasetId> allowedDatasetIds;
+  private final HAClient client;
+  private final CloseHandler closeHandler;
 
-  public FlightDatasetStreamProducer(
-      TabularManager tabularManager,
-      ServiceEntitlements serviceEntitlements,
-      String serviceResourceId,
-      DiscoveryCache discoveryCache,
-      CheckpointStore checkpointStore,
-      DuckdbNotifier changeNotifier) {
-    this(
-        tabularManager,
-        serviceEntitlements,
-        serviceResourceId,
-        discoveryCache,
-        checkpointStore,
-        changeNotifier,
-        Set.of());
+  private AmpsConnection(HAClient client, CloseHandler closeHandler) {
+    this.client = Objects.requireNonNull(client, "client");
+    this.closeHandler = closeHandler == null ? CloseHandler.NOOP : closeHandler;
   }
 
-  public FlightDatasetStreamProducer(
-      TabularManager tabularManager,
-      ServiceEntitlements serviceEntitlements,
-      String serviceResourceId,
-      DiscoveryCache discoveryCache,
-      CheckpointStore checkpointStore,
-      DuckdbNotifier changeNotifier,
-      Set<DatasetId> allowedDatasetIds) {
-    this(
-        tabularManager,
-        serviceEntitlements,
-        serviceResourceId,
-        discoveryCache,
-        checkpointStore,
-        changeNotifier,
-        allowedDatasetIds,
-        new DatasetStreamHubRegistry());
+  public static AmpsConnection shared(HAClient client) {
+    return new AmpsConnection(client, CloseHandler.NOOP);
   }
 
-  FlightDatasetStreamProducer(
-      TabularManager tabularManager,
-      ServiceEntitlements serviceEntitlements,
-      String serviceResourceId,
-      DiscoveryCache discoveryCache,
-      CheckpointStore checkpointStore,
-      DuckdbNotifier changeNotifier,
-      Set<DatasetId> allowedDatasetIds,
-      DatasetStreamHubRegistry hubRegistry) {
-    this.tabularManager = Objects.requireNonNull(tabularManager, "tabularManager");
-    this.serviceEntitlements = Objects.requireNonNull(serviceEntitlements, "serviceEntitlements");
-    this.serviceResourceId = Objects.requireNonNull(serviceResourceId, "serviceResourceId");
-    this.discoveryCache = discoveryCache;
-    this.checkpointStore = Objects.requireNonNull(checkpointStore, "checkpointStore");
-    this.changeNotifier = Objects.requireNonNull(changeNotifier, "changeNotifier");
-    this.allowedDatasetIds =
-        allowedDatasetIds == null || allowedDatasetIds.isEmpty()
-            ? Set.of()
-            : Set.copyOf(allowedDatasetIds);
-    this.hubRegistry = Objects.requireNonNull(hubRegistry, "hubRegistry");
-    this.batchPublisher = new ArrowBatchPublisher(this.tabularManager);
+  public static AmpsConnection wrap(HAClient client) {
+    return new AmpsConnection(client, CloseHandler.CLOSE_CLIENT);
   }
 
-  public void start(
-      RequestIdentity identity,
-      Ticket ticket,
-      FlightProducer.ServerStreamListener listener,
-      Runnable onCancel) {
-    start(identity, null, ticket, listener, onCancel);
+  public HAClient client() {
+    return client;
   }
 
-  public void start(
-      RequestIdentity identity,
-      FabricRequestHeaders requestHeaders,
-      Ticket ticket,
-      FlightProducer.ServerStreamListener listener,
-      Runnable onCancel) {
-    FlightDatasetStreamTicket streamTicket;
-    try {
-      streamTicket = FlightDatasetStreamTicketCodec.decode(ticket);
-    } catch (Exception ex) {
-      throw CallStatus.INVALID_ARGUMENT
-          .withDescription("Invalid dataset stream ticket: " + ex.getMessage())
-          .withCause(ex)
-          .toRuntimeException();
+  public void publish(String topic, String payload) throws Exception {
+    client.publish(topic, payload);
+  }
+
+  public void publish(String topic, String payload, long ttlMillis) throws Exception {
+    client.publish(topic, payload, Math.toIntExact(ttlMillis));
+  }
+
+  public void publish(String topic, Map<String, Object> fields) throws Exception {
+    client.publish(topic, encodeNvfix(fields));
+  }
+
+  public void publish(String topic, Map<String, Object> fields, long ttlMillis) throws Exception {
+    client.publish(topic, encodeNvfix(fields), Math.toIntExact(ttlMillis));
+  }
+
+  public void publish(String topic, byte[] payload) throws Exception {
+    publish(topic, payload, null);
+  }
+
+  public void publish(String topic, String payload, String options) throws Exception {
+    String normalizedTopic = Strings.requireNonBlank(topic, "topic");
+    String normalizedPayload = payload == null ? "" : payload;
+    String normalizedOptions = Strings.trimToNull(options);
+    if (normalizedOptions == null) {
+      client.publish(normalizedTopic, normalizedPayload);
+      return;
     }
-    runDatasetStream(identity, requestHeaders, streamTicket, listener, onCancel);
+    Command command = new Command(Message.Command.Publish);
+    command.setTopic(normalizedTopic);
+    command.setOptions(normalizedOptions);
+    command.setData(normalizedPayload);
+    try (MessageStream ignored = client.execute(command)) {
+      // sync-ack publish path
+    }
   }
 
+  public void publish(String topic, byte[] payload, String options) throws Exception {
+    String normalizedTopic = Strings.requireNonBlank(topic, "topic");
+    byte[] bytes = payload == null ? new byte[0] : payload;
+    String normalizedOptions = Strings.trimToNull(options);
+    if (normalizedOptions == null) {
+      client.publish(
+          normalizedTopic.getBytes(StandardCharsets.UTF_8),
+          0,
+          normalizedTopic.getBytes(StandardCharsets.UTF_8).length,
+          bytes,
+          0,
+          bytes.length);
+      return;
+    }
+    Command command = new Command(Message.Command.Publish);
+    command.setTopic(normalizedTopic);
+    command.setOptions(normalizedOptions);
+    command.setData(bytes, 0, bytes.length);
+    try (MessageStream ignored = client.execute(command)) {
+      // sync-ack publish path
+    }
+  }
+
+  public Subscription sowAndSubscribe(SubscriptionSpec spec, SubscriptionListener listener)
+      throws Exception {
+    return subscribe(spec, listener);
+  }
+
+  public Subscription subscribe(SubscriptionSpec spec, SubscriptionListener listener)
+      throws Exception {
+    Objects.requireNonNull(spec, "spec");
+    int commandType =
+        spec.sowOnly()
+            ? Message.Command.SOW
+            : spec.sow() ? Message.Command.SOWAndSubscribe : Message.Command.Subscribe;
+    String bookmark = spec.sowOnly() ? null : spec.bookmarkStart();
+    return subscribeInternal(
+        commandType, spec.topic(), spec.options(), spec.filter(), bookmark, spec.bookmarkFile(), listener);
+  }
+
+  public Subscription subscribe(SubscriptionSpec spec, Consumer<AmpsMessage> consumer)
+      throws Exception {
+    Objects.requireNonNull(consumer, "consumer");
+    return subscribe(spec, (SubscriptionListener) consumer::accept);
+  }
+
+  public Subscription sowAndSubscribe(
+      String topic, String options, String filter, SubscriptionListener listener) throws Exception {
+    return subscribeInternal(
+        Message.Command.SOWAndSubscribe, topic, options, filter, null, null, listener);
+  }
+
+  public Subscription subscribe(
+      String topic, String options, String filter, SubscriptionListener listener) throws Exception {
+    return subscribeInternal(Message.Command.Subscribe, topic, options, filter, null, null, listener);
+  }
+
+  @Override
   public void close() {
-    hubRegistry.closeAll();
     try {
-      ipcReadAllocator.close();
+      closeHandler.close(client);
     } catch (Exception ignore) {
     }
   }
 
-  public static void setDiagnosticsHookForTests(DiagnosticsHook hook) {
-    diagnosticsHook = hook == null ? DiagnosticsHook.NO_OP : hook;
+  public static String ensureTrailingNewline(String s) {
+    Objects.requireNonNull(s, "s");
+    return s.endsWith("\n") ? s : s + '\n';
   }
 
-  private void runDatasetStream(
-      RequestIdentity identity,
-      FabricRequestHeaders requestHeaders,
-      FlightDatasetStreamTicket streamTicket,
-      FlightProducer.ServerStreamListener listener,
-      Runnable onCancel) {
-    DatasetId datasetId = streamTicket.datasetId();
-    authorizeInvoke(identity.effectiveUserSubject(), OPERATION_DATASET_STREAM_SUBSCRIBE, datasetId.toString());
-    DatasetStreamSpec streamSpec = resolveStreamSpec(datasetId, streamTicket.accessMode());
-    installDatasetIfPresent(datasetId);
-    RowManagerImpl rowManager = localRowManager();
-    if (!streamSpec.isPublic()) {
-      requireDatasetReadAccess(rowManager, identity, datasetId);
+  private static String encodeNvfix(Map<String, Object> fields) {
+    if (fields == null || fields.isEmpty()) {
+      throw new IllegalArgumentException("fields is required");
     }
-    String filterSql = validateStreamFilterSql(streamTicket.filterSql());
-    CheckpointKey checkpointKey = streamCheckpointKey(streamTicket, identity, datasetId, streamSpec.accessMode());
-    long startSeq = resolveStartSequence(rowManager, streamTicket, checkpointKey, datasetId);
-    StreamSubscriptionContext subscriptionContext =
-        new StreamSubscriptionContext(
-            datasetId,
-            streamSpec.accessMode(),
-            streamSpec.isPublic() ? null : identity.effectiveUserSubject(),
-            identity.callerAppSubject(),
-            requestHeaders == null ? null : requestHeaders.requestMetadata(),
-            streamTicket.subscriptionId(),
-            streamTicket.start(),
-            startSeq,
-            streamTicket.batchMaxRows(),
-            streamTicket.flushMillis(),
-            filterSql,
-            streamSpec.isPublic() ? null : identity);
+    StringBuilder builder = new StringBuilder();
+    for (Map.Entry<String, Object> entry : new LinkedHashMap<>(fields).entrySet()) {
+      String key = Strings.trimToNull(entry.getKey());
+      if (key == null) {
+        throw new IllegalArgumentException("nvfix key is required");
+      }
+      if (key.indexOf('=') >= 0) {
+        throw new IllegalArgumentException("nvfix key contains '=': " + key);
+      }
+      if (key.indexOf(SOH) >= 0) {
+        throw new IllegalArgumentException("nvfix key contains SOH: " + key);
+      }
+      Object rawValue = entry.getValue();
+      if (rawValue == null) {
+        continue;
+      }
+      String rendered = String.valueOf(rawValue);
+      if (rendered.indexOf(SOH) >= 0) {
+        throw new IllegalArgumentException("nvfix value contains SOH for key: " + key);
+      }
+      builder.append(key).append('=').append(rendered).append(SOH);
+    }
+    if (builder.isEmpty()) {
+      throw new IllegalArgumentException("fields must contain at least one non-null value");
+    }
+    return builder.toString();
+  }
 
-    ByteBuffer schemaIpc = batchPublisher.querySchemaIpc(subscriptionContext);
-    Schema schema = inspectIpc(schemaIpc).schema();
-    DatasetStreamHub hub =
-        hubRegistry.getOrCreate(
-            datasetId,
-            () ->
-                new DatasetStreamHub(
-                    datasetId,
-                    streamSpec.accessMode(),
-                    streamSpec.primaryKeyColumns(),
-                    rowManager,
-                    changeNotifier,
-                    batchPublisher,
-                    hubRegistry));
-    long lastSeq = startSeq;
+  private Subscription subscribeInternal(
+      int commandType,
+      String topic,
+      String options,
+      String filter,
+      String bookmarkStart,
+      Path bookmarkFile,
+      SubscriptionListener listener)
+      throws Exception {
+    Objects.requireNonNull(listener, "listener");
+    String normalizedTopic = Strings.requireNonBlank(topic, "topic");
+    Command command = new Command(commandType);
+    command.setTopic(normalizedTopic);
+    String normalizedOptions = Strings.trimToNull(options);
+    if (normalizedOptions != null) {
+      command.setOptions(normalizedOptions);
+    }
+    String normalizedFilter = Strings.trimToNull(filter);
+    if (normalizedFilter != null) {
+      command.setFilter(normalizedFilter);
+    }
+    String normalizedBookmark = Strings.trimToNull(bookmarkStart);
+    if (normalizedBookmark != null) {
+      command.setBookmark(normalizedBookmark);
+    }
+    CommandId commandId =
+        client.executeAsync(
+            command,
+            message -> {
+              if (message == null) {
+                return;
+              }
+              listener.onMessage(new AmpsMessage(message));
+            });
+    return new Subscription(
+        client, commandId, commandType, normalizedTopic, normalizedOptions, normalizedFilter);
+  }
 
-    try (DatasetStreamHub.SubscriberHandle handle = hub.addSubscriber(subscriptionContext);
-        VectorSchemaRoot outputRoot = VectorSchemaRoot.create(schema, ipcReadAllocator)) {
-      VectorLoader loader = new VectorLoader(outputRoot);
-      listener.start(outputRoot);
-      while (!listener.isCancelled() && !Thread.currentThread().isInterrupted()) {
-        diagnosticsHook.onAwait();
-        DatasetStreamHub.Delivery delivery = handle.poll(STREAM_QUEUE_POLL_MILLIS);
-        if (delivery == null) {
-          continue;
+  public static final class Subscription implements AutoCloseable {
+    private final HAClient client;
+    private final CommandId commandId;
+    private final int commandType;
+    private final String topic;
+    private final String options;
+    private volatile String filter;
+    private volatile boolean closed;
+
+    private Subscription(
+        HAClient client,
+        CommandId commandId,
+        int commandType,
+        String topic,
+        String options,
+        String filter) {
+      this.client = client;
+      this.commandId = commandId;
+      this.commandType = commandType;
+      this.topic = topic;
+      this.options = options;
+      this.filter = filter;
+    }
+
+    @Override
+    public void close() {
+      closed = true;
+      if (client == null || commandId == null) {
+        return;
+      }
+      try {
+        client.unsubscribe(commandId);
+      } catch (Exception ignore) {
+      }
+      try {
+        client.removeMessageHandler(commandId);
+      } catch (Exception ignore) {
+      }
+    }
+
+    public void replaceFilter(String nextFilter) throws Exception {
+      if (client == null || commandId == null) {
+        throw new IllegalStateException("Subscription handle is invalid");
+      }
+      if (closed) {
+        throw new IllegalStateException("Subscription is closed");
+      }
+      if (!isReplaceSupported(commandType)) {
+        throw new IllegalStateException(
+            "Subscription replacement is unsupported for command type=" + commandType);
+      }
+      Command command = new Command(commandType);
+      command.setTopic(topic);
+      String replaceOptions = withReplaceOption(options);
+      if (replaceOptions != null) {
+        command.setOptions(replaceOptions);
+      }
+      String normalizedFilter = Strings.trimToNull(nextFilter);
+      if (normalizedFilter != null) {
+        command.setFilter(normalizedFilter);
+      }
+      command.setSubId(commandId);
+      client.executeAsync(command, null);
+      filter = normalizedFilter;
+    }
+
+    private static boolean isReplaceSupported(int commandType) {
+      return commandType == Message.Command.Subscribe
+          || commandType == Message.Command.SOWAndSubscribe
+          || commandType == Message.Command.DeltaSubscribe
+          || commandType == Message.Command.SOWAndDeltaSubscribe;
+    }
+
+    private static String withReplaceOption(String options) {
+      LinkedHashSet<String> normalized = new LinkedHashSet<>();
+      String source = Strings.trimToNull(options);
+      if (source != null) {
+        for (String token : source.split(",")) {
+          String trimmed = Strings.trimToNull(token);
+          if (trimmed != null) {
+            normalized.add(trimmed);
+          }
         }
-        if (delivery.failure() != null) {
-          throw mapStreamFailure(
-              delivery.failure(), identity.effectiveUserSubject(), datasetId, streamSpec.isPublic());
-        }
-        lastSeq = Math.max(lastSeq, delivery.lastSeq());
-        saveCheckpoint(checkpointKey, lastSeq);
-        if (delivery.terminal()) {
+      }
+      boolean hasReplace = false;
+      for (String token : normalized) {
+        if ("replace".equalsIgnoreCase(token)) {
+          hasReplace = true;
           break;
         }
-        if (delivery.ipc() != null && delivery.ipc().hasRemaining()) {
-          diagnosticsHook.onReadChanges();
-          streamBatchToListener(delivery.ipc(), loader, listener);
-        }
       }
-      saveCheckpoint(checkpointKey, lastSeq);
-      if (!listener.isCancelled()) {
-        listener.completed();
+      if (!hasReplace) {
+        normalized.add("replace");
       }
-      if (listener.isCancelled() && onCancel != null) {
-        onCancel.run();
+      if (normalized.isEmpty()) {
+        return null;
       }
-    } catch (InterruptedException ex) {
-      Thread.currentThread().interrupt();
-    } catch (FlightRuntimeException ex) {
-      throw ex;
-    } catch (RuntimeException ex) {
-      throw mapStreamFailure(ex, identity.effectiveUserSubject(), datasetId, streamSpec.isPublic());
-    } catch (Exception ex) {
-      throw CallStatus.INTERNAL
-          .withDescription("Dataset stream failed: " + ex.getMessage())
-          .withCause(ex)
-          .toRuntimeException();
-    } finally {
-      saveCheckpoint(checkpointKey, lastSeq);
+      return String.join(",", normalized);
     }
   }
-
-  private DatasetStreamSpec resolveStreamSpec(DatasetId datasetId, String requestedAccessMode) {
-    Optional<DefinitionDataset> definition =
-        discoveryCache == null
-            ? Optional.empty()
-            : discoveryCache.get(
-                DefinitionDataset.class,
-                datasetId.group(),
-                datasetId.namespace() + "/" + datasetId.name());
-    if (definition.isEmpty()) {
-      throw CallStatus.NOT_FOUND
-          .withDescription("DATASET_NOT_FOUND dataset=" + datasetId)
-          .toRuntimeException();
-    }
-    DefinitionDataset dataset = definition.get();
-    String datasetAccessMode = dataset.effectiveAccessMode();
-    String requested = normalizeAccessMode(requestedAccessMode);
-    String accessMode = requested == null ? datasetAccessMode : requested;
-    if (requested != null && !requested.equals(datasetAccessMode)) {
-      throw CallStatus.INVALID_ARGUMENT
-          .withDescription(
-              "STREAM_ACCESS_MODE_MISMATCH dataset="
-                  + datasetId
-                  + " requested="
-                  + requested
-                  + " effective="
-                  + datasetAccessMode)
-          .toRuntimeException();
-    }
-    DefinitionDataset.DuckdbBinding duckdb =
-        dataset.binding() == null ? null : dataset.binding().duckdb();
-    String targetType = duckdb == null ? null : Strings.trimToNull(duckdb.targetType());
-    if (duckdb == null || !"DUCKDB_ACTIVE".equalsIgnoreCase(targetType)) {
-      String type = dataset.type() == null ? "UNKNOWN" : dataset.type().name();
-      if ("PUBLIC".equals(accessMode)) {
-        throw CallStatus.INVALID_ARGUMENT
-            .withDescription(
-                "PUBLIC_DATASET_UNSUPPORTED dataset=" + datasetId + " type=" + type)
-            .toRuntimeException();
-      }
-      throw CallStatus.INVALID_ARGUMENT
-          .withDescription(
-              "DATASET_NOT_STREAMABLE dataset=" + datasetId + " type=" + type)
-          .toRuntimeException();
-    }
-    List<String> primaryKey = DuckdbActiveChangeLog.normalizedPrimaryKeyColumns(duckdb.primaryKey());
-    if (primaryKey.isEmpty()) {
-      throw CallStatus.INVALID_ARGUMENT
-          .withDescription(
-              "DATASET_NOT_STREAMABLE dataset=" + datasetId + " type=DUCKDB_ACTIVE")
-          .toRuntimeException();
-    }
-    return new DatasetStreamSpec(accessMode, primaryKey);
-  }
-
-  private static String normalizeAccessMode(String value) {
-    String normalized = Strings.trimToNull(value);
-    if (normalized == null) {
-      return null;
-    }
-    if ("PUBLIC".equalsIgnoreCase(normalized)) {
-      return "PUBLIC";
-    }
-    if ("PRIVATE".equalsIgnoreCase(normalized)) {
-      return "PRIVATE";
-    }
-    throw CallStatus.INVALID_ARGUMENT
-        .withDescription("accessMode must be PUBLIC or PRIVATE")
-        .toRuntimeException();
-  }
-
-  private void authorizeInvoke(String callerSubject, String operationName, String requestPayload) {
-    ServiceEntitlements.Decision decision =
-        serviceEntitlements.authorize(
-            new ServiceEntitlements.Identity(callerSubject, null),
-            new ServiceEntitlements.Request(
-                ServiceEntitlements.Transport.ARROW_FLIGHT_SQL,
-                ServiceEntitlements.Action.INVOKE,
-                serviceResourceId,
-                operationName,
-                null,
-                requestPayload,
-                Map.of(),
-                Map.of()));
-    if (decision == null || !decision.allowed()) {
-      String reason = decision == null ? "DENIED" : Strings.firstNonBlank(decision.reason(), "DENIED");
-      throw CallStatus.UNAUTHORIZED
-          .withDescription(
-              reason
-                  + " [serviceId="
-                  + serviceResourceId
-                  + ", operation="
-                  + operationName
-                  + ", subject="
-                  + safeSubject(callerSubject)
-                  + "]")
-          .toRuntimeException();
-    }
-  }
-
-  private RowManagerImpl localRowManager() {
-    if (tabularManager instanceof TabularManagerImpl localTabularManager) {
-      return localTabularManager.rowManager();
-    }
-    throw CallStatus.UNIMPLEMENTED
-        .withDescription("Dataset streaming requires DIRECT mode tabular manager")
-        .toRuntimeException();
-  }
-
-  private void installDatasetIfPresent(DatasetId datasetId) {
-    if (datasetId != null && !isAllowedDataset(datasetId)) {
-      throw CallStatus.INVALID_ARGUMENT
-          .withDescription(
-              "Dataset is not allowed for this service datasetId="
-                  + datasetId
-                  + " serviceId="
-                  + serviceResourceId)
-          .toRuntimeException();
-    }
-    if (!(tabularManager instanceof TabularManagerImpl localTabularManager)) {
-      return;
-    }
-    try {
-      localTabularManager.installDataset(datasetId.toString());
-    } catch (RuntimeException ex) {
-      throw CallStatus.INVALID_ARGUMENT
-          .withDescription("Dataset definition not available for query datasetId=" + datasetId)
-          .withCause(ex)
-          .toRuntimeException();
-    }
-  }
-
-  private long resolveStartSequence(
-      RowManagerImpl rowManager,
-      FlightDatasetStreamTicket ticket,
-      CheckpointKey checkpointKey,
-      DatasetId datasetId) {
-    if (ticket.start() == FlightDatasetStreamTicket.Start.BEGINNING) {
-      return 0L;
-    }
-    if (ticket.start() == FlightDatasetStreamTicket.Start.FROM_SEQUENCE) {
-      return Math.max(0L, ticket.fromSequence());
-    }
-    if (ticket.start() == FlightDatasetStreamTicket.Start.RESUME) {
-      Long checkpointSeq = loadCheckpointSeq(checkpointKey);
-      return checkpointSeq == null ? 0L : checkpointSeq;
-    }
-    return Math.max(0L, rowManager.duckDbActiveChangeMaxSeq(datasetId));
-  }
-
-  private boolean isAllowedDataset(DatasetId datasetId) {
-    return datasetId == null || allowedDatasetIds.isEmpty() || allowedDatasetIds.contains(datasetId);
-  }
-
-  private static void requireDatasetReadAccess(
-      RowManagerImpl rowManager, RequestIdentity identity, DatasetId datasetId) {
-    DataEntitlements.Decision decision =
-        rowManager
-            .dataEntitlementsForSqlPlanning()
-            .authorizeRead(
-                new DataEntitlements.Identity(identity.effectiveUserSubject(), null),
-                datasetId.toString());
-    if (decision == null || !decision.allowed()) {
-      String reason = decision == null ? "DENIED" : Strings.firstNonBlank(decision.reason(), "DENIED");
-      throw CallStatus.UNAUTHORIZED
-          .withDescription(
-              "READ_DENIED dataset="
-                  + datasetId
-                  + " subject="
-                  + safeSubject(identity.effectiveUserSubject())
-                  + " reason="
-                  + reason)
-          .toRuntimeException();
-    }
-  }
-
-  private CheckpointKey streamCheckpointKey(
-      FlightDatasetStreamTicket ticket, RequestIdentity identity, DatasetId datasetId, String accessMode) {
-    String scope = Strings.firstNonBlank(Strings.trimToNull(ticket.subscriptionId()), "default");
-    if ("PUBLIC".equals(accessMode)) {
-      return new CheckpointKey(datasetId.group(), CheckpointType.STREAM, datasetId.toString(), scope);
-    }
-    String caller = CheckpointKey.normalizeToken(identity.effectiveUserSubject());
-    return new CheckpointKey(
-        datasetId.group(), CheckpointType.STREAM, datasetId.toString(), scope + "_" + caller);
-  }
-
-  private static String validateStreamFilterSql(String filterSql) {
-    try {
-      return StreamFilterSqlValidator.validate(filterSql);
-    } catch (IllegalArgumentException ex) {
-      throw CallStatus.INVALID_ARGUMENT.withDescription(ex.getMessage()).withCause(ex).toRuntimeException();
-    }
-  }
-
-  private Long loadCheckpointSeq(CheckpointKey key) {
-    if (key == null) {
-      return null;
-    }
-    Optional<CheckpointRecord> record = checkpointStore.load(key);
-    if (record.isEmpty() || record.get().payload() == null) {
-      return null;
-    }
-    String raw = record.get().payload().get("lastSeq");
-    if (Strings.trimToNull(raw) == null) {
-      return null;
-    }
-    try {
-      long parsed = Long.parseLong(raw);
-      return parsed < 0L ? null : parsed;
-    } catch (NumberFormatException ex) {
-      return null;
-    }
-  }
-
-  private void saveCheckpoint(CheckpointKey key, long lastSeq) {
-    if (key == null) {
-      return;
-    }
-    try {
-      checkpointStore.save(
-          CheckpointRecord.of(
-              key,
-              Map.of(
-                  "lastSeq", Long.toString(Math.max(0L, lastSeq)),
-                  "updatedUtc", Instant.now().toString())));
-    } catch (RuntimeException ex) {
-      LOGGER.warn("[FlightStream][checkpoint-save-failed] key={} lastSeq={} message={}", key, Math.max(0L, lastSeq), ex.getMessage());
-    }
-  }
-
-  private void streamBatchToListener(
-      ByteBuffer ipc, VectorLoader loader, FlightProducer.ServerStreamListener listener) {
-    IpcSummary summary = inspectIpc(ipc);
-    if (summary.rowCount() <= 0L) {
-      return;
-    }
-    try (ArrowStreamReader reader =
-        new ArrowStreamReader(Bytes.asInputStream(ipc), ipcReadAllocator)) {
-      VectorSchemaRoot root = reader.getVectorSchemaRoot();
-      while (reader.loadNextBatch()) {
-        if (root.getRowCount() <= 0) {
-          continue;
-        }
-        try (ArrowRecordBatch batch = new VectorUnloader(root).getRecordBatch()) {
-          loader.load(batch);
-          listener.putNext();
-        }
-      }
-    } catch (Exception ex) {
-      throw CallStatus.INTERNAL
-          .withDescription("Failed to stream dataset batch")
-          .withCause(ex)
-          .toRuntimeException();
-    }
-  }
-
-  private IpcSummary inspectIpc(ByteBuffer ipc) {
-    if (ipc == null || !ipc.hasRemaining()) {
-      throw CallStatus.INTERNAL.withDescription("Query returned empty Arrow IPC payload").toRuntimeException();
-    }
-    try (ArrowStreamReader reader =
-        new ArrowStreamReader(Bytes.asInputStream(ipc), ipcReadAllocator)) {
-      VectorSchemaRoot root = reader.getVectorSchemaRoot();
-      Schema schema = root.getSchema();
-      long rowCount = 0L;
-      while (reader.loadNextBatch()) {
-        rowCount += root.getRowCount();
-      }
-      return new IpcSummary(schema, rowCount);
-    } catch (Exception ex) {
-      throw CallStatus.INTERNAL
-          .withDescription("Failed to inspect Arrow IPC payload")
-          .withCause(ex)
-          .toRuntimeException();
-    }
-  }
-
-  private RuntimeException mapStreamFailure(
-      RuntimeException ex, String callerSubject, DatasetId datasetId, boolean publicStream) {
-    if (ex instanceof FlightRuntimeException flightRuntimeException) {
-      return flightRuntimeException;
-    }
-    String message = Strings.trimToNull(ex.getMessage());
-    String details =
-        "serviceId="
-            + serviceResourceId
-            + ", datasetId="
-            + datasetId
-            + ", subject="
-            + safeSubject(callerSubject);
-    if (message == null) {
-      return CallStatus.INTERNAL
-          .withDescription("Dataset stream failed [" + details + "]")
-          .withCause(ex)
-          .toRuntimeException();
-    }
-    String lower = message.toLowerCase();
-    if (!publicStream && lower.contains("access denied for dataset")) {
-      return CallStatus.UNAUTHORIZED
-          .withDescription(
-              "READ_DENIED dataset="
-                  + datasetId
-                  + " subject="
-                  + safeSubject(callerSubject)
-                  + " reason=DENIED")
-          .withCause(ex)
-          .toRuntimeException();
-    }
-    if (lower.contains("duckdb sql failed")
-        || lower.contains("unknown table token")
-        || lower.contains("ambiguous table token")
-        || lower.contains("dataset not found")) {
-      return CallStatus.INVALID_ARGUMENT
-          .withDescription(message + " [" + details + "]")
-          .withCause(ex)
-          .toRuntimeException();
-    }
-    return CallStatus.INTERNAL
-        .withDescription(message + " [" + details + "]")
-        .withCause(ex)
-        .toRuntimeException();
-  }
-
-  private static String safeSubject(String subject) {
-    String normalized = Strings.trimToNull(subject);
-    return normalized == null ? "<unknown>" : normalized;
-  }
-
-  private record DatasetStreamSpec(String accessMode, List<String> primaryKeyColumns) {
-    private boolean isPublic() {
-      return "PUBLIC".equals(accessMode);
-    }
-  }
-
-  private record IpcSummary(Schema schema, long rowCount) {}
 
   @FunctionalInterface
-  public interface DiagnosticsHook {
-    DiagnosticsHook NO_OP = () -> {};
+  public interface SubscriptionListener {
+    void onMessage(AmpsMessage message);
+  }
 
-    void onReadChanges();
+  public record SubscriptionSpec(
+      boolean sow,
+      boolean sowOnly,
+      String topic,
+      String options,
+      String filter,
+      String bookmarkStart,
+      Path bookmarkFile
+  ) {
+    public SubscriptionSpec(boolean sow, String topic, String options, String filter) {
+      this(sow, false, topic, options, filter, null, null);
+    }
 
-    default void onAwait() {}
+    public SubscriptionSpec(boolean sow, boolean sowOnly, String topic, String options, String filter) {
+      this(sow, sowOnly, topic, options, filter, null, null);
+    }
+
+    public SubscriptionSpec {
+      if (sowOnly) {
+        sow = false;
+      }
+      topic = Strings.requireNonBlank(topic, "topic");
+      options = Strings.trimToNull(options);
+      filter = Strings.trimToNull(filter);
+      bookmarkStart = Strings.trimToNull(bookmarkStart);
+    }
+
+    public static Builder builder() {
+      return new Builder();
+    }
+
+    public static final class Builder {
+      private boolean sow;
+      private boolean sowOnly;
+      private String topic;
+      private String options;
+      private String filter;
+      private String bookmarkStart;
+      private Path bookmarkFile;
+
+      private Builder() {}
+
+      public Builder withSowSubscribe(boolean value) {
+        sow = value;
+        if (value) {
+          sowOnly = false;
+        }
+        return this;
+      }
+
+      public Builder withSow(boolean value) {
+        sowOnly = value;
+        if (value) {
+          sow = false;
+        }
+        return this;
+      }
+
+      public Builder withSow() {
+        return withSow(true);
+      }
+
+      public Builder withSow(Boolean value) {
+        return withSow(Boolean.TRUE.equals(value));
+      }
+
+      public Builder withSowSubscribe(Boolean value) {
+        sow = Boolean.TRUE.equals(value);
+        if (Boolean.TRUE.equals(value)) {
+          sowOnly = false;
+        }
+        return this;
+      }
+
+      public Builder withTopic(String value) {
+        topic = value;
+        return this;
+      }
+
+      public Builder withOptions(String value) {
+        options = value;
+        return this;
+      }
+
+      public Builder withFilter(String value) {
+        filter = value;
+        return this;
+      }
+
+      public Builder withBookmarkStart(String value) {
+        bookmarkStart = value;
+        return this;
+      }
+
+      public Builder withBookmarkFile(Path value) {
+        bookmarkFile = value;
+        return this;
+      }
+
+      public Builder withBookmarkFile(String value) {
+        String normalized = Strings.trimToNull(value);
+        bookmarkFile = normalized == null ? null : Path.of(normalized);
+        return this;
+      }
+
+      public SubscriptionSpec build() {
+        return new SubscriptionSpec(
+            sow,
+            sowOnly,
+            topic,
+            options,
+            filter,
+            bookmarkStart,
+            bookmarkFile);
+      }
+    }
+  }
+
+  public enum BatchMode {
+    STREAM,
+    BATCH
+  }
+
+  public record BatchSpec(
+      BatchMode mode,
+      int batchMaxMessages,
+      int batchMaxBytes,
+      long batchFlushMillis
+  ) {
+    public BatchSpec {
+      mode = mode == null ? BatchMode.STREAM : mode;
+      batchMaxMessages =
+          batchMaxMessages <= 0 ? DEFAULT_BATCH_MAX_MESSAGES : batchMaxMessages;
+      batchMaxBytes = batchMaxBytes <= 0 ? DEFAULT_BATCH_MAX_BYTES : batchMaxBytes;
+      batchFlushMillis =
+          batchFlushMillis <= 0L ? DEFAULT_BATCH_FLUSH_MILLIS : batchFlushMillis;
+    }
+
+    public static BatchSpec defaults() {
+      return new BatchSpec(
+          BatchMode.STREAM,
+          DEFAULT_BATCH_MAX_MESSAGES,
+          DEFAULT_BATCH_MAX_BYTES,
+          DEFAULT_BATCH_FLUSH_MILLIS);
+    }
+  }
+
+  public static final class AmpsMessage {
+    private final Message raw;
+
+    private AmpsMessage(Message raw) {
+      this.raw = Objects.requireNonNull(raw, "raw");
+    }
+
+    public String topic() {
+      return raw.getTopic();
+    }
+
+    public String data() {
+      return raw.getData();
+    }
+
+    public byte[] dataBytes() {
+      Field data = raw.getDataRaw();
+      if (data == null || data.isNull() || data.buffer == null || data.length <= 0) {
+        String fallback = raw.getData();
+        return fallback == null ? null : fallback.getBytes(StandardCharsets.UTF_8);
+      }
+      return Arrays.copyOfRange(data.buffer, data.position, data.position + data.length);
+    }
+
+    public String bookmark() {
+      return raw.getBookmark();
+    }
+
+    public String options() {
+      return raw.getOptions();
+    }
+
+    public Message raw() {
+      return raw;
+    }
+  }
+
+  @FunctionalInterface
+  private interface CloseHandler {
+    CloseHandler NOOP = client -> {};
+
+    CloseHandler CLOSE_CLIENT =
+        client -> {
+          try {
+            client.disconnect();
+          } catch (Exception ignore) {
+          }
+          client.close();
+        };
+
+    void close(HAClient client) throws Exception;
+  }
+
+  public static final class BookmarkStoreLocal {
+    private BookmarkStoreLocal() {}
+
+    public static Path defaultBookmarkPath(String group, String subscriptionName) {
+      String normalizedGroup = Strings.requireNonBlank(group, "group");
+      String normalizedSubscription = Strings.requireNonBlank(subscriptionName, "subscriptionName");
+      return Path.of("data", "lite", "bookmarks", normalizedGroup, normalizedSubscription + ".bookmark");
+    }
+
+    public static String subscriptionKey(String ingestName, String connectionName, String topic) {
+      String normalizedIngest = sanitizeToken(Strings.requireNonBlank(ingestName, "ingestName"));
+      String normalizedConnection =
+          sanitizeToken(Strings.requireNonBlank(connectionName, "connectionName"));
+      String normalizedTopic = sanitizeToken(Strings.requireNonBlank(topic, "topic"));
+      return normalizedIngest + "__" + normalizedConnection + "__" + normalizedTopic;
+    }
+
+    public static Optional<String> load(Path path) {
+      Objects.requireNonNull(path, "path");
+      try {
+        if (!Files.exists(path)) {
+          return Optional.empty();
+        }
+        String value = Strings.trimToNull(Files.readString(path, StandardCharsets.UTF_8));
+        return value == null ? Optional.empty() : Optional.of(value);
+      } catch (Exception ex) {
+        throw new IllegalStateException("Failed to load bookmark file: " + path, ex);
+      }
+    }
+
+    public static void saveAtomic(Path path, String bookmark) {
+      Objects.requireNonNull(path, "path");
+      String normalizedBookmark = Strings.requireNonBlank(bookmark, "bookmark");
+      try {
+        Path parent = path.getParent();
+        if (parent != null) {
+          Files.createDirectories(parent);
+        }
+        Path temp =
+            path.resolveSibling(path.getFileName().toString() + ".tmp." + Thread.currentThread().getId());
+        Files.writeString(
+            temp,
+            normalizedBookmark,
+            StandardCharsets.UTF_8,
+            StandardOpenOption.CREATE,
+            StandardOpenOption.TRUNCATE_EXISTING,
+            StandardOpenOption.WRITE);
+        try {
+          Files.move(
+              temp,
+              path,
+              StandardCopyOption.REPLACE_EXISTING,
+              StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException ex) {
+          Files.move(temp, path, StandardCopyOption.REPLACE_EXISTING);
+        }
+      } catch (Exception ex) {
+        throw new IllegalStateException("Failed to persist bookmark file: " + path, ex);
+      }
+    }
+
+    private static String sanitizeToken(String value) {
+      StringBuilder normalized = new StringBuilder(value.length());
+      for (int index = 0; index < value.length(); index++) {
+        char current = value.charAt(index);
+        if (Character.isLetterOrDigit(current) || current == '-' || current == '_' || current == '.') {
+          normalized.append(current);
+          continue;
+        }
+        normalized.append('_');
+      }
+      return normalized.toString();
+    }
   }
 }
