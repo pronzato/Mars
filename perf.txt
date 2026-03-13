@@ -1,502 +1,536 @@
-package org.pronzato.fabric.api.data.manager;
+package org.pronzato.fabric.api.data.format;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.Set;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConnection;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
+import java.util.TreeSet;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngest;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngestSource;
-import org.pronzato.fabric.api.data.dataset.DatasetId;
-import org.pronzato.fabric.api.data.dataset.DatasetResolver;
-import org.pronzato.fabric.api.data.entitlements.NamespaceEntitlementDefaults;
-import org.pronzato.fabric.api.data.ingest.model.IngestModel;
-import org.pronzato.fabric.api.data.ingest.model.IngestTargetDuckDbActiveModel;
-import org.pronzato.fabric.api.data.ingest.model.IngestTargetModel;
-import org.pronzato.fabric.api.data.ingest.model.IngestTargetParquetModel;
-import org.pronzato.fabric.api.schemas.SchemaCompatibility;
-import org.pronzato.fabric.api.schemas.SchemaModel;
-import org.pronzato.fabric.api.schemas.SchemaType;
+import org.pronzato.fabric.api.data.format.FormatDecoderArrowBuilder.FormatField;
+import org.pronzato.fabric.api.data.format.FormatDecoderArrowBuilder.ValueKind;
 import org.pronzato.fabric.api.util.Strings;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-final class IngestManagerImplDataset {
-  private IngestManagerImplDataset() {}
+final class SchemaEvolution {
+  private static final Logger LOGGER = LoggerFactory.getLogger(SchemaEvolution.class);
 
-  static void register(IngestManagerImpl manager, IngestModel model) {
-    IngestModel normalized = Objects.requireNonNull(model, "model");
-    if (normalized.target() == null) {
-      throw new IllegalArgumentException("ingest target is required");
-    }
-    String ingestName = Strings.requireNonBlank(normalized.name(), "model.name");
-    IngestManagerImplAppend.flushPendingParquetBuffer(manager, ingestName, "register-update");
-    applyRuntimeParquetRollPolicyFromModel(manager, ingestName, normalized.target());
-    String namespace = Strings.requireNonBlank(normalized.namespace(), "model.namespace");
-    SchemaModel schema = Objects.requireNonNull(normalized.schema(), "model.schema");
-    validateTargetSchemaReferences(ingestName, normalized.target(), schema);
-    IngestManagerImpl.ActiveTableDescriptor activeDescriptor = null;
-    if (normalized.target() instanceof IngestTargetDuckDbActiveModel duckDbActiveTarget) {
-      activeDescriptor = buildActiveTableDescriptor(manager, ingestName, schema, duckDbActiveTarget);
-    }
-    String schemaName = manager.modelMapper.deterministicSchemaName(manager.group, namespace, ingestName);
-    SchemaModel schemaToRegister =
-        schema.toBuilder()
-            .withName(schemaName)
-            .withType(SchemaType.TABULAR)
-            .withCompatibility(
-                schema.getCompatibility() == null
-                    ? SchemaCompatibility.BACKWARDS
-                    : schema.getCompatibility())
-            .build();
-    manager.schemaManager.register(schemaName, SchemaType.TABULAR, schemaToRegister);
-    DefinitionIngest ingestDefinition =
-        manager.modelMapper.toDefinition(normalized, manager.group, IngestManagerImpl.DEFAULT_ACTOR, schemaName);
-    DefinitionIngestSource sourceDefinition =
-        manager.modelMapper.toDefinition(
-            Objects.requireNonNull(normalized.source(), "model.source"),
-            manager.group,
-            IngestManagerImpl.DEFAULT_ACTOR);
-    String parquetUriOverride = inferParquetUri(manager, normalized, normalized.target());
-    DefinitionDataset datasetDefinition =
-        manager.modelMapper.toDefinitionDataset(
-            normalized, manager.group, IngestManagerImpl.DEFAULT_ACTOR, parquetUriOverride);
-    try (org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache.ConfigCacheTx tx =
-        manager.DiscoveryCache.beginTx("ingest:" + manager.group + "/" + ingestName)) {
-      if (datasetDefinition != null) {
-        manager.DiscoveryCache.upsertTx(tx, datasetDefinition);
-        NamespaceEntitlementDefaults.ensureDefaultNamespaceAccess(
-            manager.DiscoveryCache, tx, datasetDefinition, IngestManagerImpl.DEFAULT_ACTOR);
-      }
-      manager.DiscoveryCache.upsertTx(tx, ingestDefinition);
-      manager.DiscoveryCache.upsertTx(tx, sourceDefinition);
-      manager.DiscoveryCache.commitTx(tx);
-    }
-    if (activeDescriptor != null) {
-      manager.activeTableDescriptors.put(ingestName, activeDescriptor);
-    } else {
-      manager.activeTableDescriptors.remove(ingestName);
-    }
+  private SchemaEvolution() {}
+
+  static Result resolveJson(
+      String ingestId,
+      DefinitionIngest.SchemaMode schemaMode,
+      List<FormatField> expectedFields,
+      List<Map<String, JsonNode>> inputRows) {
+    return resolve(ingestId, schemaMode, expectedFields, inputRows, JsonAdapter.INSTANCE);
   }
 
-  static void deleteDatasetDefinition(IngestManagerImpl manager, String datasetId) {
-    DatasetId parsed = DatasetId.parse(Strings.requireNonBlank(datasetId, "datasetId"));
-    org.pronzato.fabric.api.control.discovery.lifecycle.DeleteResult result =
-        manager.deleteManager.delete(
-            parsed.toString(),
-            new org.pronzato.fabric.api.control.discovery.lifecycle.DeleteOptions(
-                false, false, false, false, false, false, true, false, List.of()));
-    if (result.outcome() == org.pronzato.fabric.api.control.discovery.lifecycle.DeleteOutcome.BLOCKED) {
-      throw new IllegalStateException(
-          "Delete blocked for dataset definition " + parsed + ": " + result.blockers());
-    }
-    if (result.outcome() == org.pronzato.fabric.api.control.discovery.lifecycle.DeleteOutcome.PARTIAL) {
-      throw new IllegalStateException(
-          "Delete partially completed for dataset definition " + parsed + ": " + result.warnings());
-    }
+  static Result resolveNvFix(
+      String ingestId,
+      DefinitionIngest.SchemaMode schemaMode,
+      List<FormatField> expectedFields,
+      List<Map<String, String>> inputRows) {
+    return resolve(ingestId, schemaMode, expectedFields, inputRows, NvFixAdapter.INSTANCE);
   }
 
-  static void applyRuntimeParquetRollPolicyFromModel(
-      IngestManagerImpl manager, String ingestName, IngestTargetModel target) {
-    if (!(target instanceof IngestTargetParquetModel parquetTarget)) {
-      manager.parquetRollPolicies.remove(ingestName);
-      return;
-    }
-    Integer maxRowsPerFile = parquetTarget.maxRowsPerFile();
-    Long maxIdleMillis = parquetTarget.maxIdleMillis();
-    if (maxRowsPerFile == null && maxIdleMillis == null) {
-      return;
-    }
-    IngestManagerImpl.ParquetRollPolicy policy =
-        new IngestManagerImpl.ParquetRollPolicy(
-            IngestManagerImpl.resolveMaxRowsPerFile(maxRowsPerFile),
-            IngestManagerImpl.resolveMaxIdleMillis(maxIdleMillis));
-    manager.parquetRollPolicies.put(ingestName, policy);
-  }
+  private static <V> Result resolve(
+      String ingestId,
+      DefinitionIngest.SchemaMode schemaMode,
+      List<FormatField> expectedFields,
+      List<Map<String, V>> inputRows,
+      ValueAdapter<V> adapter) {
+    String normalizedIngestId = Strings.requireNonBlank(ingestId, "ingestId");
+    DefinitionIngest.SchemaMode mode =
+        schemaMode == null ? DefinitionIngest.SchemaMode.STRICT : schemaMode;
+    Objects.requireNonNull(adapter, "adapter");
 
-  static String inferParquetUri(IngestManagerImpl manager, IngestModel model, IngestTargetModel target) {
-    if (!(target instanceof IngestTargetParquetModel parquet)) {
-      return null;
+    if (expectedFields == null || expectedFields.isEmpty()) {
+      throw new IllegalArgumentException("expectedFields are required");
     }
-    String parquetPath = Strings.trimToNull(parquet.parquetPath());
-    String connectionName = Strings.trimToNull(parquet.connectionName());
-    if (connectionName == null) {
-      return Strings.requireNonBlank(parquetPath, "target.parquet.parquetPath");
-    }
-    if (parquetPath != null) {
+    if (inputRows == null || inputRows.isEmpty()) {
       throw new IllegalArgumentException(
-          "target.parquet.parquetPath is not supported when target.parquet.connectionName is set; "
-              + "managed S3 path is derived as /fabric/data/{group}/{datasetName}");
+          "Format decode payload did not contain any messages ingest=" + normalizedIngestId);
     }
-    DatasetId datasetId =
-        manager.modelMapper.resolveDatasetId(
-            manager.group,
-            Strings.requireNonBlank(model == null ? null : model.namespace(), "model.namespace"),
-            Objects.requireNonNull(model, "model"));
-    parquetPath = datasetId.name();
-    IngestManagerImpl.S3PathRoot root = resolveS3PathRoot(manager, connectionName);
-    String normalizedClientPath = normalizeS3ClientPath(parquetPath);
-    String resolvedClientPath = stripManagedS3Prefix(manager, normalizedClientPath);
-    if (Strings.trimToNull(resolvedClientPath) == null) {
-      throw new IllegalArgumentException(
-          "target.parquet.parquetPath must include a dataset path after managed prefix "
-              + managedS3Prefix(manager));
-    }
-    String prefix = joinPath(managedS3Prefix(manager), resolvedClientPath);
-    return "s3://" + root.bucket() + (prefix == null ? "" : "/" + prefix);
-  }
 
-  static IngestManagerImpl.S3PathRoot resolveS3PathRoot(IngestManagerImpl manager, String connectionName) {
-    String normalizedName = Strings.requireNonBlank(connectionName, "target.parquet.connectionName");
-    DefinitionConnection connection = resolveConnection(manager, normalizedName);
-    if (connection.connectionType() != DefinitionConnection.ConnectionType.S3) {
-      throw new IllegalArgumentException(
-          "Connection '" + normalizedName + "' is not S3 (type=" + connection.connectionType() + ")");
+    Map<String, FormatField> expectedByName = new LinkedHashMap<>();
+    for (FormatField expectedField : expectedFields) {
+      expectedByName.put(expectedField.name(), expectedField);
     }
-    DefinitionConnection.S3 s3 = connection.s3();
-    String bucket = Strings.trimToNull(s3 == null ? null : s3.bucket());
-    String basePrefix = Strings.trimToNull(s3 == null ? null : s3.basePrefix());
-    if (bucket != null) {
-      return new IngestManagerImpl.S3PathRoot(bucket, basePrefix);
-    }
-    String physicalRef =
-        connection.client() == null ? null : Strings.trimToNull(connection.client().physicalRef());
-    if (physicalRef != null) {
-      IngestManagerImpl.ScopedConnectionRef ref = parseScopedConnectionRef(physicalRef);
-      DefinitionConnection physicalConnection = resolveConnection(manager, ref.group(), ref.name());
-      if (physicalConnection.connectionType() != DefinitionConnection.ConnectionType.S3
-          || physicalConnection.s3() == null) {
-        throw new IllegalArgumentException(
-            "Connection '" + normalizedName + "' physicalRef is not an S3 connection: " + physicalRef);
-      }
-      String fallbackBucket = Strings.trimToNull(physicalConnection.s3().bucket());
-      String fallbackPrefix = Strings.trimToNull(physicalConnection.s3().basePrefix());
-      return new IngestManagerImpl.S3PathRoot(
-          Strings.requireNonBlank(fallbackBucket, "s3.bucket"),
-          Strings.firstNonBlank(basePrefix, fallbackPrefix));
-    }
-    throw new IllegalArgumentException(
-        "Connection '" + normalizedName + "' is missing S3 bucket information");
-  }
 
-  static DefinitionConnection resolveConnection(IngestManagerImpl manager, String connectionName) {
-    Optional<DefinitionConnection> inGroup =
-        manager.DiscoveryCache.get(DefinitionConnection.class, manager.group, connectionName);
-    if (inGroup.isPresent()) {
-      return inGroup.get();
-    }
-    return manager.DiscoveryCache
-        .get(DefinitionConnection.class, IngestManagerImpl.PLATFORM_GROUP, connectionName)
-        .orElseThrow(
-            () ->
-                new IllegalArgumentException(
-                    "Connection '"
-                        + manager.group
-                        + "/"
-                        + connectionName
-                        + "' or '"
-                        + IngestManagerImpl.PLATFORM_GROUP
-                        + "/"
-                        + connectionName
-                        + "' was not found"));
-  }
-
-  static DefinitionConnection resolveConnection(
-      IngestManagerImpl manager, String groupName, String connectionName) {
-    return manager.DiscoveryCache
-        .get(DefinitionConnection.class, groupName, connectionName)
-        .orElseThrow(
-            () ->
-                new IllegalArgumentException(
-                    "Connection '" + groupName + "/" + connectionName + "' was not found"));
-  }
-
-  static IngestManagerImpl.ScopedConnectionRef parseScopedConnectionRef(String scopedRef) {
-    String normalized = Strings.requireNonBlank(scopedRef, "connection client.physicalRef");
-    int slash = normalized.indexOf('/');
-    if (slash < 0) {
-      return new IngestManagerImpl.ScopedConnectionRef(IngestManagerImpl.PLATFORM_GROUP, normalized);
-    }
-    if (slash == 0 || slash == normalized.length() - 1) {
-      throw new IllegalArgumentException("Invalid connection reference: " + normalized);
-    }
-    return new IngestManagerImpl.ScopedConnectionRef(
-        normalized.substring(0, slash), normalized.substring(slash + 1));
-  }
-
-  static String normalizeS3ClientPath(String parquetPath) {
-    String normalized = Strings.requireNonBlank(parquetPath, "target.parquet.parquetPath");
-    if (normalized.regionMatches(true, 0, "s3://", 0, 5)) {
-      throw new IllegalArgumentException("target.parquet.parquetPath must be relative, not an s3:// URI");
-    }
-    String candidate = normalized.replace('\\', '/');
-    while (candidate.startsWith("/")) {
-      candidate = candidate.substring(1);
-    }
-    String[] segments = candidate.split("/");
-    List<String> sanitized = new ArrayList<>(segments.length);
-    for (String segment : segments) {
-      String trimmed = Strings.trimToNull(segment);
-      if (trimmed == null) {
+    TreeSet<String> discoveredExtras = new TreeSet<>();
+    TreeSet<String> observedInputFields = new TreeSet<>();
+    for (Map<String, V> row : inputRows) {
+      if (row == null) {
         continue;
       }
-      if (".".equals(trimmed) || "..".equals(trimmed)) {
-        throw new IllegalArgumentException(
-            "target.parquet.parquetPath contains unsupported segment: " + trimmed);
+      for (String fieldName : row.keySet()) {
+        observedInputFields.add(fieldName);
+        if (!expectedByName.containsKey(fieldName)) {
+          discoveredExtras.add(fieldName);
+        }
       }
-      if (trimmed.indexOf(':') >= 0) {
-        throw new IllegalArgumentException("target.parquet.parquetPath must not contain ':' segments");
-      }
-      sanitized.add(trimmed);
     }
-    if (sanitized.isEmpty()) {
+
+    if (mode == DefinitionIngest.SchemaMode.STRICT && !discoveredExtras.isEmpty()) {
       throw new IllegalArgumentException(
-          "target.parquet.parquetPath must include at least one path segment");
+          "Unexpected field(s) "
+              + discoveredExtras
+              + " ingest="
+              + normalizedIngestId
+              + " mode="
+              + mode);
     }
-    return String.join("/", sanitized);
+
+    List<String> addedColumns = new ArrayList<>();
+    List<FormatField> addedFields = new ArrayList<>();
+    if (mode != DefinitionIngest.SchemaMode.STRICT) {
+      int index = expectedFields.size();
+      for (String fieldName : discoveredExtras) {
+        ValueKind inferredKind = inferAddedValueKind(fieldName, inputRows, adapter);
+        addedFields.add(
+            new FormatField(
+                index,
+                fieldName,
+                true,
+                inferredKind.expectedTypeLabel(),
+                inferredKind));
+        addedColumns.add(fieldName);
+        index++;
+      }
+    }
+
+    List<FormatField> outputFields = new ArrayList<>(expectedFields.size() + addedFields.size());
+    outputFields.addAll(expectedFields);
+    outputFields.addAll(addedFields);
+
+    TreeSet<String> defaultedFields = new TreeSet<>();
+    TreeSet<String> widenedFields = new TreeSet<>();
+    List<Object[]> outputRows = new ArrayList<>(inputRows.size());
+    for (Map<String, V> inputRow : inputRows) {
+      Map<String, V> row = inputRow == null ? Collections.emptyMap() : inputRow;
+      Object[] values = new Object[outputFields.size()];
+
+      for (FormatField field : expectedFields) {
+        V rawValue = row.get(field.name());
+        if (rawValue == null || adapter.isNull(rawValue)) {
+          values[field.index()] =
+              resolveMissingRequired(normalizedIngestId, mode, field, defaultedFields);
+          continue;
+        }
+        ValueKind actualKind = adapter.inferActualKind(rawValue);
+        if (mode == DefinitionIngest.SchemaMode.RELAXED
+            && actualKind != null
+            && actualKind != field.valueKind()
+            && isAllowedWidening(actualKind, field.valueKind())) {
+          widenedFields.add(field.name());
+        }
+        values[field.index()] =
+            convertRequiredValue(normalizedIngestId, mode, field, rawValue, adapter);
+      }
+
+      for (FormatField addedField : addedFields) {
+        V rawValue = row.get(addedField.name());
+        if (rawValue == null || adapter.isNull(rawValue)) {
+          values[addedField.index()] = null;
+          continue;
+        }
+        values[addedField.index()] =
+            convertAddedValue(normalizedIngestId, mode, addedField, rawValue, adapter);
+      }
+
+      outputRows.add(values);
+    }
+
+    if (mode != DefinitionIngest.SchemaMode.STRICT
+        && (!addedColumns.isEmpty() || !defaultedFields.isEmpty() || !widenedFields.isEmpty())) {
+      LOGGER.info("ingest={} mode={} addedColumns={} defaultedFields={} widenedFields={}", normalizedIngestId, mode, addedColumns, defaultedFields, widenedFields);
+    }
+
+    return new Result(
+        List.copyOf(outputFields),
+        List.copyOf(outputRows),
+        List.copyOf(addedColumns),
+        List.copyOf(defaultedFields),
+        List.copyOf(widenedFields),
+        List.copyOf(observedInputFields));
   }
 
-  static String stripManagedS3Prefix(IngestManagerImpl manager, String parquetPath) {
-    String normalized = normalizePathToken(parquetPath);
-    if (normalized == null) {
+  private static <V> Object resolveMissingRequired(
+      String ingestId,
+      DefinitionIngest.SchemaMode mode,
+      FormatField field,
+      Set<String> defaultedFields) {
+    if (field.nullable()) {
       return null;
     }
-    String managed = managedS3Prefix(manager);
-    if (startsWithPathPrefixIgnoreCase(normalized, managed)) {
-      return trimLeadingPathSeparator(normalized.substring(managed.length()));
+    if (mode != DefinitionIngest.SchemaMode.RELAXED) {
+      throw missingRequired(ingestId, mode, field.name());
     }
-    String groupOnly = normalizedGroupToken(manager);
-    if (startsWithPathPrefixIgnoreCase(normalized, groupOnly)) {
-      return trimLeadingPathSeparator(normalized.substring(groupOnly.length()));
+    Object defaultValue = defaultValueFor(field.valueKind());
+    if (defaultValue == null) {
+      throw missingRequired(ingestId, mode, field.name());
     }
-    return normalized;
+    defaultedFields.add(field.name());
+    return defaultValue;
   }
 
-  static String toClientVisibleS3Path(
-      IngestManagerImpl manager, String parquetPath, String connectionName) {
-    String connection = Strings.trimToNull(connectionName);
-    String value = Strings.trimToNull(parquetPath);
-    if (connection == null || value == null) {
-      return parquetPath;
+  private static Object defaultValueFor(ValueKind valueKind) {
+    return switch (valueKind) {
+      case UTF8 -> "";
+      case INT32, DATE_DAY -> 0;
+      case INT64, TIMESTAMP_MICROSECOND -> 0L;
+      case FLOAT64 -> 0.0d;
+      case BOOL -> false;
+    };
+  }
+
+  private static <V> Object convertRequiredValue(
+      String ingestId,
+      DefinitionIngest.SchemaMode mode,
+      FormatField field,
+      V rawValue,
+      ValueAdapter<V> adapter) {
+    try {
+      return adapter.convert(rawValue, field, ingestId);
+    } catch (RuntimeException ex) {
+      throw typeMismatch(
+          ingestId, mode, field.name(), field.expectedType(), adapter.actualTypeLabel(rawValue), ex);
     }
-    String normalized = value;
-    if (normalized.regionMatches(true, 0, "s3://", 0, 5)) {
-      String withoutScheme = normalized.substring(5);
-      int slash = withoutScheme.indexOf('/');
-      if (slash >= 0 && slash + 1 < withoutScheme.length()) {
-        normalized = withoutScheme.substring(slash + 1);
-      } else {
-        return parquetPath;
+  }
+
+  private static <V> Object convertAddedValue(
+      String ingestId,
+      DefinitionIngest.SchemaMode mode,
+      FormatField field,
+      V rawValue,
+      ValueAdapter<V> adapter) {
+    try {
+      return adapter.convert(rawValue, field, ingestId);
+    } catch (RuntimeException ex) {
+      if (field.valueKind() == ValueKind.UTF8) {
+        return adapter.stringify(rawValue);
       }
-    } else if (normalized.contains("://")) {
-      return parquetPath;
+      throw typeMismatch(
+          ingestId, mode, field.name(), field.expectedType(), adapter.actualTypeLabel(rawValue), ex);
     }
-    String trimmed = stripManagedS3Prefix(manager, normalized);
-    return Strings.trimToNull(trimmed) == null ? parquetPath : trimmed;
   }
 
-  static String managedS3Prefix(IngestManagerImpl manager) {
-    return joinPath(IngestManagerImpl.S3_MANAGED_ROOT, normalizedGroupToken(manager));
-  }
-
-  static String normalizedGroupToken(IngestManagerImpl manager) {
-    return Strings.requireNonBlank(manager.group, "session group").toLowerCase(Locale.ROOT);
-  }
-
-  static boolean startsWithPathPrefixIgnoreCase(String path, String prefix) {
-    String normalizedPath = normalizePathToken(path);
-    String normalizedPrefix = normalizePathToken(prefix);
-    if (normalizedPath == null || normalizedPrefix == null) {
-      return false;
-    }
-    if (normalizedPath.equalsIgnoreCase(normalizedPrefix)) {
+  private static boolean isAllowedWidening(ValueKind actual, ValueKind expected) {
+    if (actual == ValueKind.INT32 && expected == ValueKind.INT64) {
       return true;
     }
-    return normalizedPath.length() > normalizedPrefix.length()
-        && normalizedPath.regionMatches(true, 0, normalizedPrefix, 0, normalizedPrefix.length())
-        && normalizedPath.charAt(normalizedPrefix.length()) == '/';
+    if ((actual == ValueKind.INT32 || actual == ValueKind.INT64) && expected == ValueKind.FLOAT64) {
+      return true;
+    }
+    return isNumeric(actual) && expected == ValueKind.UTF8;
   }
 
-  static String normalizePathToken(String value) {
-    String normalized = Strings.trimToNull(value);
-    if (normalized == null) {
-      return null;
-    }
-    String candidate = normalized.replace('\\', '/');
-    while (candidate.startsWith("/")) {
-      candidate = candidate.substring(1);
-    }
-    while (candidate.endsWith("/")) {
-      candidate = candidate.substring(0, candidate.length() - 1);
-    }
-    return Strings.trimToNull(candidate);
+  private static boolean isNumeric(ValueKind valueKind) {
+    return valueKind == ValueKind.INT32
+        || valueKind == ValueKind.INT64
+        || valueKind == ValueKind.FLOAT64;
   }
 
-  static String trimLeadingPathSeparator(String value) {
-    String normalized = Strings.trimToNull(value);
-    if (normalized == null) {
-      return null;
-    }
-    String out = normalized;
-    while (out.startsWith("/")) {
-      out = out.substring(1);
-    }
-    return Strings.trimToNull(out);
-  }
-
-  static String joinPath(String... parts) {
-    List<String> normalized = new ArrayList<>();
-    for (String part : parts) {
-      String trimmed = Strings.trimToNull(part);
-      if (trimmed == null) {
+  private static <V> ValueKind inferAddedValueKind(
+      String fieldName, List<Map<String, V>> inputRows, ValueAdapter<V> adapter) {
+    ValueKind merged = null;
+    boolean unstable = false;
+    for (Map<String, V> inputRow : inputRows) {
+      if (inputRow == null) {
         continue;
       }
-      String candidate = trimmed.replace('\\', '/');
-      while (candidate.startsWith("/")) {
-        candidate = candidate.substring(1);
+      V raw = inputRow.get(fieldName);
+      if (raw == null || adapter.isNull(raw)) {
+        continue;
       }
-      while (candidate.endsWith("/")) {
-        candidate = candidate.substring(0, candidate.length() - 1);
+      ValueKind inferred = adapter.inferAddedKind(raw);
+      if (inferred == null) {
+        unstable = true;
+        break;
       }
-      String normalizedPart = Strings.trimToNull(candidate);
-      if (normalizedPart != null) {
-        normalized.add(normalizedPart);
+      if (merged == null) {
+        merged = inferred;
+        continue;
       }
-    }
-    return normalized.isEmpty() ? null : String.join("/", normalized);
-  }
-
-  static DefinitionIngest resolveIngestDefinition(IngestManagerImpl manager, String ingestName) {
-    Optional<DefinitionIngest> definition =
-        manager.DiscoveryCache.get(DefinitionIngest.class, manager.group, ingestName);
-    if (definition.isEmpty()) {
-      throw new IllegalArgumentException("Unknown ingest: " + manager.group + "/" + ingestName);
-    }
-    return definition.get();
-  }
-
-  static SchemaModel resolveSchemaModel(IngestManagerImpl manager, DefinitionIngest ingest) {
-    Objects.requireNonNull(ingest, "ingest");
-    String schemaName = Strings.requireNonBlank(ingest.outputSchemaId(), "ingest.outputSchemaId");
-    String ingestName =
-        Strings.requireNonBlank(
-            ingest.envelope() == null ? null : ingest.envelope().name(), "ingest.envelope.name");
-    return manager.schemaManager
-        .get(manager.group, schemaName)
-        .orElseThrow(
-            () ->
-                new IllegalStateException(
-                    "Schema not found for ingest="
-                        + manager.group
-                        + "/"
-                        + ingestName
-                        + " schema="
-                        + schemaName));
-  }
-
-  static DefinitionDataset resolveDatasetDefinition(
-      IngestManagerImpl manager, String datasetCanonicalId) {
-    String datasetIdText = Strings.trimToNull(datasetCanonicalId);
-    if (datasetIdText == null) {
-      return null;
-    }
-    DatasetId datasetId;
-    try {
-      datasetId = DatasetId.parse(datasetIdText);
-    } catch (RuntimeException ex) {
-      return null;
-    }
-    try {
-      return new DatasetResolver(manager.DiscoveryCache).resolveDefinition(datasetId);
-    } catch (RuntimeException ex) {
-      return null;
-    }
-  }
-
-  static void prepareActiveDataset(
-      IngestManagerImpl manager, DefinitionIngest ingestDefinition, DatasetId datasetId) {
-    if (!(manager.rowManager instanceof RowManagerImpl localDataManager)) {
-      return;
-    }
-    DefinitionDataset dataset = resolveDatasetDefinition(manager, ingestDefinition.datasetId());
-    if (dataset == null || dataset.binding() == null || dataset.binding().duckdb() == null) {
-      return;
-    }
-    String targetType = Strings.trimToNull(dataset.binding().duckdb().targetType());
-    if (!"DUCKDB_ACTIVE".equalsIgnoreCase(Strings.firstNonBlank(targetType, ""))) {
-      return;
-    }
-    localDataManager.prepareDuckDbActive(datasetId);
-  }
-
-  static IngestManagerImpl.ActiveTableDescriptor buildActiveTableDescriptor(
-      IngestManagerImpl manager,
-      String ingestName,
-      SchemaModel schema,
-      IngestTargetDuckDbActiveModel target) {
-    String tableName = Strings.requireNonBlank(target.tableName(), "target.duckdbActive.tableName");
-    List<String> primaryKey = target.primaryKey();
-    if (primaryKey == null || primaryKey.isEmpty()) {
-      throw new IllegalArgumentException("target.duckdbActive.primaryKey is required");
-    }
-    List<String> schemaFields =
-        schema.getFields() == null
-            ? List.of()
-            : schema.getFields().stream()
-                .map(SchemaModel.Field::getName)
-                .filter(Objects::nonNull)
-                .toList();
-    for (String key : primaryKey) {
-      if (!schemaFields.contains(key)) {
-        throw new IllegalArgumentException(
-            "target.duckdbActive.primaryKey contains unknown field '"
-                + key
-                + "' for ingest "
-                + ingestName);
+      merged = mergeKinds(merged, inferred);
+      if (merged == null) {
+        unstable = true;
+        break;
       }
     }
-    return new IngestManagerImpl.ActiveTableDescriptor(
-        ingestName,
-        tableName,
-        List.copyOf(primaryKey),
-        target.memory(),
-        target.databasePath(),
-        target.parquetHistoryPath(),
-        target.persistOnStop(),
-        target.createIfMissing(),
-        schemaFields);
+    if (unstable || merged == null) {
+      return ValueKind.UTF8;
+    }
+    return merged;
   }
 
-  static void validateTargetSchemaReferences(
-      String ingestName, IngestTargetModel target, SchemaModel schema) {
-    if (!(target instanceof IngestTargetParquetModel parquetTarget)) {
-      return;
+  private static ValueKind mergeKinds(ValueKind left, ValueKind right) {
+    if (left == right) {
+      return left;
     }
-    String partitionValueField = Strings.trimToNull(parquetTarget.partitionValueField());
-    if (partitionValueField == null) {
-      return;
+    if (isNumeric(left) && isNumeric(right)) {
+      if (left == ValueKind.FLOAT64 || right == ValueKind.FLOAT64) {
+        return ValueKind.FLOAT64;
+      }
+      if (left == ValueKind.INT64 || right == ValueKind.INT64) {
+        return ValueKind.INT64;
+      }
+      return ValueKind.INT32;
     }
-    Set<String> schemaFields = new HashSet<>();
-    if (schema.getFields() != null) {
-      for (SchemaModel.Field field : schema.getFields()) {
-        if (field == null) {
-          continue;
+    return null;
+  }
+
+  private static IllegalArgumentException missingRequired(
+      String ingestId, DefinitionIngest.SchemaMode mode, String fieldName) {
+    return new IllegalArgumentException(
+        "Missing required field '" + fieldName + "' ingest=" + ingestId + " mode=" + mode);
+  }
+
+  private static IllegalArgumentException typeMismatch(
+      String ingestId,
+      DefinitionIngest.SchemaMode mode,
+      String fieldName,
+      String expectedType,
+      String actualType) {
+    return typeMismatch(ingestId, mode, fieldName, expectedType, actualType, null);
+  }
+
+  private static IllegalArgumentException typeMismatch(
+      String ingestId,
+      DefinitionIngest.SchemaMode mode,
+      String fieldName,
+      String expectedType,
+      String actualType,
+      Throwable cause) {
+    String message =
+        "Type mismatch for field '"
+            + fieldName
+            + "' expected="
+            + expectedType
+            + " actual="
+            + actualType
+            + " ingest="
+            + ingestId
+            + " mode="
+            + mode;
+    return cause == null ? new IllegalArgumentException(message) : new IllegalArgumentException(message, cause);
+  }
+
+  private interface ValueAdapter<V> {
+    boolean isNull(V value);
+
+    ValueKind inferActualKind(V value);
+
+    ValueKind inferAddedKind(V value);
+
+    Object convert(V value, FormatField targetField, String ingestId);
+
+    String stringify(V value);
+
+    String actualTypeLabel(V value);
+  }
+
+  private enum JsonAdapter implements ValueAdapter<JsonNode> {
+    INSTANCE;
+
+    @Override
+    public boolean isNull(JsonNode value) {
+      return value == null || value.isNull();
+    }
+
+    @Override
+    public ValueKind inferActualKind(JsonNode value) {
+      if (value == null || value.isNull()) {
+        return null;
+      }
+      if (value.isBoolean()) {
+        return ValueKind.BOOL;
+      }
+      if (value.isIntegralNumber()) {
+        long numeric = value.longValue();
+        if (numeric >= Integer.MIN_VALUE && numeric <= Integer.MAX_VALUE) {
+          return ValueKind.INT32;
         }
-        String fieldName = Strings.trimToNull(field.getName());
-        if (fieldName == null) {
-          continue;
-        }
-        schemaFields.add(fieldName.toLowerCase(Locale.ROOT));
+        return ValueKind.INT64;
       }
+      if (value.isNumber()) {
+        return ValueKind.FLOAT64;
+      }
+      if (value.isTextual()) {
+        return ValueKind.UTF8;
+      }
+      return null;
     }
-    if (!schemaFields.contains(partitionValueField.toLowerCase(Locale.ROOT))) {
-      throw new IllegalArgumentException(
-          "target.parquet.partitionValueField contains unknown field '"
-              + partitionValueField
-              + "' for ingest "
-              + ingestName);
+
+    @Override
+    public ValueKind inferAddedKind(JsonNode value) {
+      return inferActualKind(value);
+    }
+
+    @Override
+    public Object convert(JsonNode value, FormatField targetField, String ingestId) {
+      return FormatDecoderConversions.fromJson(value, targetField, ingestId);
+    }
+
+    @Override
+    public String stringify(JsonNode value) {
+      if (value == null || value.isNull()) {
+        return null;
+      }
+      if (value.isTextual()) {
+        return value.textValue();
+      }
+      return value.toString();
+    }
+
+    @Override
+    public String actualTypeLabel(JsonNode value) {
+      if (value == null || value.isNull()) {
+        return "Null";
+      }
+      ValueKind kind = inferActualKind(value);
+      if (kind != null) {
+        return kind.expectedTypeLabel();
+      }
+      if (value.isArray()) {
+        return "Array";
+      }
+      if (value.isObject()) {
+        return "Object";
+      }
+      return "Unknown";
     }
   }
+
+  private enum NvFixAdapter implements ValueAdapter<String> {
+    INSTANCE;
+
+    @Override
+    public boolean isNull(String value) {
+      return value == null;
+    }
+
+    @Override
+    public ValueKind inferActualKind(String value) {
+      return inferFromString(value);
+    }
+
+    @Override
+    public ValueKind inferAddedKind(String value) {
+      return inferFromString(value);
+    }
+
+    @Override
+    public Object convert(String value, FormatField targetField, String ingestId) {
+      return FormatDecoderConversions.fromString(value, targetField, ingestId);
+    }
+
+    @Override
+    public String stringify(String value) {
+      return value;
+    }
+
+    @Override
+    public String actualTypeLabel(String value) {
+      ValueKind inferred = inferFromString(value);
+      if (inferred != null) {
+        return inferred.expectedTypeLabel();
+      }
+      return "Utf8";
+    }
+
+    private static ValueKind inferFromString(String value) {
+      String normalized = Strings.trimToNull(value);
+      if (normalized == null) {
+        return null;
+      }
+      if ("true".equalsIgnoreCase(normalized) || "false".equalsIgnoreCase(normalized)) {
+        return ValueKind.BOOL;
+      }
+      if (looksLikeTimestamp(normalized)) {
+        Long ignored = tryParseTimestampMicros(normalized);
+        if (ignored != null) {
+          return ValueKind.TIMESTAMP_MICROSECOND;
+        }
+      }
+      if (looksLikeDate(normalized)) {
+        Integer ignored = tryParseDateEpochDay(normalized);
+        if (ignored != null) {
+          return ValueKind.DATE_DAY;
+        }
+      }
+      Long integerValue = tryParseLong(normalized);
+      if (integerValue != null) {
+        if (integerValue >= Integer.MIN_VALUE && integerValue <= Integer.MAX_VALUE) {
+          return ValueKind.INT32;
+        }
+        return ValueKind.INT64;
+      }
+      Double floatingValue = tryParseDouble(normalized);
+      if (floatingValue != null) {
+        return ValueKind.FLOAT64;
+      }
+      return ValueKind.UTF8;
+    }
+
+    private static boolean looksLikeDate(String value) {
+      return value.contains("-") && value.length() >= 8;
+    }
+
+    private static boolean looksLikeTimestamp(String value) {
+      return value.contains("T") || value.endsWith("Z");
+    }
+
+    private static Integer tryParseDateEpochDay(String value) {
+      try {
+        LocalDate date = LocalDate.parse(value);
+        return Math.toIntExact(date.toEpochDay());
+      } catch (RuntimeException ex) {
+        return null;
+      }
+    }
+
+    private static Long tryParseTimestampMicros(String value) {
+      try {
+        Instant instant = Instant.parse(value);
+        return Math.addExact(
+            Math.multiplyExact(instant.getEpochSecond(), 1_000_000L), instant.getNano() / 1_000L);
+      } catch (DateTimeParseException | ArithmeticException ex) {
+        return null;
+      }
+    }
+
+    private static Long tryParseLong(String value) {
+      try {
+        return Long.parseLong(value);
+      } catch (NumberFormatException ex) {
+        return null;
+      }
+    }
+
+    private static Double tryParseDouble(String value) {
+      try {
+        return Double.parseDouble(value);
+      } catch (NumberFormatException ex) {
+        return null;
+      }
+    }
+  }
+
+  record Result(
+      List<FormatField> outputFields,
+      List<Object[]> outputRows,
+      List<String> addedColumns,
+      List<String> defaultedFields,
+      List<String> widenedFields,
+      List<String> observedInputFields) {}
 }
+
+
