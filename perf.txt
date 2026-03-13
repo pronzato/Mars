@@ -1,974 +1,948 @@
-package org.pronzato.fabric.api.data.catalog;
+package org.pronzato.fabric.api.data.duckdb;
 
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
-import java.util.function.Consumer;
+import java.util.TreeMap;
 import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConnection;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngest;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionSchema;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngestSource;
 import org.pronzato.fabric.api.data.dataset.DatasetId;
-import org.pronzato.fabric.api.data.duckdb.DuckdbSession;
-import org.pronzato.fabric.api.data.ingest.model.IngestModelMapper;
-import org.pronzato.fabric.api.data.manager.RowManagerImpl;
-import org.pronzato.fabric.api.data.views.ViewGraphPlanner;
-import org.pronzato.fabric.api.control.entitlements.core.data.DataColumnMaskPlanner;
-import org.pronzato.fabric.api.control.entitlements.core.data.DataEntitlements;
-import org.pronzato.fabric.api.control.entitlements.core.data.DataRowFilterPlanner;
-import org.pronzato.fabric.api.schemas.SchemaModel;
-import org.pronzato.fabric.api.schemas.manager.SchemaModelMapper;
-import org.pronzato.fabric.api.util.Exceptions;
 import org.pronzato.fabric.api.util.Strings;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
-public final class DuckdbCatalogImpl implements DuckdbCatalog {
-  private static final Logger LOGGER = LoggerFactory.getLogger(DuckdbCatalogImpl.class);
+public final class OdbcSessionSupport {
   private static final String PLATFORM_GROUP = "platform";
-  private static final String DEFAULT_NAMESPACE = "default";
-  private static final String DEFAULT_PARQUET_GLOB = "**/*.parquet";
-  private static final Comparator<DatasetId> DATASET_ID_ORDER =
-      Comparator.comparing(DatasetId::toString, String.CASE_INSENSITIVE_ORDER)
-          .thenComparing(DatasetId::toString);
-  private static final Comparator<MetadataTable> METADATA_TABLE_ORDER =
-      Comparator.comparing(MetadataTable::namespace, String.CASE_INSENSITIVE_ORDER)
-          .thenComparing(MetadataTable::namespace)
-          .thenComparing(MetadataTable::name, String.CASE_INSENSITIVE_ORDER)
-          .thenComparing(MetadataTable::name)
-          .thenComparing(MetadataTable::tableType, String.CASE_INSENSITIVE_ORDER)
-          .thenComparing(MetadataTable::tableType);
+  private static final String ODBC_QUERY_FUNCTION = "odbc_query(?, ?)";
+  private static final String ODBC_QUERY_SQL = "select * from odbc_query(?, ?)";
+  private static final String ODBC_CONNECTION_PROBE_SQL = "select 1 as fabric_odbc_probe";
 
-  private final Object lock = new Object();
-  private final DiscoveryCache DiscoveryCache;
-  private final RowManagerImpl rowManager;
-  private final String sessionGroup;
-  private final String defaultNamespace;
-  private final ViewGraphPlanner viewGraphPlanner = new ViewGraphPlanner();
-  private final IngestModelMapper ingestModelMapper = new IngestModelMapper();
-  private final LinkedHashSet<DatasetId> explicitInstalls = new LinkedHashSet<>();
-  private final DuckdbDatasetProviderRegistry datasetProviderRegistry;
-  private volatile CatalogSnapshot snapshot;
+  private OdbcSessionSupport() {}
 
-  public DuckdbCatalogImpl(DiscoveryCache DiscoveryCache, RowManagerImpl rowManager, String sessionGroup) {
-    this(DiscoveryCache, rowManager, sessionGroup, DEFAULT_NAMESPACE);
-  }
-
-  public DuckdbCatalogImpl(
-      DiscoveryCache DiscoveryCache, RowManagerImpl rowManager, String sessionGroup, String defaultNamespace) {
-    this.DiscoveryCache = Objects.requireNonNull(DiscoveryCache, "DiscoveryCache");
-    this.rowManager = Objects.requireNonNull(rowManager, "rowManager");
-    this.sessionGroup = Strings.requireNonBlank(sessionGroup, "sessionGroup");
-    this.defaultNamespace = Strings.requireNonBlank(defaultNamespace, "defaultNamespace");
-    this.datasetProviderRegistry = DuckdbDatasetProviderRegistry.defaults();
-    this.snapshot = CatalogSnapshot.empty(this.sessionGroup);
-  }
-
-  @Override
-  public void installAll() {
-    CatalogSnapshot updated;
-    synchronized (lock) {
-      updated = rebuildSnapshotLocked();
-      snapshot = updated;
-    }
-    rowManager.withDuckdbSession((Consumer<DuckdbSession>) session -> installSnapshotIntoSession(session, updated));
-  }
-
-  @Override
-  public void install(String datasetId) {
-    DatasetId parsed = DatasetId.parse(Strings.requireNonBlank(datasetId, "datasetId"));
-    DefinitionDataset definition = fetchDefinition(parsed);
-    synchronized (lock) {
-      explicitInstalls.add(parsed);
-      if (isActive(definition)) {
-        snapshot = upsertLocked(snapshot, toEntry(definition), true);
-      }
-    }
-    rowManager.withDuckdbSession(
-        (Consumer<DuckdbSession>) session -> installSnapshotIntoSession(session, snapshot));
-  }
-
-  @Override
-  public void onDatasetUpsert(DefinitionDataset definition) {
-    if (definition == null) {
-      return;
-    }
-    DatasetId datasetId = tryDatasetId(definition);
-    if (datasetId == null) {
-      return;
-    }
-    boolean explicit = false;
-    synchronized (lock) {
-      if (!sessionGroup.equals(datasetId.group()) && !explicitInstalls.contains(datasetId)) {
-        return;
-      }
-      explicit = explicitInstalls.contains(datasetId);
-      if (!isActive(definition)) {
-        snapshot = removeLocked(snapshot, datasetId, false);
-        return;
-      }
-      snapshot = upsertLocked(snapshot, toEntry(definition), explicit);
-    }
-    rowManager.withDuckdbSession((Consumer<DuckdbSession>) session -> installDataset(session, toEntry(definition)));
-  }
-
-  @Override
-  public void onDatasetDelete(String group, String namespace, String name) {
-    String resolvedGroup = Strings.requireNonBlank(group, "group");
-    String resolvedNamespace = Strings.requireNonBlank(namespace, "namespace");
-    String resolvedName = Strings.requireNonBlank(name, "name");
-    DatasetId datasetId = DatasetId.of(resolvedGroup, resolvedNamespace, resolvedName);
-    if (!sessionGroup.equals(datasetId.group())) {
-      synchronized (lock) {
-        if (!explicitInstalls.remove(datasetId)) {
-          return;
-        }
-      }
-    }
-
-    CatalogEntry removed;
-    synchronized (lock) {
-      removed = snapshot.entriesById().get(datasetId);
-      snapshot = removeLocked(snapshot, datasetId, true);
-    }
-    String viewName =
-        removed == null
-            ? duckdbViewName(resolvedGroup, resolvedNamespace, resolvedName)
-            : removed.physicalViewName();
-    rowManager.withDuckdbSession(
-        (Consumer<DuckdbSession>) session -> dropView(session, datasetId, viewName));
-  }
-
-  @Override
-  public QueryPlan planSql(String sql, Integer limit) {
-    String rawSql = Strings.requireNonBlank(sql, "sql");
-    CatalogSnapshot current = snapshot;
-    DatasetNameResolver resolver =
-        new DatasetNameResolver(sessionGroup, defaultNamespace, current);
-    List<DatasetId> directDatasets = resolver.resolveAllTableTokensInSql(rawSql);
-    String rewrittenSql = rewriteSqlForQuery(rawSql, resolver, current);
-    List<DatasetId> expanded = expandDependencies(directDatasets, current);
-    return new QueryPlan(applyLimit(rewrittenSql, limit), expanded);
-  }
-
-  @Override
-  public QueryPlan planSqlPublic(String sql, Integer limit) {
-    String rawSql = Strings.requireNonBlank(sql, "sql");
-    CatalogSnapshot current = snapshot;
-    DatasetNameResolver resolver =
-        new DatasetNameResolver(sessionGroup, defaultNamespace, current);
-    List<DatasetId> directDatasets = resolver.resolveAllTableTokensInSql(rawSql);
-    String rewrittenSql = rewriteSql(rawSql, resolver, current);
-    List<DatasetId> expanded = expandDependencies(directDatasets, current);
-    return new QueryPlan(applyLimit(rewrittenSql, limit), expanded);
-  }
-
-  @Override
-  public void prepareSession(DuckdbSession session) {
-    Objects.requireNonNull(session, "session");
-    installSnapshotIntoSession(session, snapshot);
-  }
-
-  @Override
-  public void close() {
-    synchronized (lock) {
-      explicitInstalls.clear();
-      snapshot = CatalogSnapshot.empty(sessionGroup);
-    }
-  }
-
-  public List<MetadataTable> metadataTables() {
-    CatalogSnapshot current = snapshot;
-    if (current.orderedEntries().isEmpty()) {
-      return List.of();
-    }
-    List<MetadataTable> tables = new ArrayList<>();
-    for (CatalogEntry entry : current.orderedEntries()) {
-      if (entry == null) {
-        continue;
-      }
-      for (String tableType : metadataTableTypes(entry)) {
-        tables.add(new MetadataTable(entry.datasetId(), entry.namespace(), entry.name(), tableType));
-      }
-    }
-    tables.sort(METADATA_TABLE_ORDER);
-    return List.copyOf(tables);
-  }
-
-  public Optional<SchemaModel> metadataSchemaModel(DatasetId datasetId) {
-    Objects.requireNonNull(datasetId, "datasetId");
-    CatalogEntry entry = snapshot.entriesById().get(datasetId);
-    if (entry == null) {
-      return Optional.empty();
-    }
-    SchemaModel schemaModel = resolveSchemaForMasking(entry);
-    if (schemaModel == null) {
-      return Optional.empty();
-    }
-    return Optional.of(schemaModel);
-  }
-
-  public record MetadataTable(
+  public static OdbcHandle installDatasetView(
+      DuckdbSession session,
+      DiscoveryCache cache,
       DatasetId datasetId,
-      String namespace,
-      String name,
-      String tableType) {}
-
-  private CatalogSnapshot rebuildSnapshotLocked() {
-    LinkedHashMap<DatasetId, CatalogEntry> byId = new LinkedHashMap<>();
-    for (DefinitionDataset definition : DiscoveryCache.list(DefinitionDataset.class, sessionGroup)) {
-      if (!isActive(definition)) {
-        continue;
+      DefinitionDataset.OdbcBinding binding) {
+    Objects.requireNonNull(datasetId, "datasetId");
+    Objects.requireNonNull(binding, "binding");
+    String canonicalDatasetId = datasetId.toString();
+    OdbcConnectionSpec connection =
+        resolveConnection(
+            cache,
+            datasetId.group(),
+            binding.connectionName(),
+            binding.databaseType(),
+            canonicalDatasetId);
+    String remoteSql = datasetSql(binding, canonicalDatasetId);
+    try {
+      installDatasetViewUsingParameterizedQuery(session, datasetId, connection, remoteSql);
+      return OdbcHandle.noOp(session, connection.connectionName(), connection.databaseType());
+    } catch (RuntimeException ex) {
+      if (!shouldFallbackToOdbcScan(ex)) {
+        throw queryFailed(canonicalDatasetId, connection, ex);
       }
-      CatalogEntry entry = toEntry(definition);
-      byId.put(entry.datasetId(), entry);
-    }
-    for (DatasetId datasetId : explicitInstalls) {
-      DefinitionDataset definition = fetchDefinition(datasetId);
-      if (!isActive(definition)) {
-        continue;
+      try {
+        installDatasetViewUsingOdbcScan(session, datasetId, connection, remoteSql);
+        return OdbcHandle.noOp(session, connection.connectionName(), connection.databaseType());
+      } catch (RuntimeException fallbackEx) {
+        throw queryFailed(canonicalDatasetId, connection, fallbackEx);
       }
-      CatalogEntry entry = toEntry(definition);
-      byId.put(entry.datasetId(), entry);
     }
-    return buildSnapshotById(byId.values());
   }
 
-  private CatalogSnapshot upsertLocked(
-      CatalogSnapshot current, CatalogEntry entry, boolean includeExplicitGroup) {
-    LinkedHashMap<DatasetId, CatalogEntry> byId = new LinkedHashMap<>(current.entriesById());
-    if (!sessionGroup.equals(entry.datasetId().group()) && !includeExplicitGroup) {
-      return current;
+  public static OdbcQueryResult openQueryResult(
+      DuckdbSession session, OdbcConnectionSpec spec, String remoteSql) {
+    Objects.requireNonNull(session, "session");
+    Objects.requireNonNull(spec, "spec");
+    String resolvedRemoteSql = Strings.requireNonBlank(remoteSql, "remoteSql");
+    try {
+      DuckdbExtensions.requireOdbc(session);
+    } catch (RuntimeException ex) {
+      throw ex;
     }
-    byId.put(entry.datasetId(), entry);
-    CatalogSnapshot updated = buildSnapshotById(byId.values());
-    LOGGER.debug("[Catalog] update datasetId={} type={} viewName={}", entry.datasetId(), typeToken(entry.definition()), entry.physicalViewName());
-    return updated;
-  }
-
-  private CatalogSnapshot removeLocked(CatalogSnapshot current, DatasetId datasetId, boolean logDrop) {
-    LinkedHashMap<DatasetId, CatalogEntry> byId = new LinkedHashMap<>(current.entriesById());
-    CatalogEntry removed = byId.remove(datasetId);
-    CatalogSnapshot updated = buildSnapshotById(byId.values());
-    if (removed != null && logDrop) {
-      LOGGER.debug("[Catalog] drop datasetId={} viewName={}", removed.datasetId(), removed.physicalViewName());
-    }
-    return updated;
-  }
-
-  private CatalogSnapshot buildSnapshotById(Collection<CatalogEntry> entries) {
-    List<CatalogEntry> ordered = new ArrayList<>(entries);
-    ordered.sort(
-        Comparator.comparing((CatalogEntry entry) -> entry.datasetId().toString(), String.CASE_INSENSITIVE_ORDER)
-            .thenComparing(entry -> entry.datasetId().toString()));
-    Map<DatasetId, CatalogEntry> byId = new LinkedHashMap<>();
-    for (CatalogEntry entry : ordered) {
-      byId.put(entry.datasetId(), entry);
-    }
-    Map<String, DatasetId> preliminaryQualified = new HashMap<>();
-    Map<String, List<DatasetId>> preliminaryUnqualified = new HashMap<>();
-    for (CatalogEntry entry : ordered) {
-      String namespaceQualified = qualifiedNameKey(entry.namespace(), entry.name());
-      putQualifiedPreferSessionGroup(preliminaryQualified, namespaceQualified, entry.datasetId());
-      preliminaryQualified.put(
-          qualifiedNameKey(entry.datasetId().group(), entry.namespace(), entry.name()),
-          entry.datasetId());
-      if (sessionGroup.equals(entry.datasetId().group())) {
-        String unqualifiedKey = entry.name().toLowerCase(Locale.ROOT);
-        preliminaryUnqualified
-            .computeIfAbsent(unqualifiedKey, ignored -> new ArrayList<>())
-            .add(entry.datasetId());
+    String queryConnectionString = queryConnectionString(spec);
+    PreparedStatement preparedStatement = null;
+    try {
+      preparedStatement = session.prepareStatement(ODBC_QUERY_SQL);
+      preparedStatement.setString(1, queryConnectionString);
+      preparedStatement.setString(2, resolvedRemoteSql);
+      ResultSet resultSet = preparedStatement.executeQuery();
+      return new OdbcQueryResult(
+          preparedStatement, resultSet, OdbcQueryPath.ODBC_QUERY_PARAMETERIZED);
+    } catch (SQLException | RuntimeException ex) {
+      closeStatementQuietly(preparedStatement);
+      if (!shouldFallbackToOdbcScan(ex)) {
+        throw new IllegalStateException(compactReason(ex), ex);
+      }
+      Statement fallbackStatement = null;
+      try {
+        fallbackStatement = session.createStatement();
+        ResultSet fallbackResultSet =
+            fallbackStatement.executeQuery(
+                "select * from " + odbcScanExpression(queryConnectionString, resolvedRemoteSql));
+        return new OdbcQueryResult(
+            fallbackStatement, fallbackResultSet, OdbcQueryPath.ODBC_SCAN_LITERAL);
+      } catch (SQLException | RuntimeException fallbackEx) {
+        closeStatementQuietly(fallbackStatement);
+        throw new IllegalStateException(compactReason(fallbackEx), fallbackEx);
       }
     }
-    Map<String, List<DatasetId>> preliminaryUnqualifiedImmutable = new HashMap<>();
-    for (Map.Entry<String, List<DatasetId>> entry : preliminaryUnqualified.entrySet()) {
-      List<DatasetId> values = new ArrayList<>(entry.getValue());
-      values.sort(DATASET_ID_ORDER);
-      preliminaryUnqualifiedImmutable.put(entry.getKey(), List.copyOf(values));
-    }
-    CatalogSnapshot preliminary =
-        new CatalogSnapshot(
-            sessionGroup,
-            List.copyOf(ordered),
-            Map.copyOf(byId),
-            Map.copyOf(preliminaryQualified),
-            Map.copyOf(preliminaryUnqualifiedImmutable));
-
-    List<CatalogEntry> withDependencies = new ArrayList<>(ordered.size());
-    DatasetNameResolver resolver = new DatasetNameResolver(sessionGroup, defaultNamespace, preliminary);
-    for (CatalogEntry entry : ordered) {
-      if (!entry.logicalView()) {
-        withDependencies.add(entry);
-        continue;
-      }
-      List<DatasetId> dependencies = resolveViewDependencies(entry, resolver);
-      withDependencies.add(
-          new CatalogEntry(
-              entry.datasetId(),
-              entry.definition(),
-              entry.namespace(),
-              entry.name(),
-              entry.physicalViewName(),
-              dependencies,
-              true));
-    }
-
-    Map<DatasetId, CatalogEntry> finalById = new LinkedHashMap<>();
-    Map<String, DatasetId> qualified = new HashMap<>();
-    Map<String, List<DatasetId>> unqualified = new HashMap<>();
-    for (CatalogEntry entry : withDependencies) {
-      finalById.put(entry.datasetId(), entry);
-      String namespaceQualified = qualifiedNameKey(entry.namespace(), entry.name());
-      putQualifiedPreferSessionGroup(qualified, namespaceQualified, entry.datasetId());
-      qualified.put(
-          qualifiedNameKey(entry.datasetId().group(), entry.namespace(), entry.name()),
-          entry.datasetId());
-      if (sessionGroup.equals(entry.datasetId().group())) {
-        String unqualifiedKey = entry.name().toLowerCase(Locale.ROOT);
-        unqualified.computeIfAbsent(unqualifiedKey, ignored -> new ArrayList<>()).add(entry.datasetId());
-      }
-    }
-    Map<String, List<DatasetId>> immutableUnqualified = new HashMap<>();
-    for (Map.Entry<String, List<DatasetId>> entry : unqualified.entrySet()) {
-      List<DatasetId> values = new ArrayList<>(entry.getValue());
-      values.sort(DATASET_ID_ORDER);
-      immutableUnqualified.put(entry.getKey(), List.copyOf(values));
-    }
-    return new CatalogSnapshot(
-        sessionGroup,
-        List.copyOf(withDependencies),
-        Map.copyOf(finalById),
-        Map.copyOf(qualified),
-        Map.copyOf(immutableUnqualified));
   }
 
-  private List<DatasetId> resolveViewDependencies(CatalogEntry entry, DatasetNameResolver resolver) {
-    DefinitionDataset.View view = entry.definition().view();
-    if (view == null) {
-      return List.of();
-    }
-    LinkedHashSet<DatasetId> dependencies = new LinkedHashSet<>();
-    List<String> configured = view.dependencies();
-    if (configured != null && !configured.isEmpty()) {
-      for (String dependency : configured) {
-        DatasetId parsed = tryParseDependencyToken(dependency, resolver);
-        if (parsed != null && !parsed.equals(entry.datasetId())) {
-          dependencies.add(parsed);
+  public static OdbcConnectionHealth probeConnection(DuckdbSession session, OdbcConnectionSpec spec) {
+    Objects.requireNonNull(session, "session");
+    Objects.requireNonNull(spec, "spec");
+    long startNanos = System.nanoTime();
+    List<String> warnings = new ArrayList<>();
+    DuckdbExtensions.OdbcExtensionLoadResult extensionResult = null;
+    try {
+      extensionResult = DuckdbExtensions.loadOdbc(session);
+      OdbcQueryPath queryPath;
+      String remoteProductName;
+      String remoteVersion;
+      try (OdbcQueryResult queryResult = openQueryResult(session, spec, ODBC_CONNECTION_PROBE_SQL)) {
+        queryPath = queryResult.path();
+        ResultSet resultSet = queryResult.resultSet();
+        if (!resultSet.next()) {
+          warnings.add("probe_query_returned_no_rows");
         }
+        remoteProductName = resolveRemoteProductName(resultSet);
+        remoteVersion = resolveRemoteVersion(resultSet);
+        if (remoteProductName == null) {
+          warnings.add("remote_product_name_unavailable");
+        }
+        if (remoteVersion == null) {
+          warnings.add("remote_version_unavailable");
+        }
+      }
+      boolean fallbackInUse =
+          queryPath == OdbcQueryPath.ODBC_SCAN_LITERAL
+              || (extensionResult != null && extensionResult.fallbackInUse());
+      return new OdbcConnectionHealth(
+          true,
+          spec.connectionName(),
+          spec.databaseType(),
+          extensionResult == null ? null : extensionResult.extensionNameUsed(),
+          extensionResult != null && extensionResult.extensionLoaded(),
+          true,
+          queryPath,
+          "ODBC_CONNECTION_OK",
+          remoteProductName,
+          remoteVersion,
+          elapsedMillis(startNanos),
+          List.copyOf(warnings),
+          fallbackInUse);
+    } catch (SQLException | RuntimeException ex) {
+      String message = probeFailureMessage(spec, ex);
+      return new OdbcConnectionHealth(
+          false,
+          spec.connectionName(),
+          spec.databaseType(),
+          extensionResult == null ? null : extensionResult.extensionNameUsed(),
+          extensionResult != null && extensionResult.extensionLoaded(),
+          !isExtensionUnavailable(message),
+          null,
+          message,
+          null,
+          null,
+          elapsedMillis(startNanos),
+          List.copyOf(warnings),
+          extensionResult != null && extensionResult.fallbackInUse());
+    }
+  }
+
+  public static OdbcSchemaInspection inspectSchema(
+      DuckdbSession session, OdbcConnectionSpec spec, String remoteSql) {
+    Objects.requireNonNull(session, "session");
+    Objects.requireNonNull(spec, "spec");
+    String resolvedRemoteSql = Strings.requireNonBlank(remoteSql, "remoteSql");
+    long startNanos = System.nanoTime();
+    List<OdbcColumnMetadata> columns = new ArrayList<>();
+    List<String> warnings = new ArrayList<>();
+    try (OdbcQueryResult result =
+        openQueryResult(
+            session,
+            spec,
+            "select * from (" + resolvedRemoteSql + ") as fabric_odbc_schema_preview limit 0")) {
+      ResultSetMetaData metadata = result.resultSet().getMetaData();
+      int count = metadata.getColumnCount();
+      for (int index = 1; index <= count; index++) {
+        String name = Strings.firstNonBlank(metadata.getColumnLabel(index), metadata.getColumnName(index));
+        int nullableCode = metadata.isNullable(index);
+        String nullability =
+            nullableCode == ResultSetMetaData.columnNoNulls
+                ? "NOT_NULL"
+                : nullableCode == ResultSetMetaData.columnNullable ? "NULLABLE" : "UNKNOWN";
+        columns.add(
+            new OdbcColumnMetadata(
+                name,
+                metadata.getColumnType(index),
+                metadata.getColumnTypeName(index),
+                metadata.getPrecision(index),
+                metadata.getScale(index),
+                nullability));
+      }
+      return new OdbcSchemaInspection(
+          true,
+          spec.connectionName(),
+          spec.databaseType(),
+          result.path(),
+          "ODBC_SCHEMA_OK columns=" + columns.size(),
+          List.copyOf(columns),
+          elapsedMillis(startNanos),
+          List.copyOf(warnings));
+    } catch (SQLException ex) {
+      return new OdbcSchemaInspection(
+          false,
+          spec.connectionName(),
+          spec.databaseType(),
+          null,
+          compactReason(ex),
+          List.of(),
+          elapsedMillis(startNanos),
+          List.copyOf(warnings));
+    } catch (RuntimeException ex) {
+      return new OdbcSchemaInspection(
+          false,
+          spec.connectionName(),
+          spec.databaseType(),
+          null,
+          compactReason(ex),
+          List.of(),
+          elapsedMillis(startNanos),
+          List.copyOf(warnings));
+    }
+  }
+
+  public static OdbcRuntimeStatus runtimeStatus(boolean configured, OdbcConnectionHealth health) {
+    if (!configured) {
+      return new OdbcRuntimeStatus(
+          false,
+          false,
+          false,
+          false,
+          ODBC_QUERY_FUNCTION,
+          false,
+          null,
+          "NOT_CONFIGURED",
+          0L,
+          List.of());
+    }
+    if (health == null) {
+      return new OdbcRuntimeStatus(
+          true,
+          false,
+          false,
+          false,
+          ODBC_QUERY_FUNCTION,
+          false,
+          null,
+          "NOT_TESTED",
+          0L,
+          List.of());
+    }
+    return new OdbcRuntimeStatus(
+        true,
+        health.extensionAvailable(),
+        health.extensionLoaded(),
+        health.ok(),
+        ODBC_QUERY_FUNCTION,
+        health.fallbackInUse(),
+        health.extensionNameUsed(),
+        Strings.firstNonBlank(Strings.trimToNull(health.message()), health.ok() ? "OK" : "FAILED"),
+        health.roundTripMillis(),
+        health.warnings());
+  }
+
+  private static void installDatasetViewUsingParameterizedQuery(
+      DuckdbSession session, DatasetId datasetId, OdbcConnectionSpec spec, String remoteSql) {
+    Objects.requireNonNull(session, "session");
+    Objects.requireNonNull(datasetId, "datasetId");
+    Objects.requireNonNull(spec, "spec");
+    String normalizedRemoteSql = Strings.requireNonBlank(remoteSql, "remoteSql");
+    String queryConnectionString = queryConnectionString(spec);
+    try {
+      DuckdbExtensions.requireOdbc(session);
+    } catch (RuntimeException ex) {
+      throw ex;
+    }
+    String sql =
+        "create or replace view "
+            + quoteIdentifier(viewName(datasetId))
+            + " as select * from odbc_query(?, ?)";
+    try (PreparedStatement statement = session.prepareStatement(sql)) {
+      statement.setString(1, queryConnectionString);
+      statement.setString(2, normalizedRemoteSql);
+      statement.execute();
+    } catch (SQLException ex) {
+      throw new IllegalStateException(ex.getMessage(), ex);
+    }
+  }
+
+  private static void installDatasetViewUsingOdbcScan(
+      DuckdbSession session, DatasetId datasetId, OdbcConnectionSpec spec, String remoteSql) {
+    Objects.requireNonNull(session, "session");
+    Objects.requireNonNull(datasetId, "datasetId");
+    Objects.requireNonNull(spec, "spec");
+    String normalizedRemoteSql = Strings.requireNonBlank(remoteSql, "remoteSql");
+    String queryConnectionString = queryConnectionString(spec);
+    session.exec(
+        "create or replace view "
+            + quoteIdentifier(viewName(datasetId))
+            + " as select * from "
+            + odbcScanExpression(queryConnectionString, normalizedRemoteSql));
+  }
+
+  private static boolean shouldFallbackToOdbcScan(Throwable cause) {
+    String reason =
+        Strings.firstNonBlank(
+            Strings.trimToNull(cause == null ? null : cause.getMessage()),
+            cause == null ? null : cause.getClass().getSimpleName());
+    if (reason == null) {
+      return false;
+    }
+    String normalized = reason.toLowerCase();
+    if (!normalized.contains("odbc_query")) {
+      return false;
+    }
+    return normalized.contains("does not exist")
+        || normalized.contains("not found")
+        || normalized.contains("catalog error")
+        || normalized.contains("binder error")
+        || normalized.contains("no function matches")
+        || normalized.contains("unknown table function")
+        || (normalized.contains("parameter") && normalized.contains("not"));
+  }
+
+  private static String odbcScanExpression(String queryConnectionString, String remoteSql) {
+    return "odbc_scan('"
+        + escapeSqlLiteral(Strings.requireNonBlank(queryConnectionString, "queryConnectionString"))
+        + "', '"
+        + escapeSqlLiteral(Strings.requireNonBlank(remoteSql, "remoteSql"))
+        + "')";
+  }
+
+  private static String queryConnectionString(OdbcConnectionSpec spec) {
+    Objects.requireNonNull(spec, "spec");
+    String base = Strings.requireNonBlank(spec.connectionString(), "connectionString");
+    StringBuilder builder = new StringBuilder(base);
+    if (!base.endsWith(";")) {
+      builder.append(';');
+    }
+    appendCredentialOption(builder, "UID", spec.username(), "UID", "USER ID");
+    appendCredentialOption(builder, "PWD", spec.password(), "PWD", "PASSWORD");
+    return builder.toString();
+  }
+
+  private static void appendCredentialOption(
+      StringBuilder builder, String optionName, String value, String... aliases) {
+    String normalizedValue = Strings.trimToNull(value);
+    if (normalizedValue == null) {
+      return;
+    }
+    if (hasOption(builder.toString(), aliases)) {
+      return;
+    }
+    builder.append(optionName).append('=').append(normalizedValue).append(';');
+  }
+
+  private static boolean hasOption(String connectionString, String... aliases) {
+    String normalized = Strings.trimToNull(connectionString);
+    if (normalized == null || aliases == null || aliases.length == 0) {
+      return false;
+    }
+    for (String token : normalized.split(";")) {
+      int equalsIndex = token.indexOf('=');
+      if (equalsIndex <= 0) {
+        continue;
+      }
+      String key = Strings.trimToNull(token.substring(0, equalsIndex));
+      if (key == null) {
+        continue;
+      }
+      for (String alias : aliases) {
+        if (alias != null && key.equalsIgnoreCase(alias)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  private static void closeStatementQuietly(Statement statement) {
+    if (statement == null) {
+      return;
+    }
+    try {
+      statement.close();
+    } catch (SQLException | RuntimeException ignore) {
+      // best effort cleanup.
+    }
+  }
+
+  private static void closeResultSetQuietly(ResultSet resultSet) {
+    if (resultSet == null) {
+      return;
+    }
+    try {
+      resultSet.close();
+    } catch (SQLException | RuntimeException ignore) {
+      // best effort cleanup.
+    }
+  }
+
+  private static String compactReason(Throwable cause) {
+    String message =
+        Strings.firstNonBlank(
+            Strings.trimToNull(cause == null ? null : cause.getMessage()),
+            cause == null ? null : cause.getClass().getSimpleName());
+    if (message == null) {
+      return "unknown";
+    }
+    return message.replace('\n', ' ').replace('\r', ' ');
+  }
+
+  private static String probeFailureMessage(OdbcConnectionSpec spec, Throwable cause) {
+    String reason = compactReason(cause);
+    if (reason.startsWith("ODBC_EXTENSION_UNAVAILABLE") || reason.startsWith("ODBC_EXTENSION_LOAD_FAILED")) {
+      return reason;
+    }
+    return connectionFailed(
+            spec == null ? null : spec.connectionName(),
+            spec == null ? null : spec.databaseType(),
+            reason,
+            cause)
+        .getMessage();
+  }
+
+  private static boolean isExtensionUnavailable(String message) {
+    String normalized = Strings.firstNonBlank(Strings.trimToNull(message), "").toUpperCase();
+    return normalized.startsWith("ODBC_EXTENSION_UNAVAILABLE")
+        || normalized.startsWith("ODBC_EXTENSION_LOAD_FAILED");
+  }
+
+  private static String resolveRemoteProductName(ResultSet resultSet) {
+    if (resultSet == null) {
+      return null;
+    }
+    try {
+      String value = Strings.trimToNull(resultSet.getStatement().getConnection().getMetaData().getDatabaseProductName());
+      if (value == null || value.equalsIgnoreCase("duckdb")) {
+        return null;
+      }
+      return value;
+    } catch (SQLException | RuntimeException ignore) {
+      return null;
+    }
+  }
+
+  private static String resolveRemoteVersion(ResultSet resultSet) {
+    if (resultSet == null) {
+      return null;
+    }
+    try {
+      String value = Strings.trimToNull(resultSet.getStatement().getConnection().getMetaData().getDatabaseProductVersion());
+      if (value == null) {
+        return null;
+      }
+      if (value.toLowerCase().contains("duckdb")) {
+        return null;
+      }
+      return value;
+    } catch (SQLException | RuntimeException ignore) {
+      return null;
+    }
+  }
+
+  private static long elapsedMillis(long startNanos) {
+    return Math.max(0L, (System.nanoTime() - startNanos) / 1_000_000L);
+  }
+
+  public static String ingestSourceSql(
+      DefinitionIngestSource.OdbcSource source, String ingestName, String connectionName) {
+    Objects.requireNonNull(source, "source");
+    String remoteSql = Strings.trimToNull(source.querySql());
+    if (remoteSql != null) {
+      return remoteSql;
+    }
+    String tableName = Strings.trimToNull(source.tableName());
+    if (tableName != null) {
+      return "select * from " + tableName;
+    }
+    String resolvedConnectionName =
+        Strings.firstNonBlank(Strings.trimToNull(connectionName), Strings.trimToNull(source.connectionName()));
+    throw ingestSourceFailed(
+        ingestName,
+        resolvedConnectionName,
+        source.databaseType(),
+        "missing_table_or_query",
+        null);
+  }
+
+  public static String datasetSql(DefinitionDataset.OdbcBinding binding, String datasetId) {
+    Objects.requireNonNull(binding, "binding");
+    return datasetRemoteSql(binding, datasetId);
+  }
+
+  public static OdbcConnectionSpec resolveConnection(
+      DiscoveryCache cache,
+      String preferredGroup,
+      String connectionName,
+      DefinitionConnection.Odbc.DatabaseType requestedDatabaseType,
+      String datasetOrIngestId) {
+    Objects.requireNonNull(cache, "cache");
+    String resolvedConnectionName = Strings.requireNonBlank(connectionName, "connectionName");
+    String normalizedGroup = Strings.trimToNull(preferredGroup);
+    if (normalizedGroup == null) {
+      normalizedGroup = PLATFORM_GROUP;
+    }
+    Optional<DefinitionConnection> resolved =
+        cache.get(DefinitionConnection.class, normalizedGroup, resolvedConnectionName);
+    if (resolved.isEmpty() && !PLATFORM_GROUP.equals(normalizedGroup)) {
+      resolved = cache.get(DefinitionConnection.class, PLATFORM_GROUP, resolvedConnectionName);
+    }
+    if (resolved.isEmpty()) {
+      throw connectionFailed(
+          resolvedConnectionName,
+          requestedDatabaseType,
+          "connection_not_found id=" + Strings.firstNonBlank(datasetOrIngestId, "<unknown>"),
+          null);
+    }
+    DefinitionConnection connection = resolved.get();
+    if (connection.connectionType() != DefinitionConnection.ConnectionType.ODBC
+        || connection.odbc() == null) {
+      throw connectionFailed(
+          resolvedConnectionName,
+          requestedDatabaseType,
+          "connection_not_odbc",
+          null);
+    }
+    DefinitionConnection.Odbc odbc = connection.odbc();
+    DefinitionConnection.Odbc.DatabaseType databaseType =
+        requestedDatabaseType == null
+            ? (odbc.databaseType() == null ? DefinitionConnection.Odbc.DatabaseType.OTHER : odbc.databaseType())
+            : requestedDatabaseType;
+    String connectionString = buildConnectionString(odbc);
+    String username = Strings.trimToNull(odbc.username());
+    String password = Strings.firstNonBlank(Strings.trimToNull(odbc.password()), Strings.trimToNull(odbc.secretRef()));
+    return new OdbcConnectionSpec(resolvedConnectionName, databaseType, connectionString, username, password);
+  }
+
+  public static OdbcHandle openHandle(DuckdbSession session, OdbcConnectionSpec spec) {
+    Objects.requireNonNull(session, "session");
+    Objects.requireNonNull(spec, "spec");
+    try {
+      DuckdbExtensions.requireOdbc(session);
+    } catch (RuntimeException ex) {
+      throw ex;
+    }
+    String sql = connectSql(spec);
+    try (Statement statement = session.createStatement();
+        ResultSet resultSet = statement.executeQuery(sql)) {
+      if (!resultSet.next()) {
+        throw connectionFailed(spec.connectionName(), spec.databaseType(), "empty_handle_result", null);
+      }
+      long handle = resultSet.getLong(1);
+      if (resultSet.wasNull()) {
+        throw connectionFailed(spec.connectionName(), spec.databaseType(), "null_handle_result", null);
+      }
+      return new OdbcHandle(session, spec.connectionName(), spec.databaseType(), handle, true);
+    } catch (SQLException ex) {
+      throw connectionFailed(spec.connectionName(), spec.databaseType(), ex.getMessage(), ex);
+    } catch (RuntimeException ex) {
+      throw connectionFailed(spec.connectionName(), spec.databaseType(), ex.getMessage(), ex);
+    }
+  }
+
+  public static String queryExpression(long handle, String remoteSql) {
+    return "odbc_query(" + handle + ", '" + escapeSqlLiteral(Strings.requireNonBlank(remoteSql, "remoteSql")) + "')";
+  }
+
+  public static String viewName(DatasetId id) {
+    Objects.requireNonNull(id, "id");
+    return sanitizeIdentifier(id.group())
+        + "__"
+        + sanitizeIdentifier(id.namespace())
+        + "__"
+        + sanitizeIdentifier(id.name());
+  }
+
+  public static RuntimeException queryFailed(
+      String datasetId, OdbcConnectionSpec spec, Throwable cause) {
+    return queryFailed(
+        datasetId,
+        spec == null ? null : spec.connectionName(),
+        spec == null ? null : spec.databaseType(),
+        compactReason(cause),
+        cause);
+  }
+
+  public static RuntimeException queryFailed(
+      String datasetId,
+      String connectionName,
+      DefinitionConnection.Odbc.DatabaseType databaseType,
+      String reason,
+      Throwable cause) {
+    return new IllegalStateException(
+        "ODBC_QUERY_FAILED datasetId="
+            + Strings.firstNonBlank(Strings.trimToNull(datasetId), "<unknown>")
+            + " connectionName="
+            + Strings.firstNonBlank(Strings.trimToNull(connectionName), "<unknown>")
+            + " databaseType="
+            + databaseTypeName(databaseType)
+            + " reason="
+            + Strings.firstNonBlank(Strings.trimToNull(reason), "unknown"),
+        cause);
+  }
+
+  public static RuntimeException connectionFailed(
+      String connectionName,
+      DefinitionConnection.Odbc.DatabaseType databaseType,
+      String reason,
+      Throwable cause) {
+    return new IllegalStateException(
+        "ODBC_CONNECTION_FAILED connectionName="
+            + Strings.firstNonBlank(Strings.trimToNull(connectionName), "<unknown>")
+            + " databaseType="
+            + databaseTypeName(databaseType)
+            + " reason="
+            + Strings.firstNonBlank(Strings.trimToNull(reason), "unknown"),
+        cause);
+  }
+
+  public static RuntimeException ingestSourceFailed(
+      String ingestName,
+      String connectionName,
+      DefinitionConnection.Odbc.DatabaseType databaseType,
+      String reason,
+      Throwable cause) {
+    return new IllegalStateException(
+        "ODBC_INGEST_SOURCE_FAILED ingestName="
+            + Strings.firstNonBlank(Strings.trimToNull(ingestName), "<unknown>")
+            + " connectionName="
+            + Strings.firstNonBlank(Strings.trimToNull(connectionName), "<unknown>")
+            + " databaseType="
+            + databaseTypeName(databaseType)
+            + " reason="
+            + Strings.firstNonBlank(Strings.trimToNull(reason), "unknown"),
+        cause);
+  }
+
+  public static void closeQuietly(OdbcHandle handle) {
+    if (handle == null) {
+      return;
+    }
+    try {
+      handle.close();
+    } catch (RuntimeException ignore) {
+      // keep query path deterministic and do not mask upstream failures.
+    }
+  }
+
+  private static String datasetRemoteSql(DefinitionDataset.OdbcBinding binding, String datasetId) {
+    String querySql = Strings.trimToNull(binding.querySql());
+    if (querySql != null) {
+      return querySql;
+    }
+    String tableName = Strings.trimToNull(binding.tableName());
+    if (tableName == null) {
+      throw queryFailed(
+          datasetId,
+          binding.connectionName(),
+          binding.databaseType(),
+          "missing_table_or_query",
+          null);
+    }
+    String catalogName = Strings.trimToNull(binding.catalogName());
+    String schemaName = Strings.trimToNull(binding.schemaName());
+    StringBuilder sql = new StringBuilder("select * from ");
+    appendQualifiedTable(sql, catalogName, schemaName, tableName);
+    return sql.toString();
+  }
+
+  private static void appendQualifiedTable(
+      StringBuilder sql, String catalogName, String schemaName, String tableName) {
+    if (catalogName != null) {
+      sql.append(quoteRemoteIdentifier(catalogName)).append('.');
+    }
+    if (schemaName != null) {
+      sql.append(quoteRemoteIdentifier(schemaName)).append('.');
+    }
+    sql.append(quoteRemoteIdentifier(Strings.requireNonBlank(tableName, "tableName")));
+  }
+
+  private static String buildConnectionString(DefinitionConnection.Odbc odbc) {
+    String explicit = Strings.trimToNull(odbc.connectionString());
+    StringBuilder builder = new StringBuilder();
+    if (explicit != null) {
+      builder.append(explicit);
+      if (!explicit.endsWith(";")) {
+        builder.append(';');
       }
     } else {
-      String querySql = Strings.trimToNull(view.querySql());
-      if (querySql != null) {
-        try {
-          for (DatasetId dependency : resolver.resolveAllTableTokensInSql(querySql)) {
-            if (!dependency.equals(entry.datasetId())) {
-              dependencies.add(dependency);
-            }
-          }
-        } catch (IllegalArgumentException ignore) {
-          // Keep catalog rebuild deterministic even when configured view dependencies are temporarily missing.
-        }
+      String dsn = Strings.trimToNull(odbc.dsn());
+      if (dsn != null) {
+        appendOption(builder, "DSN", dsn);
+      }
+      String driver = Strings.trimToNull(odbc.driverName());
+      if (driver != null) {
+        appendOption(builder, "Driver", "{" + driver + "}");
       }
     }
-    return List.copyOf(dependencies);
+    if (builder.length() == 0) {
+      throw connectionFailed(
+          odbc.connectionName(),
+          odbc.databaseType(),
+          "missing_connection_string_or_dsn",
+          null);
+    }
+    if (odbc.sslEnabled() != null) {
+      appendOption(builder, "SSL", Boolean.TRUE.equals(odbc.sslEnabled()) ? "1" : "0");
+    }
+    if (odbc.connectTimeoutSeconds() != null) {
+      appendOption(builder, "ConnectTimeout", String.valueOf(odbc.connectTimeoutSeconds()));
+    }
+    if (odbc.queryTimeoutSeconds() != null) {
+      appendOption(builder, "QueryTimeout", String.valueOf(odbc.queryTimeoutSeconds()));
+    }
+    if (odbc.fetchSize() != null) {
+      appendOption(builder, "FetchSize", String.valueOf(odbc.fetchSize()));
+    }
+    appendOptions(builder, odbc.properties());
+    appendOptions(builder, odbc.options());
+    return builder.toString();
   }
 
-  private DatasetId tryParseDependencyToken(String dependency, DatasetNameResolver resolver) {
-    String token = Strings.trimToNull(dependency);
-    if (token == null) {
-      return null;
-    }
-    try {
-      if (token.regionMatches(true, 0, "dataset:", 0, "dataset:".length())) {
-        return DatasetId.parse(token);
-      }
-      if (token.indexOf('/') >= 0) {
-        String[] parts = token.split("/", 2);
-        if (parts.length != 2) {
-          return null;
-        }
-        return DatasetId.of(sessionGroup, parts[0], parts[1]);
-      }
-      return resolver.resolveTableToken(token);
-    } catch (IllegalArgumentException ex) {
-      return null;
-    }
-  }
-
-  private void installSnapshotIntoSession(DuckdbSession session, CatalogSnapshot current) {
-    for (CatalogEntry entry : current.orderedEntries()) {
-      if (!entry.logicalView()) {
-        installDataset(session, entry);
-      }
-    }
-    installLogicalViews(session, current);
-  }
-
-  private void installLogicalViews(DuckdbSession session, CatalogSnapshot current) {
-    Map<String, List<String>> graph = new LinkedHashMap<>();
-    for (CatalogEntry entry : current.orderedEntries()) {
-      if (!entry.logicalView()) {
-        continue;
-      }
-      List<String> dependencies = new ArrayList<>();
-      for (DatasetId dependency : entry.dependencies()) {
-        CatalogEntry dependencyEntry = current.entriesById().get(dependency);
-        if (dependencyEntry != null && dependencyEntry.logicalView()) {
-          dependencies.add(dependency.toString());
-        }
-      }
-      dependencies.sort(String.CASE_INSENSITIVE_ORDER);
-      graph.put(entry.datasetId().toString(), List.copyOf(dependencies));
-    }
-
-    LinkedHashSet<String> ordered = new LinkedHashSet<>();
-    List<String> roots = new ArrayList<>(graph.keySet());
-    roots.sort(String.CASE_INSENSITIVE_ORDER);
-    for (String root : roots) {
-      ordered.addAll(viewGraphPlanner.plan(root, graph));
-    }
-
-    DatasetNameResolver resolver = new DatasetNameResolver(sessionGroup, defaultNamespace, current);
-    for (String datasetId : ordered) {
-      CatalogEntry entry = current.entriesById().get(DatasetId.parse(datasetId));
-      if (entry == null) {
-        continue;
-      }
-      String querySql = Strings.requireNonBlank(entry.definition().view().querySql(), "view.querySql");
-      String rewritten;
-      try {
-        rewritten = rewriteSql(querySql, resolver, current);
-      } catch (IllegalArgumentException ex) {
-        dropView(session, entry.datasetId(), entry.physicalViewName());
-        LOGGER.debug("[Catalog] install-skipped datasetId={} type={} viewName={} reason=unresolved-view-dependency message={}", entry.datasetId(), typeToken(entry.definition()), entry.physicalViewName(), ex.getMessage());
-        continue;
-      }
-      String sql =
-          "create or replace view "
-              + quoteIdentifier(entry.physicalViewName())
-              + " as "
-              + stripTrailingSemicolon(rewritten);
-      exec(session, sql);
-      LOGGER.debug("[Catalog] install datasetId={} type={} viewName={}", entry.datasetId(), typeToken(entry.definition()), entry.physicalViewName());
-    }
-  }
-
-  private void installDataset(DuckdbSession session, CatalogEntry entry) {
-    try (DuckdbPreparedDataset prepared = prepareDatasetForCatalog(session, entry)) {
-      if (!prepared.installed()) {
-        return;
-      }
-      LOGGER.debug("[Catalog] install datasetId={} type={} viewName={}", entry.datasetId(), typeToken(entry.definition()), entry.physicalViewName());
-    } catch (IllegalStateException ex) {
-      if (isMissingParquetFilesError(ex)) {
-        LOGGER.debug("[Catalog] install-skipped datasetId={} type={} viewName={} reason=no-matching-parquet-files", entry.datasetId(), typeToken(entry.definition()), entry.physicalViewName());
-        return;
-      }
-      if (isS3CredentialUnavailableError(ex)) {
-        LOGGER.warn("[Catalog] install-skipped datasetId={} type={} viewName={} reason=s3-credentials-unavailable message={}", entry.datasetId(), typeToken(entry.definition()), entry.physicalViewName(), Exceptions.rootMessageNullable(ex));
-        return;
-      }
-      if (isMissingDuckdbRelationError(ex) && isDuckdbActive(entry.definition().binding() == null ? null : entry.definition().binding().duckdb())) {
-        LOGGER.debug("[Catalog] install-skipped datasetId={} type={} viewName={} reason=missing-duckdb-active-relation", entry.datasetId(), typeToken(entry.definition()), entry.physicalViewName());
-        return;
-      }
-      throw ex;
-    } catch (Exception ex) {
-      throw new IllegalStateException(
-          "Failed to prepare dataset install for " + entry.datasetId() + ": " + ex.getMessage(),
-          ex);
-    }
-  }
-
-  private DuckdbPreparedDataset prepareDatasetForCatalog(
-      DuckdbSession session, CatalogEntry entry) {
-    DefinitionDataset definition = entry.definition();
-    DefinitionDataset.View view = definition.view();
-    String viewName = quoteIdentifier(entry.physicalViewName());
-
-    if (view != null) {
-      DefinitionDataset.Target target = view.target();
-      String targetParquetPath = target == null ? null : Strings.trimToNull(target.parquetPath());
-      if (targetParquetPath != null) {
-        String parquetExpression = parquetFromPath(targetParquetPath, null, false);
-        exec(
-            session,
-            "create or replace view " + viewName + " as select * from " + parquetExpression);
-        return DuckdbPreparedDataset.installed(entry.datasetId(), entry.physicalViewName(), null);
-      }
-      String targetTable = target == null ? null : Strings.trimToNull(target.duckdbTableName());
-      if (targetTable != null) {
-        exec(
-            session,
-            "create or replace view " + viewName + " as select * from " + targetTable);
-        return DuckdbPreparedDataset.installed(entry.datasetId(), entry.physicalViewName(), null);
-      }
-      if (entry.logicalView()) {
-        return DuckdbPreparedDataset.noOp(entry.datasetId(), entry.physicalViewName());
-      }
-    }
-    DuckdbDatasetPrepareRequest request =
-        new DuckdbDatasetPrepareRequest(
-            entry.datasetId(),
-            definition,
-            entry.physicalViewName(),
-            session,
-            DiscoveryCache,
-            rowManager,
-            DuckdbDatasetPrepareMode.CATALOG);
-    return datasetProviderRegistry.prepare(request);
-  }
-
-  private static String rewriteSql(String sql, DatasetNameResolver resolver, CatalogSnapshot snapshot) {
-    List<DatasetToken> tokens = resolver.scanTableTokensInSql(sql);
-    if (tokens.isEmpty()) {
-      return stripTrailingSemicolon(sql);
-    }
-    StringBuilder rewritten = new StringBuilder(sql.length() + (tokens.size() * 16));
-    int cursor = 0;
-    for (DatasetToken token : tokens) {
-      DatasetId datasetId = resolver.resolveTableToken(token.normalizedToken());
-      CatalogEntry entry = snapshot.entriesById().get(datasetId);
-      if (entry == null) {
-        throw new IllegalArgumentException("Unknown table token '" + token.token() + "'");
-      }
-      rewritten.append(sql, cursor, token.start());
-      rewritten.append(withAlias(quoteIdentifier(entry.physicalViewName()), token));
-      cursor = token.end();
-    }
-    rewritten.append(sql, cursor, sql.length());
-    return stripTrailingSemicolon(rewritten.toString());
-  }
-
-  private String rewriteSqlForQuery(String sql, DatasetNameResolver resolver, CatalogSnapshot snapshot) {
-    List<DatasetToken> tokens = resolver.scanTableTokensInSql(sql, true);
-    if (tokens.isEmpty()) {
-      return stripTrailingSemicolon(sql);
-    }
-    DataEntitlements entitlements = rowManager.dataEntitlementsForSqlPlanning();
-    DataEntitlements.Identity identity = rowManager.effectiveIdentityForSqlPlanning();
-    Map<DatasetId, DataRowFilterPlanner.RowFilterPlan> rowPlansByDataset = new HashMap<>();
-    Map<DatasetId, DataColumnMaskPlanner.ColumnMaskPlan> maskPlansByDataset = new HashMap<>();
-    StringBuilder rewritten = new StringBuilder(sql.length() + (tokens.size() * 32));
-    int cursor = 0;
-    for (DatasetToken token : tokens) {
-      DatasetId datasetId = resolver.resolveTableToken(token.normalizedToken());
-      CatalogEntry entry = snapshot.entriesById().get(datasetId);
-      if (entry == null) {
-        throw new IllegalArgumentException("Unknown table token '" + token.token() + "'");
-      }
-      DataRowFilterPlanner.RowFilterPlan rowPlan =
-          rowPlansByDataset.computeIfAbsent(
-              datasetId,
-              ignored -> DataRowFilterPlanner.planRead(entitlements, identity, datasetId.toString()));
-      if (!rowPlan.allowed()) {
-        throw new IllegalStateException(firstDenyReason(rowPlan.reasons(), "row filter", datasetId));
-      }
-
-      DataColumnMaskPlanner.ColumnMaskPlan maskPlan =
-          maskPlansByDataset.computeIfAbsent(
-              datasetId,
-              ignored ->
-                  DataColumnMaskPlanner.planRead(
-                      entitlements,
-                      identity,
-                      datasetId.toString(),
-                      resolveSchemaForMasking(entry)));
-      if (!maskPlan.allowed()) {
-        throw new IllegalStateException(firstDenyReason(maskPlan.reasons(), "column mask", datasetId));
-      }
-
-      String replacement = quoteIdentifier(entry.physicalViewName());
-      String predicate = Strings.trimToNull(rowPlan.predicateSql());
-      if (predicate != null) {
-        replacement = "(select * from " + replacement + " where " + predicate + ")";
-      }
-      String projection = Strings.trimToNull(maskPlan.projectionSql());
-      if (projection != null) {
-        replacement = "(select " + projection + " from " + replacement + ")";
-      }
-      rewritten.append(sql, cursor, token.start());
-      rewritten.append(withAlias(replacement, token));
-      cursor = token.end();
-    }
-    rewritten.append(sql, cursor, sql.length());
-    return stripTrailingSemicolon(rewritten.toString());
-  }
-
-  private static String withAlias(String replacement, DatasetToken token) {
-    String alias = Strings.trimToNull(token.alias());
-    if (alias == null) {
-      return replacement;
-    }
-    if (token.aliasUsesAsKeyword()) {
-      return replacement + " as " + alias;
-    }
-    return replacement + " " + alias;
-  }
-
-  private static String firstDenyReason(
-      List<String> reasons, String policyType, DatasetId datasetId) {
-    if (reasons == null || reasons.isEmpty()) {
-      return "DENIED: no " + policyType + " decision for dataset " + datasetId;
-    }
-    String reason = Strings.trimToNull(reasons.get(0));
-    if (reason == null) {
-      return "DENIED: no " + policyType + " decision for dataset " + datasetId;
-    }
-    return reason;
-  }
-
-  private SchemaModel resolveSchemaForMasking(CatalogEntry entry) {
-    String schemaName = resolveSchemaName(entry);
-    if (schemaName == null) {
-      return null;
-    }
-    Optional<DefinitionSchema> definition = resolveSchemaDefinition(entry.datasetId().group(), schemaName);
-    return definition.map(SchemaModelMapper::fromDefinition).orElse(null);
-  }
-
-  private Optional<DefinitionSchema> resolveSchemaDefinition(String datasetGroup, String schemaName) {
-    List<String> groups = new ArrayList<>();
-    addDistinct(groups, datasetGroup);
-    addDistinct(groups, sessionGroup);
-    addDistinct(groups, PLATFORM_GROUP);
-    for (String group : groups) {
-      Optional<DefinitionSchema> schema = DiscoveryCache.get(DefinitionSchema.class, group, schemaName);
-      if (schema.isPresent() && isTabularSchema(schema.get())) {
-        return schema;
-      }
-    }
-    return Optional.empty();
-  }
-
-  private String resolveSchemaName(CatalogEntry entry) {
-    DefinitionDataset definition = entry == null ? null : entry.definition();
-    DefinitionDataset.View view = definition == null ? null : definition.view();
-    String viewSchemaName = view == null ? null : Strings.trimToNull(view.schemaName());
-    if (viewSchemaName != null) {
-      return viewSchemaName;
-    }
-    String ingestSchemaName = resolveSchemaNameFromIngest(entry.datasetId());
-    if (ingestSchemaName != null) {
-      return ingestSchemaName;
-    }
-    String deterministic =
-        ingestModelMapper.deterministicSchemaName(
-            entry.datasetId().group(), entry.datasetId().namespace(), entry.datasetId().name());
-    return resolveSchemaDefinition(entry.datasetId().group(), deterministic).isPresent()
-        ? deterministic
-        : null;
-  }
-
-  private String resolveSchemaNameFromIngest(DatasetId datasetId) {
-    List<String> schemaNames = new ArrayList<>();
-    List<DefinitionIngest> ingests = DiscoveryCache.list(DefinitionIngest.class, datasetId.group());
-    for (DefinitionIngest ingest : ingests) {
-      if (ingest == null) {
-        continue;
-      }
-      String ingestDatasetId = Strings.trimToNull(ingest.datasetId());
-      String outputSchemaId = Strings.trimToNull(ingest.outputSchemaId());
-      if (ingestDatasetId == null || outputSchemaId == null) {
-        continue;
-      }
-      try {
-        if (DatasetId.parse(ingestDatasetId).equals(datasetId)) {
-          schemaNames.add(outputSchemaId);
-        }
-      } catch (RuntimeException ignore) {
-        // skip invalid ingest references for deterministic planning
-      }
-    }
-    if (schemaNames.isEmpty()) {
-      return null;
-    }
-    schemaNames.sort(String.CASE_INSENSITIVE_ORDER.thenComparing(Comparator.naturalOrder()));
-    return schemaNames.get(0);
-  }
-
-  private static boolean isTabularSchema(DefinitionSchema schema) {
-    DefinitionSchema.SchemaType schemaType = schema == null ? null : schema.schemaType();
-    return schemaType == null || schemaType == DefinitionSchema.SchemaType.TABULAR;
-  }
-
-  private static void addDistinct(List<String> values, String value) {
-    String normalized = Strings.trimToNull(value);
-    if (normalized != null && !values.contains(normalized)) {
-      values.add(normalized);
-    }
-  }
-
-  private List<DatasetId> expandDependencies(List<DatasetId> directDatasets, CatalogSnapshot current) {
-    LinkedHashSet<DatasetId> visited = new LinkedHashSet<>();
-    List<DatasetId> roots = new ArrayList<>(directDatasets);
-    roots.sort(DATASET_ID_ORDER);
-    for (DatasetId root : roots) {
-      collectDependencies(root, current, visited, new LinkedHashSet<>());
-    }
-    return List.copyOf(visited);
-  }
-
-  private static void collectDependencies(
-      DatasetId datasetId,
-      CatalogSnapshot current,
-      LinkedHashSet<DatasetId> visited,
-      LinkedHashSet<DatasetId> visiting) {
-    if (visited.contains(datasetId)) {
+  private static void appendOptions(StringBuilder builder, Map<String, String> values) {
+    if (values == null || values.isEmpty()) {
       return;
     }
-    if (!visiting.add(datasetId)) {
+    TreeMap<String, String> ordered = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+    ordered.putAll(values);
+    for (Map.Entry<String, String> entry : ordered.entrySet()) {
+      appendOption(builder, entry.getKey(), entry.getValue());
+    }
+  }
+
+  private static void appendOption(StringBuilder builder, String key, String value) {
+    String normalizedKey = Strings.trimToNull(key);
+    String normalizedValue = Strings.trimToNull(value);
+    if (normalizedKey == null || normalizedValue == null) {
       return;
     }
-    CatalogEntry entry = current.entriesById().get(datasetId);
-    if (entry != null) {
-      List<DatasetId> dependencies = new ArrayList<>(entry.dependencies());
-      dependencies.sort(DATASET_ID_ORDER);
-      for (DatasetId dependency : dependencies) {
-        collectDependencies(dependency, current, visited, visiting);
-      }
-    }
-    visiting.remove(datasetId);
-    visited.add(datasetId);
+    builder.append(normalizedKey).append('=').append(normalizedValue).append(';');
   }
 
-  private CatalogEntry toEntry(DefinitionDataset definition) {
-    DatasetId datasetId = requireDatasetId(definition);
-    String namespace = datasetId.namespace();
-    String name = datasetId.name();
-    String viewName = duckdbViewName(datasetId.group(), namespace, name);
-    boolean logicalView = isLogicalView(definition);
-    return new CatalogEntry(
-        datasetId,
-        definition,
-        namespace,
-        name,
-        viewName,
-        List.of(),
-        logicalView);
-  }
-
-  private static boolean isLogicalView(DefinitionDataset definition) {
-    if (definition == null || definition.view() == null) {
-      return false;
+  private static String connectSql(OdbcConnectionSpec spec) {
+    String connectionString = escapeSqlLiteral(spec.connectionString());
+    String username = Strings.trimToNull(spec.username());
+    String password = Strings.trimToNull(spec.password());
+    if (username == null && password == null) {
+      return "select odbc_connect('" + connectionString + "')";
     }
-    DefinitionDataset.Target target = definition.view().target();
-    if (target == null) {
-      return true;
-    }
-    return Strings.trimToNull(target.duckdbTableName()) == null
-        && Strings.trimToNull(target.parquetPath()) == null;
-  }
-
-  private DefinitionDataset fetchDefinition(DatasetId datasetId) {
-    String name = datasetId.namespace() + "/" + datasetId.name();
-    Optional<DefinitionDataset> definition =
-        DiscoveryCache.get(DefinitionDataset.class, datasetId.group(), name);
-    return definition.orElseThrow(
-        () -> new IllegalArgumentException("Dataset definition not found for install: " + datasetId));
-  }
-
-  private static DatasetId tryDatasetId(DefinitionDataset definition) {
-    try {
-      return requireDatasetId(definition);
-    } catch (RuntimeException ex) {
-      return null;
-    }
-  }
-
-  private static DatasetId requireDatasetId(DefinitionDataset definition) {
-    Objects.requireNonNull(definition, "definition");
-    DefinitionEnvelope envelope = Objects.requireNonNull(definition.envelope(), "definition.envelope");
-    String group = Strings.requireNonBlank(envelope.group(), "definition.envelope.group");
-    String namespace = Strings.requireNonBlank(definition.namespace(), "definition.namespace");
-    String baseName = datasetBaseName(definition);
-    return DatasetId.of(group, namespace, baseName);
-  }
-
-  private static String datasetBaseName(DefinitionDataset definition) {
-    DefinitionEnvelope envelope = Objects.requireNonNull(definition.envelope(), "definition.envelope");
-    String namespace = Strings.requireNonBlank(definition.namespace(), "definition.namespace");
-    String envelopeName = Strings.requireNonBlank(envelope.name(), "definition.envelope.name");
-    String prefix = namespace + "/";
-    if (!envelopeName.startsWith(prefix)) {
-      throw new IllegalStateException(
-          "Dataset definition invalid envelope.name. Expected namespace/baseName with namespace='"
-              + namespace
-              + "' and envelope.name='"
-              + envelopeName
-              + "'");
-    }
-    String base = envelopeName.substring(prefix.length());
-    if (base.isBlank() || base.indexOf('/') >= 0) {
-      throw new IllegalStateException(
-          "Dataset definition invalid envelope.name. Expected namespace/baseName with namespace='"
-              + namespace
-              + "' and envelope.name='"
-              + envelopeName
-              + "'");
-    }
-    return base;
-  }
-
-  private static boolean isActive(DefinitionDataset definition) {
-    if (definition == null || definition.envelope() == null) {
-      return false;
-    }
-    DefinitionEnvelope envelope = definition.envelope();
-    if (Boolean.FALSE.equals(envelope.enabled())) {
-      return false;
-    }
-    String status = Strings.trimToNull(envelope.lifecycleStatus());
-    return status == null || "ACTIVE".equalsIgnoreCase(status);
-  }
-
-  private static String applyLimit(String sql, Integer limit) {
-    if (limit == null) {
-      return sql;
-    }
-    if (limit <= 0) {
-      throw new IllegalArgumentException("limit must be > 0");
-    }
-    return "select * from (" + sql + ") as __fabric_sql limit " + limit;
-  }
-
-  private static void exec(DuckdbSession session, String sql) {
-    if (sql == null || sql.isBlank()) {
-      return;
-    }
-    String[] statements = sql.split(";\\s*\\n|;\\s*$|;\\s*");
-    for (String statementSql : statements) {
-      String trimmed = Strings.trimToNull(statementSql);
-      if (trimmed == null) {
-        continue;
-      }
-      try (Statement statement = session.createStatement()) {
-        statement.execute(trimmed);
-      } catch (SQLException ex) {
-        throw new IllegalStateException("DuckDB SQL failed: " + ex.getMessage(), ex);
-      }
-    }
-  }
-
-  private static void dropView(DuckdbSession session, DatasetId datasetId, String viewName) {
-    String sql = "drop view if exists " + quoteIdentifier(viewName);
-    exec(session, sql);
-    LOGGER.debug("[Catalog] drop datasetId={} viewName={}", datasetId, viewName);
-  }
-
-  private static String duckdbViewName(String group, String namespace, String name) {
-    return DuckdbCatalogImplRelation.duckdbViewName(group, namespace, name);
-  }
-
-  private static String sanitizeIdentifier(String value) {
-    return DuckdbCatalogImplRelation.sanitizeIdentifier(value);
+    return "select odbc_connect('"
+        + connectionString
+        + "', '"
+        + escapeSqlLiteral(Strings.firstNonBlank(username, ""))
+        + "', '"
+        + escapeSqlLiteral(Strings.firstNonBlank(password, ""))
+        + "')";
   }
 
   private static String quoteIdentifier(String identifier) {
-    return DuckdbCatalogImplRelation.quoteIdentifier(identifier);
+    return "\"" + Strings.requireNonBlank(identifier, "identifier").replace("\"", "\"\"") + "\"";
   }
 
-  private static String stripTrailingSemicolon(String sql) {
-    return DuckdbCatalogImplRelation.stripTrailingSemicolon(sql);
+  private static String quoteRemoteIdentifier(String identifier) {
+    return "\"" + Strings.requireNonBlank(identifier, "identifier").replace("\"", "\"\"") + "\"";
   }
 
-  private static String typeToken(DefinitionDataset definition) {
-    return DuckdbCatalogImplRelation.typeToken(definition);
+  private static String sanitizeIdentifier(String value) {
+    String token = Strings.requireNonBlank(value, "identifier");
+    StringBuilder normalized = new StringBuilder(token.length());
+    for (int index = 0; index < token.length(); index++) {
+      char ch = token.charAt(index);
+      if (Character.isLetterOrDigit(ch) || ch == '_') {
+        normalized.append(ch);
+      } else {
+        normalized.append('_');
+      }
+    }
+    String resolved = Strings.trimToNull(normalized.toString());
+    return resolved == null ? "dataset" : resolved;
   }
 
-  private static boolean isDuckdbActive(DefinitionDataset.DuckdbBinding binding) {
-    return DuckdbCatalogImplRelation.isDuckdbActive(binding);
-  }
-
-  private static String resolveDuckDbActiveDatabasePath(DefinitionDataset.DuckdbBinding binding) {
-    return DuckdbCatalogImplRelation.resolveDuckDbActiveDatabasePath(binding);
-  }
-
-  private static String parquetFromPath(String uri, String glob, boolean hivePartitioning) {
-    return DuckdbCatalogImplRelation.parquetFromPath(uri, glob, DEFAULT_PARQUET_GLOB, hivePartitioning);
-  }
-
-  private static String normalizePathForDuckdb(String value) {
-    return DuckdbCatalogImplRelation.normalizePathForDuckdb(value);
-  }
-
-  private static boolean isS3Uri(String value) {
-    return DuckdbCatalogImplRelation.isS3Uri(value);
-  }
-
-  private static String trimTrailingSlash(String value) {
-    return DuckdbCatalogImplRelation.trimTrailingSlash(value);
+  private static String databaseTypeName(DefinitionConnection.Odbc.DatabaseType databaseType) {
+    return databaseType == null ? DefinitionConnection.Odbc.DatabaseType.OTHER.name() : databaseType.name();
   }
 
   private static String escapeSqlLiteral(String value) {
-    return DuckdbCatalogImplRelation.escapeSqlLiteral(value);
+    return value.replace("'", "''");
   }
 
-  private static boolean isMissingParquetFilesError(IllegalStateException ex) {
-    return DuckdbCatalogImplRelation.isMissingParquetFilesError(ex);
-  }
+  public record OdbcConnectionSpec(
+      String connectionName,
+      DefinitionConnection.Odbc.DatabaseType databaseType,
+      String connectionString,
+      String username,
+      String password) {}
 
-  private static boolean isMissingDuckdbRelationError(IllegalStateException ex) {
-    return DuckdbCatalogImplRelation.isMissingDuckdbRelationError(ex);
-  }
-
-  private static boolean isS3CredentialUnavailableError(IllegalStateException ex) {
-    return DuckdbCatalogImplRelation.isS3CredentialUnavailableError(ex);
-  }
-
-  private static String qualifiedNameKey(String namespace, String name) {
-    return DuckdbCatalogImplRelation.qualifiedNameKey(namespace, name);
-  }
-
-  private static String qualifiedNameKey(String group, String namespace, String name) {
-    return DuckdbCatalogImplRelation.qualifiedNameKey(group, namespace, name);
-  }
-
-  private void putQualifiedPreferSessionGroup(
-      Map<String, DatasetId> qualified, String key, DatasetId candidate) {
-    DatasetId existing = qualified.get(key);
-    if (existing == null) {
-      qualified.put(key, candidate);
-      return;
-    }
-    boolean existingSession = sessionGroup.equals(existing.group());
-    boolean candidateSession = sessionGroup.equals(candidate.group());
-    if (!existingSession && candidateSession) {
-      qualified.put(key, candidate);
+  public record OdbcConnectionHealth(
+      boolean ok,
+      String connectionName,
+      DefinitionConnection.Odbc.DatabaseType databaseType,
+      String extensionNameUsed,
+      boolean extensionLoaded,
+      boolean extensionAvailable,
+      OdbcQueryPath queryPath,
+      String message,
+      String remoteProductName,
+      String remoteVersion,
+      long roundTripMillis,
+      List<String> warnings,
+      boolean fallbackInUse) {
+    public OdbcConnectionHealth {
+      warnings = warnings == null ? List.of() : List.copyOf(warnings);
     }
   }
 
-  private static List<String> metadataTableTypes(CatalogEntry entry) {
-    if (entry == null) {
-      return List.of("TABLE");
+  public record OdbcRuntimeStatus(
+      boolean configured,
+      boolean extensionAvailable,
+      boolean extensionLoaded,
+      boolean connectionTestOk,
+      String canonicalPath,
+      boolean fallbackInUse,
+      String extensionNameUsed,
+      String message,
+      long roundTripMillis,
+      List<String> warnings) {
+    public OdbcRuntimeStatus {
+      warnings = warnings == null ? List.of() : List.copyOf(warnings);
     }
-    if (entry.logicalView()) {
-      return List.of("VIEW");
+  }
+
+  public record OdbcColumnMetadata(
+      String name,
+      int jdbcType,
+      String jdbcTypeName,
+      int precision,
+      int scale,
+      String nullability) {}
+
+  public record OdbcSchemaInspection(
+      boolean ok,
+      String connectionName,
+      DefinitionConnection.Odbc.DatabaseType databaseType,
+      OdbcQueryPath queryPath,
+      String message,
+      List<OdbcColumnMetadata> columns,
+      long roundTripMillis,
+      List<String> warnings) {
+    public OdbcSchemaInspection {
+      columns = columns == null ? List.of() : List.copyOf(columns);
+      warnings = warnings == null ? List.of() : List.copyOf(warnings);
     }
-    DefinitionDataset definition = entry.definition();
-    DefinitionDataset.Binding binding = definition == null ? null : definition.binding();
-    DefinitionDataset.DuckdbBinding duckdb = binding == null ? null : binding.duckdb();
-    if (isDuckdbActive(duckdb)) {
-      return List.of("TABLE", "STREAM");
+  }
+
+  public enum OdbcQueryPath {
+    ODBC_QUERY_PARAMETERIZED,
+    ODBC_SCAN_LITERAL
+  }
+
+  public static final class OdbcQueryResult implements AutoCloseable {
+    private final Statement statement;
+    private final ResultSet resultSet;
+    private final OdbcQueryPath path;
+    private boolean closed;
+
+    private OdbcQueryResult(Statement statement, ResultSet resultSet, OdbcQueryPath path) {
+      this.statement = Objects.requireNonNull(statement, "statement");
+      this.resultSet = Objects.requireNonNull(resultSet, "resultSet");
+      this.path = Objects.requireNonNull(path, "path");
     }
-    return List.of("TABLE");
+
+    public ResultSet resultSet() {
+      return resultSet;
+    }
+
+    public OdbcQueryPath path() {
+      return path;
+    }
+
+    @Override
+    public void close() {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      closeResultSetQuietly(resultSet);
+      closeStatementQuietly(statement);
+    }
+  }
+
+  public static final class OdbcHandle implements AutoCloseable {
+    private final DuckdbSession session;
+    private final String connectionName;
+    private final DefinitionConnection.Odbc.DatabaseType databaseType;
+    private final long handle;
+    private final boolean closeOnClose;
+    private boolean closed;
+
+    private OdbcHandle(
+        DuckdbSession session,
+        String connectionName,
+        DefinitionConnection.Odbc.DatabaseType databaseType,
+        long handle,
+        boolean closeOnClose) {
+      this.session = Objects.requireNonNull(session, "session");
+      this.connectionName = connectionName;
+      this.databaseType = databaseType;
+      this.handle = handle;
+      this.closeOnClose = closeOnClose;
+    }
+
+    private static OdbcHandle noOp(
+        DuckdbSession session,
+        String connectionName,
+        DefinitionConnection.Odbc.DatabaseType databaseType) {
+      return new OdbcHandle(session, connectionName, databaseType, -1L, false);
+    }
+
+    public long handle() {
+      return handle;
+    }
+
+    public String connectionName() {
+      return connectionName;
+    }
+
+    public DefinitionConnection.Odbc.DatabaseType databaseType() {
+      return databaseType;
+    }
+
+    @Override
+    public void close() {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      if (!closeOnClose || handle < 0L) {
+        return;
+      }
+      try (Statement statement = session.createStatement()) {
+        statement.execute("select odbc_close(" + handle + ")");
+      } catch (SQLException | RuntimeException ignore) {
+        // best-effort close.
+      }
+    }
   }
 }
-
-
-
-
-
