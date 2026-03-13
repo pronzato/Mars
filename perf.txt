@@ -1,444 +1,418 @@
-package org.pronzato.fabric.api.control.security.identity;
+package org.pronzato.fabric.api.control.discovery.lifecycle;
 
-import java.util.Locale;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
-import java.util.Objects;
-import java.util.Optional;
-import java.util.function.Supplier;
-import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionApp;
-import org.pronzato.fabric.api.control.security.UserContext;
-import org.pronzato.fabric.api.control.security.UserPrincipal;
-import org.pronzato.fabric.api.control.security.headers.FabricRequestHeaders;
-import org.pronzato.fabric.api.util.Strings;
+import java.util.Set;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
 
-public final class RequestIdentityResolver {
-  private static final String USER_PREFIX = "user:";
-  private static final String APP_PREFIX = "app:";
+public final class DeletePlanner {
+  private DeletePlanner() {}
 
-  private RequestIdentityResolver() {}
-
-  public static RequestIdentity resolve(
-      FabricRequestHeaders headers, DiscoveryCache DiscoveryCache, String runtimeEnvironment) {
-    Objects.requireNonNull(headers, "headers");
-
-    String rawObo = Strings.trimToNull(headers.oboUser());
-    CallerAppIdentity requestCallerApp = normalizeCallerApp(headers.callerApp());
-    String authenticatedSubject =
-        normalizeAuthenticatedPrincipal(headers.authenticatedPrincipal(), requestCallerApp, rawObo);
-
-    if (authenticatedSubject == null) {
-      throw failure(
-          Code.UNAUTHENTICATED,
-          OboDenyRule.OBO_PRESENT_BUT_NOT_AUTHENTICATED,
-          requestCallerApp,
-          rawObo);
-    }
-
-    String normalizedObo = null;
-    String effectiveUserSubject = authenticatedSubject;
-    CallerAppIdentity resolvedCallerApp = mergeCallerAppForContext(requestCallerApp, authenticatedSubject);
-    if (rawObo != null) {
-      if (!requestCallerApp.isPresent()) {
-        throw failure(
-            Code.PERMISSION_DENIED,
-            OboDenyRule.OBO_CALLER_APP_HEADERS_REQUIRED,
-            requestCallerApp,
-            rawObo);
-      }
-      resolvedCallerApp = requestCallerApp;
-      DefinitionApp callerDefinition = requireCallerAppDefinition(DiscoveryCache, resolvedCallerApp, rawObo);
-      Config config = Config.from(callerDefinition, runtimeEnvironment, headers.requestMetadata().env());
-
-      if (!config.delegatedUserEnabled()) {
-        throw failure(
-            Code.PERMISSION_DENIED, OboDenyRule.OBO_DISABLED_FOR_APP, resolvedCallerApp, rawObo);
-      }
-
-      normalizedObo =
-          normalizeOboUser(
-              rawObo,
-              false,
-              true,
-              resolvedCallerApp,
-              rawObo);
-      effectiveUserSubject = normalizedObo;
-    }
-
-    return new RequestIdentity(
-        effectiveUserSubject,
-        callerAppSubject(resolvedCallerApp),
-        headers.requestMetadata().requestId(),
-        headers.requestMetadata().traceId(),
-        normalizedObo);
+  public static DeletePlan plan(AssetLifecycleGraph graph, String rootAssetIdOrToken) {
+    return plan(graph, rootAssetIdOrToken, DeleteOptions.defaults());
   }
 
-  public static <T> T callAsRequestIdentity(RequestIdentity identity, Supplier<T> action) {
-    Objects.requireNonNull(identity, "identity");
-    Objects.requireNonNull(action, "action");
-    UserPrincipal previousUser = UserContext.get().orElse(null);
-    CallerAppContext.ContextValue previousCallerApp = CallerAppContext.get().orElse(null);
-    UserContext.set(new UserPrincipal(identity.effectiveUserSubject(), Map.of()));
-    CallerAppContext.set(identity);
-    try {
-      return action.get();
-    } finally {
-      if (previousUser == null) {
-        UserContext.clear();
-      } else {
-        UserContext.set(previousUser);
-      }
-      if (previousCallerApp == null) {
-        CallerAppContext.clear();
-      } else {
-        CallerAppContext.set(previousCallerApp);
-      }
-    }
-  }
+  public static DeletePlan plan(
+      AssetLifecycleGraph graph, String rootAssetIdOrToken, DeleteOptions options) {
+    DeleteOptions resolvedOptions = options == null ? DeleteOptions.defaults() : options;
+    String normalizedRootToken = trim(rootAssetIdOrToken);
+    String resolvedRoot = resolveRootAssetId(graph, normalizedRootToken);
 
-  public static void runAsRequestIdentity(RequestIdentity identity, Runnable action) {
-    callAsRequestIdentity(
-        identity,
-        () -> {
-          action.run();
-          return null;
-        });
-  }
+    List<DeleteBlocker> blockers = new ArrayList<>();
+    LinkedHashSet<String> assetsToDelete = new LinkedHashSet<>();
+    LinkedHashSet<String> assetsToDetach = new LinkedHashSet<>();
+    LinkedHashSet<String> assetsRetained = new LinkedHashSet<>();
+    LinkedHashSet<String> storageToDelete = new LinkedHashSet<>();
+    LinkedHashSet<String> historyToDelete = new LinkedHashSet<>();
+    LinkedHashSet<String> warnings = new LinkedHashSet<>();
+    LinkedHashSet<String> manualActions = new LinkedHashSet<>();
 
-  private static String normalizeAuthenticatedPrincipal(
-      String principal, CallerAppIdentity callerApp, String rawObo) {
-    String candidate = Strings.trimToNull(principal);
-    if (candidate == null) {
-      return null;
+    if (graph == null) {
+      blockers.add(
+          new DeleteBlocker(
+              normalizedRootToken,
+              "<graph>",
+              "GRAPH_UNAVAILABLE",
+              "Lifecycle graph is required for delete planning."));
+      return emptyPlan(normalizedRootToken, resolvedOptions, blockers);
     }
-    if (startsWithIgnoreCase(candidate, USER_PREFIX)) {
-      String userId = normalizeUserId(candidate.substring(USER_PREFIX.length()));
-      if (userId == null) {
-        throw failure(
-            Code.PERMISSION_DENIED, OboDenyRule.OBO_REQUIRES_APP_SUBJECT, callerApp, rawObo);
-      }
-      return USER_PREFIX + userId;
-    }
-    if (startsWithIgnoreCase(candidate, APP_PREFIX)) {
-      String appId = normalizeAppId(candidate.substring(APP_PREFIX.length()));
-      if (appId == null) {
-        throw failure(
-            Code.PERMISSION_DENIED, OboDenyRule.OBO_REQUIRES_APP_SUBJECT, callerApp, rawObo);
-      }
-      return APP_PREFIX + appId;
+    if (resolvedRoot == null || !graph.hasAsset(resolvedRoot)) {
+      blockers.add(
+          new DeleteBlocker(
+              normalizedRootToken,
+              "<graph>",
+              "ROOT_NOT_FOUND",
+              "Root asset was not found in lifecycle graph."));
+      return emptyPlan(normalizedRootToken, resolvedOptions, blockers);
     }
 
-    String withoutRealm = stripRealm(candidate);
-    String asApp = normalizeAppId(withoutRealm);
-    if (asApp != null) {
-      return APP_PREFIX + asApp;
-    }
-    String userId = normalizeUserId(candidate);
-    if (userId == null) {
-      throw failure(
-          Code.PERMISSION_DENIED, OboDenyRule.OBO_REQUIRES_APP_SUBJECT, callerApp, rawObo);
-    }
-    return USER_PREFIX + userId;
-  }
-
-  private static String normalizeOboUser(
-      String rawObo,
-      boolean requireCanonicalUser,
-      boolean allowRawUsernameInDev,
-      CallerAppIdentity callerApp,
-      String originalObo) {
-    String candidate = Strings.trimToNull(rawObo);
-    if (candidate == null) {
-      throw failure(
-          Code.PERMISSION_DENIED,
-          OboDenyRule.OBO_CANONICAL_REQUIRED,
-          callerApp,
-          originalObo);
-    }
-
-    if (startsWithIgnoreCase(candidate, USER_PREFIX)) {
-      String userId = normalizeUserId(candidate.substring(USER_PREFIX.length()));
-      if (userId == null) {
-        throw failure(
-            Code.PERMISSION_DENIED,
-            OboDenyRule.OBO_CANONICAL_REQUIRED,
-            callerApp,
-            originalObo);
-      }
-      return USER_PREFIX + userId;
-    }
-
-    if (requireCanonicalUser) {
-      throw failure(
-          Code.PERMISSION_DENIED,
-          OboDenyRule.OBO_CANONICAL_REQUIRED,
-          callerApp,
-          originalObo);
-    }
-    if (!allowRawUsernameInDev) {
-      throw failure(
-          Code.PERMISSION_DENIED,
-          OboDenyRule.OBO_RAW_USERNAME_DISALLOWED,
-          callerApp,
-          originalObo);
-    }
-    String userId = normalizeUserId(candidate);
-    if (userId == null) {
-      throw failure(
-          Code.PERMISSION_DENIED,
-          OboDenyRule.OBO_CANONICAL_REQUIRED,
-          callerApp,
-          originalObo);
-    }
-    return USER_PREFIX + userId;
-  }
-
-  private static CallerAppIdentity normalizeCallerApp(CallerAppIdentity callerApp) {
-    if (callerApp == null) {
-      return new CallerAppIdentity(null, null, null);
-    }
-    return new CallerAppIdentity(callerApp.group(), callerApp.name(), callerApp.instance());
-  }
-
-  private static CallerAppIdentity mergeCallerAppForContext(
-      CallerAppIdentity requestCallerApp, String authenticatedSubject) {
-    if (requestCallerApp != null && requestCallerApp.isPresent()) {
-      return requestCallerApp;
-    }
-    CallerAppIdentity authenticatedCaller = callerAppFromAppSubject(authenticatedSubject);
-    if (authenticatedCaller != null && authenticatedCaller.isPresent()) {
-      return authenticatedCaller;
-    }
-    return requestCallerApp == null ? new CallerAppIdentity(null, null, null) : requestCallerApp;
-  }
-
-  private static CallerAppIdentity callerAppFromAppSubject(String subject) {
-    String normalized = Strings.trimToNull(subject);
-    if (normalized == null || !startsWithIgnoreCase(normalized, APP_PREFIX)) {
-      return null;
-    }
-    String appId = normalizeAppId(normalized.substring(APP_PREFIX.length()));
-    if (appId == null) {
-      return null;
-    }
-    int delimiter = appId.indexOf('/');
-    if (delimiter <= 0 || delimiter >= appId.length() - 1) {
-      return null;
-    }
-    return new CallerAppIdentity(appId.substring(0, delimiter), appId.substring(delimiter + 1), null);
-  }
-
-  private static String callerAppSubject(CallerAppIdentity callerApp) {
-    if (callerApp == null || !callerApp.isPresent()) {
-      return null;
-    }
-    return callerApp.asSubject();
-  }
-
-  private static DefinitionApp requireCallerAppDefinition(
-      DiscoveryCache DiscoveryCache, CallerAppIdentity callerApp, String rawObo) {
-    if (callerApp == null || !callerApp.isPresent()) {
-      throw failure(
-          Code.PERMISSION_DENIED,
-          OboDenyRule.OBO_CALLER_APP_HEADERS_REQUIRED,
-          callerApp,
-          rawObo);
-    }
-    if (DiscoveryCache == null) {
-      throw failure(
-          Code.PERMISSION_DENIED, OboDenyRule.OBO_APP_DEFINITION_MISSING, callerApp, rawObo);
-    }
-    Optional<DefinitionApp> definition =
-        DiscoveryCache.get(DefinitionApp.class, callerApp.group(), callerApp.name());
-    if (definition.isEmpty()) {
-      throw failure(
-          Code.PERMISSION_DENIED, OboDenyRule.OBO_APP_DEFINITION_MISSING, callerApp, rawObo);
-    }
-    return definition.get();
-  }
-
-  private static String normalizeUserId(String value) {
-    String candidate = Strings.trimToNull(value);
-    if (candidate == null) {
-      return null;
-    }
-    int slash = candidate.lastIndexOf('\\');
-    if (slash >= 0 && slash < candidate.length() - 1) {
-      candidate = candidate.substring(slash + 1);
-    }
-    candidate = stripRealm(candidate);
-    candidate = Strings.trimToNull(candidate);
-    if (candidate == null) {
-      return null;
-    }
-    if (candidate.contains("/") || candidate.contains(":")) {
-      return null;
-    }
-    for (int i = 0; i < candidate.length(); i++) {
-      if (Character.isWhitespace(candidate.charAt(i))) {
-        return null;
+    ArrayDeque<String> queue = new ArrayDeque<>();
+    assetsToDelete.add(resolvedRoot);
+    queue.add(resolvedRoot);
+    while (!queue.isEmpty()) {
+      String current = queue.removeFirst();
+      for (AssetLifecycleEdge edge : graph.outgoing(current)) {
+        String target = edge.toAssetId();
+        if (target == null || target.equals(current)) {
+          continue;
+        }
+        DefinitionType targetType =
+            graph.node(target).map(AssetLifecycleNode::type).orElse(DefinitionType.UNKNOWN);
+        if (targetType == DefinitionType.UNKNOWN && isInternalAssetId(target)) {
+          warnings.add(
+              "Compatibility: unresolved dependency type for internal asset "
+                  + target
+                  + "; dependency retained");
+          assetsToDetach.add(target);
+          assetsRetained.add(target);
+          if (edge.required() && !resolvedOptions.force()) {
+            blockers.add(
+                new DeleteBlocker(
+                    current,
+                    target,
+                    "UNKNOWN_DEPENDENCY_TYPE",
+                    "Dependency type is UNKNOWN for internal asset; cannot safely cascade delete."));
+          }
+          continue;
+        }
+        switch (edge.deleteBehavior()) {
+          case CASCADE_SOFT, CASCADE_HARD -> {
+            boolean cascadeAllowed =
+                resolvedOptions.deleteOwnedDependencies()
+                    && (edge.ownershipType() == OwnershipType.OWNED
+                        || edge.ownershipType() == OwnershipType.DERIVED);
+            boolean cascadeTypeAllowed = resolvedOptions.allowsCascadeType(targetType);
+            if (!cascadeTypeAllowed) {
+              warnings.add(
+                  "Cascade suppressed by options for "
+                      + targetType.name().toLowerCase()
+                      + " dependency "
+                      + target);
+              assetsToDetach.add(target);
+              assetsRetained.add(target);
+              continue;
+            }
+            if (!cascadeAllowed) {
+              if (edge.required() && !resolvedOptions.force()) {
+                blockers.add(
+                    new DeleteBlocker(
+                        current,
+                        target,
+                        "DEPENDENCY_NOT_OWNED",
+                        "Dependency cannot be cascaded because it is not owned."));
+              } else {
+                assetsToDetach.add(target);
+                assetsRetained.add(target);
+              }
+              continue;
+            }
+            if (isStorageOrExternalTarget(graph, target, edge)) {
+              if (resolvedOptions.deleteData()
+                  && (resolvedOptions.hardDeleteData()
+                      || edge.deleteBehavior() == DeleteBehavior.CASCADE_HARD)) {
+                storageToDelete.add(target);
+              } else {
+                assetsRetained.add(target);
+                manualActions.add("Manual data deletion required for " + target);
+              }
+              if (resolvedOptions.deleteHistory()
+                  && edge.retentionBehavior() == RetentionBehavior.DELETE_HISTORY) {
+                historyToDelete.add(target);
+              }
+              continue;
+            }
+            if (assetsToDelete.add(target)) {
+              queue.addLast(target);
+            }
+          }
+          case DETACH -> {
+            assetsToDetach.add(target);
+            assetsRetained.add(target);
+          }
+          case BLOCK -> {
+            if (!resolvedOptions.force()) {
+              blockers.add(
+                  new DeleteBlocker(
+                      current, target, "BLOCKING_DEPENDENCY", "Dependency blocks delete cascade."));
+            } else {
+              warnings.add("Force delete bypassed blocker: " + current + " -> " + target);
+            }
+            assetsRetained.add(target);
+          }
+          case MANUAL -> {
+            manualActions.add("Manual delete action required: " + current + " -> " + target);
+            assetsRetained.add(target);
+          }
+        }
       }
     }
-    return candidate;
+
+    addIncomingDependencyBlockers(graph, assetsToDelete, assetsToDetach, assetsRetained, blockers, warnings, resolvedOptions);
+    if (resolvedOptions.deleteOrphanedSchemas()) {
+      addOrphanedAssetsByType(graph, assetsToDelete, DefinitionType.SCHEMA, warnings);
+    }
+    if (resolvedOptions.deleteOrphanedEntitlements()) {
+      addOrphanedAssetsByType(graph, assetsToDelete, DefinitionType.ENTITLEMENT, warnings);
+    }
+    populateStorageAndHistoryEffects(
+        graph,
+        assetsToDelete,
+        resolvedOptions,
+        storageToDelete,
+        historyToDelete,
+        assetsRetained,
+        manualActions);
+
+    // Final normalization: an asset cannot be both scheduled for delete and retained/detached.
+    assetsToDetach.removeAll(assetsToDelete);
+    assetsRetained.removeAll(assetsToDelete);
+
+    List<String> deleteList = sortStrings(assetsToDelete);
+    List<String> detachList = sortStrings(assetsToDetach);
+    List<String> retainedList = sortStrings(assetsRetained);
+    List<String> storageList = sortStrings(storageToDelete);
+    List<String> historyList = sortStrings(historyToDelete);
+    List<String> warningList = sortStrings(warnings);
+    List<String> manualList = sortStrings(manualActions);
+    List<String> order = buildDeleteExecutionOrder(graph, assetsToDelete);
+    blockers.sort(
+        Comparator.comparing(DeleteBlocker::assetId)
+            .thenComparing(DeleteBlocker::blockedByAssetId)
+            .thenComparing(DeleteBlocker::code));
+
+    return new DeletePlan(
+        resolvedRoot,
+        resolvedOptions,
+        deleteList,
+        detachList,
+        retainedList,
+        storageList,
+        historyList,
+        blockers,
+        warningList,
+        order,
+        manualList);
   }
 
-  private static String stripRealm(String value) {
-    String candidate = Strings.trimToNull(value);
-    if (candidate == null) {
-      return null;
+  private static void addIncomingDependencyBlockers(
+      AssetLifecycleGraph graph,
+      Set<String> assetsToDelete,
+      Set<String> assetsToDetach,
+      Set<String> assetsRetained,
+      List<DeleteBlocker> blockers,
+      Set<String> warnings,
+      DeleteOptions options) {
+    for (String deleting : assetsToDelete) {
+      for (AssetLifecycleEdge incoming : graph.incoming(deleting)) {
+        String dependent = incoming.fromAssetId();
+        if (dependent == null || assetsToDelete.contains(dependent)) {
+          continue;
+        }
+        boolean blocking = incoming.deleteBehavior() == DeleteBehavior.BLOCK || incoming.required();
+        if (blocking && !options.force()) {
+          blockers.add(
+              new DeleteBlocker(
+                  deleting,
+                  dependent,
+                  "INCOMING_DEPENDENT",
+                  "External dependent asset still references asset slated for delete."));
+        } else if (blocking) {
+          warnings.add("Force delete bypassed incoming dependency: " + dependent + " -> " + deleting);
+        } else if (incoming.deleteBehavior() == DeleteBehavior.DETACH) {
+          assetsToDetach.add(dependent);
+        }
+        assetsRetained.add(dependent);
+      }
     }
-    int realm = candidate.indexOf('@');
-    if (realm > 0) {
-      return candidate.substring(0, realm);
-    }
-    return candidate;
   }
 
-  private static String normalizeAppId(String value) {
-    String candidate = Strings.trimToNull(value);
-    if (candidate == null) {
-      return null;
+  private static void addOrphanedAssetsByType(
+      AssetLifecycleGraph graph, Set<String> assetsToDelete, DefinitionType type, Set<String> warnings) {
+    boolean changed = true;
+    while (changed) {
+      changed = false;
+      for (AssetLifecycleNode node : graph.nodes().values()) {
+        if (node == null || node.type() != type || assetsToDelete.contains(node.assetId())) {
+          continue;
+        }
+        if (isOrphanAfterDelete(graph, node.assetId(), assetsToDelete)) {
+          assetsToDelete.add(node.assetId());
+          warnings.add("Deleting orphaned " + type.name().toLowerCase() + ": " + node.assetId());
+          changed = true;
+        }
+      }
     }
-    if (candidate.startsWith("/") || candidate.endsWith("/")) {
-      return null;
-    }
-    int firstSlash = candidate.indexOf('/');
-    if (firstSlash <= 0 || firstSlash >= candidate.length() - 1) {
-      return null;
-    }
-    int secondSlash = candidate.indexOf('/', firstSlash + 1);
-    if (secondSlash >= 0) {
-      return null;
-    }
-    String group = candidate.substring(0, firstSlash).trim();
-    String app = candidate.substring(firstSlash + 1).trim();
-    if (group.isEmpty() || app.isEmpty()) {
-      return null;
-    }
-    if (!isSimpleToken(group) || !isSimpleToken(app)) {
-      return null;
-    }
-    return group + "/" + app;
   }
 
-  private static boolean isSimpleToken(String token) {
-    if (token == null || token.isBlank()) {
-      return false;
-    }
-    for (int i = 0; i < token.length(); i++) {
-      char ch = token.charAt(i);
-      boolean ok =
-          (ch >= 'a' && ch <= 'z')
-              || (ch >= 'A' && ch <= 'Z')
-              || (ch >= '0' && ch <= '9')
-              || ch == '-'
-              || ch == '_'
-              || ch == '.';
-      if (!ok) {
+  private static boolean isOrphanAfterDelete(
+      AssetLifecycleGraph graph, String candidateAssetId, Set<String> assetsToDelete) {
+    for (AssetLifecycleEdge incoming : graph.incoming(candidateAssetId)) {
+      String from = incoming.fromAssetId();
+      if (from == null || from.equals(candidateAssetId) || assetsToDelete.contains(from)) {
+        continue;
+      }
+      if (isInternalAssetId(from)) {
         return false;
       }
     }
     return true;
   }
 
-  private static boolean startsWithIgnoreCase(String value, String prefix) {
-    if (value == null || prefix == null || value.length() < prefix.length()) {
+  private static void populateStorageAndHistoryEffects(
+      AssetLifecycleGraph graph,
+      Set<String> assetsToDelete,
+      DeleteOptions options,
+      Set<String> storageToDelete,
+      Set<String> historyToDelete,
+      Set<String> assetsRetained,
+      Set<String> manualActions) {
+    for (String deleting : assetsToDelete) {
+      for (AssetLifecycleEdge edge : graph.outgoing(deleting)) {
+        String target = edge.toAssetId();
+        if (target == null) {
+          continue;
+        }
+        if (edge.relationshipType() == RelationshipType.STORES_IN || target.startsWith("storage:")) {
+          if (options.deleteData() && (options.hardDeleteData() || edge.deleteBehavior() == DeleteBehavior.CASCADE_HARD)) {
+            storageToDelete.add(target);
+          } else {
+            assetsRetained.add(target);
+            manualActions.add("Data retained unless hard delete is requested: " + target);
+          }
+        }
+        if (options.deleteHistory() && edge.retentionBehavior() == RetentionBehavior.DELETE_HISTORY) {
+          historyToDelete.add(target);
+        }
+      }
+    }
+  }
+
+  private static List<String> buildDeleteExecutionOrder(
+      AssetLifecycleGraph graph, Set<String> selectedAssets) {
+    Map<String, Integer> indegree = new LinkedHashMap<>();
+    Map<String, LinkedHashSet<String>> edges = new LinkedHashMap<>();
+    for (String asset : selectedAssets) {
+      indegree.put(asset, 0);
+      edges.put(asset, new LinkedHashSet<>());
+    }
+    for (String dependent : selectedAssets) {
+      for (AssetLifecycleEdge edge : graph.outgoing(dependent)) {
+        String dependency = edge.toAssetId();
+        if (!selectedAssets.contains(dependency) || dependent.equals(dependency)) {
+          continue;
+        }
+        if (edges.get(dependent).add(dependency)) {
+          indegree.put(dependency, indegree.get(dependency) + 1);
+        }
+      }
+    }
+
+    ArrayDeque<String> queue = new ArrayDeque<>();
+    List<String> roots = new ArrayList<>();
+    for (Map.Entry<String, Integer> entry : indegree.entrySet()) {
+      if (entry.getValue() == 0) {
+        roots.add(entry.getKey());
+      }
+    }
+    roots.sort(String::compareToIgnoreCase);
+    queue.addAll(roots);
+
+    List<String> order = new ArrayList<>(selectedAssets.size());
+    while (!queue.isEmpty()) {
+      String next = queue.removeFirst();
+      order.add(next);
+      List<String> dependencies = new ArrayList<>(edges.getOrDefault(next, new LinkedHashSet<>()));
+      dependencies.sort(String::compareToIgnoreCase);
+      for (String dependency : dependencies) {
+        int remaining = indegree.get(dependency) - 1;
+        indegree.put(dependency, remaining);
+        if (remaining == 0) {
+          queue.addLast(dependency);
+        }
+      }
+    }
+    if (order.size() < selectedAssets.size()) {
+      List<String> unresolved = new ArrayList<>();
+      for (String asset : selectedAssets) {
+        if (!order.contains(asset)) {
+          unresolved.add(asset);
+        }
+      }
+      unresolved.sort(String::compareToIgnoreCase);
+      order.addAll(unresolved);
+    }
+    return List.copyOf(order);
+  }
+
+  private static boolean isStorageOrExternalTarget(
+      AssetLifecycleGraph graph, String targetAssetId, AssetLifecycleEdge edge) {
+    if (targetAssetId.startsWith("storage:")
+        || targetAssetId.startsWith("external:")
+        || edge.ownershipType() == OwnershipType.EXTERNAL) {
+      return true;
+    }
+    DefinitionType type = graph.node(targetAssetId).map(AssetLifecycleNode::type).orElse(DefinitionType.UNKNOWN);
+    return type == DefinitionType.UNKNOWN && !isInternalAssetId(targetAssetId);
+  }
+
+  private static boolean isInternalAssetId(String assetId) {
+    String value = trim(assetId);
+    if (value == null) {
       return false;
     }
-    return value.substring(0, prefix.length()).toLowerCase(Locale.ROOT)
-        .equals(prefix.toLowerCase(Locale.ROOT));
+    return value.startsWith("dataset:")
+        || value.startsWith("service:")
+        || value.startsWith("stream:")
+        || value.startsWith("schema:")
+        || value.startsWith("config:")
+        || value.startsWith("connection:")
+        || value.startsWith("ingest:")
+        || value.startsWith("ingest-source:")
+        || value.startsWith("entitlement:");
   }
 
-  private static ResolutionException failure(
-      Code code, OboDenyRule rule, CallerAppIdentity callerApp, String oboUser) {
-    return new ResolutionException(
-        code,
-        "OBO_DENIED rule="
-            + Objects.requireNonNull(rule, "rule").name()
-            + " caller="
-            + callerAppToken(callerApp)
-            + " obo="
-            + oboToken(oboUser));
+  private static DeletePlan emptyPlan(
+      String rootAssetId, DeleteOptions options, List<DeleteBlocker> blockers) {
+    return new DeletePlan(
+        rootAssetId,
+        options,
+        List.of(),
+        List.of(),
+        List.of(),
+        List.of(),
+        List.of(),
+        blockers,
+        List.of(),
+        List.of(),
+        List.of());
   }
 
-  private static String callerAppToken(CallerAppIdentity callerApp) {
-    if (callerApp == null || !callerApp.isPresent()) {
-      return "<none>";
+  private static String resolveRootAssetId(AssetLifecycleGraph graph, String rootAssetIdOrToken) {
+    if (graph == null || rootAssetIdOrToken == null || rootAssetIdOrToken.isBlank()) {
+      return null;
     }
-    return callerApp.asSubject();
-  }
-
-  private static String oboToken(String oboUser) {
-    String normalized = Strings.trimToNull(oboUser);
-    return normalized == null ? "<none>" : normalized;
-  }
-
-  private enum OboDenyRule {
-    OBO_PRESENT_BUT_NOT_AUTHENTICATED,
-    OBO_CALLER_APP_HEADERS_REQUIRED,
-    OBO_REQUIRES_APP_SUBJECT,
-    OBO_APP_DEFINITION_MISSING,
-    OBO_DISABLED_FOR_APP,
-    OBO_CANONICAL_REQUIRED,
-    OBO_RAW_USERNAME_DISALLOWED,
-    OBO_UNTRUSTED_HEADERS
-  }
-
-  public enum Code {
-    UNAUTHENTICATED,
-    PERMISSION_DENIED
-  }
-
-  public static final class ResolutionException extends RuntimeException {
-    private final Code code;
-
-    public ResolutionException(Code code, String message) {
-      super(message);
-      this.code = Objects.requireNonNull(code, "code");
+    if (graph.hasAsset(rootAssetIdOrToken)) {
+      return rootAssetIdOrToken;
     }
-
-    public Code code() {
-      return code;
-    }
+    return graph.resolveAssetId(rootAssetIdOrToken);
   }
 
-  public record Config(
-      boolean delegatedUserEnabled,
-      boolean delegatedUserRequireCanonical,
-      boolean delegatedUserAllowRawUsernameInDev,
-      boolean delegatedUserTrustUserHeaders,
-      boolean devEnvironment) {
-    public static Config from(
-        DefinitionApp appDefinition, String runtimeEnvironment, String requestEnvironment) {
-      String effectiveEnvironment = Strings.firstNonBlank(runtimeEnvironment, requestEnvironment);
-      boolean dev = isDevEnvironment(effectiveEnvironment);
-      boolean enabled =
-          appDefinition != null && Boolean.TRUE.equals(appDefinition.delegatedUserEnabled());
-      boolean requireCanonical =
-          appDefinition == null || appDefinition.delegatedUserRequireCanonical() == null
-              ? true
-              : appDefinition.delegatedUserRequireCanonical();
-      boolean allowRawDev =
-          appDefinition != null
-              && Boolean.TRUE.equals(appDefinition.delegatedUserAllowRawUsernameInDev());
-      boolean trustHeaders =
-          appDefinition != null && Boolean.TRUE.equals(appDefinition.delegatedUserTrustUserHeaders());
-      return new Config(enabled, requireCanonical, allowRawDev, trustHeaders, dev);
-    }
+  private static List<String> sortStrings(Set<String> values) {
+    List<String> sorted = new ArrayList<>(values);
+    sorted.sort(String::compareToIgnoreCase);
+    return List.copyOf(sorted);
+  }
 
-    private static boolean isDevEnvironment(String value) {
-      String normalized = Strings.trimToNull(value);
-      if (normalized == null) {
-        return false;
-      }
-      return normalized.equalsIgnoreCase("dev")
-          || normalized.equalsIgnoreCase("local")
-          || normalized.equalsIgnoreCase("localhost");
+  private static String trim(String value) {
+    if (value == null) {
+      return null;
     }
+    String trimmed = value.trim();
+    return trimmed.isEmpty() ? null : trimmed;
   }
 }
-
-
-
-
-
