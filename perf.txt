@@ -1,536 +1,511 @@
-package org.pronzato.fabric.api.data.format;
+package org.pronzato.fabric.api.services.grpc;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import java.time.Instant;
-import java.time.LocalDate;
-import java.time.format.DateTimeParseException;
+import io.grpc.ClientCall;
+import io.grpc.ClientInterceptor;
+import io.grpc.ManagedChannel;
+import io.grpc.MethodDescriptor;
+import io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts;
+import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
+import io.grpc.netty.shaded.io.netty.handler.ssl.SslContext;
+import io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder;
+import java.io.File;
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
-import java.util.TreeSet;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngest;
-import org.pronzato.fabric.api.data.format.FormatDecoderArrowBuilder.FormatField;
-import org.pronzato.fabric.api.data.format.FormatDecoderArrowBuilder.ValueKind;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.pronzato.fabric.api.control.status.service.ServiceHbCache;
+import org.pronzato.fabric.api.control.security.UserContext;
+import org.pronzato.fabric.api.control.security.UserPrincipal;
+import org.pronzato.fabric.api.control.security.identity.CallerAppContext;
+import org.pronzato.fabric.api.control.security.kerberos.KerberosClient;
+import org.pronzato.fabric.api.control.security.kerberos.KerberosConfig;
+import org.pronzato.fabric.api.control.security.kerberos.KerberosKrb5Source;
+import org.pronzato.fabric.api.control.security.kerberos.KerberosSpn;
+import org.pronzato.fabric.api.services.common.ServiceAdvertise;
+import org.pronzato.fabric.api.services.common.ServiceEndpointSelector;
+import org.pronzato.fabric.api.services.common.ServiceInstanceResolver;
+import org.pronzato.fabric.api.services.common.routing.ServiceRoutingContext;
+import org.pronzato.fabric.api.services.common.routing.ServiceRoutingMode;
+import org.pronzato.fabric.api.services.common.routing.ServiceRoutingState;
 import org.pronzato.fabric.api.util.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-final class SchemaEvolution {
-  private static final Logger LOGGER = LoggerFactory.getLogger(SchemaEvolution.class);
+public final class GrpcClientRuntime {
+  private static final Logger LOGGER = LoggerFactory.getLogger(GrpcClientRuntime.class);
+  private GrpcClientRuntime() {}
 
-  private SchemaEvolution() {}
+  public static ManagedChannel createChannel(
+      Config cfg, List<ClientInterceptor> extraInterceptors) throws Exception {
+    Objects.requireNonNull(cfg, "cfg");
+    cfg.validate();
 
-  static Result resolveJson(
-      String ingestId,
-      DefinitionIngest.SchemaMode schemaMode,
-      List<FormatField> expectedFields,
-      List<Map<String, JsonNode>> inputRows) {
-    return resolve(ingestId, schemaMode, expectedFields, inputRows, JsonAdapter.INSTANCE);
-  }
+    String host = ServiceAdvertise.requireRoutableHost(cfg.host, "grpc target host");
+    NettyChannelBuilder builder = NettyChannelBuilder.forAddress(host, cfg.port);
 
-  static Result resolveNvFix(
-      String ingestId,
-      DefinitionIngest.SchemaMode schemaMode,
-      List<FormatField> expectedFields,
-      List<Map<String, String>> inputRows) {
-    return resolve(ingestId, schemaMode, expectedFields, inputRows, NvFixAdapter.INSTANCE);
-  }
-
-  private static <V> Result resolve(
-      String ingestId,
-      DefinitionIngest.SchemaMode schemaMode,
-      List<FormatField> expectedFields,
-      List<Map<String, V>> inputRows,
-      ValueAdapter<V> adapter) {
-    String normalizedIngestId = Strings.requireNonBlank(ingestId, "ingestId");
-    DefinitionIngest.SchemaMode mode =
-        schemaMode == null ? DefinitionIngest.SchemaMode.STRICT : schemaMode;
-    Objects.requireNonNull(adapter, "adapter");
-
-    if (expectedFields == null || expectedFields.isEmpty()) {
-      throw new IllegalArgumentException("expectedFields are required");
-    }
-    if (inputRows == null || inputRows.isEmpty()) {
-      throw new IllegalArgumentException(
-          "Format decode payload did not contain any messages ingest=" + normalizedIngestId);
-    }
-
-    Map<String, FormatField> expectedByName = new LinkedHashMap<>();
-    for (FormatField expectedField : expectedFields) {
-      expectedByName.put(expectedField.name(), expectedField);
-    }
-
-    TreeSet<String> discoveredExtras = new TreeSet<>();
-    TreeSet<String> observedInputFields = new TreeSet<>();
-    for (Map<String, V> row : inputRows) {
-      if (row == null) {
-        continue;
+    if (cfg.tlsEnabled) {
+      SslContextBuilder sslBuilder = GrpcSslContexts.forClient();
+      if (cfg.trustCertPem != null) {
+        sslBuilder.trustManager(cfg.trustCertPem);
       }
-      for (String fieldName : row.keySet()) {
-        observedInputFields.add(fieldName);
-        if (!expectedByName.containsKey(fieldName)) {
-          discoveredExtras.add(fieldName);
+      SslContext context = sslBuilder.build();
+      builder.sslContext(context);
+    } else {
+      if (cfg.kerberosEnabled && cfg.kerberosRequireTls) {
+        throw new IllegalStateException("Kerberos requires TLS but grpc.tls.enabled=false");
+      }
+      builder.usePlaintext();
+    }
+
+    KerberosClient ownedKerberosContext = null;
+    List<ClientInterceptor> interceptors = new ArrayList<>();
+    if (cfg.kerberosEnabled) {
+      ownedKerberosContext = startKerberos(cfg);
+      String realm = KerberosSpn.resolveRealm(cfg.kerberosRealm, ownedKerberosContext.getSubject());
+      String baseSpn = KerberosSpn.resolveSpn(cfg.kerberosSpn, host);
+      String normalizedSpn = KerberosSpn.normalizeSpnWithRealm(baseSpn, realm);
+      interceptors.add(
+          new GrpcKerberosClientInterceptor(
+              ownedKerberosContext, normalizedSpn, cfg.useDelegatedSubjectIfPresent));
+    }
+
+    if (extraInterceptors != null) {
+      for (ClientInterceptor interceptor : extraInterceptors) {
+        if (interceptor != null) {
+          interceptors.add(interceptor);
         }
       }
     }
-
-    if (mode == DefinitionIngest.SchemaMode.STRICT && !discoveredExtras.isEmpty()) {
-      throw new IllegalArgumentException(
-          "Unexpected field(s) "
-              + discoveredExtras
-              + " ingest="
-              + normalizedIngestId
-              + " mode="
-              + mode);
+    if (!interceptors.isEmpty()) {
+      builder.intercept(interceptors);
     }
 
-    List<String> addedColumns = new ArrayList<>();
-    List<FormatField> addedFields = new ArrayList<>();
-    if (mode != DefinitionIngest.SchemaMode.STRICT) {
-      int index = expectedFields.size();
-      for (String fieldName : discoveredExtras) {
-        ValueKind inferredKind = inferAddedValueKind(fieldName, inputRows, adapter);
-        addedFields.add(
-            new FormatField(
-                index,
-                fieldName,
-                true,
-                inferredKind.expectedTypeLabel(),
-                inferredKind));
-        addedColumns.add(fieldName);
-        index++;
+    ManagedChannel channel = builder.build();
+    if (ownedKerberosContext == null) {
+      return channel;
+    }
+    return new ManagedChannelWithCleanup(channel, ownedKerberosContext);
+  }
+
+  public static ManagedChannel createRoutingChannel(
+      RoutingConfig cfg, List<ClientInterceptor> extraInterceptors) throws Exception {
+    Objects.requireNonNull(cfg, "cfg");
+    cfg.validate();
+    return new RoutingManagedChannel(cfg, extraInterceptors);
+  }
+
+  private static KerberosClient startKerberos(Config cfg) {
+    KerberosConfig kerberosConfig =
+        new KerberosConfig(
+            KerberosConfig.DEFAULT_CONTEXT_NAME,
+            true,
+            cfg.kerberosPrincipal,
+            cfg.kerberosKeytab.toPath(),
+            null,
+            KerberosKrb5Source.DEFAULT,
+            cfg.kerberosRealm,
+            false,
+            true);
+    return new KerberosClient(kerberosConfig).start();
+  }
+
+  public static final class RoutingConfig {
+    public String serviceId;
+    public ServiceHbCache statusCache;
+    public ServiceInstanceResolver instanceResolver;
+    public String serviceGroup;
+    public String serviceName;
+    public boolean tlsEnabled;
+    public File trustCertPem;
+    public boolean kerberosEnabled;
+    public boolean kerberosRequireTls = true;
+    public String kerberosSpn;
+    public String kerberosPrincipal;
+    public File kerberosKeytab;
+    public String kerberosRealm;
+    public boolean useDelegatedSubjectIfPresent;
+    public boolean logRoutingSelections;
+    public boolean closeInstanceResolverOnCleanup = true;
+    public long shutdownTimeoutMillis = 2000L;
+    public ServiceRoutingMode routingMode = ServiceRoutingMode.ROUND_ROBIN;
+    public String defaultEffectiveSubject;
+    public String callerAppSubject;
+    public String routingKey;
+
+    public void validate() {
+      serviceId = Strings.trimToNull(serviceId);
+      serviceGroup = Strings.trimToNull(serviceGroup);
+      serviceName = Strings.trimToNull(serviceName);
+      defaultEffectiveSubject = Strings.trimToNull(defaultEffectiveSubject);
+      callerAppSubject = Strings.trimToNull(callerAppSubject);
+      routingKey = Strings.trimToNull(routingKey);
+      if (statusCache == null && instanceResolver == null) {
+        throw new IllegalArgumentException("routing status cache is required");
       }
-    }
-
-    List<FormatField> outputFields = new ArrayList<>(expectedFields.size() + addedFields.size());
-    outputFields.addAll(expectedFields);
-    outputFields.addAll(addedFields);
-
-    TreeSet<String> defaultedFields = new TreeSet<>();
-    TreeSet<String> widenedFields = new TreeSet<>();
-    List<Object[]> outputRows = new ArrayList<>(inputRows.size());
-    for (Map<String, V> inputRow : inputRows) {
-      Map<String, V> row = inputRow == null ? Collections.emptyMap() : inputRow;
-      Object[] values = new Object[outputFields.size()];
-
-      for (FormatField field : expectedFields) {
-        V rawValue = row.get(field.name());
-        if (rawValue == null || adapter.isNull(rawValue)) {
-          values[field.index()] =
-              resolveMissingRequired(normalizedIngestId, mode, field, defaultedFields);
-          continue;
+      if (instanceResolver != null) {
+        if (serviceGroup == null) {
+          throw new IllegalArgumentException("routing service group is required");
         }
-        ValueKind actualKind = adapter.inferActualKind(rawValue);
-        if (mode == DefinitionIngest.SchemaMode.RELAXED
-            && actualKind != null
-            && actualKind != field.valueKind()
-            && isAllowedWidening(actualKind, field.valueKind())) {
-          widenedFields.add(field.name());
+        if (serviceName == null) {
+          throw new IllegalArgumentException("routing service name is required");
         }
-        values[field.index()] =
-            convertRequiredValue(normalizedIngestId, mode, field, rawValue, adapter);
       }
-
-      for (FormatField addedField : addedFields) {
-        V rawValue = row.get(addedField.name());
-        if (rawValue == null || adapter.isNull(rawValue)) {
-          values[addedField.index()] = null;
-          continue;
+      if (kerberosEnabled) {
+        kerberosPrincipal = Strings.trimToNull(kerberosPrincipal);
+        if (kerberosPrincipal == null) {
+          throw new IllegalArgumentException(
+              "Kerberos principal is required when grpc.kerberos.enabled=true");
         }
-        values[addedField.index()] =
-            convertAddedValue(normalizedIngestId, mode, addedField, rawValue, adapter);
+        if (kerberosKeytab == null) {
+          throw new IllegalArgumentException(
+              "Kerberos keytab is required when grpc.kerberos.enabled=true");
+        }
+        if (!kerberosKeytab.isFile()) {
+          throw new IllegalArgumentException(
+              "Kerberos keytab does not exist: " + kerberosKeytab.getAbsolutePath());
+        }
+        kerberosSpn = Strings.trimToNull(kerberosSpn);
+        kerberosRealm = Strings.trimToNull(kerberosRealm);
       }
-
-      outputRows.add(values);
-    }
-
-    if (mode != DefinitionIngest.SchemaMode.STRICT
-        && (!addedColumns.isEmpty() || !defaultedFields.isEmpty() || !widenedFields.isEmpty())) {
-      LOGGER.info("ingest={} mode={} addedColumns={} defaultedFields={} widenedFields={}", normalizedIngestId, mode, addedColumns, defaultedFields, widenedFields);
-    }
-
-    return new Result(
-        List.copyOf(outputFields),
-        List.copyOf(outputRows),
-        List.copyOf(addedColumns),
-        List.copyOf(defaultedFields),
-        List.copyOf(widenedFields),
-        List.copyOf(observedInputFields));
-  }
-
-  private static <V> Object resolveMissingRequired(
-      String ingestId,
-      DefinitionIngest.SchemaMode mode,
-      FormatField field,
-      Set<String> defaultedFields) {
-    if (field.nullable()) {
-      return null;
-    }
-    if (mode != DefinitionIngest.SchemaMode.RELAXED) {
-      throw missingRequired(ingestId, mode, field.name());
-    }
-    Object defaultValue = defaultValueFor(field.valueKind());
-    if (defaultValue == null) {
-      throw missingRequired(ingestId, mode, field.name());
-    }
-    defaultedFields.add(field.name());
-    return defaultValue;
-  }
-
-  private static Object defaultValueFor(ValueKind valueKind) {
-    return switch (valueKind) {
-      case UTF8 -> "";
-      case INT32, DATE_DAY -> 0;
-      case INT64, TIMESTAMP_MICROSECOND -> 0L;
-      case FLOAT64 -> 0.0d;
-      case BOOL -> false;
-    };
-  }
-
-  private static <V> Object convertRequiredValue(
-      String ingestId,
-      DefinitionIngest.SchemaMode mode,
-      FormatField field,
-      V rawValue,
-      ValueAdapter<V> adapter) {
-    try {
-      return adapter.convert(rawValue, field, ingestId);
-    } catch (RuntimeException ex) {
-      throw typeMismatch(
-          ingestId, mode, field.name(), field.expectedType(), adapter.actualTypeLabel(rawValue), ex);
-    }
-  }
-
-  private static <V> Object convertAddedValue(
-      String ingestId,
-      DefinitionIngest.SchemaMode mode,
-      FormatField field,
-      V rawValue,
-      ValueAdapter<V> adapter) {
-    try {
-      return adapter.convert(rawValue, field, ingestId);
-    } catch (RuntimeException ex) {
-      if (field.valueKind() == ValueKind.UTF8) {
-        return adapter.stringify(rawValue);
+      if (routingMode == null) {
+        routingMode = ServiceRoutingMode.ROUND_ROBIN;
       }
-      throw typeMismatch(
-          ingestId, mode, field.name(), field.expectedType(), adapter.actualTypeLabel(rawValue), ex);
     }
   }
 
-  private static boolean isAllowedWidening(ValueKind actual, ValueKind expected) {
-    if (actual == ValueKind.INT32 && expected == ValueKind.INT64) {
+  public static final class Config {
+    public String host;
+    public int port;
+    public boolean tlsEnabled;
+    public File trustCertPem;
+    public boolean kerberosEnabled;
+    public boolean kerberosRequireTls = true;
+    public String kerberosSpn;
+    public String kerberosPrincipal;
+    public File kerberosKeytab;
+    public String kerberosRealm;
+    public boolean useDelegatedSubjectIfPresent;
+
+    public void validate() {
+      host = Strings.trimToNull(host);
+      if (host == null) {
+        throw new IllegalArgumentException("grpc target host is required");
+      }
+      if (port <= 0) {
+        throw new IllegalArgumentException("grpc target port must be > 0");
+      }
+      if (kerberosEnabled) {
+        kerberosPrincipal = Strings.trimToNull(kerberosPrincipal);
+        if (kerberosPrincipal == null) {
+          throw new IllegalArgumentException(
+              "Kerberos principal is required when grpc.kerberos.enabled=true");
+        }
+        if (kerberosKeytab == null) {
+          throw new IllegalArgumentException(
+              "Kerberos keytab is required when grpc.kerberos.enabled=true");
+        }
+        if (!kerberosKeytab.isFile()) {
+          throw new IllegalArgumentException(
+              "Kerberos keytab does not exist: " + kerberosKeytab.getAbsolutePath());
+        }
+        kerberosSpn = Strings.trimToNull(kerberosSpn);
+        kerberosRealm = Strings.trimToNull(kerberosRealm);
+      }
+    }
+  }
+
+  private static final class RoutingManagedChannel extends ManagedChannel {
+    private final RoutingConfig cfg;
+    private final List<ClientInterceptor> interceptors;
+    private final ConcurrentMap<String, ManagedChannel> channels = new ConcurrentHashMap<>();
+    private final AtomicBoolean shutdown = new AtomicBoolean(false);
+    private final AtomicBoolean cleanupDone = new AtomicBoolean(false);
+    private final ServiceRoutingState routingState = new ServiceRoutingState();
+    private volatile String lastRouteKey;
+
+    private RoutingManagedChannel(RoutingConfig cfg, List<ClientInterceptor> extraInterceptors) {
+      this.cfg = cfg;
+      if (extraInterceptors == null || extraInterceptors.isEmpty()) {
+        this.interceptors = List.of();
+      } else {
+        List<ClientInterceptor> normalized = new ArrayList<>();
+        for (ClientInterceptor interceptor : extraInterceptors) {
+          if (interceptor != null) {
+            normalized.add(interceptor);
+          }
+        }
+        this.interceptors = normalized.isEmpty() ? List.of() : List.copyOf(normalized);
+      }
+    }
+
+    @Override
+    public ManagedChannel shutdown() {
+      if (shutdown.compareAndSet(false, true)) {
+        for (ManagedChannel channel : channels.values()) {
+          if (channel != null) {
+            channel.shutdown();
+          }
+        }
+      }
+      if (channels.isEmpty()) {
+        cleanupRouting();
+      }
+      return this;
+    }
+
+    @Override
+    public boolean isShutdown() {
+      return shutdown.get();
+    }
+
+    @Override
+    public boolean isTerminated() {
+      if (!shutdown.get()) {
+        return false;
+      }
+      for (ManagedChannel channel : channels.values()) {
+        if (channel != null && !channel.isTerminated()) {
+          return false;
+        }
+      }
+      cleanupRouting();
       return true;
     }
-    if ((actual == ValueKind.INT32 || actual == ValueKind.INT64) && expected == ValueKind.FLOAT64) {
+
+    @Override
+    public ManagedChannel shutdownNow() {
+      if (shutdown.compareAndSet(false, true)) {
+        for (ManagedChannel channel : channels.values()) {
+          if (channel != null) {
+            channel.shutdownNow();
+          }
+        }
+      }
+      cleanupRouting();
+      return this;
+    }
+
+    @Override
+    public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
+      long timeoutNanos = unit.toNanos(timeout);
+      long start = System.nanoTime();
+      for (ManagedChannel channel : channels.values()) {
+        if (channel == null) {
+          continue;
+        }
+        long elapsed = System.nanoTime() - start;
+        long remaining = timeoutNanos - elapsed;
+        if (remaining <= 0L) {
+          return false;
+        }
+        if (!channel.awaitTermination(remaining, TimeUnit.NANOSECONDS)) {
+          return false;
+        }
+      }
+      cleanupRouting();
       return true;
     }
-    return isNumeric(actual) && expected == ValueKind.UTF8;
-  }
-
-  private static boolean isNumeric(ValueKind valueKind) {
-    return valueKind == ValueKind.INT32
-        || valueKind == ValueKind.INT64
-        || valueKind == ValueKind.FLOAT64;
-  }
-
-  private static <V> ValueKind inferAddedValueKind(
-      String fieldName, List<Map<String, V>> inputRows, ValueAdapter<V> adapter) {
-    ValueKind merged = null;
-    boolean unstable = false;
-    for (Map<String, V> inputRow : inputRows) {
-      if (inputRow == null) {
-        continue;
-      }
-      V raw = inputRow.get(fieldName);
-      if (raw == null || adapter.isNull(raw)) {
-        continue;
-      }
-      ValueKind inferred = adapter.inferAddedKind(raw);
-      if (inferred == null) {
-        unstable = true;
-        break;
-      }
-      if (merged == null) {
-        merged = inferred;
-        continue;
-      }
-      merged = mergeKinds(merged, inferred);
-      if (merged == null) {
-        unstable = true;
-        break;
-      }
-    }
-    if (unstable || merged == null) {
-      return ValueKind.UTF8;
-    }
-    return merged;
-  }
-
-  private static ValueKind mergeKinds(ValueKind left, ValueKind right) {
-    if (left == right) {
-      return left;
-    }
-    if (isNumeric(left) && isNumeric(right)) {
-      if (left == ValueKind.FLOAT64 || right == ValueKind.FLOAT64) {
-        return ValueKind.FLOAT64;
-      }
-      if (left == ValueKind.INT64 || right == ValueKind.INT64) {
-        return ValueKind.INT64;
-      }
-      return ValueKind.INT32;
-    }
-    return null;
-  }
-
-  private static IllegalArgumentException missingRequired(
-      String ingestId, DefinitionIngest.SchemaMode mode, String fieldName) {
-    return new IllegalArgumentException(
-        "Missing required field '" + fieldName + "' ingest=" + ingestId + " mode=" + mode);
-  }
-
-  private static IllegalArgumentException typeMismatch(
-      String ingestId,
-      DefinitionIngest.SchemaMode mode,
-      String fieldName,
-      String expectedType,
-      String actualType) {
-    return typeMismatch(ingestId, mode, fieldName, expectedType, actualType, null);
-  }
-
-  private static IllegalArgumentException typeMismatch(
-      String ingestId,
-      DefinitionIngest.SchemaMode mode,
-      String fieldName,
-      String expectedType,
-      String actualType,
-      Throwable cause) {
-    String message =
-        "Type mismatch for field '"
-            + fieldName
-            + "' expected="
-            + expectedType
-            + " actual="
-            + actualType
-            + " ingest="
-            + ingestId
-            + " mode="
-            + mode;
-    return cause == null ? new IllegalArgumentException(message) : new IllegalArgumentException(message, cause);
-  }
-
-  private interface ValueAdapter<V> {
-    boolean isNull(V value);
-
-    ValueKind inferActualKind(V value);
-
-    ValueKind inferAddedKind(V value);
-
-    Object convert(V value, FormatField targetField, String ingestId);
-
-    String stringify(V value);
-
-    String actualTypeLabel(V value);
-  }
-
-  private enum JsonAdapter implements ValueAdapter<JsonNode> {
-    INSTANCE;
 
     @Override
-    public boolean isNull(JsonNode value) {
-      return value == null || value.isNull();
-    }
-
-    @Override
-    public ValueKind inferActualKind(JsonNode value) {
-      if (value == null || value.isNull()) {
-        return null;
+    public <RequestT, ResponseT> ClientCall<RequestT, ResponseT> newCall(
+        MethodDescriptor<RequestT, ResponseT> methodDescriptor, io.grpc.CallOptions callOptions) {
+      if (shutdown.get()) {
+        throw unavailable("Routing channel is closed");
       }
-      if (value.isBoolean()) {
-        return ValueKind.BOOL;
+      ServiceRoutingContext routingContext = routingContext(methodDescriptor);
+      ServiceHbCache.Target target =
+          // Selection happens once per RPC; stream RPCs stay pinned to that selected endpoint.
+          cfg.instanceResolver != null
+              ? (cfg.routingMode == ServiceRoutingMode.ROUND_ROBIN
+                  ? cfg.instanceResolver.chooseRoundRobin(
+                      cfg.serviceGroup, cfg.serviceName, serviceId())
+                  : cfg.instanceResolver.choose(
+                      cfg.serviceGroup,
+                      cfg.serviceName,
+                      serviceId(),
+                      cfg.routingMode,
+                      routingContext,
+                      routingState))
+              : ServiceEndpointSelector.choose(
+                  cfg.statusCache,
+                  serviceId(),
+                  cfg.routingMode,
+                  routingContext,
+                  routingState);
+      if (target == null) {
+        throw unavailable("No available instances for service: " + serviceId());
       }
-      if (value.isIntegralNumber()) {
-        long numeric = value.longValue();
-        if (numeric >= Integer.MIN_VALUE && numeric <= Integer.MAX_VALUE) {
-          return ValueKind.INT32;
-        }
-        return ValueKind.INT64;
-      }
-      if (value.isNumber()) {
-        return ValueKind.FLOAT64;
-      }
-      if (value.isTextual()) {
-        return ValueKind.UTF8;
-      }
-      return null;
-    }
-
-    @Override
-    public ValueKind inferAddedKind(JsonNode value) {
-      return inferActualKind(value);
-    }
-
-    @Override
-    public Object convert(JsonNode value, FormatField targetField, String ingestId) {
-      return FormatDecoderConversions.fromJson(value, targetField, ingestId);
-    }
-
-    @Override
-    public String stringify(JsonNode value) {
-      if (value == null || value.isNull()) {
-        return null;
-      }
-      if (value.isTextual()) {
-        return value.textValue();
-      }
-      return value.toString();
-    }
-
-    @Override
-    public String actualTypeLabel(JsonNode value) {
-      if (value == null || value.isNull()) {
-        return "Null";
-      }
-      ValueKind kind = inferActualKind(value);
-      if (kind != null) {
-        return kind.expectedTypeLabel();
-      }
-      if (value.isArray()) {
-        return "Array";
-      }
-      if (value.isObject()) {
-        return "Object";
-      }
-      return "Unknown";
-    }
-  }
-
-  private enum NvFixAdapter implements ValueAdapter<String> {
-    INSTANCE;
-
-    @Override
-    public boolean isNull(String value) {
-      return value == null;
-    }
-
-    @Override
-    public ValueKind inferActualKind(String value) {
-      return inferFromString(value);
-    }
-
-    @Override
-    public ValueKind inferAddedKind(String value) {
-      return inferFromString(value);
-    }
-
-    @Override
-    public Object convert(String value, FormatField targetField, String ingestId) {
-      return FormatDecoderConversions.fromString(value, targetField, ingestId);
-    }
-
-    @Override
-    public String stringify(String value) {
-      return value;
-    }
-
-    @Override
-    public String actualTypeLabel(String value) {
-      ValueKind inferred = inferFromString(value);
-      if (inferred != null) {
-        return inferred.expectedTypeLabel();
-      }
-      return "Utf8";
-    }
-
-    private static ValueKind inferFromString(String value) {
-      String normalized = Strings.trimToNull(value);
-      if (normalized == null) {
-        return null;
-      }
-      if ("true".equalsIgnoreCase(normalized) || "false".equalsIgnoreCase(normalized)) {
-        return ValueKind.BOOL;
-      }
-      if (looksLikeTimestamp(normalized)) {
-        Long ignored = tryParseTimestampMicros(normalized);
-        if (ignored != null) {
-          return ValueKind.TIMESTAMP_MICROSECOND;
-        }
-      }
-      if (looksLikeDate(normalized)) {
-        Integer ignored = tryParseDateEpochDay(normalized);
-        if (ignored != null) {
-          return ValueKind.DATE_DAY;
-        }
-      }
-      Long integerValue = tryParseLong(normalized);
-      if (integerValue != null) {
-        if (integerValue >= Integer.MIN_VALUE && integerValue <= Integer.MAX_VALUE) {
-          return ValueKind.INT32;
-        }
-        return ValueKind.INT64;
-      }
-      Double floatingValue = tryParseDouble(normalized);
-      if (floatingValue != null) {
-        return ValueKind.FLOAT64;
-      }
-      return ValueKind.UTF8;
-    }
-
-    private static boolean looksLikeDate(String value) {
-      return value.contains("-") && value.length() >= 8;
-    }
-
-    private static boolean looksLikeTimestamp(String value) {
-      return value.contains("T") || value.endsWith("Z");
-    }
-
-    private static Integer tryParseDateEpochDay(String value) {
+      String host = ServiceAdvertise.requireRoutableHost(target.host, "grpc target host");
+      int port = target.port;
+      String key = host + ":" + port + "|" + target.tls + "|" + Strings.nullToEmpty(target.authorityOverride);
+      ManagedChannel delegate;
       try {
-        LocalDate date = LocalDate.parse(value);
-        return Math.toIntExact(date.toEpochDay());
+        delegate =
+            channels.computeIfAbsent(
+                key, ignored -> createEndpointChannel(host, port, target.tls));
       } catch (RuntimeException ex) {
-        return null;
+        if (ex.getCause() instanceof Exception cause) {
+          throw new IllegalStateException(
+              "Failed to create routed channel for service " + serviceId() + " endpoint " + host + ":" + port,
+              cause);
+        }
+        throw ex;
+      }
+      if (cfg.logRoutingSelections) {
+        LOGGER.info("[GrpcClient][routing] mode={} serviceId={} endpoint={} instance={} tls={} subject={} callerApp={} routingKey={} operation={}", cfg.routingMode, serviceId(), host + ":" + port, target.instanceId, target.tls, routingContext.effectiveSubject(), routingContext.callerAppSubject(), routingContext.routingKey(), routingContext.operation());
+      } else if (!key.equals(lastRouteKey)) {
+        lastRouteKey = key;
+      }
+      return delegate.newCall(methodDescriptor, callOptions);
+    }
+
+    private ServiceRoutingContext routingContext(MethodDescriptor<?, ?> methodDescriptor) {
+      String operation = methodDescriptor == null ? null : methodDescriptor.getFullMethodName();
+      String subject = resolveEffectiveSubject();
+      CallerAppContext.ContextValue callerContext = CallerAppContext.get().orElse(null);
+      String callerAppSubject =
+          Strings.firstNonBlank(
+              callerContext == null ? null : callerContext.callerAppSubject(),
+              cfg.callerAppSubject);
+      return new ServiceRoutingContext(
+          serviceId(),
+          "GRPC",
+          subject,
+          callerAppSubject,
+          cfg.routingKey,
+          callerContext == null ? null : callerContext.requestId(),
+          operation);
+    }
+
+    private String resolveEffectiveSubject() {
+      UserPrincipal principal = UserContext.get().orElse(null);
+      String userSubject = principal == null ? null : Strings.trimToNull(principal.username());
+      return Strings.firstNonBlank(userSubject, cfg.defaultEffectiveSubject);
+    }
+
+    @Override
+    public String authority() {
+      return "fabric-routing/" + serviceId();
+    }
+
+    private ManagedChannel createEndpointChannel(String host, int port, boolean routeTls) {
+      Config endpoint = new Config();
+      endpoint.host = host;
+      endpoint.port = port;
+      endpoint.tlsEnabled = cfg.tlsEnabled || routeTls;
+      endpoint.trustCertPem = cfg.trustCertPem;
+      endpoint.kerberosEnabled = cfg.kerberosEnabled;
+      endpoint.kerberosRequireTls = cfg.kerberosRequireTls;
+      endpoint.kerberosSpn = cfg.kerberosSpn;
+      endpoint.kerberosPrincipal = cfg.kerberosPrincipal;
+      endpoint.kerberosKeytab = cfg.kerberosKeytab;
+      endpoint.kerberosRealm = cfg.kerberosRealm;
+      endpoint.useDelegatedSubjectIfPresent = cfg.useDelegatedSubjectIfPresent;
+      try {
+        return createChannel(endpoint, interceptors);
+      } catch (Exception ex) {
+        throw new RuntimeException(ex);
       }
     }
 
-    private static Long tryParseTimestampMicros(String value) {
+    private void cleanupRouting() {
+      if (!cleanupDone.compareAndSet(false, true)) {
+        return;
+      }
       try {
-        Instant instant = Instant.parse(value);
-        return Math.addExact(
-            Math.multiplyExact(instant.getEpochSecond(), 1_000_000L), instant.getNano() / 1_000L);
-      } catch (DateTimeParseException | ArithmeticException ex) {
-        return null;
+        if (cfg.statusCache != null) {
+          cfg.statusCache.close();
+        }
+      } catch (Exception ignore) {
+      }
+      try {
+        if (cfg.closeInstanceResolverOnCleanup && cfg.instanceResolver != null) {
+          cfg.instanceResolver.close();
+        }
+      } catch (Exception ignore) {
       }
     }
 
-    private static Long tryParseLong(String value) {
-      try {
-        return Long.parseLong(value);
-      } catch (NumberFormatException ex) {
-        return null;
-      }
+    private String serviceId() {
+      return Strings.isBlank(cfg.serviceId) ? "<unknown>" : cfg.serviceId;
     }
 
-    private static Double tryParseDouble(String value) {
-      try {
-        return Double.parseDouble(value);
-      } catch (NumberFormatException ex) {
-        return null;
-      }
+    private IllegalStateException unavailable(String message) {
+      return new IllegalStateException(message);
     }
   }
 
-  record Result(
-      List<FormatField> outputFields,
-      List<Object[]> outputRows,
-      List<String> addedColumns,
-      List<String> defaultedFields,
-      List<String> widenedFields,
-      List<String> observedInputFields) {}
+  private static final class ManagedChannelWithCleanup extends ManagedChannel {
+    private final ManagedChannel delegate;
+    private final AutoCloseable cleanup;
+    private final AtomicBoolean cleanupDone = new AtomicBoolean(false);
+
+    private ManagedChannelWithCleanup(ManagedChannel delegate, AutoCloseable cleanup) {
+      this.delegate = Objects.requireNonNull(delegate, "delegate");
+      this.cleanup = Objects.requireNonNull(cleanup, "cleanup");
+    }
+
+    @Override
+    public ManagedChannel shutdown() {
+      delegate.shutdown();
+      if (delegate.isTerminated()) {
+        cleanup();
+      }
+      return this;
+    }
+
+    @Override
+    public boolean isShutdown() {
+      return delegate.isShutdown();
+    }
+
+    @Override
+    public boolean isTerminated() {
+      boolean terminated = delegate.isTerminated();
+      if (terminated) {
+        cleanup();
+      }
+      return terminated;
+    }
+
+    @Override
+    public ManagedChannel shutdownNow() {
+      delegate.shutdownNow();
+      cleanup();
+      return this;
+    }
+
+    @Override
+    public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
+      boolean terminated = delegate.awaitTermination(timeout, unit);
+      if (terminated) {
+        cleanup();
+      }
+      return terminated;
+    }
+
+    @Override
+    public <RequestT, ResponseT> ClientCall<RequestT, ResponseT> newCall(
+        MethodDescriptor<RequestT, ResponseT> methodDescriptor, io.grpc.CallOptions callOptions) {
+      return delegate.newCall(methodDescriptor, callOptions);
+    }
+
+    @Override
+    public String authority() {
+      return delegate.authority();
+    }
+
+    private void cleanup() {
+      if (!cleanupDone.compareAndSet(false, true)) {
+        return;
+      }
+      try {
+        cleanup.close();
+      } catch (Exception ignore) {
+      }
+    }
+  }
 }
-
-
