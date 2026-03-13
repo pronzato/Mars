@@ -1,997 +1,1060 @@
-package org.pronzato.fabric.api.access.manager;
+package org.pronzato.fabric.api.services.manager;
 
-import org.pronzato.fabric.api.util.CloseSupport;
+import io.grpc.BindableService;
+import io.grpc.ClientCall;
+import io.grpc.Channel;
+import io.grpc.ClientInterceptor;
+import io.grpc.ForwardingClientCall;
+import io.grpc.ManagedChannel;
+import io.grpc.Metadata;
+import io.grpc.ServerCall;
+import io.grpc.ServerCallHandler;
+import io.grpc.ServerInterceptor;
+import io.grpc.Status;
+import io.opentelemetry.api.common.Attributes;
+import org.apache.arrow.flight.FlightProducer;
+import org.apache.arrow.flight.FlightServerMiddleware;
+import java.io.File;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.EnumMap;
-import java.util.EnumSet;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Supplier;
-import org.pronzato.fabric.api.access.AccessManager;
-import org.pronzato.fabric.api.control.ControlConnection;
-import org.pronzato.fabric.api.control.discovery.CanonicalIds;
-import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
+import java.util.concurrent.TimeUnit;
+import java.util.UUID;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionSchema;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionService;
-import org.pronzato.fabric.api.control.status.service.ServiceStatusCache;
-import org.pronzato.fabric.api.control.status.service.ServiceStatusRow;
-import org.pronzato.fabric.api.data.DataOptions;
-import org.pronzato.fabric.api.data.TabularTableMetadata;
-import org.pronzato.fabric.api.data.manager.RemoteTabularManager;
-import org.pronzato.fabric.api.control.entitlements.core.data.DataEntitlements;
+import org.pronzato.fabric.api.control.status.service.ServiceHbCache;
+import org.pronzato.fabric.api.control.status.service.ServiceStatusPublisher;
+import org.pronzato.fabric.api.data.TabularManager;
+import org.pronzato.fabric.api.data.checkpoints.CheckpointStore;
+import org.pronzato.fabric.api.data.checkpoints.CheckpointStores;
+import org.pronzato.fabric.api.data.dataset.DatasetId;
 import org.pronzato.fabric.api.control.entitlements.core.services.ServiceEntitlements;
-import org.pronzato.fabric.api.control.entitlements.manager.EntitlementsManagerImpl;
-import org.pronzato.fabric.api.control.security.UserContext;
-import org.pronzato.fabric.api.control.security.UserPrincipal;
+import org.pronzato.fabric.api.control.security.headers.FabricRequestHeaders;
+import org.pronzato.fabric.api.control.security.identity.CallerAppIdentity;
+import org.pronzato.fabric.api.control.security.identity.RequestIdentity;
+import org.pronzato.fabric.api.control.security.identity.RequestIdentityResolver;
+import org.pronzato.fabric.api.services.ServiceClient;
+import org.pronzato.fabric.api.services.ServiceHandle;
+import org.pronzato.fabric.api.services.ServiceManager;
 import org.pronzato.fabric.api.services.ServiceRunOptions;
-import org.pronzato.fabric.api.services.common.ServiceInstanceResolver;
-import org.pronzato.fabric.api.control.session.SessionContext;
+import org.pronzato.fabric.api.services.flight.FlightSqlServiceProducer;
+import org.pronzato.fabric.api.services.flight.FlightSqlServiceRuntime;
+import org.pronzato.fabric.api.services.flight.ingest.FlightIngestProducer;
+import org.pronzato.fabric.api.services.flight.ingest.FlightIngestServiceRuntime;
+import org.pronzato.fabric.api.services.grpc.GrpcServiceRuntime;
+import org.pronzato.fabric.api.services.common.routing.ServiceRoutingMode;
 import org.pronzato.fabric.api.control.session.SessionImpl;
+import org.pronzato.fabric.api.telemetry.manager.FabricOtelAttributes;
+import org.pronzato.fabric.api.telemetry.manager.FabricGrpcOtelInterceptors;
+import org.pronzato.fabric.api.telemetry.manager.FabricOtelEnablement;
+import org.pronzato.fabric.api.telemetry.OtelManager;
+import org.pronzato.fabric.api.telemetry.manager.FabricOtelSupport;
 import org.pronzato.fabric.api.util.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public final class AccessManagerImpl implements AccessManager, AutoCloseable {
-  private static final Logger LOGGER = LoggerFactory.getLogger(AccessManagerImpl.class);
-  private static final String DIRECT_QUERY_SERVICE_ID = "direct";
-  private static final String DIRECT_QUERY_SERVICE_DISPLAY = "DIRECT";
-  private static final long SERVICE_TABLE_CACHE_TTL_MILLIS = 60_000L;
-  private static final long SERVICE_TABLE_FAILURE_COOLDOWN_MILLIS = 20_000L;
+public class ServiceManagerImpl implements ServiceManager {
+
+  private static final Logger LOGGER = LoggerFactory.getLogger(ServiceManagerImpl.class);
+  private static final String[] STUB_FACTORIES = {"newBlockingStub", "newFutureStub", "newStub"};
+  static final long DEFAULT_HEARTBEAT_SECONDS = 10L;
+  static final int DEFAULT_TTL_SECONDS = 30;
 
   private final SessionImpl session;
-  private final Supplier<EntitlementsManagerImpl> entitlementsSupplier;
-  private final Supplier<DiscoveryCache> discoveryCacheSupplier;
-  private final Supplier<ServiceStatusCache> serviceStatusCacheSupplier;
-  private final Map<String, CachedServiceTables> serviceTableCache = new ConcurrentHashMap<>();
-  private final Map<String, Long> serviceTableFailureCooldownUntilMs = new ConcurrentHashMap<>();
-  private volatile ServiceInstanceResolver dynamicServiceResolver;
-  private volatile boolean ownsDynamicServiceResolver;
+  private final ServiceEntitlements entitlements;
+  private final CheckpointStore checkpointStore;
+  private final Map<String, LocalServiceHandle> runningServices = new ConcurrentHashMap<>();
 
-  public AccessManagerImpl(
-      SessionImpl session,
-      Supplier<EntitlementsManagerImpl> entitlementsSupplier,
-      Supplier<DiscoveryCache> discoveryCacheSupplier,
-      Supplier<ServiceStatusCache> serviceStatusCacheSupplier) {
+  public ServiceManagerImpl(SessionImpl session) {
+    this(
+        session,
+        CheckpointStores.failFast(
+            "ServiceManager checkpoint store is not configured. Configure session with withCheckpointPath(...)"));
+  }
+
+  public ServiceManagerImpl(SessionImpl session, CheckpointStore checkpointStore) {
     this.session = Objects.requireNonNull(session, "session");
-    this.entitlementsSupplier = Objects.requireNonNull(entitlementsSupplier, "entitlementsSupplier");
-    this.discoveryCacheSupplier = Objects.requireNonNull(discoveryCacheSupplier, "discoveryCacheSupplier");
-    this.serviceStatusCacheSupplier =
-        Objects.requireNonNull(serviceStatusCacheSupplier, "serviceStatusCacheSupplier");
+    this.entitlements = session.serviceEntitlements();
+    this.checkpointStore = Objects.requireNonNull(checkpointStore, "checkpointStore");
+  }
+
+  SessionImpl session() {
+    return session;
+  }
+
+  ServiceEntitlements entitlements() {
+    return entitlements;
+  }
+
+  CheckpointStore checkpointStore() {
+    return checkpointStore;
+  }
+
+  Logger logger() {
+    return LOGGER;
+  }
+
+  long resolvedServiceHeartbeatSeconds() {
+    long configured = session.serviceHeartbeatCadenceSeconds();
+    return configured > 0L ? configured : DEFAULT_HEARTBEAT_SECONDS;
+  }
+
+  long resolvedServiceStatusSeconds() {
+    long configured = session.serviceStatusCadenceSeconds();
+    return configured > 0L ? configured : 30L;
+  }
+
+  int resolvedServiceHeartbeatTtlSeconds() {
+    long heartbeatSeconds = resolvedServiceHeartbeatSeconds();
+    long minTtl = heartbeatSeconds * 3L;
+    long resolved = Math.max(DEFAULT_TTL_SECONDS, minTtl);
+    return (int) Math.min(Integer.MAX_VALUE, resolved);
   }
 
   @Override
-  public void close() {
-    serviceTableCache.clear();
-    serviceTableFailureCooldownUntilMs.clear();
-    ServiceInstanceResolver resolver = dynamicServiceResolver;
-    dynamicServiceResolver = null;
-    if (ownsDynamicServiceResolver) {
-      CloseSupport.closeQuietly(resolver);
+  public ServiceClient client(String name, ServiceRunOptions options) throws Exception {
+    DefinitionService service = requireDefinition(name);
+    if (isArrowFlightIngestService(service)) {
+      throw unsupported("Arrow Flight ingest client");
     }
-    ownsDynamicServiceResolver = false;
-  }
-
-  @Override
-  public String defaultSubject() {
-    return resolveSubject(null);
-  }
-
-  @Override
-  public List<DatasetAccess> datasets() {
-    return datasets(null);
-  }
-
-  @Override
-  public List<DatasetAccess> datasets(String subject) {
-    String resolvedSubject = resolveSubject(subject);
-    List<DatasetDescriptor> datasetDescriptors = listDatasetDescriptors();
-    if (datasetDescriptors.isEmpty()) {
-      return List.of();
+    if (isArrowFlightSqlService(service)) {
+      throw unsupported("Arrow Flight SQL client");
     }
-    Map<String, DatasetServiceRoute> routes = resolveDatasetRoutes(resolvedSubject, datasetDescriptors);
-    DataEntitlements dataEntitlements = requireDataEntitlements();
-    List<DatasetAccess> rows = new ArrayList<>(datasetDescriptors.size());
-    for (DatasetDescriptor descriptor : datasetDescriptors) {
-      EnumSet<DatasetAction> allowed = EnumSet.noneOf(DatasetAction.class);
-      DataEntitlements.Identity identity = new DataEntitlements.Identity(resolvedSubject, null);
-      if (isAllowed(dataEntitlements.authorizeRead(identity, descriptor.datasetId()))) {
-        allowed.add(DatasetAction.READ);
-      }
-      if (isAllowed(dataEntitlements.authorizeWrite(identity, descriptor.datasetId()))) {
-        allowed.add(DatasetAction.WRITE);
-      }
-      rows.add(
-          new DatasetAccess(
-              descriptor.datasetId(),
-              descriptor.group(),
-              descriptor.namespace(),
-              descriptor.name(),
-              allowed.isEmpty() ? Set.of() : Set.copyOf(allowed),
-              allowed.contains(DatasetAction.READ) ? routes.get(descriptor.datasetId()) : null));
+    requireGrpc(service, name);
+    requireGrpcRoutingMode(service, "client");
+    ManagedChannel channel = createGrpcChannel(service, options);
+    String group = resolveGroup(service);
+    return new LocalServiceClient(name, group, channel);
+  }
+
+  @Override
+  public ServiceHandle start(String name, ServiceRunOptions options, Object implementation)
+      throws Exception {
+    DefinitionService service = requireDefinition(name);
+    RunningService running;
+    if (isArrowFlightIngestService(service)) {
+      running = startArrowFlightIngestServerInternal(service, options, implementation);
+    } else if (isArrowFlightSqlService(service)) {
+      running = startArrowFlightSqlServerInternal(service, options, implementation);
+    } else {
+      requireGrpc(service, name);
+      requireGrpcRoutingMode(service, "server");
+      BindableService bindableService = toBindableService(name, implementation);
+      running = startGrpcServer(service, bindableService, options);
     }
-    return List.copyOf(rows);
-  }
-
-  @Override
-  public List<String> queryableDatasets() {
-    return queryableDatasets(null);
-  }
-
-  @Override
-  public List<String> queryableDatasets(String subject) {
-    List<String> allowed = new ArrayList<>();
-    for (DatasetAccess access : datasets(subject)) {
-      if (access != null && access.allowedActions().contains(DatasetAction.READ)) {
-        allowed.add(access.datasetId());
-      }
+    LocalServiceHandle handle = new LocalServiceHandle(running);
+    String serviceKey = runningServiceKey(normalizeServiceName(name), running.instanceId());
+    LocalServiceHandle previous = runningServices.put(serviceKey, handle);
+    if (previous != null) {
+      previous.close();
+      throw new IllegalStateException(
+          "Service already started: " + name + " instance=" + running.instanceId());
     }
-    return List.copyOf(allowed);
+    return handle;
   }
 
   @Override
-  public boolean canQueryDataset(String datasetId) {
-    return canQueryDataset(null, datasetId);
-  }
-
-  @Override
-  public boolean canQueryDataset(String subject, String datasetId) {
-    String canonicalDataset = DataEntitlements.requireDatasetResourceId(datasetId);
-    DataEntitlements dataEntitlements = requireDataEntitlements();
-    DataEntitlements.Decision decision =
-        dataEntitlements.authorizeRead(
-            new DataEntitlements.Identity(resolveSubject(subject), null), canonicalDataset);
-    return isAllowed(decision);
-  }
-
-  @Override
-  public Optional<DatasetServiceRoute> datasetQueryRoute(String datasetId) {
-    return datasetQueryRoute(null, datasetId);
-  }
-
-  @Override
-  public Optional<DatasetServiceRoute> datasetQueryRoute(String subject, String datasetId) {
-    String canonicalDataset = DataEntitlements.requireDatasetResourceId(datasetId);
-    String resolvedSubject = resolveSubject(subject);
-    if (!canQueryDataset(resolvedSubject, canonicalDataset)) {
-      return Optional.empty();
+  public void stop(String name) throws Exception {
+    String normalized = normalizeServiceName(name);
+    if (normalized == null) {
+      return;
     }
-    List<DatasetDescriptor> descriptors = listDatasetDescriptors();
-    for (DatasetDescriptor descriptor : descriptors) {
-      if (canonicalDataset.equals(descriptor.datasetId())) {
-        return Optional.ofNullable(
-            resolveDatasetRoutes(resolvedSubject, List.of(descriptor)).get(canonicalDataset));
+    List<String> keysToRemove = new ArrayList<>();
+    for (String key : runningServices.keySet()) {
+      if (isServiceKeyForName(key, normalized)) {
+        keysToRemove.add(key);
       }
     }
-    return Optional.empty();
-  }
-
-  @Override
-  public List<ServiceAccess> services() {
-    return services(null);
-  }
-
-  @Override
-  public List<ServiceAccess> services(String subject) {
-    String resolvedSubject = resolveSubject(subject);
-    List<ServiceAccess> rows = new ArrayList<>();
-    for (ServiceDescriptor descriptor : listServiceDescriptors()) {
-      Map<ServiceEntitlements.Transport, Set<ServiceAction>> byTransport =
-          new EnumMap<>(ServiceEntitlements.Transport.class);
-      for (ServiceEntitlements.Transport transport : transportsForService(descriptor.serviceType())) {
-        EnumSet<ServiceAction> allowed = EnumSet.noneOf(ServiceAction.class);
-        for (ServiceAction action : ServiceAction.values()) {
-          if (isServiceActionAllowed(resolvedSubject, descriptor.serviceId(), transport, action)) {
-            allowed.add(action);
-          }
-        }
-        if (!allowed.isEmpty()) {
-          byTransport.put(transport, Set.copyOf(allowed));
-        }
-      }
-      rows.add(
-          new ServiceAccess(
-              descriptor.serviceId(),
-              descriptor.group(),
-              descriptor.name(),
-              descriptor.serviceType() == null ? null : descriptor.serviceType().name(),
-              descriptor.online(),
-              byTransport.isEmpty() ? Map.of() : Map.copyOf(byTransport)));
-    }
-    return List.copyOf(rows);
-  }
-
-  @Override
-  public List<String> callableServices() {
-    return callableServices(null);
-  }
-
-  @Override
-  public List<String> callableServices(String subject) {
-    List<String> allowed = new ArrayList<>();
-    for (ServiceAccess access : services(subject)) {
-      if (access == null || access.allowedActionsByTransport().isEmpty()) {
-        continue;
-      }
-      boolean callable = false;
-      for (Set<ServiceAction> actions : access.allowedActionsByTransport().values()) {
-        if (actions != null && actions.contains(ServiceAction.INVOKE)) {
-          callable = true;
-          break;
-        }
-      }
-      if (callable) {
-        allowed.add(access.serviceId());
+    for (String key : keysToRemove) {
+      LocalServiceHandle handle = runningServices.remove(key);
+      if (handle != null) {
+        handle.close();
       }
     }
-    return List.copyOf(allowed);
   }
 
   @Override
-  public boolean canCallService(String serviceId) {
-    return canCallService(null, serviceId);
-  }
-
-  @Override
-  public boolean canCallService(String subject, String serviceId) {
-    String canonicalService = ServiceEntitlements.requireServiceResourceId(serviceId);
-    String resolvedSubject = resolveSubject(subject);
-    Set<ServiceEntitlements.Transport> transports = transportsForService(resolveServiceType(canonicalService));
-    if (transports.isEmpty()) {
-      transports = Set.of(ServiceEntitlements.Transport.values());
+  public void stopAll() {
+    List<LocalServiceHandle> snapshot = new ArrayList<>(runningServices.values());
+    runningServices.clear();
+    for (LocalServiceHandle handle : snapshot) {
+      handle.close();
     }
-    for (ServiceEntitlements.Transport transport : transports) {
-      if (isServiceActionAllowed(resolvedSubject, canonicalService, transport, ServiceAction.INVOKE)) {
-        return true;
-      }
-    }
-    return false;
   }
 
-  @Override
-  public boolean canCallService(
-      String subject,
+  public AutoCloseable startGrpcServer(DefinitionService def, BindableService svc) throws Exception {
+    return ServiceManagerImplBootstrap.startGrpcServer(
+        this, def, svc, ServiceRunOptions.defaults());
+  }
+
+  public ManagedChannel createGrpcChannel(DefinitionService def) throws Exception {
+    return ServiceManagerImplBootstrap.createGrpcChannel(
+        this, def, ServiceRunOptions.defaults());
+  }
+
+  public AutoCloseable startArrowFlightServer(Object... ignored) {
+    throw unsupported("Arrow Flight server");
+  }
+
+  public Object createArrowFlightClient(Object... ignored) {
+    throw unsupported("Arrow Flight client");
+  }
+
+  public AutoCloseable startArrowFlightSqlServer(Object... ignored) {
+    throw unsupported("Arrow Flight SQL server");
+  }
+
+  public Object createArrowFlightSqlClient(Object... ignored) {
+    throw unsupported("Arrow Flight SQL client");
+  }
+
+  public AutoCloseable startAmpsService(Object... ignored) {
+    throw unsupported("AMPS service");
+  }
+
+  public Object createAmpsClient(Object... ignored) {
+    throw unsupported("AMPS client");
+  }
+
+  private RunningGrpcServer startGrpcServer(
+      DefinitionService def, BindableService svc, ServiceRunOptions options) throws Exception {
+    return ServiceManagerImplBootstrap.startGrpcServer(this, def, svc, options);
+  }
+
+  private RunningArrowFlightSqlServer startArrowFlightSqlServerInternal(
+      DefinitionService def, ServiceRunOptions options, Object implementation) throws Exception {
+    return ServiceManagerImplBootstrap.startArrowFlightSqlServerInternal(
+        this, def, options, implementation);
+  }
+
+  private RunningArrowFlightIngestServer startArrowFlightIngestServerInternal(
+      DefinitionService def, ServiceRunOptions options, Object implementation) throws Exception {
+    return ServiceManagerImplBootstrap.startArrowFlightIngestServerInternal(
+        this, def, options, implementation);
+  }
+
+  private ManagedChannel createGrpcChannel(DefinitionService def, ServiceRunOptions options)
+      throws Exception {
+    return ServiceManagerImplBootstrap.createGrpcChannel(this, def, options);
+  }
+
+  private ServiceHbCache createRoutingStatusCache(String group, String serviceName, String serviceId)
+      throws Exception {
+    return ServiceManagerImplBootstrap.createRoutingStatusCache(
+        this, group, serviceName, serviceId);
+  }
+
+  DefinitionService requireDefinition(String name) {
+    return ServiceManagerImplRegistry.requireDefinition(this, name);
+  }
+
+  DefinitionService.Grpc requireGrpc(DefinitionService service, String serviceName) {
+    return ServiceManagerImplRegistry.requireGrpc(service, serviceName);
+  }
+
+  DefinitionService.Arrow requireArrowFlightSql(DefinitionService service, String serviceName) {
+    return ServiceManagerImplRegistry.requireArrowFlightSql(service, serviceName);
+  }
+
+  DefinitionService.Arrow requireArrowFlightIngest(DefinitionService service, String serviceName) {
+    return ServiceManagerImplRegistry.requireArrowFlightIngest(service, serviceName);
+  }
+
+  static boolean isArrowFlightSqlService(DefinitionService service) {
+    return ServiceManagerImplRegistry.isArrowFlightSqlService(service);
+  }
+
+  static boolean isArrowFlightIngestService(DefinitionService service) {
+    return ServiceManagerImplRegistry.isArrowFlightIngestService(service);
+  }
+
+  static BindableService toBindableService(String serviceName, Object implementation) {
+    return ServiceManagerImplRegistry.toBindableService(serviceName, implementation);
+  }
+
+  FlightSqlServiceProducer toFlightSqlProducer(
+      Object implementation,
+      String serviceResourceId,
+      String advertiseHost,
+      java.util.function.IntSupplier portSupplier,
+      boolean tlsEnabled,
+      ServiceRunOptions options) {
+    return ServiceManagerImplBootstrap.toFlightSqlProducer(
+        this, implementation, serviceResourceId, advertiseHost, portSupplier, tlsEnabled, options);
+  }
+
+  TabularManager resolveFlightSqlTabularManager(
+      String serviceResourceId, List<String> datasetAllowlist) {
+    return ServiceManagerImplBootstrap.resolveFlightSqlTabularManager(
+        this, serviceResourceId, datasetAllowlist);
+  }
+
+  static List<String> normalizeDatasetAllowlist(List<String> datasetIds) {
+    return ServiceManagerImplBootstrap.normalizeDatasetAllowlist(datasetIds);
+  }
+
+  static Set<DatasetId> parseDatasetAllowlist(List<String> datasetIds) {
+    return ServiceManagerImplBootstrap.parseDatasetAllowlist(datasetIds);
+  }
+
+  FlightIngestProducer toFlightIngestProducer(Object implementation, String serviceResourceId) {
+    return ServiceManagerImplBootstrap.toFlightIngestProducer(this, implementation, serviceResourceId);
+  }
+
+  List<ServerInterceptor> buildServerInterceptors(
+      DefinitionService def,
       String serviceId,
-      ServiceEntitlements.Transport transport,
-      ServiceAction action) {
-    if (transport == null || action == null) {
-      throw new IllegalArgumentException("transport and action are required");
+      DefinitionService.Grpc grpc,
+      ServiceRunOptions options) {
+    List<ServerInterceptor> interceptors = new ArrayList<>();
+    OtelManager otelManager = sessionOtelManager();
+    if (otelManager.enabled() && FabricOtelEnablement.isGrpcServerTracingEnabled(def)) {
+      interceptors.add(
+          FabricGrpcOtelInterceptors.server(
+              otelManager, resolveGroup(def), currentAppName(), resolveServiceName(def)));
     }
-    String canonicalService = ServiceEntitlements.requireServiceResourceId(serviceId);
-    return isServiceActionAllowed(resolveSubject(subject), canonicalService, transport, action);
+    DefinitionService.IdentityMode identityMode = resolveGrpcIdentityMode(grpc);
+    interceptors.add(
+        new ServerInterceptor() {
+          @Override
+          public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+              ServerCall<ReqT, RespT> call,
+              Metadata headers,
+              ServerCallHandler<ReqT, RespT> next) {
+            String operationName =
+                call.getMethodDescriptor() == null
+                    ? null
+                    : call.getMethodDescriptor().getFullMethodName();
+            Map<String, String> headerSnapshot = snapshotGrpcHeaders(headers);
+            RequestIdentity identity;
+            try {
+              String principal = resolveGrpcAuthenticatedPrincipal(identityMode, headers);
+              if (principal == null && identityMode == DefinitionService.IdentityMode.APP) {
+                call.close(
+                    Status.UNAUTHENTICATED.withDescription(
+                        "Missing caller app headers for grpc.identityMode=APP"),
+                    new Metadata());
+                return new ServerCall.Listener<>() {};
+              }
+              FabricRequestHeaders requestHeaders = FabricRequestHeaders.fromGrpc(headers, principal);
+              identity =
+                  RequestIdentityResolver.resolve(
+                      requestHeaders, session.discoveryCache(), resolveRuntimeEnvironment());
+            } catch (FabricRequestHeaders.ParseException ex) {
+              call.close(Status.UNAUTHENTICATED.withDescription(ex.getMessage()), new Metadata());
+              return new ServerCall.Listener<>() {};
+            } catch (RequestIdentityResolver.ResolutionException ex) {
+              call.close(statusFor(ex).withDescription(ex.getMessage()), new Metadata());
+              return new ServerCall.Listener<>() {};
+            }
+            LOGGER.info("[Request] transport=GRPC serviceId={} operation={} requestId={} caller={} user={} delegatedUser={} headers={}", serviceId, Strings.firstNonBlank(operationName, "<unknown>"), identity.requestId(), safeCaller(identity.callerAppSubject()), identity.effectiveUserSubject(), Strings.firstNonBlank(identity.delegatedUserSubject(), "<none>"), headerSnapshot);
+
+            String subject = identity.effectiveUserSubject();
+            if (Strings.isNotBlank(subject)) {
+              FabricOtelSupport.setCurrentSpanAttributes(
+                  Attributes.builder()
+                      .put(FabricOtelAttributes.FABRIC_SUBJECT, subject)
+                      .build());
+            }
+            ServiceEntitlements.Decision decision =
+                authorizeInvoke(subject, serviceId, operationName);
+            if (decision == null || !decision.allowed()) {
+              String reason = decisionReason(decision);
+              LOGGER.warn("[ServiceManager][gRPC][server-deny] serviceId={} operation={} subject={} reason={}", serviceId, operationName, subject, reason);
+              call.close(Status.PERMISSION_DENIED.withDescription(reason), new Metadata());
+              return new ServerCall.Listener<>() {};
+            }
+            ServerCall.Listener<ReqT> delegate =
+                RequestIdentityResolver.callAsRequestIdentity(
+                    identity, () -> next.startCall(call, headers));
+            return scopedServerListener(delegate, identity);
+          }
+        });
+    interceptors.addAll(extractServerInterceptors(options));
+    return interceptors;
   }
 
-  @Override
-  public boolean isServiceOnline(String serviceId) {
-    return onlineServiceKeys().contains(serviceKeyFromResourceId(serviceId));
+  List<ClientInterceptor> buildClientInterceptors(
+      DefinitionService def, String serviceId, ServiceRunOptions options) {
+    List<ClientInterceptor> interceptors = new ArrayList<>();
+    OtelManager otelManager = sessionOtelManager();
+    if (otelManager.enabled() && FabricOtelEnablement.isGrpcClientTracingEnabled(def)) {
+      interceptors.add(
+          FabricGrpcOtelInterceptors.client(
+              otelManager, resolveGroup(def), currentAppName(), resolveServiceName(def)));
+    }
+    String appSubject = sessionAppSubject();
+    String userSubject = sessionKerberosPrincipal();
+    String primarySubject = Strings.firstNonBlank(appSubject, userSubject);
+    CallerAppIdentity callerApp = currentCallerApp();
+    FabricRequestHeaders.RequestMetadata staticMetadata = currentRequestMetadataTemplate();
+    interceptors.add(
+        new ClientInterceptor() {
+          @Override
+          public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
+              io.grpc.MethodDescriptor<ReqT, RespT> method,
+              io.grpc.CallOptions callOptions,
+              io.grpc.Channel next) {
+            String operationName = method == null ? null : method.getFullMethodName();
+            String normalizedOperation = Strings.firstNonBlank(operationName, "<unknown>");
+            ServiceEntitlements.Decision primaryDecision =
+                authorizeInvoke(primarySubject, serviceId, operationName);
+            ServiceEntitlements.Decision decision = primaryDecision;
+            if (shouldFallbackToUserSubject(primaryDecision, primarySubject, appSubject, userSubject)) {
+              ServiceEntitlements.Decision fallbackDecision =
+                  authorizeInvoke(userSubject, serviceId, operationName);
+              decision = fallbackDecision;
+              LOGGER.info("[ServiceManager][gRPC][client-auth] serviceId={} operation={} primarySubject={} primaryAllowed={} primaryReason={} fallbackSubject={} fallbackAllowed={} fallbackReason={} finalSubject={} finalAllowed={} finalReason={}", serviceId, normalizedOperation, primarySubject, decisionAllowed(primaryDecision), decisionReason(primaryDecision), userSubject, decisionAllowed(fallbackDecision), decisionReason(fallbackDecision), userSubject, decisionAllowed(decision), decisionReason(decision));
+            } else if (decision == null || !decision.allowed()) {
+              LOGGER.warn("[ServiceManager][gRPC][client-auth] serviceId={} operation={} subject={} allowed={} reason={}", serviceId, normalizedOperation, primarySubject, decisionAllowed(decision), decisionReason(decision));
+            }
+            if (decision == null || !decision.allowed()) {
+              throw new IllegalArgumentException(decisionReason(decision));
+            }
+            ClientCall<ReqT, RespT> delegate = next.newCall(method, callOptions);
+            return new ForwardingClientCall.SimpleForwardingClientCall<>(delegate) {
+              @Override
+              public void start(Listener<RespT> responseListener, Metadata headers) {
+                Metadata metadata = headers == null ? new Metadata() : headers;
+                FabricRequestHeaders requestHeaders =
+                    FabricRequestHeaders.outbound(
+                        callerApp,
+                        null,
+                        new FabricRequestHeaders.RequestMetadata(
+                            Strings.firstNonBlank(
+                                staticMetadata.requestId(), FabricRequestHeaders.generateRequestId()),
+                            Strings.firstNonBlank(
+                                staticMetadata.traceId(), UUID.randomUUID().toString()),
+                            staticMetadata.env(),
+                            staticMetadata.region(),
+                            staticMetadata.site()));
+                requestHeaders.applyToGrpcMetadata(metadata);
+                super.start(responseListener, metadata);
+              }
+            };
+          }
+        });
+    interceptors.addAll(extractClientInterceptors(options));
+    return interceptors;
   }
 
-  private Map<String, DatasetServiceRoute> resolveDatasetRoutes(
-      String subject, List<DatasetDescriptor> datasets) {
-    if (datasets == null || datasets.isEmpty()) {
-      return Map.of();
-    }
-    Map<String, DatasetServiceRoute> selections = new LinkedHashMap<>();
-    Map<String, List<DatasetDescriptor>> byNamespaceAndName = new HashMap<>();
-    Map<String, List<DatasetDescriptor>> byGroupNamespaceAndName = new HashMap<>();
-    for (DatasetDescriptor dataset : datasets) {
-      if (dataset == null || dataset.datasetId() == null) {
-        continue;
-      }
-      if (dataset.directQuery()) {
-        selections.put(
-            dataset.datasetId(),
-            new DatasetServiceRoute(
-                dataset.datasetId(),
-                DIRECT_QUERY_SERVICE_ID,
-                DIRECT_QUERY_SERVICE_DISPLAY,
-                DIRECT_QUERY_SERVICE_DISPLAY,
-                1,
-                true));
-        continue;
-      }
-      String key = datasetKey(dataset.namespace(), dataset.name());
-      if (key == null) {
-        continue;
-      }
-      byNamespaceAndName.computeIfAbsent(key, ignored -> new ArrayList<>()).add(dataset);
-      String grouped = groupedDatasetKey(dataset.group(), dataset.namespace(), dataset.name());
-      if (grouped != null) {
-        byGroupNamespaceAndName.computeIfAbsent(grouped, ignored -> new ArrayList<>()).add(dataset);
-      }
-    }
-    if (byNamespaceAndName.isEmpty()) {
-      return selections;
-    }
+  static List<ServerInterceptor> extractServerInterceptors(ServiceRunOptions options) {
+    return ServiceManagerImplInterceptors.extractServerInterceptors(options);
+  }
 
-    Map<String, Map<String, DatasetServiceCandidate>> candidatesByDatasetId = new HashMap<>();
-    for (ServiceReference serviceRef : listAvailableArrowServices(subject)) {
-      Set<String> supportedKeys = fetchSupportedDatasetKeys(subject, serviceRef);
-      if (supportedKeys.isEmpty()) {
+  @SuppressWarnings("unchecked")
+  static Map<
+          FlightServerMiddleware.Key<?>,
+          FlightServerMiddleware.Factory<? extends FlightServerMiddleware>>
+      mergeFlightMiddlewares(
+          ServiceRunOptions options,
+          Map<
+                  FlightServerMiddleware.Key<?>,
+                  FlightServerMiddleware.Factory<? extends FlightServerMiddleware>>
+              defaults) {
+    LinkedHashMap<
+            FlightServerMiddleware.Key<?>,
+            FlightServerMiddleware.Factory<? extends FlightServerMiddleware>>
+        merged = new LinkedHashMap<>();
+    if (defaults != null && !defaults.isEmpty()) {
+      merged.putAll(defaults);
+    }
+    if (options == null || Strings.isEmpty(options.interceptors())) {
+      return Map.copyOf(merged);
+    }
+    for (Object candidate : options.interceptors()) {
+      if (candidate == null) {
         continue;
       }
-      for (String key : supportedKeys) {
-        List<DatasetDescriptor> matches =
-            byGroupNamespaceAndName.get(groupedDatasetKey(serviceRef.group(), key));
-        if (matches == null || matches.isEmpty()) {
-          matches = byNamespaceAndName.get(key);
-        }
-        if (matches == null || matches.isEmpty()) {
+      if (candidate instanceof Map.Entry<?, ?> entry) {
+        Object key = entry.getKey();
+        Object value = entry.getValue();
+        if (key instanceof FlightServerMiddleware.Key<?> middlewareKey
+            && value instanceof FlightServerMiddleware.Factory<?> middlewareFactory) {
+          merged.put(
+              middlewareKey,
+              (FlightServerMiddleware.Factory<? extends FlightServerMiddleware>) middlewareFactory);
           continue;
         }
-        for (DatasetDescriptor match : matches) {
-          Map<String, DatasetServiceCandidate> perDataset =
-              candidatesByDatasetId.computeIfAbsent(match.datasetId(), ignored -> new LinkedHashMap<>());
-          perDataset.putIfAbsent(
-              serviceRef.serviceId(),
-              new DatasetServiceCandidate(
-                  serviceRef.serviceId(),
-                  serviceRef.serviceDisplay(),
-                  serviceRef.serviceType(),
-                  Strings.trimToNull(match.group()) != null
-                      && Strings.trimToNull(match.group()).equalsIgnoreCase(serviceRef.group()),
-                  serviceRef.online()));
-        }
       }
+      throw new IllegalArgumentException(
+          "Unsupported Arrow Flight middleware registration type: "
+              + candidate.getClass().getName()
+              + " (expected Map.Entry<FlightServerMiddleware.Key, FlightServerMiddleware.Factory>)");
     }
-    for (Map.Entry<String, Map<String, DatasetServiceCandidate>> entry :
-        candidatesByDatasetId.entrySet()) {
-      String datasetId = entry.getKey();
-      List<DatasetServiceCandidate> candidates = List.copyOf(entry.getValue().values());
-      if (candidates.isEmpty()) {
-        continue;
-      }
-      DatasetServiceCandidate selected =
-          candidates.stream().min(this::compareServiceCandidates).orElse(null);
-      if (selected == null) {
-        continue;
-      }
-      int serviceCount = candidates.size();
-      String display =
-          serviceCount > 1
-              ? selected.serviceDisplay() + " (+" + (serviceCount - 1) + ")"
-              : selected.serviceDisplay();
-      selections.put(
-          datasetId,
-          new DatasetServiceRoute(
-              datasetId,
-              selected.serviceId(),
-              display,
-              selected.serviceType() == null ? null : selected.serviceType().name(),
-              serviceCount,
-              selected.online()));
-    }
-    return selections;
+    return Map.copyOf(merged);
   }
 
-  private List<ServiceReference> listAvailableArrowServices(String subject) {
-    Set<String> onlineKeys = onlineServiceKeys();
-    if (onlineKeys.isEmpty()) {
-      return List.of();
-    }
-    List<ServiceReference> resolved = new ArrayList<>();
-    for (ServiceDescriptor descriptor : listServiceDescriptors()) {
-      if (descriptor == null || descriptor.serviceType() == null) {
-        continue;
-      }
-      if (descriptor.serviceType() != DefinitionService.ServiceType.ARROW_FLIGHT_SQL
-          && descriptor.serviceType() != DefinitionService.ServiceType.ARROW_FLIGHT) {
-        continue;
-      }
-      if (!onlineKeys.contains(serviceKey(descriptor.group(), descriptor.name()))) {
-        continue;
-      }
-      ServiceEntitlements.Transport requiredTransport =
-          descriptor.serviceType() == DefinitionService.ServiceType.ARROW_FLIGHT_SQL
-              ? ServiceEntitlements.Transport.ARROW_FLIGHT_SQL
-              : ServiceEntitlements.Transport.ARROW_FLIGHT;
-      if (!isServiceActionAllowed(subject, descriptor.serviceId(), requiredTransport, ServiceAction.INVOKE)) {
-        continue;
-      }
-      resolved.add(
-          new ServiceReference(
-              descriptor.group(),
-              descriptor.name(),
-              descriptor.serviceId(),
-              descriptor.serviceType(),
-              descriptor.group() + "/" + descriptor.name(),
-              descriptor.online()));
-    }
-    resolved.sort(
-        Comparator.comparing(
-                (ServiceReference value) -> Strings.firstNonBlank(value.group(), ""),
-                String.CASE_INSENSITIVE_ORDER)
-            .thenComparing(
-                value -> Strings.firstNonBlank(value.serviceName(), ""),
-                String.CASE_INSENSITIVE_ORDER));
-    return List.copyOf(resolved);
+  void authorizeStart(String serviceId, String subject) {
+    ServiceManagerImplBootstrap.authorizeStart(this, serviceId, subject);
   }
 
-  private Set<String> fetchSupportedDatasetKeys(String subject, ServiceReference serviceRef) {
-    if (serviceRef == null
-        || serviceRef.serviceType() != DefinitionService.ServiceType.ARROW_FLIGHT_SQL) {
-      return Set.of();
-    }
-    String serviceKey = serviceKey(serviceRef.group(), serviceRef.serviceName());
-    if (serviceKey == null) {
-      return Set.of();
-    }
-    String cacheKey = tableCacheKey(serviceKey, subject);
-    long nowMs = System.currentTimeMillis();
-    CachedServiceTables cached = cachedServiceTables(cacheKey, nowMs);
-    if (cached != null) {
-      return cached.datasetKeys();
-    }
-    if (isServiceTableLookupCoolingDown(cacheKey, nowMs)) {
-      return Set.of();
-    }
-    try (RemoteTabularManager tabular = newRemoteTabularManager(serviceRef)) {
-      List<TabularTableMetadata> tables = runAsSubject(resolveSubject(subject), tabular::listTables);
-      Set<String> supported = new HashSet<>();
-      if (tables != null) {
-        for (TabularTableMetadata table : tables) {
-          if (table == null) {
-            continue;
-          }
-          String key = datasetKey(table.schemaName(), table.tableName());
-          if (key != null) {
-            supported.add(key);
-          }
-        }
-      }
-      cacheServiceTables(cacheKey, supported, nowMs);
-      clearServiceTableFailureCooldown(cacheKey, nowMs);
-      return supported;
-    } catch (Exception ex) {
-      markServiceTableFailure(cacheKey, nowMs);
-      CachedServiceTables fallback = cachedServiceTables(cacheKey, nowMs);
-      LOGGER.debug(
-          "[Access][ServiceTables][LookupFailed] service={} subject={} message={} fallbackDatasetCount={}",
-          serviceRef.serviceId(),
-          resolveSubject(subject),
-          Strings.firstNonBlank(ex.getMessage(), ex.getClass().getSimpleName()),
-          fallback == null ? 0 : fallback.datasetKeys().size());
-      return fallback == null ? Set.of() : fallback.datasetKeys();
-    }
+  void authorizeStart(
+      String serviceId, String subject, ServiceEntitlements.Transport transport) {
+    ServiceManagerImplBootstrap.authorizeStart(this, serviceId, subject, transport);
   }
 
-  private RemoteTabularManager newRemoteTabularManager(ServiceReference serviceRef) {
-    Objects.requireNonNull(serviceRef, "serviceRef");
-    DiscoveryCache cache = requireDiscoveryCache();
-    SessionContext context = session.context();
-    String sessionGroup = Strings.firstNonBlank(context == null ? null : context.getGroup(), "platform");
-    String sessionApp = Strings.firstNonBlank(context == null ? null : context.getAppName(), "app");
-    String sessionInstance =
-        Strings.firstNonBlank(context == null ? null : context.getInstance(), "instance");
-    String sessionEnv = Strings.trimToNull(context == null ? null : context.getEnv());
-    String sessionRegion = Strings.trimToNull(context == null ? null : context.getRegion());
-    String sessionSite = Strings.trimToNull(context == null ? null : context.getSite());
-    DataOptions.ServiceOptions serviceOptions = serviceOptionsFor(serviceRef, sessionGroup);
-    ServiceInstanceResolver resolver = resolveDynamicServiceResolver();
-    return new RemoteTabularManager(
-        session,
-        cache,
-        sessionGroup,
-        sessionApp,
-        sessionInstance,
-        sessionEnv,
-        sessionRegion,
-        sessionSite,
-        serviceOptions,
-        session.kerberosPrincipal(),
-        session.kerberosKeytab(),
-        resolver);
+  ServiceEntitlements.Decision authorizeInvoke(
+      String subject, String serviceId, String operationName) {
+    return entitlements.authorize(
+        new ServiceEntitlements.Identity(subject, null),
+        new ServiceEntitlements.Request(
+            ServiceEntitlements.Transport.GRPC,
+            ServiceEntitlements.Action.INVOKE,
+            serviceId,
+            operationName,
+            null,
+            null,
+            Map.of(),
+            Map.of()));
   }
 
-  private DataOptions.ServiceOptions serviceOptionsFor(
-      ServiceReference serviceRef, String defaultGroup) {
-    String group = Strings.firstNonBlank(serviceRef.group(), defaultGroup);
-    ServiceRunOptions.Builder optionsBuilder = ServiceRunOptions.builder();
-    if (group != null) {
-      optionsBuilder.withGroup(group);
-    }
-    Path trustCert = session.trustCert();
-    if (trustCert != null) {
-      optionsBuilder.withTlsTrustCert(trustCert).withTlsClientTrustCert(trustCert);
-    }
-    return DataOptions.ServiceOptions.builder()
-        .withEnabled(true)
-        .withQueryService(serviceRef.serviceName())
-        .withServiceOptions(optionsBuilder.build())
-        .build();
+  static boolean shouldFallbackToUserSubject(
+      ServiceEntitlements.Decision decision,
+      String primarySubject,
+      String appSubject,
+      String userSubject) {
+    return ServiceManagerImplInterceptors.shouldFallbackToUserSubject(
+        decision, primarySubject, appSubject, userSubject);
   }
 
-  private ServiceInstanceResolver resolveDynamicServiceResolver() {
-    ServiceInstanceResolver existing = dynamicServiceResolver;
-    if (existing != null) {
-      return existing;
-    }
-    synchronized (this) {
-      existing = dynamicServiceResolver;
-      if (existing != null) {
-        return existing;
-      }
-      ServiceInstanceResolver fromSession = session.serviceInstanceResolverIfInitialized();
-      if (fromSession != null) {
-        dynamicServiceResolver = fromSession;
-        ownsDynamicServiceResolver = false;
-        return fromSession;
-      }
-      ControlConnection control = session.controlPlaneConnection();
-      if (control == null) {
-        throw new IllegalStateException("Session control plane is not initialized");
-      }
-      ServiceInstanceResolver created = new ServiceInstanceResolver(control, session.statusScheduler());
-      dynamicServiceResolver = created;
-      ownsDynamicServiceResolver = true;
-      return created;
-    }
+  static String decisionReason(ServiceEntitlements.Decision decision) {
+    return ServiceManagerImplInterceptors.decisionReason(decision);
   }
 
-  private boolean isServiceActionAllowed(
-      String subject,
-      String serviceResourceId,
-      ServiceEntitlements.Transport transport,
-      ServiceAction action) {
-    try {
-      ServiceEntitlements entitlements = requireServiceEntitlements();
-      ServiceEntitlements.Identity identity = new ServiceEntitlements.Identity(subject, null);
-      ServiceEntitlements.Request request =
-          new ServiceEntitlements.Request(
-              transport,
-              toCoreAction(action),
-              ServiceEntitlements.requireServiceResourceId(serviceResourceId),
-              null,
-              null,
-              null,
-              Map.of(),
-              Map.of());
-      ServiceEntitlements.Decision decision = entitlements.authorize(identity, request);
-      return decision != null && decision.allowed();
-    } catch (Exception ex) {
-      return false;
-    }
+  static boolean decisionAllowed(ServiceEntitlements.Decision decision) {
+    return ServiceManagerImplInterceptors.decisionAllowed(decision);
   }
 
-  private static ServiceEntitlements.Action toCoreAction(ServiceAction action) {
-    return switch (action) {
-      case START -> ServiceEntitlements.Action.START;
-      case INVOKE -> ServiceEntitlements.Action.INVOKE;
-      case READ -> ServiceEntitlements.Action.READ;
-      case WRITE -> ServiceEntitlements.Action.WRITE;
-    };
+  static String safeCaller(String callerAppSubject) {
+    return ServiceManagerImplInterceptors.safeCaller(callerAppSubject);
   }
 
-  private DefinitionService.ServiceType resolveServiceType(String serviceResourceId) {
-    String canonical = ServiceEntitlements.requireServiceResourceId(serviceResourceId);
-    CanonicalIds.ParsedId parsed = CanonicalIds.parse(canonical);
-    if (!parsed.isService()) {
+  static Map<String, String> snapshotGrpcHeaders(Metadata headers) {
+    return ServiceManagerImplInterceptors.snapshotGrpcHeaders(headers);
+  }
+
+  static String startOperationName(ServiceEntitlements.Transport transport) {
+    return ServiceManagerImplInterceptors.startOperationName(transport);
+  }
+
+  String resolveServerStartSubject(DefinitionService.Grpc grpc) {
+    return ServiceManagerImplBootstrap.resolveServerStartSubject(this, grpc);
+  }
+
+  String resolveServerStartSubject(DefinitionService.Arrow arrow) {
+    return ServiceManagerImplBootstrap.resolveServerStartSubject(this, arrow);
+  }
+
+  static String resolveGrpcAuthenticatedPrincipal(
+      DefinitionService.IdentityMode identityMode, Metadata headers) {
+    return ServiceManagerImplInterceptors.resolveGrpcAuthenticatedPrincipal(identityMode, headers);
+  }
+
+  static DefinitionService.IdentityMode resolveGrpcIdentityMode(
+      DefinitionService.Grpc grpc) {
+    return ServiceManagerImplInterceptors.resolveGrpcIdentityMode(grpc);
+  }
+
+  static Status statusFor(RequestIdentityResolver.ResolutionException ex) {
+    return ServiceManagerImplInterceptors.statusFor(ex);
+  }
+
+  static <ReqT> ServerCall.Listener<ReqT> scopedServerListener(
+      ServerCall.Listener<ReqT> delegate, RequestIdentity identity) {
+    return ServiceManagerImplInterceptors.scopedServerListener(delegate, identity);
+  }
+
+  CallerAppIdentity currentCallerApp() {
+    String group = session.context() == null ? null : session.context().getGroup();
+    String name = session.context() == null ? null : session.context().getAppName();
+    String instance = session.context() == null ? null : session.context().getInstance();
+    return new CallerAppIdentity(group, name, instance);
+  }
+
+  String currentAppName() {
+    return session.context() == null ? null : session.context().getAppName();
+  }
+
+  FlightProducer maybeInstrumentArrowServerProducer(
+      DefinitionService service,
+      FlightProducer producer,
+      String transport,
+      boolean transportEnabled) {
+    return ServiceManagerImplBootstrap.maybeInstrumentArrowServerProducer(
+        this, service, producer, transport, transportEnabled);
+  }
+
+  OtelManager sessionOtelManager() {
+    return ServiceManagerImplBootstrap.sessionOtelManager(this);
+  }
+
+  FabricRequestHeaders.RequestMetadata currentRequestMetadataTemplate() {
+    return new FabricRequestHeaders.RequestMetadata(
+        null,
+        null,
+        session.context() == null ? null : session.context().getEnv(),
+        session.context() == null ? null : session.context().getRegion(),
+        session.context() == null ? null : session.context().getSite());
+  }
+
+  String resolveRuntimeEnvironment() {
+    return ServiceManagerImplBootstrap.resolveRuntimeEnvironment(this);
+  }
+
+  String sessionAppSubject() {
+    String group = session.context() == null ? null : Strings.trimToNull(session.context().getGroup());
+    String app = session.context() == null ? null : Strings.trimToNull(session.context().getAppName());
+    if (group == null || app == null) {
       return null;
     }
-    DiscoveryCache cache = discoveryCacheSupplier.get();
-    if (cache == null) {
-      return null;
-    }
-    DefinitionService definition =
-        cache.get(DefinitionService.class, parsed.group(), parsed.name()).orElse(null);
-    return definition == null ? null : definition.serviceType();
+    return "app:" + group + "/" + app;
   }
 
-  private Set<ServiceEntitlements.Transport> transportsForService(
-      DefinitionService.ServiceType serviceType) {
-    if (serviceType == null) {
-      return Set.of();
-    }
-    return switch (serviceType) {
-      case GRPC -> Set.of(ServiceEntitlements.Transport.GRPC);
-      case AMPS -> Set.of(ServiceEntitlements.Transport.AMPS);
-      case ARROW_FLIGHT -> Set.of(ServiceEntitlements.Transport.ARROW_FLIGHT);
-      case ARROW_FLIGHT_INGEST -> Set.of(ServiceEntitlements.Transport.ARROW_FLIGHT_INGEST);
-      case ARROW_FLIGHT_SQL -> Set.of(ServiceEntitlements.Transport.ARROW_FLIGHT_SQL);
-      case UNKNOWN -> Set.of();
-    };
+  static List<ClientInterceptor> extractClientInterceptors(ServiceRunOptions options) {
+    return ServiceManagerImplInterceptors.extractClientInterceptors(options);
   }
 
-  private List<DatasetDescriptor> listDatasetDescriptors() {
-    DiscoveryCache cache = discoveryCacheSupplier.get();
-    if (cache == null) {
-      return List.of();
-    }
-    List<DatasetDescriptor> rows = new ArrayList<>();
-    for (DefinitionDataset definition : cache.list(DefinitionDataset.class)) {
-      if (definition == null || definition.envelope() == null) {
-        continue;
-      }
-      if (Boolean.FALSE.equals(definition.envelope().enabled())) {
-        continue;
-      }
-      String group = Strings.trimToNull(definition.envelope().group());
-      String namespace =
-          Strings.firstNonBlank(
-              Strings.trimToNull(definition.namespace()), namespaceFromEnvelopeName(definition.envelope()));
-      String name = datasetName(definition);
-      if (group == null || namespace == null || name == null) {
-        continue;
-      }
-      String datasetId;
-      try {
-        datasetId = DataEntitlements.canonicalDatasetResourceId(group, namespace, name);
-      } catch (Exception ex) {
-        continue;
-      }
-      rows.add(
-          new DatasetDescriptor(
-              datasetId, group, namespace, name, prefersDirectQuery(definition)));
-    }
-    rows.sort(
-        Comparator.comparing(DatasetDescriptor::group, String.CASE_INSENSITIVE_ORDER)
-            .thenComparing(DatasetDescriptor::namespace, String.CASE_INSENSITIVE_ORDER)
-            .thenComparing(DatasetDescriptor::name, String.CASE_INSENSITIVE_ORDER));
-    return List.copyOf(rows);
+  int resolveBindPort(DefinitionService.Grpc grpc, ServiceRunOptions options) {
+    return ServiceManagerImplRegistry.resolveBindPort(grpc, options);
   }
 
-  private List<ServiceDescriptor> listServiceDescriptors() {
-    DiscoveryCache cache = discoveryCacheSupplier.get();
-    if (cache == null) {
-      return List.of();
-    }
-    Set<String> online = onlineServiceKeys();
-    List<ServiceDescriptor> rows = new ArrayList<>();
-    for (DefinitionService service : cache.list(DefinitionService.class)) {
-      if (service == null || service.envelope() == null) {
-        continue;
-      }
-      if (Boolean.FALSE.equals(service.envelope().enabled())) {
-        continue;
-      }
-      String group = Strings.trimToNull(service.envelope().group());
-      String name = Strings.trimToNull(service.envelope().name());
-      if (group == null || name == null) {
-        continue;
-      }
-      String canonical = Strings.firstNonBlank(service.resourceId(), "service:" + group + "/" + name);
-      String serviceId;
-      try {
-        serviceId = ServiceEntitlements.requireServiceResourceId(canonical);
-      } catch (Exception ex) {
-        continue;
-      }
-      rows.add(
-          new ServiceDescriptor(
-              serviceId,
-              group,
-              name,
-              service.serviceType(),
-              online.contains(serviceKey(group, name))));
-    }
-    rows.sort(
-        Comparator.comparing(ServiceDescriptor::group, String.CASE_INSENSITIVE_ORDER)
-            .thenComparing(ServiceDescriptor::name, String.CASE_INSENSITIVE_ORDER));
-    return List.copyOf(rows);
+  int resolveBindPort(DefinitionService.Arrow arrow, ServiceRunOptions options) {
+    return ServiceManagerImplRegistry.resolveBindPort(arrow, options);
   }
 
-  private Set<String> onlineServiceKeys() {
-    ServiceStatusCache cache = serviceStatusCacheSupplier.get();
-    if (cache == null) {
-      return Set.of();
-    }
-    Set<String> keys = new HashSet<>();
-    for (ServiceStatusRow row : cache.snapshot()) {
-      if (row == null) {
-        continue;
-      }
-      if (!"ONLINE".equalsIgnoreCase(Strings.trimToNull(row.state()))) {
-        continue;
-      }
-      String key = serviceKey(row.group(), row.name());
-      if (key != null) {
-        keys.add(key);
-      }
-    }
-    return keys;
+  String resolveBindHost(DefinitionService.Grpc grpc, ServiceRunOptions options) {
+    return ServiceManagerImplRegistry.resolveBindHost(grpc, options);
   }
 
-  private String resolveSubject(String requestedSubject) {
-    String explicit = Strings.trimToNull(requestedSubject);
-    if (explicit != null) {
-      return explicit;
-    }
-    String current =
-        UserContext.get().map(UserPrincipal::username).map(Strings::trimToNull).orElse(null);
-    if (current != null) {
-      return current;
-    }
-    SessionContext context = session.context();
-    String group = Strings.trimToNull(context == null ? null : context.getGroup());
-    String appName = Strings.trimToNull(context == null ? null : context.getAppName());
-    if (group != null && appName != null) {
-      try {
-        return CanonicalIds.appPrincipal(group, appName);
-      } catch (Exception ignored) {
-      }
-    }
-    return "app:unknown/unknown";
+  String resolveBindHost(DefinitionService.Arrow arrow, ServiceRunOptions options) {
+    return ServiceManagerImplRegistry.resolveBindHost(arrow, options);
   }
 
-  private DiscoveryCache requireDiscoveryCache() {
-    DiscoveryCache cache = discoveryCacheSupplier.get();
-    if (cache == null) {
-      throw new IllegalStateException("DiscoveryCache is not initialized");
-    }
-    return cache;
+  String resolveAdvertiseHost(DefinitionService.Grpc grpc, ServiceRunOptions options) {
+    return ServiceManagerImplRegistry.resolveAdvertiseHost(this, grpc, options);
   }
 
-  private EntitlementsManagerImpl requireEntitlementsManager() {
-    EntitlementsManagerImpl manager = entitlementsSupplier.get();
-    if (manager == null) {
-      throw new IllegalStateException("Entitlements manager is not initialized");
-    }
-    return manager;
+  String resolveAdvertiseHost(DefinitionService.Arrow arrow, ServiceRunOptions options) {
+    return ServiceManagerImplRegistry.resolveAdvertiseHost(this, arrow, options);
   }
 
-  private DataEntitlements requireDataEntitlements() {
-    return requireEntitlementsManager().dataEntitlements();
+  int resolveAdvertisePort(
+      DefinitionService.Grpc grpc, ServiceRunOptions options, int bindPort) {
+    return ServiceManagerImplRegistry.resolveAdvertisePort(grpc, options, bindPort);
   }
 
-  private ServiceEntitlements requireServiceEntitlements() {
-    return requireEntitlementsManager().serviceEntitlements();
+  int resolveAdvertisePort(
+      DefinitionService.Arrow arrow, ServiceRunOptions options, int bindPort) {
+    return ServiceManagerImplRegistry.resolveAdvertisePort(arrow, options, bindPort);
   }
 
-  private int compareServiceCandidates(DatasetServiceCandidate left, DatasetServiceCandidate right) {
-    int leftGroup = left.sameGroup() ? 0 : 1;
-    int rightGroup = right.sameGroup() ? 0 : 1;
-    if (leftGroup != rightGroup) {
-      return Integer.compare(leftGroup, rightGroup);
-    }
-    int leftType = serviceTypeRank(left.serviceType());
-    int rightType = serviceTypeRank(right.serviceType());
-    if (leftType != rightType) {
-      return Integer.compare(leftType, rightType);
-    }
-    return Strings.firstNonBlank(left.serviceDisplay(), "")
-        .compareToIgnoreCase(Strings.firstNonBlank(right.serviceDisplay(), ""));
+  static boolean tlsEnabled(DefinitionService.Grpc grpc) {
+    return ServiceManagerImplRegistry.tlsEnabled(grpc);
   }
 
-  private static int serviceTypeRank(DefinitionService.ServiceType serviceType) {
-    if (serviceType == null) {
-      return 99;
-    }
-    return switch (serviceType) {
-      case ARROW_FLIGHT_SQL -> 0;
-      case ARROW_FLIGHT -> 1;
-      default -> 99;
-    };
+  static boolean tlsEnabled(DefinitionService.Arrow arrow) {
+    return ServiceManagerImplRegistry.tlsEnabled(arrow);
   }
 
-  private CachedServiceTables cachedServiceTables(String cacheKey, long nowMs) {
-    if (cacheKey == null) {
-      return null;
-    }
-    CachedServiceTables cached = serviceTableCache.get(cacheKey);
-    if (cached == null) {
-      return null;
-    }
-    if (nowMs - cached.loadedAtMs() > SERVICE_TABLE_CACHE_TTL_MILLIS) {
-      serviceTableCache.remove(cacheKey, cached);
-      return null;
-    }
-    return cached;
+  static boolean kerberosEnabled(DefinitionService.Grpc grpc) {
+    return ServiceManagerImplRegistry.kerberosEnabled(grpc);
   }
 
-  private boolean isServiceTableLookupCoolingDown(String cacheKey, long nowMs) {
-    if (cacheKey == null) {
-      return false;
-    }
-    Long cooldownUntil = serviceTableFailureCooldownUntilMs.get(cacheKey);
-    if (cooldownUntil == null) {
-      return false;
-    }
-    if (cooldownUntil <= nowMs) {
-      serviceTableFailureCooldownUntilMs.remove(cacheKey, cooldownUntil);
-      return false;
-    }
-    return true;
+  static boolean kerberosEnabled(DefinitionService.Arrow arrow) {
+    return ServiceManagerImplRegistry.kerberosEnabled(arrow);
   }
 
-  private void cacheServiceTables(String cacheKey, Set<String> datasetKeys, long nowMs) {
-    if (cacheKey == null || datasetKeys == null) {
-      return;
-    }
-    Set<String> normalized =
-        new LinkedHashSet<>(datasetKeys.stream().sorted(String.CASE_INSENSITIVE_ORDER).toList());
-    serviceTableCache.put(cacheKey, new CachedServiceTables(normalized, nowMs));
+  String sessionKerberosPrincipal() {
+    return ServiceManagerImplRegistry.sessionKerberosPrincipal(this);
   }
 
-  private void markServiceTableFailure(String cacheKey, long nowMs) {
-    if (cacheKey == null) {
-      return;
-    }
-    serviceTableFailureCooldownUntilMs.put(
-        cacheKey, nowMs + SERVICE_TABLE_FAILURE_COOLDOWN_MILLIS);
+  File sessionKerberosKeytab() {
+    return ServiceManagerImplRegistry.sessionKerberosKeytab(this);
   }
 
-  private void clearServiceTableFailureCooldown(String cacheKey, long nowMs) {
-    if (cacheKey == null) {
-      return;
-    }
-    Long cooldownUntil = serviceTableFailureCooldownUntilMs.get(cacheKey);
-    if (cooldownUntil != null && cooldownUntil <= nowMs) {
-      serviceTableFailureCooldownUntilMs.remove(cacheKey, cooldownUntil);
-      return;
-    }
-    serviceTableFailureCooldownUntilMs.remove(cacheKey);
+  static File toFile(Path path) {
+    return ServiceManagerImplRegistry.toFile(path);
   }
 
-  private static String tableCacheKey(String serviceKey, String subject) {
-    String normalizedService = Strings.trimToNull(serviceKey);
-    if (normalizedService == null) {
-      return null;
-    }
-    String normalizedSubject = Strings.trimToNull(subject);
-    if (normalizedSubject == null) {
-      return normalizedService;
-    }
-    return normalizedService + "|" + normalizedSubject.toLowerCase(Locale.ROOT);
+  static <T> T firstNonNull(T first, T second) {
+    return ServiceManagerImplRegistry.firstNonNull(first, second);
   }
 
-  private static <T> T runAsSubject(String subject, Supplier<T> callback) {
-    Objects.requireNonNull(callback, "callback");
-    String normalizedSubject = Strings.trimToNull(subject);
-    if (normalizedSubject == null) {
-      return callback.get();
-    }
-    UserPrincipal previous = UserContext.get().orElse(null);
-    UserContext.set(new UserPrincipal(normalizedSubject, Map.of()));
-    try {
-      return callback.get();
-    } finally {
-      if (previous == null) {
-        UserContext.clear();
-      } else {
-        UserContext.set(previous);
-      }
-    }
+  static <T> T firstNonNull(T first, T second, T third) {
+    return ServiceManagerImplRegistry.firstNonNull(first, second, third);
   }
 
-  private static boolean isAllowed(DataEntitlements.Decision decision) {
-    return decision != null && decision.allowed();
+  static String firstNonBlank(String... values) {
+    return ServiceManagerImplRegistry.firstNonBlank(values);
   }
 
-  private static String datasetName(DefinitionDataset definition) {
-    if (definition == null) {
-      return null;
-    }
-    DefinitionEnvelope envelope = definition.envelope();
-    String name = Strings.trimToNull(envelope == null ? null : envelope.name());
-    if (name == null) {
-      return null;
-    }
-    int slash = name.indexOf('/');
-    if (slash < 0 || slash == name.length() - 1) {
-      return name;
-    }
-    return name.substring(slash + 1);
+  ServiceRoutingMode requireGrpcRoutingMode(DefinitionService service, String usage) {
+    return ServiceManagerImplRegistry.requireGrpcRoutingMode(service, usage);
   }
 
-  private static String namespaceFromEnvelopeName(DefinitionEnvelope envelope) {
-    String name = Strings.trimToNull(envelope == null ? null : envelope.name());
-    if (name == null) {
-      return null;
-    }
-    int slash = name.indexOf('/');
-    if (slash <= 0) {
-      return null;
-    }
-    return name.substring(0, slash);
+  ServiceRoutingMode requireArrowRoutingMode(DefinitionService service, String usage) {
+    return ServiceManagerImplRegistry.requireArrowRoutingMode(service, usage);
   }
 
-  private static String datasetKey(String namespace, String name) {
-    String normalizedNamespace = Strings.trimToNull(namespace);
-    String normalizedName = Strings.trimToNull(name);
-    if (normalizedNamespace == null || normalizedName == null) {
-      return null;
-    }
-    return normalizedNamespace.toLowerCase(Locale.ROOT) + "/" + normalizedName.toLowerCase(Locale.ROOT);
-  }
-
-  private static String groupedDatasetKey(String group, String namespace, String name) {
-    String normalizedGroup = Strings.trimToNull(group);
-    String key = datasetKey(namespace, name);
-    if (normalizedGroup == null || key == null) {
-      return null;
-    }
-    return normalizedGroup.toLowerCase(Locale.ROOT) + "|" + key;
-  }
-
-  private static String groupedDatasetKey(String group, String datasetKey) {
-    String normalizedGroup = Strings.trimToNull(group);
-    String normalizedKey = Strings.trimToNull(datasetKey);
-    if (normalizedGroup == null || normalizedKey == null) {
-      return null;
-    }
-    return normalizedGroup.toLowerCase(Locale.ROOT) + "|" + normalizedKey;
-  }
-
-  private static String serviceKey(String group, String name) {
-    String normalizedGroup = Strings.trimToNull(group);
-    String normalizedName = Strings.trimToNull(name);
-    if (normalizedGroup == null || normalizedName == null) {
-      return null;
-    }
-    return normalizedGroup.toLowerCase(Locale.ROOT) + "/" + normalizedName.toLowerCase(Locale.ROOT);
-  }
-
-  private static String serviceKeyFromResourceId(String serviceResourceId) {
-    String normalized = Strings.trimToNull(serviceResourceId);
-    if (normalized == null || isDirectServiceId(normalized)) {
-      return null;
-    }
-    String token =
-        normalized.regionMatches(true, 0, "service:", 0, "service:".length())
-            ? normalized.substring("service:".length())
-            : normalized;
-    int slash = token.indexOf('/');
-    if (slash <= 0 || slash >= token.length() - 1) {
-      return null;
-    }
-    String group = Strings.trimToNull(token.substring(0, slash));
-    String name = Strings.trimToNull(token.substring(slash + 1));
-    return serviceKey(group, name);
-  }
-
-  private static boolean prefersDirectQuery(DefinitionDataset definition) {
-    return definition != null && definition.binding() != null && definition.binding().parquet() != null;
-  }
-
-  private static boolean isDirectServiceId(String serviceId) {
-    String normalized = Strings.trimToNull(serviceId);
-    return normalized != null
-        && (DIRECT_QUERY_SERVICE_ID.equalsIgnoreCase(normalized)
-            || DIRECT_QUERY_SERVICE_DISPLAY.equalsIgnoreCase(normalized));
-  }
-
-  private record DatasetDescriptor(
-      String datasetId, String group, String namespace, String name, boolean directQuery) {}
-
-  private record ServiceDescriptor(
-      String serviceId,
-      String group,
-      String name,
-      DefinitionService.ServiceType serviceType,
-      boolean online) {}
-
-  private record ServiceReference(
-      String group,
+  ServiceStatusPublisher createGrpcStatusPublisher(
       String serviceName,
-      String serviceId,
-      DefinitionService.ServiceType serviceType,
-      String serviceDisplay,
-      boolean online) {}
+      String instanceId,
+      String advertiseHost,
+      int advertisePort,
+      String bindHost,
+      int bindPort,
+      DefinitionService.Grpc grpc,
+      boolean tlsEnabled,
+      ServiceRunOptions options) {
+    return ServiceManagerImplBootstrap.createGrpcStatusPublisher(
+        this,
+        serviceName,
+        instanceId,
+        advertiseHost,
+        advertisePort,
+        bindHost,
+        bindPort,
+        grpc,
+        tlsEnabled,
+        options);
+  }
 
-  private record DatasetServiceCandidate(
-      String serviceId,
-      String serviceDisplay,
-      DefinitionService.ServiceType serviceType,
-      boolean sameGroup,
-      boolean online) {}
+  ServiceStatusPublisher createArrowStatusPublisher(
+      String serviceName,
+      String instanceId,
+      String advertiseHost,
+      int advertisePort,
+      String bindHost,
+      int bindPort,
+      DefinitionService.Arrow arrow,
+      boolean tlsEnabled,
+      ServiceRunOptions options) {
+    return ServiceManagerImplBootstrap.createArrowStatusPublisher(
+        this,
+        serviceName,
+        instanceId,
+        advertiseHost,
+        advertisePort,
+        bindHost,
+        bindPort,
+        arrow,
+        tlsEnabled,
+        options);
+  }
 
-  private record CachedServiceTables(Set<String> datasetKeys, long loadedAtMs) {
-    private CachedServiceTables {
-      datasetKeys = datasetKeys == null ? Set.of() : Set.copyOf(datasetKeys);
+  String resolveInstanceId(
+      ServiceRunOptions options, String advertiseHost, int advertisePort) {
+    return ServiceManagerImplBootstrap.resolveInstanceId(options, advertiseHost, advertisePort);
+  }
+
+  String resolveGroupName() {
+    return ServiceManagerImplRegistry.resolveGroupName(this);
+  }
+
+  static String requireValue(String value, String label) {
+    return ServiceManagerImplRegistry.requireValue(value, label);
+  }
+
+  static String runningServiceKey(String serviceName, String instanceId) {
+    return ServiceManagerImplRegistry.runningServiceKey(serviceName, instanceId);
+  }
+
+  static boolean isServiceKeyForName(String key, String serviceName) {
+    return ServiceManagerImplRegistry.isServiceKeyForName(key, serviceName);
+  }
+
+  static String serviceId(DefinitionService service) {
+    return ServiceManagerImplRegistry.serviceId(service);
+  }
+
+  static String resolveServiceName(DefinitionService service) {
+    return ServiceManagerImplRegistry.resolveServiceName(service);
+  }
+
+  String resolveGroup(DefinitionService service) {
+    return ServiceManagerImplRegistry.resolveGroup(this, service);
+  }
+
+  static String normalizeServiceName(String name) {
+    return ServiceManagerImplRegistry.normalizeServiceName(name);
+  }
+
+  static UnsupportedOperationException unsupported(String operation) {
+    return ServiceManagerImplRegistry.unsupported(operation);
+  }
+
+  Optional<DefinitionSchema> resolveSchema(DefinitionService service) {
+    return ServiceManagerImplRegistry.resolveSchema(this, service);
+  }
+
+  interface RunningService extends AutoCloseable {
+    String instanceId();
+
+    int port();
+
+    void blockUntilShutdown() throws InterruptedException;
+  }
+
+  static final class RunningGrpcServer implements RunningService {
+    private final String serviceId;
+    private final String instanceId;
+    private final GrpcServiceRuntime runtime;
+    private final ServiceStatusPublisher publisher;
+
+    RunningGrpcServer(
+        String serviceId, String instanceId, GrpcServiceRuntime runtime, ServiceStatusPublisher publisher) {
+      this.serviceId = serviceId;
+      this.instanceId = instanceId;
+      this.runtime = Objects.requireNonNull(runtime, "runtime");
+      this.publisher = Objects.requireNonNull(publisher, "publisher");
+    }
+
+    @Override
+    public String instanceId() {
+      return instanceId;
+    }
+
+    @Override
+    public int port() {
+      return runtime.port();
+    }
+
+    @Override
+    public void blockUntilShutdown() throws InterruptedException {
+      runtime.blockUntilShutdown();
+    }
+
+    @Override
+    public void close() {
+      try {
+        publisher.close();
+      } catch (Exception ex) {
+        LOGGER.warn("[ServiceManager][gRPC][publisher-close] serviceId={} instance={} error={}",
+            serviceId, instanceId, ex.toString());
+      }
+      runtime.close();
     }
   }
+
+  static final class RunningArrowFlightSqlServer implements RunningService {
+    private final String serviceId;
+    private final String instanceId;
+    private final FlightSqlServiceRuntime runtime;
+    private final ServiceStatusPublisher publisher;
+
+    RunningArrowFlightSqlServer(
+        String serviceId,
+        String instanceId,
+        FlightSqlServiceRuntime runtime,
+        ServiceStatusPublisher publisher) {
+      this.serviceId = serviceId;
+      this.instanceId = instanceId;
+      this.runtime = Objects.requireNonNull(runtime, "runtime");
+      this.publisher = Objects.requireNonNull(publisher, "publisher");
+    }
+
+    @Override
+    public String instanceId() {
+      return instanceId;
+    }
+
+    @Override
+    public int port() {
+      return runtime.port();
+    }
+
+    @Override
+    public void blockUntilShutdown() throws InterruptedException {
+      runtime.blockUntilShutdown();
+    }
+
+    @Override
+    public void close() {
+      try {
+        publisher.close();
+      } catch (Exception ex) {
+        LOGGER.warn("[ServiceManager][FlightSQL][publisher-close] serviceId={} instance={} error={}", serviceId, instanceId, ex.toString());
+      }
+      runtime.close();
+    }
+  }
+
+  static final class RunningArrowFlightIngestServer implements RunningService {
+    private final String serviceId;
+    private final String instanceId;
+    private final FlightIngestServiceRuntime runtime;
+    private final ServiceStatusPublisher publisher;
+
+    RunningArrowFlightIngestServer(
+        String serviceId,
+        String instanceId,
+        FlightIngestServiceRuntime runtime,
+        ServiceStatusPublisher publisher) {
+      this.serviceId = serviceId;
+      this.instanceId = instanceId;
+      this.runtime = Objects.requireNonNull(runtime, "runtime");
+      this.publisher = Objects.requireNonNull(publisher, "publisher");
+    }
+
+    @Override
+    public String instanceId() {
+      return instanceId;
+    }
+
+    @Override
+    public int port() {
+      return runtime.port();
+    }
+
+    @Override
+    public void blockUntilShutdown() throws InterruptedException {
+      runtime.blockUntilShutdown();
+    }
+
+    @Override
+    public void close() {
+      try {
+        publisher.close();
+      } catch (Exception ex) {
+        LOGGER.warn("[ServiceManager][FlightIngest][publisher-close] serviceId={} instance={} error={}", serviceId, instanceId, ex.toString());
+      }
+      runtime.close();
+    }
+  }
+
+  static final class LocalServiceHandle implements ServiceHandle {
+    private final RunningService running;
+
+    LocalServiceHandle(RunningService running) {
+      this.running = Objects.requireNonNull(running, "running");
+    }
+
+    @Override
+    public int port() {
+      return running.port();
+    }
+
+    @Override
+    public void blockUntilShutdown() throws InterruptedException {
+      running.blockUntilShutdown();
+    }
+
+    @Override
+    public void close() {
+      try {
+        running.close();
+      } catch (Exception ex) {
+        throw new IllegalStateException("Failed to close service handle", ex);
+      }
+    }
+  }
+
+  private static final class LocalServiceClient implements ServiceClient {
+    private final String serviceName;
+    private final String group;
+    private final ManagedChannel channel;
+
+    private LocalServiceClient(String serviceName, String group, ManagedChannel channel) {
+      this.serviceName = serviceName;
+      this.group = group;
+      this.channel = Objects.requireNonNull(channel, "channel");
+    }
+
+    @Override
+    public String serviceName() {
+      return serviceName;
+    }
+
+    @Override
+    public String group() {
+      return group;
+    }
+
+    @Override
+    public <T> T as(Class<T> type) {
+      Objects.requireNonNull(type, "type");
+      if (type.isAssignableFrom(channel.getClass())) {
+        return type.cast(channel);
+      }
+      if (type == ManagedChannel.class || type == Channel.class) {
+        return type.cast(channel);
+      }
+      Class<?> owner = type.getEnclosingClass();
+      if (owner != null) {
+        for (String factory : STUB_FACTORIES) {
+          T stub = invokeFactory(owner, factory, channel, type);
+          if (stub != null) {
+            return stub;
+          }
+        }
+      }
+      for (String factory : STUB_FACTORIES) {
+        T stub = invokeFactory(type, factory, channel, type);
+        if (stub != null) {
+          return stub;
+        }
+      }
+      throw new IllegalArgumentException("Unsupported gRPC stub type: " + type.getName());
+    }
+
+    @Override
+    public void close() {
+      channel.shutdown();
+      try {
+        if (!channel.awaitTermination(2, TimeUnit.SECONDS)) {
+          channel.shutdownNow();
+          channel.awaitTermination(1, TimeUnit.SECONDS);
+        }
+      } catch (InterruptedException ex) {
+        Thread.currentThread().interrupt();
+        channel.shutdownNow();
+      }
+    }
+
+    private static <T> T invokeFactory(
+        Class<?> factoryOwner, String methodName, Channel channel, Class<T> expectedType) {
+      Method method;
+      try {
+        method = factoryOwner.getMethod(methodName, Channel.class);
+      } catch (NoSuchMethodException ex) {
+        return null;
+      }
+      if (!Modifier.isStatic(method.getModifiers())) {
+        return null;
+      }
+      if (!expectedType.isAssignableFrom(method.getReturnType())) {
+        return null;
+      }
+      try {
+        Object value = method.invoke(null, channel);
+        return expectedType.cast(value);
+      } catch (Exception ex) {
+        throw new IllegalArgumentException(
+            "Unable to create gRPC stub via "
+                + factoryOwner.getName()
+                + "."
+                + methodName
+                + "(Channel)",
+            ex);
+      }
+    }
+  }
+
 }
+
+
+
+
+
 
 
 
