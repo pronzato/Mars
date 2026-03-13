@@ -1,12 +1,8 @@
-package org.pronzato.fabric.api.data.views;
+package org.pronzato.fabric.api.streams.manager;
 
-import org.pronzato.fabric.api.util.CloseSupport;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.sql.ResultSet;
-import java.sql.ResultSetMetaData;
-import java.sql.SQLException;
-import java.sql.Types;
+import com.crankuptheamps.client.Message;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -18,1068 +14,1046 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 import org.pronzato.fabric.api.Fabric;
-import org.pronzato.fabric.api.data.checkpoints.CheckpointStore;
-import org.pronzato.fabric.api.data.checkpoints.CheckpointStores;
+import org.pronzato.fabric.api.connections.ConnectionManager;
+import org.pronzato.fabric.api.connections.ConnectionOptions;
+import org.pronzato.fabric.api.connectors.amps.AmpsConnection;
+import org.pronzato.fabric.api.control.discovery.CanonicalIds;
 import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
+import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionSchema;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStatusData;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStream;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
-import org.pronzato.fabric.api.data.RowManager;
-import org.pronzato.fabric.api.data.ViewManager;
-import org.pronzato.fabric.api.data.dataset.DatasetId;
-import org.pronzato.fabric.api.data.dataset.DatasetType;
-import org.pronzato.fabric.api.data.duckdb.DuckdbSession;
-import org.pronzato.fabric.api.data.entitlements.NamespaceEntitlementDefaults;
-import org.pronzato.fabric.api.data.manager.RowManagerImpl;
-import org.pronzato.fabric.api.control.entitlements.core.data.DataWriteAuthorization;
-import org.pronzato.fabric.api.data.views.internal.ViewModelMapper;
-import org.pronzato.fabric.api.data.views.model.ViewModel;
-import org.pronzato.fabric.api.data.views.model.ViewRefreshModel;
-import org.pronzato.fabric.api.data.views.model.ViewRefreshState;
-import org.pronzato.fabric.api.data.views.model.ViewRefreshType;
-import org.pronzato.fabric.api.data.views.model.ViewTargetType;
+import org.pronzato.fabric.api.control.discovery.lifecycle.DeleteOutcome;
+import org.pronzato.fabric.api.control.discovery.lifecycle.DeleteResult;
+import org.pronzato.fabric.api.control.discovery.DeleteManager;
+import org.pronzato.fabric.api.control.status.data.DataStatusPublisher;
 import org.pronzato.fabric.api.schemas.SchemaCompatibility;
 import org.pronzato.fabric.api.schemas.SchemaManager;
 import org.pronzato.fabric.api.schemas.SchemaModel;
 import org.pronzato.fabric.api.schemas.SchemaType;
-import org.pronzato.fabric.api.schemas.manager.SchemaManagerImpl;
+import org.pronzato.fabric.api.streams.Stream;
+import org.pronzato.fabric.api.streams.StreamBytesListener;
+import org.pronzato.fabric.api.streams.StreamListener;
+import org.pronzato.fabric.api.streams.StreamManager;
+import org.pronzato.fabric.api.streams.StreamMessage;
+import org.pronzato.fabric.api.streams.StreamModel;
+import org.pronzato.fabric.api.streams.StreamPublishOptions;
+import org.pronzato.fabric.api.streams.StreamPublishResult;
+import org.pronzato.fabric.api.streams.StreamRunOptions;
+import org.pronzato.fabric.api.streams.StreamSubscribeOptions;
+import org.pronzato.fabric.api.streams.StreamSubscription;
+import org.pronzato.fabric.api.control.session.SessionContext;
 import org.pronzato.fabric.api.control.session.SessionImpl;
+import org.pronzato.fabric.api.util.IdentityParsingSupport;
 import org.pronzato.fabric.api.util.Strings;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
-public final class ViewManagerImpl implements ViewManager, AutoCloseable {
-  private static final Logger LOGGER = LoggerFactory.getLogger(ViewManagerImpl.class);
-  private static final String DEFAULT_NAMESPACE = "default";
-  private static final String DEFAULT_ACTOR = "fabric-lite";
-  private static final String DEFAULT_PARQUET_GLOB = "**/*.parquet";
-  private static final String SNAPSHOT_FILE_NAME = "snapshot.parquet";
-  private static final int MAX_ERROR_CHARS = 500;
+public final class StreamManagerImpl implements StreamManager, AutoCloseable {
+  private static final ObjectMapper MAPPER = DiscoveryCodec.mapper();
+  private static final String SYSTEM_ACTOR = "fabric-lite";
+  private static final String DEFAULT_LIFECYCLE_STATUS = "ACTIVE";
+  private static final String HEADER_SCHEMA_ID = "fabric.schema_id";
+  private static final String HEADER_MESSAGE_TYPE = "fabric.message_type";
+  private static final String HEADER_CONTENT_TYPE = "fabric.content_type";
 
-  private final RowManager rowManager;
-  private final RowManagerImpl localDataManager;
-  private final DiscoveryCache DiscoveryCache;
-  private final String group;
-  private final SchemaManager schemaManager;
-  private final ViewModelMapper modelMapper;
-  private final ViewGraphPlanner graphPlanner;
-  private final CheckpointStore checkpointStore;
-  private final ScheduledExecutorService scheduler;
-  private final boolean ownsScheduler;
-  private final ConcurrentMap<String, ViewRuntimeImpl> runtimes = new ConcurrentHashMap<>();
+  private final Supplier<DiscoveryCache> cacheSupplier;
+  private final Supplier<String> groupSupplier;
+  private final Supplier<SchemaManager> schemaManagerSupplier;
+  private final Supplier<ConnectionManager> connectionManagerSupplier;
+  private final Supplier<DeleteManager> deleteManagerSupplier;
+  private final Fabric.Session session;
+  private final ConcurrentMap<String, StreamRuntime> runtimes = new ConcurrentHashMap<>();
 
-  public ViewManagerImpl(RowManager rowManager, DiscoveryCache DiscoveryCache, String group) {
+  public StreamManagerImpl(
+      Supplier<DiscoveryCache> cacheSupplier,
+      Supplier<String> groupSupplier,
+      Supplier<SchemaManager> schemaManagerSupplier,
+      Supplier<ConnectionManager> connectionManagerSupplier,
+      Supplier<DeleteManager> deleteManagerSupplier) {
     this(
-        rowManager,
-        DiscoveryCache,
-        group,
-        null,
-        CheckpointStores.failFast(
-            "ViewManager checkpoint store is not configured. Configure session with withCheckpointPath(...)"));
+        cacheSupplier,
+        groupSupplier,
+        schemaManagerSupplier,
+        connectionManagerSupplier,
+        deleteManagerSupplier,
+        null);
   }
 
-  public ViewManagerImpl(
-      RowManager rowManager, DiscoveryCache DiscoveryCache, String group, Fabric.Session session) {
-    this(
-        rowManager,
-        DiscoveryCache,
-        group,
-        session,
-        CheckpointStores.failFast(
-            "ViewManager checkpoint store is not configured. Configure session with withCheckpointPath(...)"));
+  public StreamManagerImpl(
+      Supplier<DiscoveryCache> cacheSupplier,
+      Supplier<String> groupSupplier,
+      Supplier<SchemaManager> schemaManagerSupplier,
+      Supplier<ConnectionManager> connectionManagerSupplier,
+      Supplier<DeleteManager> deleteManagerSupplier,
+      Fabric.Session session) {
+    this.cacheSupplier = Objects.requireNonNull(cacheSupplier, "cacheSupplier");
+    this.groupSupplier = Objects.requireNonNull(groupSupplier, "groupSupplier");
+    this.schemaManagerSupplier = Objects.requireNonNull(schemaManagerSupplier, "schemaManagerSupplier");
+    this.connectionManagerSupplier = Objects.requireNonNull(connectionManagerSupplier, "connectionManagerSupplier");
+    this.deleteManagerSupplier = deleteManagerSupplier == null ? () -> null : deleteManagerSupplier;
+    this.session = session;
   }
 
-  public ViewManagerImpl(
-      RowManager rowManager,
-      DiscoveryCache DiscoveryCache,
-      String group,
-      Fabric.Session session,
-      CheckpointStore checkpointStore) {
-    this.rowManager = Objects.requireNonNull(rowManager, "rowManager");
-    this.localDataManager = rowManager instanceof RowManagerImpl local ? local : null;
-    this.DiscoveryCache = Objects.requireNonNull(DiscoveryCache, "DiscoveryCache");
-    this.group = Strings.requireNonBlank(group, "session group");
-    this.schemaManager =
-        session == null
-            ? new SchemaManagerImpl(() -> this.DiscoveryCache, () -> this.group, () -> null)
-            : Objects.requireNonNull(session.schemas(), "session.schemas");
-    this.modelMapper = new ViewModelMapper();
-    this.graphPlanner = new ViewGraphPlanner();
-    this.checkpointStore = Objects.requireNonNull(checkpointStore, "checkpointStore");
-    if (session instanceof SessionImpl sessionImpl) {
-      this.scheduler = sessionImpl.statusScheduler();
-      this.ownsScheduler = false;
-    } else {
-      this.scheduler =
-          Executors.newSingleThreadScheduledExecutor(
-              runnable -> {
-                Thread thread = new Thread(runnable, "fabric-view-runtime");
-                thread.setDaemon(true);
-                return thread;
-              });
-      this.ownsScheduler = true;
+  @Override
+  public void register(StreamModel model) {
+    StreamModel normalized = normalizeModel(Objects.requireNonNull(model, "model"));
+    StreamModel associated = associateSchema(normalized);
+    String group = requireGroup();
+    String scoped = scopedName(associated.namespace(), associated.name());
+    DefinitionStream existing = requireCache().get(DefinitionStream.class, group, scoped).orElse(null);
+    requireCache().upsert(toDefinition(group, associated, existing));
+  }
+
+  @Override
+  public void delete(String streamName, DeleteOptions options) {
+    StreamLookup lookup = parseLookup(streamName);
+    String group = requireGroup();
+    String scoped = scopedName(lookup.namespace(), lookup.name());
+    DefinitionStream definition =
+        requireCache().get(DefinitionStream.class, group, scoped)
+            .orElseThrow(() -> new IllegalArgumentException("Unknown stream: " + group + "/" + scoped));
+
+    String streamAssetId =
+        Strings.firstNonBlank(
+            Strings.trimToNull(definition.streamId()),
+            "stream:" + group + "/" + lookup.namespace() + "/" + lookup.name());
+    DeleteOptions resolved = options == null ? DeleteOptions.streamOnly() : options;
+    org.pronzato.fabric.api.control.discovery.lifecycle.DeleteOptions deleteOptions =
+        new org.pronzato.fabric.api.control.discovery.lifecycle.DeleteOptions(
+            true,
+            resolved.deleteSchemaDefinition(),
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            List.of());
+    stopRuntime(lookup.namespace(), lookup.name());
+    DeleteResult result = requireDeleteManager().delete(streamAssetId, deleteOptions);
+    if (result.outcome() == DeleteOutcome.BLOCKED) {
+      throw new IllegalStateException("Delete blocked for stream " + streamAssetId + ": " + result.blockers());
+    }
+    if (result.outcome() == DeleteOutcome.PARTIAL) {
+      throw new IllegalStateException("Delete partially completed for stream " + streamAssetId + ": " + result.warnings());
     }
   }
 
   @Override
-  public void register(ViewModel model) {
-    ViewModel normalized = Objects.requireNonNull(model, "model");
-    String viewName = Strings.requireNonBlank(normalized.name(), "model.name");
-    String namespace = Strings.firstNonBlank(normalized.namespace(), DEFAULT_NAMESPACE);
-    String schemaName = modelMapper.deterministicSchemaName(namespace, viewName);
-
-    SchemaModel schemaToRegister =
-        Objects.requireNonNull(normalized.schema(), "model.schema")
-            .toBuilder()
-            .withName(schemaName)
-            .withType(SchemaType.TABULAR)
-            .withCompatibility(
-                normalized.schemaCompatibility() == null
-                    ? SchemaCompatibility.BACKWARDS
-                    : normalized.schemaCompatibility())
-            .build();
-    schemaManager.register(schemaName, SchemaType.TABULAR, schemaToRegister);
-
-    DefinitionDataset definition =
-        modelMapper.toDefinitionDataset(normalized, group, DEFAULT_ACTOR, schemaName);
-    try (DiscoveryCache.ConfigCacheTx tx =
-        DiscoveryCache.beginTx("view:" + group + "/" + namespace + "/" + viewName)) {
-      DiscoveryCache.upsertTx(tx, definition);
-      NamespaceEntitlementDefaults.ensureDefaultNamespaceAccess(
-          DiscoveryCache, tx, definition, DEFAULT_ACTOR);
-      DiscoveryCache.commitTx(tx);
-    }
-
-    String outputDatasetId = canonicalDatasetId(definition);
-    ViewRuntimeImpl runtime = runtimes.remove(outputDatasetId);
-    CloseSupport.closeQuietly(runtime);
+  public Optional<StreamModel> getModel(String streamName) {
+    StreamLookup lookup = parseLookup(streamName);
+    String group = requireGroup();
+    String scoped = scopedName(lookup.namespace(), lookup.name());
+    return requireCache().get(DefinitionStream.class, group, scoped).map(this::fromDefinition);
   }
 
   @Override
-  public Optional<ViewModel> getModel(String viewName) {
-    DefinitionDataset definition = resolveViewDefinition(viewName);
-    String schemaName = requireSchemaName(definition);
-    SchemaModel schema =
-        schemaManager
-            .get(schemaName)
-            .orElseThrow(
-                () ->
-                    new IllegalStateException(
-                        "View schema not found: group="
-                            + group
-                            + " schemaName="
-                            + schemaName
-                            + " view="
-                            + canonicalDatasetId(definition)));
-    return Optional.of(modelMapper.fromDefinitionDataset(definition, schema));
-  }
-
-  @Override
-  public List<ViewModel> listModels() {
-    List<DefinitionDataset> definitions = listViewDefinitions();
-    definitions.sort(
-        Comparator.comparing(
-            definition ->
-                Strings.requireNonBlank(
-                    definition.envelope() == null ? null : definition.envelope().name(),
-                    "view.envelope.name"),
-            String.CASE_INSENSITIVE_ORDER));
-    List<ViewModel> models = new ArrayList<>(definitions.size());
-    for (DefinitionDataset definition : definitions) {
-      try {
-        String schemaName = requireSchemaName(definition);
-        Optional<SchemaModel> schema = schemaManager.get(schemaName);
-        if (schema.isEmpty()) {
-          LOGGER.warn("[View][list][missing-schema] group={} datasetId={} schemaName={}", group, canonicalDatasetId(definition), schemaName);
-          continue;
-        }
-        models.add(modelMapper.fromDefinitionDataset(definition, schema.get()));
-      } catch (RuntimeException ex) {
-        LOGGER.warn("[View][list][skip] group={} datasetId={} reason={}", group, safeDatasetId(definition), ex.toString());
+  public List<StreamModel> listModels() {
+    String group = requireGroup();
+    List<StreamModel> models = new ArrayList<>();
+    for (DefinitionStream definition : requireCache().list(DefinitionStream.class, group)) {
+      if (definition == null || definition.envelope() == null) {
+        continue;
       }
+      models.add(fromDefinition(definition));
     }
+    models.sort(
+        Comparator.comparing(StreamModel::namespace, String.CASE_INSENSITIVE_ORDER)
+            .thenComparing(StreamModel::name, String.CASE_INSENSITIVE_ORDER)
+            .thenComparing(StreamModel::name));
     return List.copyOf(models);
   }
 
   @Override
-  public ViewRuntime open(String viewName) {
-    DefinitionDataset definition = resolveViewDefinition(viewName);
-    String datasetId = canonicalDatasetId(definition);
-    return runtimes.computeIfAbsent(datasetId, key -> new ViewRuntimeImpl(key));
-  }
-
-  @Override
-  public ViewRuntime start(String viewName) {
-    ViewRuntime runtime = open(viewName);
-    runtime.start();
-    return runtime;
-  }
-
-  @Override
-  public void stop(String viewName) {
-    DefinitionDataset definition = resolveViewDefinition(viewName);
-    String datasetId = canonicalDatasetId(definition);
-    ViewRuntimeImpl runtime = runtimes.get(datasetId);
-    if (runtime != null) {
-      runtime.stop();
+  public Stream start(String streamName, StreamRunOptions options) {
+    StreamModel model = getModel(streamName).orElseThrow(() -> new IllegalArgumentException("Unknown stream: " + streamName));
+    String key = runtimeKey(model.namespace(), model.name());
+    StreamRuntime existing = runtimes.get(key);
+    if (existing != null) {
+      return existing;
     }
+    StreamRunOptions resolved = options == null ? StreamRunOptions.defaults() : options;
+    ConnectionOptions connectionOptions =
+        ConnectionOptions.builder().withPinnedInstance(Strings.trimToNull(resolved.ampsConnectionInstance())).build();
+    AmpsConnection connection = requireConnectionManager().amps(model.connectionName(), connectionOptions);
+    StreamRuntime created = new StreamRuntime(model, connection, () -> runtimes.remove(key));
+    StreamRuntime prior = runtimes.putIfAbsent(key, created);
+    if (prior != null) {
+      created.close();
+      return prior;
+    }
+    return created;
   }
 
   @Override
-  public ViewRefreshResult refresh(String viewName) {
-    return open(viewName).refresh();
+  public Stream runtime(String streamName) {
+    StreamLookup lookup = parseLookup(streamName);
+    return runtimes.get(runtimeKey(lookup.namespace(), lookup.name()));
   }
 
   @Override
-  public ViewRefreshResult refreshGraph(String rootViewName) {
-    return open(rootViewName).refreshGraph();
-  }
-
-  @Override
-  public ViewStatus status(String viewName) {
-    return open(viewName).status();
+  public List<Stream> runtimes() {
+    return List.copyOf(runtimes.values());
   }
 
   @Override
   public void close() {
-    for (ViewRuntimeImpl runtime : runtimes.values()) {
-      CloseSupport.closeQuietly(runtime);
+    List<StreamRuntime> snapshot = List.copyOf(runtimes.values());
+    for (StreamRuntime runtime : snapshot) {
+      runtime.close();
     }
     runtimes.clear();
-    if (ownsScheduler) {
-      try {
-        scheduler.shutdownNow();
-      } catch (Exception ignore) {
-      }
-    }
   }
 
-  private ViewRefreshResult refreshCanonicalDatasetId(String rootDatasetId, boolean includeGraph) {
-    DatasetId root = DatasetId.parse(rootDatasetId);
-    DefinitionDataset rootDefinition = resolveDatasetDefinition(root);
-    if (rootDefinition.view() == null) {
-      throw new IllegalStateException("Dataset is not a view: " + rootDatasetId);
+  private StreamModel normalizeModel(StreamModel model) {
+    String group = requireGroup();
+    String name = Strings.requireNonBlank(model.name(), "stream.name");
+    String namespace = Strings.requireNonBlank(model.namespace(), "stream.namespace");
+    String streamId = Strings.firstNonBlank(model.streamId(), StreamModel.buildStreamId(group, namespace, name));
+    StreamModel.Transport transport = model.transport() == null ? StreamModel.Transport.AMPS : model.transport();
+    if (transport != StreamModel.Transport.AMPS) {
+      throw new IllegalArgumentException("Only AMPS stream transport is supported");
     }
-
-    List<String> ordered =
-        includeGraph
-            ? graphPlanner.plan(rootDatasetId, buildViewDependencyGraph())
-            : List.of(rootDatasetId);
-
-    return localDataManager.withDuckdbSession(
-        session -> {
-          ViewRefreshResult rootResult = null;
-          for (String candidateDatasetId : ordered) {
-            DefinitionDataset candidate = resolveDatasetDefinition(DatasetId.parse(candidateDatasetId));
-            if (candidate.view() == null) {
-              continue;
-            }
-            ViewRefreshResult result = refreshSingleView(candidate, session);
-            if (candidateDatasetId.equals(rootDatasetId)) {
-              rootResult = result;
-            }
-          }
-          if (rootResult == null) {
-            throw new IllegalStateException("View refresh did not include root view: " + rootDatasetId);
-          }
-          return rootResult;
-        });
+    StreamModel.Serde serde = model.serde() == null ? StreamModel.Serde.JSON : model.serde();
+    StreamModel.Address address = Objects.requireNonNull(model.address(), "stream.address");
+    String topic = Strings.requireNonBlank(address.topic(), "stream.address.topic");
+    String connectionName = Strings.requireNonBlank(model.connectionName(), "stream.connectionName");
+    return model.toBuilder()
+        .withName(name)
+        .withNamespace(namespace)
+        .withStreamId(streamId)
+        .withTransport(transport)
+        .withSerde(serde)
+        .withAddress(new StreamModel.Address(topic, address.channel(), address.streamId()))
+        .withConnectionName(connectionName)
+        .withLifecycleStatus(Strings.firstNonBlank(model.lifecycleStatus(), DEFAULT_LIFECYCLE_STATUS))
+        .build();
   }
 
-  private ViewRefreshResult refreshSingleView(DefinitionDataset definition, DuckdbSession session) {
-    if (localDataManager == null) {
-      throw new IllegalStateException(
-          "View refresh requires DIRECT mode local RowManager implementation");
+  private StreamModel associateSchema(StreamModel model) {
+    if (model.serde() == StreamModel.Serde.BYTES) {
+      return model;
     }
+    String group = requireGroup();
+    SchemaManager schemas = requireSchemaManager();
+    String schemaName = Strings.firstNonBlank(model.schemaName(), parseSchemaNameFromKey(model.schemaKey()), model.name() + "-stream");
+    SchemaModel schemaModel = model.schema();
+    if (schemaModel != null) {
+      SchemaCompatibility compatibility = toSchemaCompatibility(model.compatibilityMode());
+      schemaModel =
+          schemaModel.toBuilder()
+              .withGroup(group)
+              .withName(schemaName)
+              .withType(SchemaType.TRANSPORT)
+              .withCompatibility(compatibility)
+              .build();
+      schemaModel = schemas.register(schemaName, SchemaType.TRANSPORT, schemaModel);
+    } else {
+      schemaModel = schemas.get(group, schemaName).orElseGet(() -> schemas.get(schemaName).orElse(null));
+    }
+    String schemaKey = "schema:" + group + "/" + schemaName;
+    String schemaId = resolveSchemaUuid(group, schemaName);
+    return model.toBuilder()
+        .withSchemaName(schemaName)
+        .withSchemaKey(schemaKey)
+        .withSchemaId(Strings.firstNonBlank(schemaId, model.schemaId()))
+        .withSchema(schemaModel)
+        .build();
+  }
 
-    String datasetId = canonicalDatasetId(definition);
-    String viewName = datasetBaseName(definition);
-    DataWriteAuthorization.requireWrite(
-        localDataManager.dataEntitlementsForSqlPlanning(),
-        localDataManager.effectiveIdentityForSqlPlanning(),
-        datasetId,
-        "VIEW_REFRESH",
+  private DefinitionStream toDefinition(String group, StreamModel model, DefinitionStream existing) {
+    String now = Instant.now().toString();
+    String scoped = scopedName(model.namespace(), model.name());
+    DefinitionEnvelope previous = existing == null ? null : existing.envelope();
+    String createdAt = previous == null ? now : Strings.firstNonBlank(previous.createdTimeUtc(), now);
+    String createdBy = previous == null ? SYSTEM_ACTOR : Strings.firstNonBlank(previous.createdBy(), SYSTEM_ACTOR);
+    String uuid = Strings.firstNonBlank(model.uuid(), previous == null ? null : previous.uuid(), model.streamId());
+    DefinitionEnvelope envelope =
+        new DefinitionEnvelope(
+            group,
+            DefinitionType.STREAM,
+            scoped,
+            uuid,
+            model.enabled(),
+            Strings.firstNonBlank(model.lifecycleStatus(), DEFAULT_LIFECYCLE_STATUS),
+            createdAt,
+            createdBy,
+            now,
+            SYSTEM_ACTOR);
+    List<String> refs = normalizeRefs(model.connectionRefs());
+    if (refs.isEmpty()) {
+      refs = List.of(model.connectionName());
+    }
+    return new DefinitionStream(
+        envelope,
+        model.versionNum(),
+        model.versionName(),
+        model.namespace(),
+        model.streamId(),
+        toDefinitionTransport(model.transport()),
+        new DefinitionStream.Address(model.address().topic(), model.address().channel(), model.address().streamId()),
+        model.schemaId(),
+        model.schemaKey(),
+        model.messageType(),
+        toDefinitionSerde(model.serde()),
+        toDefinitionCompatibility(model.compatibilityMode()),
+        toDefinitionResolution(model.resolutionPolicy()),
+        refs,
+        normalizeRefs(model.dependencyRefs()),
+        null,
         null);
-    DefinitionDataset.View view =
-        Objects.requireNonNull(definition.view(), "definition.view");
-    SchemaModel expectedSchema =
-        schemaManager
-            .get(requireSchemaName(definition))
-            .orElseThrow(
-                () ->
-                    new IllegalStateException(
-                        "View schema not found: group="
-                            + group
-                            + " datasetId="
-                            + datasetId
-                            + " schemaName="
-                            + view.schemaName()));
+  }
 
-    long startedEpochMs = System.currentTimeMillis();
-    String startedUtc = Instant.ofEpochMilli(startedEpochMs).toString();
-    DefinitionDataset running = withRunningRefresh(definition, startedUtc);
-    upsertDataset(running, "view-refresh-running:" + datasetId);
-    LOGGER.info("[View] refresh-start view={} mode={} dataset={}", viewName, "DIRECT", datasetId);
-    try {
-      List<DatasetId> dependencies = parseDependencies(view.dependencies(), datasetId);
-      List<DefinitionDataset> dependencyDefs = resolveDependencyDefinitions(dependencies);
-      for (int i = 0; i < dependencies.size(); i++) {
-        createDependencyAlias(session, dependencies.get(i), dependencyDefs.get(i));
+  private StreamModel fromDefinition(DefinitionStream definition) {
+    String group = requireGroup();
+    DefinitionEnvelope envelope = definition.envelope();
+    String scoped = Strings.requireNonBlank(envelope == null ? null : envelope.name(), "stream.envelope.name");
+    IdentityParsingSupport.ScopedName parsed =
+        IdentityParsingSupport.parseScopedName(scoped, "stream.namespace", "stream.name");
+    String namespace =
+        Strings.requireNonBlank(
+            Strings.firstNonBlank(definition.namespace(), parsed.namespace()),
+            "stream.namespace");
+    String name = parsed.name();
+    String schemaName = parseSchemaNameFromKey(definition.schemaKey());
+    SchemaModel schema = null;
+    SchemaManager manager = schemaManagerSupplier.get();
+    if (manager != null && schemaName != null) {
+      schema = manager.get(group, schemaName).orElseGet(() -> manager.get(schemaName).orElse(null));
+    }
+    String streamId = Strings.firstNonBlank(definition.streamId(), StreamModel.buildStreamId(group, namespace, name));
+    String connectionName =
+        Strings.requireNonBlank(resolveConnectionName(definition.connectionRefs()), "stream.connectionName");
+    return StreamModel.builder()
+        .withName(name)
+        .withNamespace(namespace)
+        .withUuid(envelope == null ? null : envelope.uuid())
+        .withEnabled(envelope == null || envelope.enabled() == null || Boolean.TRUE.equals(envelope.enabled()))
+        .withLifecycleStatus(envelope == null ? null : envelope.lifecycleStatus())
+        .withVersionNum(definition.versionNum())
+        .withVersionName(definition.versionName())
+        .withStreamId(streamId)
+        .withTransport(fromDefinitionTransport(definition.transport()))
+        .withAddress(new StreamModel.Address(definition.address().topic(), definition.address().channel(), definition.address().streamId()))
+        .withConnectionName(connectionName)
+        .withSchemaName(schemaName)
+        .withSchemaId(definition.schemaId())
+        .withSchemaKey(definition.schemaKey())
+        .withSchema(schema)
+        .withMessageType(definition.messageType())
+        .withSerde(fromDefinitionSerde(definition.serde()))
+        .withCompatibilityMode(fromDefinitionCompatibility(definition.compatibilityMode()))
+        .withResolutionPolicy(fromDefinitionResolution(definition.resolutionPolicy()))
+        .withConnectionRefs(definition.connectionRefs())
+        .withDependencyRefs(definition.dependencyRefs())
+        .build();
+  }
+
+  private StreamLookup parseLookup(String streamName) {
+    String value = Strings.requireNonBlank(streamName, "streamName");
+    if (value.startsWith("stream:")) {
+      CanonicalIds.ParsedId parsed = CanonicalIds.parse(value);
+      if (!parsed.isStream()) {
+        throw new IllegalArgumentException("streamName must be a stream id");
       }
+      String group = requireGroup();
+      if (!group.equalsIgnoreCase(parsed.group())) {
+        throw new IllegalArgumentException("Stream group mismatch: " + parsed.group());
+      }
+      return new StreamLookup(
+          IdentityParsingSupport.requireNamespace(parsed.namespace(), "stream.namespace"),
+          IdentityParsingSupport.requireName(parsed.name(), "stream.name"));
+    }
+    String[] parts = value.split("/");
+    if (parts.length == 1) {
+      throw new IllegalArgumentException(
+          "streamName must include namespace (expected namespace/name): " + value);
+    }
+    if (parts.length == 2) {
+      return new StreamLookup(
+          IdentityParsingSupport.requireNamespace(parts[0], "stream.namespace"),
+          IdentityParsingSupport.requireName(parts[1], "stream.name"));
+    }
+    if (parts.length == 3 && requireGroup().equalsIgnoreCase(parts[0])) {
+      return new StreamLookup(
+          IdentityParsingSupport.requireNamespace(parts[1], "stream.namespace"),
+          IdentityParsingSupport.requireName(parts[2], "stream.name"));
+    }
+    throw new IllegalArgumentException("Invalid streamName format: " + value);
+  }
 
-      String querySql = Strings.requireNonBlank(view.querySql(), "view.querySql");
-      validateResultSchema(session, querySql, expectedSchema, datasetId);
-      materializeViewTarget(session, definition, querySql);
-      long rowCount = queryRowCount(session, definition, querySql);
+  private String requireGroup() {
+    return IdentityParsingSupport.requireGroup(groupSupplier.get());
+  }
 
-      long durationMs = Math.max(0L, System.currentTimeMillis() - startedEpochMs);
-      String endedUtc = Instant.now().toString();
-      DefinitionDataset updated =
-          withTerminalRefresh(
-              running,
-              startedUtc,
-              endedUtc,
-              durationMs,
-              "SUCCESS",
-              null,
-              rowCount,
-              buildInputFingerprints(dependencies),
-              "schemaHash=" + Strings.firstNonBlank(expectedSchema.getHash(), "n/a"));
-      upsertDataset(updated, "view-refresh-success:" + datasetId);
-      writeViewCheckpoint(datasetId, "SUCCESS", endedUtc, durationMs, rowCount, null);
-      ViewStatus status = statusFromDefinition(updated, ViewRefreshState.STOPPED);
-      LOGGER.info("[View] refresh-success view={} rows={} durationMs={}", viewName, rowCount, durationMs);
-      return new ViewRefreshResult(viewName, datasetId, true, rowCount, durationMs, null, status);
-    } catch (RuntimeException ex) {
-      long durationMs = Math.max(0L, System.currentTimeMillis() - startedEpochMs);
-      String endedUtc = Instant.now().toString();
-      String truncatedError = truncateError(ex.getMessage());
-      DefinitionDataset failed =
-          withTerminalRefresh(
-              running,
-              startedUtc,
-              endedUtc,
-              durationMs,
-              "FAILED",
-              truncatedError,
-              null,
-              Map.of(),
-              null);
-      upsertDataset(failed, "view-refresh-failed:" + datasetId);
-      writeViewCheckpoint(datasetId, "FAILED", endedUtc, durationMs, null, truncatedError);
-      LOGGER.warn("[View] refresh-fail view={} error={}", viewName, truncatedError);
-      throw ex;
+  private DiscoveryCache requireCache() {
+    return IdentityParsingSupport.requireNonNullRuntime(
+        cacheSupplier.get(), "DiscoveryCache is not initialized");
+  }
+
+  private SchemaManager requireSchemaManager() {
+    return IdentityParsingSupport.requireNonNullRuntime(
+        schemaManagerSupplier.get(), "SchemaManager is not initialized");
+  }
+
+  private DeleteManager requireDeleteManager() {
+    return IdentityParsingSupport.requireNonNullRuntime(
+        deleteManagerSupplier.get(), "DeleteManager is not initialized");
+  }
+
+  private ConnectionManager requireConnectionManager() {
+    return IdentityParsingSupport.requireNonNullRuntime(
+        connectionManagerSupplier.get(), "ConnectionManager is not initialized");
+  }
+
+  private DataStatusPublisher createDataStatusPublisher(StreamModel model) {
+    if (!(session instanceof SessionImpl sessionImpl)) {
+      return null;
+    }
+    if (sessionImpl.controlPlaneConnection() == null || sessionImpl.context() == null) {
+      return null;
+    }
+    SessionContext context = sessionImpl.context();
+    String group = Strings.trimToNull(context.getGroup());
+    String instance = Strings.trimToNull(context.getInstance());
+    if (group == null || instance == null) {
+      return null;
+    }
+    String namespace = IdentityParsingSupport.requireNamespace(model.namespace(), "stream.namespace");
+    String statusName = "stream/" + namespace + "/" + model.name();
+    String producerId =
+        Strings.firstNonBlank(
+            Strings.trimToNull(model.streamId()),
+            "stream:" + group + "/" + namespace + "/" + model.name());
+    Map<String, String> tags = new LinkedHashMap<>();
+    tags.put("namespace", namespace);
+    tags.put("streamName", model.name());
+    tags.put("transport", model.transport() == null ? "UNKNOWN" : model.transport().name());
+    tags.put("serde", model.serde() == null ? "UNKNOWN" : model.serde().name());
+    tags.put("topic", model.address() == null ? null : model.address().topic());
+    tags.put("connectionName", model.connectionName());
+    return new DataStatusPublisher(
+        sessionImpl.controlPlaneConnection(),
+        group,
+        statusName,
+        instance,
+        DefinitionStatusData.ProducerType.STREAM,
+        producerId,
+        null,
+        sessionImpl.runtimePlacementHost(),
+        Strings.trimToNull(context.getAppName()),
+        Strings.trimToNull(context.getInstance()),
+        Strings.trimToNull(context.getGroup()),
+        tags,
+        sessionImpl.dataStatusCadenceSeconds(),
+        sessionImpl.statusScheduler());
+  }
+
+  private void stopRuntime(String namespace, String name) {
+    StreamRuntime runtime = runtimes.remove(runtimeKey(namespace, name));
+    if (runtime != null) {
+      runtime.close();
     }
   }
 
-  private void createDependencyAlias(
-      DuckdbSession session, DatasetId dependencyId, DefinitionDataset dependencyDefinition) {
-    localDataManager.prepareDatasetForQuery(dependencyId);
-    String alias = quoteIdentifier(dependencyId.name());
-    String fromExpression = queryFromExpression(dependencyDefinition);
-    session.exec("create or replace temp view " + alias + " as select * from " + fromExpression);
+  private static String scopedName(String namespace, String name) {
+    return IdentityParsingSupport.requireNamespace(namespace, "stream.namespace")
+        + "/"
+        + IdentityParsingSupport.requireName(name, "stream.name");
   }
 
-  private String queryFromExpression(DefinitionDataset definition) {
-    if (definition.type() == DatasetType.DUCKDB
-        && definition.binding() != null
-        && definition.binding().duckdb() != null) {
-      return Strings.requireNonBlank(
-          definition.binding().duckdb().relationName(),
-          "dataset.duckdb.relationName");
-    }
-    if (definition.type() == DatasetType.PARQUET
-        && definition.binding() != null
-        && definition.binding().parquet() != null) {
-      DefinitionDataset.ParquetBinding parquet = definition.binding().parquet();
-      String uri = Strings.requireNonBlank(parquet.uri(), "dataset.parquet.uri");
-      if (isS3Uri(uri)) {
-        throw new IllegalStateException(
-            "View refresh in this prompt supports LOCAL parquet only: " + uri);
-      }
-      String glob = Strings.firstNonBlank(parquet.glob(), DEFAULT_PARQUET_GLOB);
-      String base = trimTrailingSlash(Path.of(uri).normalize().toString().replace('\\', '/'));
-      String parquetGlob = glob.startsWith("/") ? base + glob : base + "/" + glob;
-      StringBuilder sql =
-          new StringBuilder("read_parquet('")
-              .append(escapeSqlLiteral(parquetGlob))
-              .append("'");
-      if (Boolean.TRUE.equals(parquet.hivePartitioning())) {
-        sql.append(", hive_partitioning=true");
-      }
-      return sql.append(")").toString();
-    }
-    throw new IllegalStateException(
-        "View dependency dataset is not queryable: " + canonicalDatasetId(definition));
+  private static String runtimeKey(String namespace, String name) {
+    return IdentityParsingSupport.requireNamespace(namespace, "stream.namespace").toLowerCase(Locale.ROOT)
+        + "/"
+        + IdentityParsingSupport.requireName(name, "stream.name").toLowerCase(Locale.ROOT);
   }
 
-  private void validateResultSchema(
-      DuckdbSession session,
-      String querySql,
-      SchemaModel expectedSchema,
-      String datasetId) {
-    String sql = "select * from (" + querySql + ") as __fabric_view_schema where 1=0";
-    List<SchemaModel.Field> actual = readSchemaFromQuery(session, sql, datasetId);
-    List<SchemaModel.Field> expected = expectedSchema.getFields();
-
-    if (expected.size() != actual.size()) {
-      throw new IllegalStateException(
-          "View schema mismatch dataset="
-              + datasetId
-              + " reason=FIELD_COUNT expected="
-              + expected.size()
-              + " actual="
-              + actual.size()
-              + " expectedFields="
-              + summarizeFields(expected)
-              + " actualFields="
-              + summarizeFields(actual));
+  private static String parseSchemaNameFromKey(String schemaKey) {
+    String normalized = Strings.trimToNull(schemaKey);
+    if (normalized == null) {
+      return null;
     }
-
-    for (int i = 0; i < expected.size(); i++) {
-      SchemaModel.Field expectedField = expected.get(i);
-      SchemaModel.Field actualField = actual.get(i);
-      if (!Objects.equals(expectedField.getName(), actualField.getName())
-          || expectedField.getType() != actualField.getType()
-          || expectedField.isNullable() != actualField.isNullable()) {
-        throw new IllegalStateException(
-            "View schema mismatch dataset="
-                + datasetId
-                + " index="
-                + i
-                + " expected="
-                + formatField(expectedField)
-                + " actual="
-                + formatField(actualField)
-                + " expectedFields="
-                + summarizeFields(expected)
-                + " actualFields="
-                + summarizeFields(actual));
-      }
+    if (!normalized.startsWith("schema:")) {
+      return normalized;
     }
+    String payload = normalized.substring("schema:".length());
+    int slash = payload.indexOf('/');
+    return slash < 0 || slash + 1 >= payload.length() ? payload : payload.substring(slash + 1);
   }
 
-  private static List<SchemaModel.Field> readSchemaFromQuery(
-      DuckdbSession session, String sql, String datasetId) {
-    try (java.sql.Statement statement = session.createStatement();
-        ResultSet resultSet = statement.executeQuery(sql)) {
-      ResultSetMetaData metadata = resultSet.getMetaData();
-      int count = metadata.getColumnCount();
-      List<SchemaModel.Field> fields = new ArrayList<>(count);
-      for (int index = 1; index <= count; index++) {
-        String name = Strings.requireNonBlank(metadata.getColumnLabel(index), "columnLabel");
-        SchemaModel.FieldType type = toSchemaType(metadata.getColumnType(index), metadata.getColumnTypeName(index));
-        boolean nullable = metadata.isNullable(index) != ResultSetMetaData.columnNoNulls;
-        fields.add(
-            SchemaModel.Field.builder().withName(name).withType(type).withNullable(nullable).build());
-      }
-      return List.copyOf(fields);
-    } catch (SQLException ex) {
-      throw new IllegalStateException(
-          "Failed to inspect view query schema dataset=" + datasetId + " error=" + ex.getMessage(), ex);
-    }
+  private String resolveSchemaUuid(String group, String schemaName) {
+    return requireCache()
+        .get(DefinitionSchema.class, group, schemaName)
+        .map(DefinitionSchema::envelope)
+        .map(DefinitionEnvelope::uuid)
+        .map(Strings::trimToNull)
+        .orElse(null);
   }
 
-  private static SchemaModel.FieldType toSchemaType(int jdbcType, String typeName) {
-    return switch (jdbcType) {
-      case Types.CHAR,
-          Types.VARCHAR,
-          Types.LONGVARCHAR,
-          Types.NCHAR,
-          Types.NVARCHAR,
-          Types.LONGNVARCHAR -> SchemaModel.FieldType.STRING;
-      case Types.BIT, Types.BOOLEAN -> SchemaModel.FieldType.BOOL;
-      case Types.TINYINT, Types.SMALLINT, Types.INTEGER -> SchemaModel.FieldType.INT32;
-      case Types.BIGINT -> SchemaModel.FieldType.INT64;
-      case Types.REAL,
-          Types.FLOAT,
-          Types.DOUBLE,
-          Types.DECIMAL,
-          Types.NUMERIC -> SchemaModel.FieldType.FLOAT64;
-      case Types.DATE -> SchemaModel.FieldType.DATE;
-      case Types.TIMESTAMP, Types.TIMESTAMP_WITH_TIMEZONE -> SchemaModel.FieldType.TIMESTAMP;
-      case Types.BINARY,
-          Types.VARBINARY,
-          Types.LONGVARBINARY,
-          Types.BLOB -> SchemaModel.FieldType.BINARY;
-      default ->
-          throw new IllegalStateException(
-              "Unsupported JDBC type for view schema validation: jdbcType="
-                  + jdbcType
-                  + " typeName="
-                  + Strings.firstNonBlank(typeName, "n/a"));
+  private static List<String> normalizeRefs(List<String> refs) {
+    if (Strings.isEmpty(refs)) {
+      return List.of();
+    }
+    List<String> normalized = new ArrayList<>();
+    for (String ref : refs) {
+      String value = Strings.trimToNull(ref);
+      if (value != null) {
+        normalized.add(value);
+      }
+    }
+    return normalized.isEmpty() ? List.of() : List.copyOf(normalized);
+  }
+
+  private static String resolveConnectionName(List<String> refs) {
+    if (Strings.isEmpty(refs)) {
+      return null;
+    }
+    String value = Strings.trimToNull(refs.get(0));
+    if (value == null) {
+      return null;
+    }
+    if (value.startsWith("connection:")) {
+      value = value.substring("connection:".length());
+    }
+    int slash = value.indexOf('/');
+    return slash >= 0 && slash + 1 < value.length() ? value.substring(slash + 1) : value;
+  }
+
+  private static SchemaCompatibility toSchemaCompatibility(StreamModel.SchemaCompatibilityMode mode) {
+    if (mode == null) {
+      return SchemaCompatibility.BACKWARDS;
+    }
+    return switch (mode) {
+      case NONE -> SchemaCompatibility.NONE;
+      case FORWARD -> SchemaCompatibility.FORWARD;
+      case FULL, TRANSITIVE_FULL -> SchemaCompatibility.FULL;
+      case BACKWARD, TRANSITIVE_BACKWARD -> SchemaCompatibility.BACKWARDS;
     };
   }
 
-  private void materializeViewTarget(
-      DuckdbSession session, DefinitionDataset definition, String querySql) {
-    DefinitionDataset.Target target =
-        Objects.requireNonNull(definition.view().target(), "definition.view.target");
-    ViewTargetType targetType = parseTargetType(target.targetType());
-    String tableName = Strings.requireNonBlank(target.duckdbTableName(), "view.target.duckdbTableName");
+  private static DefinitionStream.TransportType toDefinitionTransport(StreamModel.Transport value) {
+    return DefinitionStream.TransportType.AMPS;
+  }
 
-    if (targetType == ViewTargetType.DUCKDB_TABLE
-        || targetType == ViewTargetType.DUCKDB_TABLE_AND_PARQUET) {
-      session.exec("create or replace table " + quoteIdentifier(tableName) + " as " + querySql);
+  private static StreamModel.Transport fromDefinitionTransport(DefinitionStream.TransportType value) {
+    return StreamModel.Transport.AMPS;
+  }
+
+  private static DefinitionStream.SerdeType toDefinitionSerde(StreamModel.Serde value) {
+    if (value == null) {
+      return DefinitionStream.SerdeType.JSON;
+    }
+    return switch (value) {
+      case NVFIX -> DefinitionStream.SerdeType.NVFIX;
+      case JSON -> DefinitionStream.SerdeType.JSON;
+      case PROTOBUF -> DefinitionStream.SerdeType.PROTOBUF;
+      case BYTES -> DefinitionStream.SerdeType.BYTES;
+    };
+  }
+
+  private static StreamModel.Serde fromDefinitionSerde(DefinitionStream.SerdeType value) {
+    if (value == null) {
+      return StreamModel.Serde.JSON;
+    }
+    return switch (value) {
+      case NVFIX -> StreamModel.Serde.NVFIX;
+      case JSON, UNKNOWN -> StreamModel.Serde.JSON;
+      case PROTOBUF -> StreamModel.Serde.PROTOBUF;
+      case BYTES -> StreamModel.Serde.BYTES;
+    };
+  }
+
+  private static DefinitionStream.SchemaCompatibilityMode toDefinitionCompatibility(StreamModel.SchemaCompatibilityMode value) {
+    if (value == null) {
+      return DefinitionStream.SchemaCompatibilityMode.BACKWARD;
+    }
+    return switch (value) {
+      case NONE -> DefinitionStream.SchemaCompatibilityMode.NONE;
+      case BACKWARD -> DefinitionStream.SchemaCompatibilityMode.BACKWARD;
+      case FORWARD -> DefinitionStream.SchemaCompatibilityMode.FORWARD;
+      case FULL -> DefinitionStream.SchemaCompatibilityMode.FULL;
+      case TRANSITIVE_BACKWARD -> DefinitionStream.SchemaCompatibilityMode.TRANSITIVE_BACKWARD;
+      case TRANSITIVE_FULL -> DefinitionStream.SchemaCompatibilityMode.TRANSITIVE_FULL;
+    };
+  }
+
+  private static StreamModel.SchemaCompatibilityMode fromDefinitionCompatibility(DefinitionStream.SchemaCompatibilityMode value) {
+    if (value == null) {
+      return StreamModel.SchemaCompatibilityMode.BACKWARD;
+    }
+    return switch (value) {
+      case NONE -> StreamModel.SchemaCompatibilityMode.NONE;
+      case BACKWARD, UNKNOWN -> StreamModel.SchemaCompatibilityMode.BACKWARD;
+      case FORWARD -> StreamModel.SchemaCompatibilityMode.FORWARD;
+      case FULL -> StreamModel.SchemaCompatibilityMode.FULL;
+      case TRANSITIVE_BACKWARD -> StreamModel.SchemaCompatibilityMode.TRANSITIVE_BACKWARD;
+      case TRANSITIVE_FULL -> StreamModel.SchemaCompatibilityMode.TRANSITIVE_FULL;
+    };
+  }
+
+  private static DefinitionStream.SchemaResolutionPolicy toDefinitionResolution(StreamModel.SchemaResolutionPolicy value) {
+    if (value == null) {
+      return DefinitionStream.SchemaResolutionPolicy.COMPATIBLE;
+    }
+    return switch (value) {
+      case EXACT_ID -> DefinitionStream.SchemaResolutionPolicy.EXACT_ID;
+      case LATEST -> DefinitionStream.SchemaResolutionPolicy.LATEST;
+      case COMPATIBLE -> DefinitionStream.SchemaResolutionPolicy.COMPATIBLE;
+    };
+  }
+
+  private static StreamModel.SchemaResolutionPolicy fromDefinitionResolution(DefinitionStream.SchemaResolutionPolicy value) {
+    if (value == null) {
+      return StreamModel.SchemaResolutionPolicy.COMPATIBLE;
+    }
+    return switch (value) {
+      case EXACT_ID -> StreamModel.SchemaResolutionPolicy.EXACT_ID;
+      case LATEST -> StreamModel.SchemaResolutionPolicy.LATEST;
+      case COMPATIBLE, UNKNOWN -> StreamModel.SchemaResolutionPolicy.COMPATIBLE;
+    };
+  }
+
+  private static Map<String, byte[]> resolvePublishHeaders(StreamModel model, StreamPublishOptions options) {
+    Map<String, byte[]> headers = new LinkedHashMap<>();
+    if (options != null && Strings.isNotEmpty(options.headers())) {
+      options.headers().forEach(
+          (key, value) -> {
+            String normalizedKey = Strings.trimToNull(key);
+            if (normalizedKey != null && value != null) {
+              headers.put(normalizedKey, value.clone());
+            }
+          });
+    }
+    String schemaId = Strings.trimToNull(options == null ? null : options.schemaId());
+    if (schemaId == null) {
+      schemaId = Strings.trimToNull(model.schemaId());
+    }
+    if (schemaId != null) {
+      headers.put(HEADER_SCHEMA_ID, schemaId.getBytes(StandardCharsets.UTF_8));
+    }
+    String messageType = Strings.trimToNull(options == null ? null : options.messageType());
+    if (messageType == null) {
+      messageType = Strings.trimToNull(model.messageType());
+    }
+    if (messageType != null) {
+      headers.put(HEADER_MESSAGE_TYPE, messageType.getBytes(StandardCharsets.UTF_8));
+    }
+    String contentType = Strings.trimToNull(options == null ? null : options.contentType());
+    if (contentType == null) {
+      contentType = contentTypeFor(model.serde());
+    }
+    if (contentType != null) {
+      headers.put(HEADER_CONTENT_TYPE, contentType.getBytes(StandardCharsets.UTF_8));
+    }
+    return headers.isEmpty() ? Map.of() : Map.copyOf(headers);
+  }
+
+  private static String encodeOptions(Map<String, byte[]> headers) {
+    if (Strings.isEmpty(headers)) {
+      return null;
+    }
+    List<String> values = new ArrayList<>();
+    for (Map.Entry<String, byte[]> entry : headers.entrySet()) {
+      String key = Strings.trimToNull(entry.getKey());
+      byte[] value = entry.getValue();
+      if (key == null || value == null) {
+        continue;
+      }
+      values.add(key + "=" + new String(value, StandardCharsets.UTF_8));
+    }
+    return values.isEmpty() ? null : String.join(";", values);
+  }
+
+  private static String contentTypeFor(StreamModel.Serde serde) {
+    if (serde == null) {
+      return null;
+    }
+    return switch (serde) {
+      case NVFIX -> "application/nvfix";
+      case JSON -> "application/json";
+      case PROTOBUF -> "application/x-protobuf";
+      case BYTES -> "application/octet-stream";
+    };
+  }
+
+  private static byte[] encodePayload(StreamModel model, Object value) {
+    if (value instanceof byte[] bytes) {
+      return bytes;
+    }
+    return switch (model.serde()) {
+      case NVFIX -> encodeNvfix(toMap(value)).getBytes(StandardCharsets.UTF_8);
+      case JSON -> {
+        try {
+          yield MAPPER.writeValueAsBytes(value);
+        } catch (Exception ex) {
+          throw new IllegalArgumentException("Failed to encode JSON payload", ex);
+        }
+      }
+      case PROTOBUF -> throw new IllegalArgumentException("PROTOBUF publish requires byte[] payload");
+      case BYTES -> throw new IllegalArgumentException("BYTES publish requires byte[] payload");
+    };
+  }
+
+  private static <T> T decodePayload(StreamModel model, byte[] payload, Class<T> targetType) {
+    Objects.requireNonNull(targetType, "targetType");
+    byte[] bytes = payload == null ? new byte[0] : payload;
+    if (targetType == byte[].class) {
+      return targetType.cast(bytes);
+    }
+    if (targetType == String.class) {
+      return targetType.cast(new String(bytes, StandardCharsets.UTF_8));
+    }
+    return switch (model.serde()) {
+      case JSON -> {
+        try {
+          yield MAPPER.readValue(bytes, targetType);
+        } catch (Exception ex) {
+          throw new IllegalArgumentException("Failed to decode JSON payload", ex);
+        }
+      }
+      case NVFIX -> {
+        Map<String, String> decoded = decodeNvfix(bytes);
+        if (targetType == Object.class || Map.class.isAssignableFrom(targetType)) {
+          @SuppressWarnings("unchecked")
+          T cast = (T) decoded;
+          yield cast;
+        }
+        yield MAPPER.convertValue(decoded, targetType);
+      }
+      case PROTOBUF, BYTES -> throw new UnsupportedOperationException("Typed decode for " + model.serde() + " supports byte[] or String only");
+    };
+  }
+
+  private static Map<String, Object> toMap(Object value) {
+    if (value instanceof Map<?, ?> map) {
+      Map<String, Object> out = new LinkedHashMap<>();
+      for (Map.Entry<?, ?> entry : map.entrySet()) {
+        String key = Strings.trimToNull(entry.getKey() == null ? null : String.valueOf(entry.getKey()));
+        if (key != null && entry.getValue() != null) {
+          out.put(key, entry.getValue());
+        }
+      }
+      return out;
+    }
+    return MAPPER.convertValue(value, Map.class);
+  }
+
+  private static String encodeNvfix(Map<String, Object> fields) {
+    if (Strings.isEmpty(fields)) {
+      throw new IllegalArgumentException("NVFIX payload requires fields");
+    }
+    StringBuilder builder = new StringBuilder();
+    for (Map.Entry<String, Object> entry : fields.entrySet()) {
+      String key = Strings.trimToNull(entry.getKey());
+      if (key == null || entry.getValue() == null) {
+        continue;
+      }
+      builder.append(key).append('=').append(entry.getValue()).append('\u0001');
+    }
+    if (builder.isEmpty()) {
+      throw new IllegalArgumentException("NVFIX payload requires at least one non-null field");
+    }
+    return builder.toString();
+  }
+
+  private static Map<String, String> decodeNvfix(byte[] payload) {
+    Map<String, String> out = new LinkedHashMap<>();
+    String text = payload == null ? "" : new String(payload, StandardCharsets.UTF_8);
+    for (String token : text.split("\u0001")) {
+      String normalized = Strings.trimToNull(token);
+      if (normalized == null) {
+        continue;
+      }
+      int equals = normalized.indexOf('=');
+      if (equals <= 0 || equals + 1 >= normalized.length()) {
+        continue;
+      }
+      String key = Strings.trimToNull(normalized.substring(0, equals));
+      String value = Strings.trimToNull(normalized.substring(equals + 1));
+      if (key != null && value != null) {
+        out.put(key, value);
+      }
+    }
+    return out;
+  }
+
+  private static Map<String, byte[]> parseHeaders(AmpsConnection.AmpsMessage message) {
+    String raw = Strings.trimToNull(message == null ? null : message.options());
+    if (raw == null) {
+      return Map.of();
+    }
+    Map<String, byte[]> headers = new LinkedHashMap<>();
+    for (String token : raw.split(";")) {
+      String normalized = Strings.trimToNull(token);
+      if (normalized == null) {
+        continue;
+      }
+      int equals = normalized.indexOf('=');
+      if (equals <= 0 || equals + 1 >= normalized.length()) {
+        continue;
+      }
+      String key = Strings.trimToNull(normalized.substring(0, equals));
+      String value = Strings.trimToNull(normalized.substring(equals + 1));
+      if (key != null && value != null) {
+        headers.put(key, value.getBytes(StandardCharsets.UTF_8));
+      }
+    }
+    return headers.isEmpty() ? Map.of() : Map.copyOf(headers);
+  }
+
+  private static long messageTimestamp(AmpsConnection.AmpsMessage message) {
+    Message raw = message == null ? null : message.raw();
+    if (raw == null) {
+      return System.currentTimeMillis();
+    }
+    String text = Strings.trimToNull(raw.getTimestamp());
+    if (text == null) {
+      return System.currentTimeMillis();
+    }
+    try {
+      return Instant.parse(text).toEpochMilli();
+    } catch (Exception ignore) {
+    }
+    try {
+      return Long.parseLong(text);
+    } catch (Exception ignore) {
+    }
+    return System.currentTimeMillis();
+  }
+
+  private static boolean isBoundary(AmpsConnection.AmpsMessage message) {
+    Message raw = message == null ? null : message.raw();
+    if (raw == null) {
+      return false;
+    }
+    return raw.getCommand() == Message.Command.GroupBegin || raw.getCommand() == Message.Command.GroupEnd;
+  }
+
+  private record StreamLookup(String namespace, String name) {}
+
+  @FunctionalInterface
+  private interface MessageConsumer {
+    void onMessage(StreamMessage message);
+  }
+
+  private final class StreamRuntime implements Stream {
+    private final StreamModel model;
+    private final AmpsConnection amps;
+    private final Runnable onClose;
+    private final DataStatusPublisher statusPublisher;
+    private final AtomicLong messagesPublished = new AtomicLong(0L);
+    private final AtomicLong messagesReceived = new AtomicLong(0L);
+    private final CopyOnWriteArrayList<ManagedSubscription> subscriptions = new CopyOnWriteArrayList<>();
+    private final AtomicBoolean closed = new AtomicBoolean(false);
+
+    private StreamRuntime(StreamModel model, AmpsConnection amps, Runnable onClose) {
+      this.model = model;
+      this.amps = amps;
+      this.onClose = onClose == null ? () -> {} : onClose;
+      this.statusPublisher = createDataStatusPublisher(model);
+      if (statusPublisher != null) {
+        statusPublisher.start();
+        statusPublisher.publishOnline("stream runtime opened");
+      }
     }
 
-    if (targetType == ViewTargetType.PARQUET_SNAPSHOT
-        || targetType == ViewTargetType.DUCKDB_TABLE_AND_PARQUET) {
-      Path snapshotFile = resolveSnapshotFile(target.parquetPath());
+    @Override
+    public StreamPublishResult publish(byte[] payload, StreamPublishOptions options) {
+      ensureOpen();
       try {
-        Files.createDirectories(snapshotFile.getParent());
-        Files.deleteIfExists(snapshotFile);
+        String encodedOptions = encodeOptions(resolvePublishHeaders(model, options));
+        amps.publish(model.address().topic(), payload == null ? new byte[0] : payload, encodedOptions);
+        long published = messagesPublished.incrementAndGet();
+        if (statusPublisher != null) {
+          statusPublisher.putTag("messagesPublished", Long.toString(published));
+        }
+        return new StreamPublishResult(model.streamId(), true, model.address().topic());
       } catch (Exception ex) {
-        throw new IllegalStateException(
-            "Failed to prepare view parquet snapshot path: " + snapshotFile, ex);
-      }
-      String sourceSql =
-          targetType == ViewTargetType.DUCKDB_TABLE_AND_PARQUET
-              ? "select * from " + quoteIdentifier(tableName)
-              : "select * from (" + querySql + ") as __fabric_view_snapshot";
-      session.exec(
-          "copy ("
-              + sourceSql
-              + ") to '"
-              + escapeSqlLiteral(snapshotFile.toString().replace('\\', '/'))
-              + "' (format parquet)");
-    }
-  }
-
-  private static Path resolveSnapshotFile(String parquetPath) {
-    String normalized = Strings.requireNonBlank(parquetPath, "view.target.parquetPath");
-    Path path = Path.of(normalized).toAbsolutePath().normalize();
-    String name = Strings.firstNonBlank(path.getFileName() == null ? null : path.getFileName().toString(), "");
-    if (name.toLowerCase(Locale.ROOT).endsWith(".parquet")) {
-      return path;
-    }
-    return path.resolve(SNAPSHOT_FILE_NAME);
-  }
-
-  private static long queryRowCount(
-      DuckdbSession session, DefinitionDataset definition, String querySql) {
-    DefinitionDataset.Target target = definition.view().target();
-    ViewTargetType targetType = parseTargetType(target == null ? null : target.targetType());
-    String sql;
-    if (targetType == ViewTargetType.DUCKDB_TABLE
-        || targetType == ViewTargetType.DUCKDB_TABLE_AND_PARQUET) {
-      String tableName =
-          Strings.requireNonBlank(
-              target == null ? null : target.duckdbTableName(), "view.target.duckdbTableName");
-      sql = "select count(*) as row_count from " + quoteIdentifier(tableName);
-    } else {
-      sql = "select count(*) as row_count from (" + querySql + ") as __fabric_view_count";
-    }
-
-    try (java.sql.Statement statement = session.createStatement();
-        ResultSet resultSet = statement.executeQuery(sql)) {
-      if (!resultSet.next()) {
-        return 0L;
-      }
-      return resultSet.getLong(1);
-    } catch (SQLException ex) {
-      throw new IllegalStateException("Failed to query view row count: " + ex.getMessage(), ex);
-    }
-  }
-
-  private List<DatasetId> parseDependencies(List<String> dependencies, String datasetId) {
-    return ViewManagerImplRefresh.parseDependencies(
-        dependencies, datasetId, this::resolveDependencyDatasetId);
-  }
-
-  private List<DefinitionDataset> resolveDependencyDefinitions(List<DatasetId> dependencies) {
-    if (dependencies == null || dependencies.isEmpty()) {
-      return List.of();
-    }
-    List<DefinitionDataset> resolved = new ArrayList<>(dependencies.size());
-    for (DatasetId dependency : dependencies) {
-      resolved.add(resolveDatasetDefinition(dependency));
-    }
-    return List.copyOf(resolved);
-  }
-
-  private void upsertDataset(DefinitionDataset definition, String context) {
-    try (DiscoveryCache.ConfigCacheTx tx = DiscoveryCache.beginTx(context)) {
-      DiscoveryCache.upsertTx(tx, definition);
-      DiscoveryCache.commitTx(tx);
-    }
-  }
-
-  private DefinitionDataset withRunningRefresh(DefinitionDataset definition, String startedUtc) {
-    DefinitionDataset.View existingView = Objects.requireNonNull(definition.view(), "definition.view");
-    DefinitionDataset.LastRefresh lastRefresh =
-        new DefinitionDataset.LastRefresh(
-            startedUtc,
-            null,
-            null,
-            "RUNNING",
-            null,
-            null,
-            Map.of(),
-            null);
-    DefinitionDataset.View updatedView =
-        new DefinitionDataset.View(
-            existingView.querySql(),
-            existingView.dependencies(),
-            existingView.refresh(),
-            existingView.target(),
-            existingView.schemaName(),
-            existingView.schemaCompatibility(),
-            lastRefresh);
-    return new DefinitionDataset(
-        updatedEnvelope(definition.envelope(), DEFAULT_ACTOR),
-        definition.type(),
-        definition.namespace(),
-        definition.binding(),
-        updatedView);
-  }
-
-  private DefinitionDataset withTerminalRefresh(
-      DefinitionDataset definition,
-      String startedUtc,
-      String endedUtc,
-      long durationMillis,
-      String status,
-      String errorMessage,
-      Long rowCount,
-      Map<String, String> inputFingerprints,
-      String outputSnapshot) {
-    DefinitionDataset.View existingView = Objects.requireNonNull(definition.view(), "definition.view");
-    DefinitionDataset.LastRefresh lastRefresh =
-        new DefinitionDataset.LastRefresh(
-            startedUtc,
-            endedUtc,
-            durationMillis,
-            Strings.firstNonBlank(Strings.trimToNull(status), "FAILED"),
-            Strings.trimToNull(errorMessage),
-            rowCount,
-            inputFingerprints == null ? Map.of() : inputFingerprints,
-            Strings.trimToNull(outputSnapshot));
-    DefinitionDataset.View updatedView =
-        new DefinitionDataset.View(
-            existingView.querySql(),
-            existingView.dependencies(),
-            existingView.refresh(),
-            existingView.target(),
-            existingView.schemaName(),
-            existingView.schemaCompatibility(),
-            lastRefresh);
-    return new DefinitionDataset(
-        updatedEnvelope(definition.envelope(), DEFAULT_ACTOR),
-        definition.type(),
-        definition.namespace(),
-        definition.binding(),
-        updatedView);
-  }
-
-  private DatasetId resolveDependencyDatasetId(String dependency, String ownerDatasetId) {
-    try {
-      return DatasetId.parse(dependency);
-    } catch (RuntimeException ignored) {
-    }
-    try {
-      DefinitionDataset resolvedView = resolveViewDefinition(dependency);
-      return DatasetId.parse(canonicalDatasetId(resolvedView));
-    } catch (RuntimeException ex) {
-      throw new IllegalStateException(
-          "Invalid view dependency value="
-              + dependency
-              + " viewDataset="
-              + ownerDatasetId
-              + " reason="
-              + ex.getMessage(),
-          ex);
-    }
-  }
-
-  private Map<String, List<String>> buildViewDependencyGraph() {
-    List<DefinitionDataset> definitions = listViewDefinitions();
-    definitions.sort(Comparator.comparing(ViewManagerImpl::canonicalDatasetId, String.CASE_INSENSITIVE_ORDER));
-    LinkedHashMap<String, List<String>> graph = new LinkedHashMap<>();
-    for (DefinitionDataset definition : definitions) {
-      String datasetId = canonicalDatasetId(definition);
-      List<String> dependencies = new ArrayList<>();
-      for (DatasetId dependency : parseDependencies(definition.view().dependencies(), datasetId)) {
-        dependencies.add(dependency.toString());
-      }
-      dependencies.sort(String.CASE_INSENSITIVE_ORDER);
-      graph.put(datasetId, List.copyOf(dependencies));
-    }
-    return Map.copyOf(graph);
-  }
-
-  private Map<String, String> buildInputFingerprints(List<DatasetId> dependencies) {
-    return ViewManagerImplRefresh.buildInputFingerprints(dependencies, this::resolveDatasetDefinition);
-  }
-
-  private void writeViewCheckpoint(
-      String datasetId, String status, String refreshEndUtc, long durationMs, Long rowCount, String error) {
-    ViewManagerImplRefresh.writeViewCheckpoint(
-        checkpointStore, group, datasetId, status, refreshEndUtc, durationMs, rowCount, error);
-  }
-
-  private static String truncateError(String error) {
-    return ViewManagerImplRefresh.truncateError(error, MAX_ERROR_CHARS);
-  }
-
-  private static DefinitionEnvelope updatedEnvelope(DefinitionEnvelope envelope, String actor) {
-    String now = Instant.now().toString();
-    return new DefinitionEnvelope(
-        envelope.group(),
-        DefinitionType.DATASET,
-        envelope.name(),
-        envelope.uuid(),
-        envelope.enabled(),
-        envelope.lifecycleStatus(),
-        envelope.createdTimeUtc(),
-        envelope.createdBy(),
-        now,
-        Strings.firstNonBlank(actor, DEFAULT_ACTOR));
-  }
-
-  private DefinitionDataset resolveViewDefinition(String viewNameOrDatasetId) {
-    String normalized = Strings.requireNonBlank(viewNameOrDatasetId, "viewName");
-    if (normalized.regionMatches(true, 0, "dataset:", 0, "dataset:".length())) {
-      DefinitionDataset definition = resolveDatasetDefinition(DatasetId.parse(normalized));
-      if (definition.view() == null) {
-        throw new IllegalArgumentException("Dataset is not a view: " + normalized);
-      }
-      return definition;
-    }
-
-    List<DefinitionDataset> candidates = new ArrayList<>();
-    for (DefinitionDataset definition : listViewDefinitions()) {
-      String envelopeName =
-          Strings.requireNonBlank(
-              definition.envelope() == null ? null : definition.envelope().name(),
-              "view.envelope.name");
-      if (normalized.contains("/")) {
-        if (normalized.equals(envelopeName)) {
-          candidates.add(definition);
+        if (statusPublisher != null) {
+          statusPublisher.publishError(
+              "publish failed: "
+                  + Strings.firstNonBlank(
+                      Strings.trimToNull(ex.getMessage()), ex.getClass().getSimpleName()));
         }
-      } else if (normalized.equals(datasetBaseName(definition))) {
-        candidates.add(definition);
-      }
-    }
-
-    if (candidates.isEmpty()) {
-      throw new IllegalArgumentException("Unknown view: " + group + "/" + normalized);
-    }
-    if (candidates.size() > 1) {
-      List<String> ids = new ArrayList<>();
-      for (DefinitionDataset candidate : candidates) {
-        ids.add(canonicalDatasetId(candidate));
-      }
-      ids.sort(String.CASE_INSENSITIVE_ORDER);
-      throw new IllegalArgumentException(
-          "Ambiguous view name '" + normalized + "'. Candidates=" + ids);
-    }
-    return candidates.get(0);
-  }
-
-  private List<DefinitionDataset> listViewDefinitions() {
-    List<DefinitionDataset> listed = new ArrayList<>(DiscoveryCache.list(DefinitionDataset.class, group));
-    List<DefinitionDataset> filtered = new ArrayList<>();
-    for (DefinitionDataset definition : listed) {
-      if (definition != null && definition.view() != null) {
-        filtered.add(definition);
-      }
-    }
-    return filtered;
-  }
-
-  private DefinitionDataset resolveDatasetDefinition(DatasetId datasetId) {
-    for (DefinitionDataset definition : DiscoveryCache.list(DefinitionDataset.class, datasetId.group())) {
-      if (definition == null) {
-        continue;
-      }
-      DefinitionEnvelope envelope = definition.envelope();
-      if (envelope == null) {
-        continue;
-      }
-      if (!datasetId.group().equals(envelope.group())) {
-        continue;
-      }
-      if (!datasetId.namespace().equals(definition.namespace())) {
-        continue;
-      }
-      if (!datasetId.name().equals(datasetBaseName(definition))) {
-        continue;
-      }
-      return definition;
-    }
-    throw new IllegalStateException("Dataset definition not found: " + datasetId);
-  }
-
-  private static String requireSchemaName(DefinitionDataset definition) {
-    DefinitionDataset.View view = Objects.requireNonNull(definition.view(), "definition.view");
-    return Strings.requireNonBlank(view.schemaName(), "view.schemaName");
-  }
-
-  private static ViewStatus statusFromDefinition(DefinitionDataset definition, ViewRefreshState fallbackState) {
-    DefinitionDataset.View view = definition == null ? null : definition.view();
-    DefinitionDataset.LastRefresh last = view == null ? null : view.lastRefresh();
-    return new ViewStatus(
-        fallbackState,
-        last == null ? null : last.lastRefreshStartUtc(),
-        last == null ? null : last.lastRefreshEndUtc(),
-        last == null ? null : last.lastDurationMs(),
-        last == null ? null : last.lastStatus(),
-        last == null ? null : last.lastError(),
-        last == null ? null : last.lastRowCount(),
-        last == null ? Map.of() : last.lastInputFingerprints(),
-        last == null ? null : last.lastOutputSnapshot());
-  }
-
-  private static ViewTargetType parseTargetType(String token) {
-    String normalized = Strings.trimToNull(token);
-    if (normalized == null) {
-      return ViewTargetType.DUCKDB_TABLE;
-    }
-    try {
-      return ViewTargetType.valueOf(normalized.toUpperCase(Locale.ROOT));
-    } catch (IllegalArgumentException ex) {
-      return ViewTargetType.DUCKDB_TABLE;
-    }
-  }
-
-  private static ViewRefreshType parseRefreshType(String token) {
-    String normalized = Strings.trimToNull(token);
-    if (normalized == null) {
-      return ViewRefreshType.MANUAL;
-    }
-    try {
-      return ViewRefreshType.valueOf(normalized.toUpperCase(Locale.ROOT));
-    } catch (IllegalArgumentException ex) {
-      return ViewRefreshType.MANUAL;
-    }
-  }
-
-  private static String canonicalDatasetId(DefinitionDataset definition) {
-    DefinitionEnvelope envelope = Objects.requireNonNull(definition.envelope(), "definition.envelope");
-    String namespace = Strings.requireNonBlank(definition.namespace(), "definition.namespace");
-    String name = datasetBaseName(definition);
-    return DatasetId.of(envelope.group(), namespace, name).toString();
-  }
-
-  private static String datasetBaseName(DefinitionDataset definition) {
-    DefinitionEnvelope envelope = Objects.requireNonNull(definition.envelope(), "definition.envelope");
-    String namespace = Strings.requireNonBlank(definition.namespace(), "definition.namespace");
-    String envelopeName = Strings.requireNonBlank(envelope.name(), "definition.envelope.name");
-    String prefix = namespace + "/";
-    if (!envelopeName.startsWith(prefix)) {
-      throw new IllegalStateException(
-          "Dataset definition invalid envelope.name. Expected namespace/baseName with namespace='"
-              + namespace
-              + "' and envelope.name='"
-              + envelopeName
-              + "'");
-    }
-    String base = envelopeName.substring(prefix.length());
-    if (base.isBlank() || base.indexOf('/') >= 0) {
-      throw new IllegalStateException(
-          "Dataset definition invalid envelope.name. Expected namespace/baseName with namespace='"
-              + namespace
-              + "' and envelope.name='"
-              + envelopeName
-              + "'");
-    }
-    return base;
-  }
-
-  private static String safeDatasetId(DefinitionDataset definition) {
-    try {
-      return definition == null ? "<null>" : canonicalDatasetId(definition);
-    } catch (RuntimeException ex) {
-      return "<invalid>";
-    }
-  }
-
-  private static String summarizeFields(List<SchemaModel.Field> fields) {
-    List<String> parts = new ArrayList<>();
-    for (SchemaModel.Field field : fields) {
-      parts.add(formatField(field));
-    }
-    return parts.toString();
-  }
-
-  private static String formatField(SchemaModel.Field field) {
-    return field.getName() + ":" + field.getType() + ":" + (field.isNullable() ? "NULLABLE" : "NOT_NULL");
-  }
-
-  private static boolean isS3Uri(String value) {
-    return value.regionMatches(true, 0, "s3://", 0, "s3://".length())
-        || value.regionMatches(true, 0, "s3a://", 0, "s3a://".length());
-  }
-
-  private static String trimTrailingSlash(String value) {
-    int end = value.length();
-    while (end > 0 && value.charAt(end - 1) == '/') {
-      end--;
-    }
-    return end == value.length() ? value : value.substring(0, end);
-  }
-
-  private static String quoteIdentifier(String identifier) {
-    String normalized = Strings.requireNonBlank(identifier, "identifier");
-    return "\"" + normalized.replace("\"", "\"\"") + "\"";
-  }
-
-  private static String escapeSqlLiteral(String value) {
-    return value.replace("'", "''");
-  }
-
-
-  private final class ViewRuntimeImpl implements ViewRuntime {
-    private final Object lifecycleLock = new Object();
-    private final String datasetId;
-    private volatile ViewStatus status;
-    private volatile ScheduledFuture<?> periodicTask;
-
-    private ViewRuntimeImpl(String datasetId) {
-      this.datasetId = datasetId;
-      DefinitionDataset definition = resolveDatasetDefinition(DatasetId.parse(datasetId));
-      this.status = statusFromDefinition(definition, ViewRefreshState.STOPPED);
-    }
-
-    @Override
-    public ViewRuntime start() {
-      synchronized (lifecycleLock) {
-        DefinitionDataset definition = resolveDatasetDefinition(DatasetId.parse(datasetId));
-        ViewRefreshModel refresh = toRefreshModel(definition);
-        if (refresh.type() != ViewRefreshType.PERIODIC) {
-          return this;
-        }
-        if (periodicTask != null && !periodicTask.isCancelled() && !periodicTask.isDone()) {
-          return this;
-        }
-
-        long intervalMillis =
-            refresh.intervalMillis() == null || refresh.intervalMillis() <= 0L
-                ? 1000L
-                : refresh.intervalMillis();
-        if (refresh.runOnStart()) {
-          refreshGraph();
-        }
-        periodicTask =
-            scheduler.scheduleAtFixedRate(
-                () -> {
-                  try {
-                    refreshGraph();
-                  } catch (RuntimeException ex) {
-                    synchronized (lifecycleLock) {
-                      DefinitionDataset current = resolveDatasetDefinition(DatasetId.parse(datasetId));
-                      status = statusFromDefinition(current, ViewRefreshState.FAILED);
-                    }
-                  }
-                },
-                intervalMillis,
-                intervalMillis,
-                TimeUnit.MILLISECONDS);
-        status = statusFromDefinition(definition, ViewRefreshState.RUNNING);
-        return this;
+        throw new IllegalStateException("Failed to publish stream " + model.streamId(), ex);
       }
     }
 
     @Override
-    public void stop() {
-      synchronized (lifecycleLock) {
-        ScheduledFuture<?> task = periodicTask;
-        periodicTask = null;
-        if (task != null) {
-          task.cancel(false);
-        }
-        DefinitionDataset definition = resolveDatasetDefinition(DatasetId.parse(datasetId));
-        status = statusFromDefinition(definition, ViewRefreshState.STOPPED);
-      }
+    public StreamPublishResult publish(Object value, StreamPublishOptions options) {
+      return publish(encodePayload(model, value), options);
     }
 
     @Override
-    public ViewRefreshResult refresh() {
-      synchronized (lifecycleLock) {
-        try {
-          ViewRefreshResult result = refreshCanonicalDatasetId(datasetId, false);
-          DefinitionDataset definition = resolveDatasetDefinition(DatasetId.parse(datasetId));
-          status =
-              statusFromDefinition(
-                  definition,
-                  periodicTask == null || periodicTask.isCancelled()
-                      ? ViewRefreshState.STOPPED
-                      : ViewRefreshState.RUNNING);
-          return new ViewRefreshResult(
-              result.viewName(),
-              result.outputDatasetId(),
-              result.success(),
-              result.rowCount(),
-              result.durationMillis(),
-              result.message(),
-              status);
-        } catch (RuntimeException ex) {
-          DefinitionDataset definition = resolveDatasetDefinition(DatasetId.parse(datasetId));
-          status = statusFromDefinition(definition, ViewRefreshState.FAILED);
-          throw ex;
-        }
-      }
+    public StreamSubscription subscribeBytes(StreamBytesListener listener) {
+      Objects.requireNonNull(listener, "listener");
+      return subscribeInternal(StreamSubscribeOptions.defaults(), listener::onMessage);
     }
 
     @Override
-    public ViewRefreshResult refreshGraph() {
-      synchronized (lifecycleLock) {
-        try {
-          ViewRefreshResult result = refreshCanonicalDatasetId(datasetId, true);
-          DefinitionDataset definition = resolveDatasetDefinition(DatasetId.parse(datasetId));
-          status =
-              statusFromDefinition(
-                  definition,
-                  periodicTask == null || periodicTask.isCancelled()
-                      ? ViewRefreshState.STOPPED
-                      : ViewRefreshState.RUNNING);
-          return new ViewRefreshResult(
-              result.viewName(),
-              result.outputDatasetId(),
-              result.success(),
-              result.rowCount(),
-              result.durationMillis(),
-              result.message(),
-              status);
-        } catch (RuntimeException ex) {
-          DefinitionDataset definition = resolveDatasetDefinition(DatasetId.parse(datasetId));
-          status = statusFromDefinition(definition, ViewRefreshState.FAILED);
-          throw ex;
-        }
-      }
-    }
-
-    @Override
-    public ViewStatus status() {
-      synchronized (lifecycleLock) {
-        return status;
-      }
+    public <T> StreamSubscription subscribe(Class<T> targetType, StreamListener<T> listener, StreamSubscribeOptions options) {
+      Objects.requireNonNull(targetType, "targetType");
+      Objects.requireNonNull(listener, "listener");
+      StreamSubscribeOptions resolved = options == null ? StreamSubscribeOptions.defaults() : options;
+      return subscribeInternal(
+          resolved,
+          message -> listener.onMessage(decodePayload(model, message.payload(), targetType), message.headers()));
     }
 
     @Override
     public void close() {
-      stop();
+      if (!closed.compareAndSet(false, true)) {
+        return;
+      }
+      for (ManagedSubscription subscription : List.copyOf(subscriptions)) {
+        subscription.close();
+      }
+      subscriptions.clear();
+      try {
+        amps.close();
+      } catch (Exception ignore) {
+      }
+      if (statusPublisher != null) {
+        statusPublisher.putTag("messagesPublished", Long.toString(messagesPublished.get()));
+        statusPublisher.putTag("messagesReceived", Long.toString(messagesReceived.get()));
+        statusPublisher.close();
+      }
+      onClose.run();
     }
 
-    private ViewRefreshModel toRefreshModel(DefinitionDataset definition) {
-      DefinitionDataset.Refresh refresh =
-          definition.view() == null ? null : definition.view().refresh();
-      return ViewRefreshModel.builder()
-          .withType(parseRefreshType(refresh == null ? null : refresh.type()))
-          .withIntervalMillis(refresh == null ? null : refresh.intervalMillis())
-          .withRunOnStart(Boolean.TRUE.equals(refresh == null ? null : refresh.runOnStart()))
-          .build();
+    private ManagedSubscription subscribeInternal(StreamSubscribeOptions options, MessageConsumer consumer) {
+      ensureOpen();
+      AmpsConnection.SubscriptionSpec spec =
+          new AmpsConnection.SubscriptionSpec(
+              options.sowSubscribe(),
+              options.sowOnly(),
+              model.address().topic(),
+              options.options(),
+              options.filter(),
+              options.bookmarkStart(),
+              options.bookmarkFile());
+      AtomicBoolean subscriptionClosed = new AtomicBoolean(false);
+      try {
+        AmpsConnection.Subscription nativeSubscription =
+            amps.subscribe(
+                spec,
+                (AmpsConnection.SubscriptionListener)
+                    message -> {
+                  if (closed.get() || subscriptionClosed.get() || isBoundary(message)) {
+                    return;
+                  }
+                  byte[] payload = message.dataBytes();
+                  Map<String, byte[]> headers = parseHeaders(message);
+                  BasicStreamMessage streamMessage =
+                      new BasicStreamMessage(
+                          model.streamId(),
+                          Strings.firstNonBlank(message.topic(), model.address().topic()),
+                          messageTimestamp(message),
+                          headers,
+                          payload == null ? new byte[0] : payload);
+                  if (statusPublisher != null) {
+                    long received = messagesReceived.incrementAndGet();
+                    statusPublisher.putTag("messagesReceived", Long.toString(received));
+                  }
+                  consumer.onMessage(streamMessage);
+                });
+        ManagedSubscription managed = new ManagedSubscription(subscriptionClosed, nativeSubscription, () -> subscriptions.removeIf(ManagedSubscription::isClosed));
+        subscriptions.add(managed);
+        return managed;
+      } catch (Exception ex) {
+        throw new IllegalStateException("Failed to subscribe stream " + model.streamId(), ex);
+      }
+    }
+
+    private void ensureOpen() {
+      if (closed.get()) {
+        throw new IllegalStateException("Stream runtime is closed: " + model.streamId());
+      }
+    }
+  }
+
+  private static final class ManagedSubscription implements StreamSubscription {
+    private final AtomicBoolean closed;
+    private final AmpsConnection.Subscription delegate;
+    private final Runnable onClose;
+
+    private ManagedSubscription(AtomicBoolean closed, AmpsConnection.Subscription delegate, Runnable onClose) {
+      this.closed = closed;
+      this.delegate = delegate;
+      this.onClose = onClose == null ? () -> {} : onClose;
+    }
+
+    @Override
+    public void close() {
+      if (!closed.compareAndSet(false, true)) {
+        return;
+      }
+      try {
+        if (delegate != null) {
+          delegate.close();
+        }
+      } finally {
+        onClose.run();
+      }
+    }
+
+    @Override
+    public boolean isClosed() {
+      return closed.get();
+    }
+  }
+
+  private static final class BasicStreamMessage implements StreamMessage {
+    private final String streamId;
+    private final String topic;
+    private final long timestampEpochMillis;
+    private final Map<String, byte[]> headers;
+    private final byte[] payload;
+
+    private BasicStreamMessage(
+        String streamId,
+        String topic,
+        long timestampEpochMillis,
+        Map<String, byte[]> headers,
+        byte[] payload) {
+      this.streamId = streamId;
+      this.topic = topic;
+      this.timestampEpochMillis = timestampEpochMillis;
+      this.headers = headers == null ? Map.of() : Map.copyOf(headers);
+      this.payload = payload == null ? new byte[0] : payload.clone();
+    }
+
+    @Override
+    public String streamId() {
+      return streamId;
+    }
+
+    @Override
+    public String topic() {
+      return topic;
+    }
+
+    @Override
+    public long timestampEpochMillis() {
+      return timestampEpochMillis;
+    }
+
+    @Override
+    public Map<String, byte[]> headers() {
+      return headers;
+    }
+
+    @Override
+    public byte[] payload() {
+      return payload.clone();
     }
   }
 }
-
-
-
 
 
