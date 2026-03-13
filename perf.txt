@@ -1,909 +1,1204 @@
-package org.pronzato.fabric.lite.config;
-
-import com.crankuptheamps.client.Command;
-import com.crankuptheamps.client.HAClient;
-import com.crankuptheamps.client.Message;
-import com.crankuptheamps.client.MessageStream;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Locale;
-import java.util.stream.Stream;
-import org.pronzato.fabric.api.connectors.amps.factory.AmpsFactoryClient;
-import org.pronzato.fabric.api.connectors.amps.factory.AmpsFactoryOptions;
-
-public abstract class FabricConfig {
-  protected static final ObjectMapper MAPPER = new ObjectMapper();
-  protected static final String TOPIC = "/fabric/discovery";
-
-  private final String discovery;
-  private final String kerberosUsername;
-  private final String kerberosKeytab;
-  private final Path jsonRoot;
-
-  protected FabricConfig(
-      String discovery, String kerberosUsername, String kerberosKeytab, Path jsonRoot) {
-    this.discovery = requireNonBlank(discovery, "discovery");
-    this.kerberosUsername = requireNonBlank(kerberosUsername, "kerberosUsername");
-    this.kerberosKeytab = requireNonBlank(kerberosKeytab, "kerberosKeytab");
-    this.jsonRoot = jsonRoot == null ? Path.of("vault", "git", "dev") : jsonRoot;
+vault\git\dev\platform\app\studio.json
+{
+  "displayName" : "Studio",
+  "appType" : "APP",
+  "sessionType" : "PLATFORM",
+  "configCacheAdmin" : true,
+  "delegatedUserEnabled" : true,
+  "controlEnabled" : true,
+  "tags" : { },
+  "envelope" : {
+    "group" : "platform",
+    "type" : "APP",
+    "name" : "studio",
+    "uuid" : "90db3ec9-c221-4773-b54d-4bc6aeb9acb7",
+    "enabled" : true,
+    "lifecycleStatus" : "ACTIVE",
+    "createdTimeUtc" : "2026-02-12T01:00:00.000Z",
+    "createdBy" : "codex",
+    "updatedTimeUtc" : "2026-02-12T01:00:00.000Z",
+    "updatedBy" : "codex"
   }
+}
+===================================================================================
 
-  protected final HAClient connect(String clientName) throws Exception {
-    List<String> endpoints = parseDiscovery(discovery);
-    if (endpoints.isEmpty()) {
-      throw new IllegalArgumentException("No AMPS discovery endpoints configured.");
+vault\git\dev\platform\connection\amps-fabric-discovery.json
+{
+  "envelope" : {
+    "group" : "platform",
+    "type" : "CONNECTION",
+    "name" : "amps-fabric-discovery",
+    "uuid" : "a5c7d1e2-7d2a-4c7f-9f4d-7d8e7a1b6c31",
+    "enabled" : true,
+    "lifecycleStatus" : "ACTIVE",
+    "createdTimeUtc" : "2026-02-03T00:00:00.000Z",
+    "createdBy" : "Alice",
+    "updatedTimeUtc" : "2026-02-03T00:00:00.000Z",
+    "updatedBy" : "Alice"
+  },
+  "connectionType" : "AMPS",
+  "amps" : {
+    "uris" : [ "tcp://127.0.0.1:9607/amps/json", "tcp://127.0.0.1:9617/amps/json" ],
+    "instances" : [ {
+      "name" : "instance1",
+      "uris" : [ "tcp://127.0.0.1:9607/amps/json" ]
+    }, {
+      "name" : "instance2",
+      "uris" : [ "tcp://127.0.0.1:9617/amps/json" ]
+    } ],
+    "transport" : "tcp",
+    "messageType" : "json",
+    "kerberosEnabled" : true,
+    "kerberosService" : "HTTP",
+    "attributes" : {
+      "instances" : "instance1,instance2",
+      "purpose" : "amps-fabric-discovery",
+      "role" : "metadata-json"
     }
+  },
+  "physicalSites" : [ ],
+  "physical" : {
+    "connectionType" : "AMPS",
+    "uriOrEndpoint" : "tcp://127.0.0.1:9607/amps/json,tcp://127.0.0.1:9617/amps/json",
+    "options" : { },
+    "tags" : { }
+  },
+  "mode" : "PHYSICAL"
+}
+===================================================================================
 
-    AmpsFactoryOptions options = new AmpsFactoryOptions();
-    options.withKerberos(
-        kerberos ->
-            kerberos
-                .enabled(true)
-                .principal(kerberosUsername)
-                .keytab(Path.of(kerberosKeytab).toAbsolutePath().toString()));
 
-    HAClient client = AmpsFactoryClient.create(clientName, options);
-    try {
-      AmpsFactoryClient.connect(client, endpoints, options);
-      return client;
-    } catch (Exception ex) {
-      try {
-        client.close();
-      } catch (Exception ignored) {
-      }
-      throw ex;
-    }
-  }
 
-  protected final void clearTopic(HAClient client) throws Exception {
-    Command command = new Command("sow_delete");
-    command.setTopic(TOPIC);
-    command.setFilter("1=1");
-    try (MessageStream stream = client.execute(command)) {
-      for (Message ignored : stream) {
-        // consume stream to ensure command completes
-      }
-    }
-  }
+vault/git/dev/platform/connection/s3-fabric.json
+{
+  "envelope" : {
+    "group" : "platform",
+    "type" : "CONNECTION",
+    "name" : "s3-fabric",
+    "uuid" : "e9d6c3c8-5c76-41e6-8c7a-8a0d0e6f3c9b",
+    "enabled" : true,
+    "lifecycleStatus" : "ACTIVE",
+    "createdTimeUtc" : "2025-12-08T15:25:01.438Z",
+    "createdBy" : "Alice",
+    "updatedTimeUtc" : "2026-01-02T21:26:18.504Z",
+    "updatedBy" : "Alice"
+  },
+  "connectionType" : "S3",
+  "s3" : {
+    "region" : "us-east-2",
+    "bucket" : "pronz-fabric1",
+    "pathStyleAccess" : false,
+    "basePrefix" : "",
+    "attributes" : { },
+    "accessKeyIdEnc" : "123",
+    "secretAccessKeyEnc" : "xyz",
+    "kekAlias" : "default",
+    "encFormat" : "FABRIC_AES_GCM_V1"
+  },
+  "physicalSites" : [ ],
+  "client" : {
+    "physicalRef" : "platform/s3-storage",
+    "connectionRole" : "rw",
+    "options" : { },
+    "tags" : { }
+  },
+  "mode" : "CLIENT"
+}
+===================================================================================
 
-  protected final Path jsonRoot() {
-    return jsonRoot;
-  }
 
-  protected final List<Path> listJsonFiles() throws IOException {
-    if (Files.notExists(jsonRoot)) {
-      return List.of();
-    }
-    try (Stream<Path> stream = Files.walk(jsonRoot)) {
-      return stream
-          .filter(Files::isRegularFile)
-          .filter(path -> path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".json"))
-          .sorted(Comparator.comparing(Path::toString))
-          .toList();
-    }
-  }
 
-  protected final JsonNode parseOrThrow(String payload, String errorPrefix) {
-    try {
-      return MAPPER.readTree(payload);
-    } catch (Exception ex) {
-      throw new IllegalStateException(errorPrefix + " message=" + trim(ex.getMessage()), ex);
-    }
-  }
 
-  protected final EnvelopeKey extractEnvelope(JsonNode node, String sowKey, String payload) {
-    String group = pointerText(node, "/envelope/group");
-    String type = pointerText(node, "/envelope/type");
-    String name = pointerText(node, "/envelope/name");
 
-    if (group != null && type != null && name != null) {
-      return new EnvelopeKey(group, type, name);
-    }
+vault\git\dev\platform\connection\s3-storage.json
+{
+  "envelope" : {
+    "group" : "platform",
+    "type" : "CONNECTION",
+    "name" : "s3-storage",
+    "uuid" : "f8d5297f-a0c8-43d3-ba1d-dd1e10a7ec36",
+    "enabled" : true,
+    "lifecycleStatus" : "ACTIVE",
+    "createdTimeUtc" : "2025-10-11T16:26:42Z",
+    "createdBy" : "Alice",
+    "updatedTimeUtc" : "2026-01-02T21:26:18.506Z",
+    "updatedBy" : "Alice"
+  },
+  "connectionType" : "S3",
+  "s3" : {
+    "region" : "us-east-2",
+    "bucket" : "p-fabric1",
+    "pathStyleAccess" : false,
+    "basePrefix" : "",
+    "attributes" : { }
+  },
+  "physicalSites" : [ ],
+  "physical" : {
+    "connectionType" : "S3",
+    "uriOrEndpoint" : "s3://p-fabric1",
+    "regionOrLocation" : "us-east-2",
+    "options" : { },
+    "tags" : { }
+  },
+  "mode" : "PHYSICAL"
+}
+===================================================================================
 
-    String[] parts = parseCompositeSowKey(sowKey);
-    if (parts != null) {
-      String fromSowGroup = group != null ? group : parts[0];
-      String fromSowType = type != null ? type : parts[1];
-      String fromSowName = name != null ? name : parts[2];
-      if (fromSowGroup != null && fromSowType != null && fromSowName != null) {
-        return new EnvelopeKey(fromSowGroup, fromSowType, fromSowName);
-      }
-    }
 
-    throw new IllegalStateException(
-        "Missing envelope.group/type/name and unable to infer from sowKey="
-            + trim(sowKey)
-            + " payloadPrefix="
-            + abbreviate(payload, 120));
-  }
 
-  /**
-   * Default on-disk layout for legacy/other assets:
-   *   <root>/<group>/<type>/<name>.json
-   *
-   * DATASET / METASET folder layout is handled by Import/Export, not here.
-   */
-  protected final Path toFilePath(EnvelopeKey key) {
-    return jsonRoot
-        .resolve(safeDirectoryName(key.group()))
-        .resolve(safeDirectoryName(key.type()))
-        .resolve(safeFileName(key.name()) + ".json");
-  }
 
-  protected static String trim(String value) {
-    if (value == null) {
-      return null;
-    }
-    String trimmed = value.trim();
-    return trimmed.isEmpty() ? null : trimmed;
-  }
 
-  protected static boolean isBlank(String value) {
-    return value == null || value.trim().isEmpty();
-  }
 
-  protected static String safeFileName(String value) {
-    String trimmed = trim(value);
-    if (trimmed == null) {
-      return "unknown";
-    }
-    StringBuilder builder = new StringBuilder(trimmed.length());
-    for (int index = 0; index < trimmed.length(); index++) {
-      char ch = trimmed.charAt(index);
-      if (isInvalidPathChar(ch)) {
-        builder.append('_');
-      } else {
-        builder.append(ch);
-      }
-    }
-    String normalized = trimTrailingDotsAndSpaces(builder.toString());
-    return normalized.isBlank() ? "unknown" : normalized;
-  }
+vault\git\dev\platform\environment\environment.json
+{
+    "configId":  "platform-environment",
+    "effectiveConfigId":  "platform-environment",
+    "envelope":  {
+                     "group":  "platform",
+                     "type":  "ENVIRONMENT",
+                     "name":  "environment",
+                     "uuid":  "fd37ed58-964e-4d69-9eb4-4077a102c488",
+                     "enabled":  true,
+                     "lifecycleStatus":  "ACTIVE",
+                     "createdTimeUtc":  "2026-01-02T20:19:15.788Z",
+                     "createdBy":  "import/fixup",
+                     "updatedTimeUtc":  "2026-01-02T21:26:18.475Z",
+                     "updatedBy":  "import/fixup"
+                 },
+    "version":  1,
+    "environments":  [
+                         {
+                             "environment":  "DEV",
+                             "regions":  [
+                                             {
+                                                 "region":  "AMRS",
+                                                 "sites":  [
+                                                               {
+                                                                   "site":  "AMRS1",
+                                                                   "amps":  [
+                                                                                {
+                                                                                    "name":  "local-amps",
+                                                                                    "endpoints":  [
+                                                                                                      "127.0.0.1:9507"
+                                                                                                  ]
+                                                                                }
+                                                                            ]
+                                                               }
+                                                           ]
+                                             }
+                                         ]
+                         }
+                     ],
+    "entitlements":  {
+                         "implementation":  "SIMPLE",
+                         "defaultProviderId":  "platform-model",
+                         "providers":  [
+                                           {
+                                               "id":  "platform-model",
+                                               "type":  "platform-model",
+                                               "enabled":  true,
+                                               "config":  {
 
-  protected static String safeDirectoryName(String value) {
-    return safeFileName(value).toLowerCase(Locale.ROOT);
-  }
+                                                          }
+                                           },
+                                           {
+                                               "id":  "demo-static",
+                                               "type":  "demo-static",
+                                               "enabled":  true,
+                                               "config":  {
+                                                              "subjects":  {
+                                                                               "user:alice":  {
+                                                                                                  "directGroups":  [
+                                                                                                                       "platform"
+                                                                                                                   ],
+                                                                                                  "effectiveGroups":  [
+                                                                                                                          "platform",
+                                                                                                                          "lab"
+                                                                                                                      ],
+                                                                                                  "attributes":  {
+                                                                                                                     "desk":  "lab"
+                                                                                                                 }
+                                                                                              },
+                                                                               "user:bob":  {
+                                                                                                "directGroups":  [
+                                                                                                                     "desk1"
+                                                                                                                 ],
+                                                                                                "effectiveGroups":  [
+                                                                                                                        "desk1"
+                                                                                                                    ]
+                                                                                            },
+                                                                               "app:desk1/starter":  {
+                                                                                                         "effectiveGroups":  [
+                                                                                                                                 "desk1"
+                                                                                                                             ],
+                                                                                                         "serviceAccount":  true
+                                                                                                     },
+                                                                               "lenny":  {
+                                                                                             "directGroups":  [
+                                                                                                                  "demo-lab"
+                                                                                                              ],
+                                                                                             "effectiveGroups":  [
+                                                                                                                     "demo-lab"
+                                                                                                                 ]
+                                                                                         }
+                                                                           },
+                                                              "serviceAccounts":  [
+                                                                                      "app:desk1/starter"
+                                                                                  ],
+                                                              "attributes":  {
+                                                                                 "source":  "demo-static"
+                                                                             }
+                                                          }
+                                           }
+                                       ],
+                         "events":  {
+                                        "enabled":  true,
+                                        "transport":  "AMPS",
+                                        "amps":  {
+                                                     "connection":  "amps-fabric-discovery",
+                                                     "topic":  "/fabric/events/entitlements",
+                                                     "maxRetries":  3,
+                                                     "initialBackoffMillis":  100,
+                                                     "maxBackoffMillis":  2000,
+                                                     "backoffMultiplier":  2.0
+                                                 }
+                                    }
+                     },
+    "configs":  {
+                    "implementation":  "DEFAULT",
+                    "events":  {
+                                   "enabled":  true,
+                                   "transport":  "AMPS",
+                                   "amps":  {
+                                                "connection":  "amps-fabric-discovery",
+                                                "topic":  "/fabric/events/config",
+                                                "maxRetries":  3,
+                                                "initialBackoffMillis":  100,
+                                                "maxBackoffMillis":  2000,
+                                                "backoffMultiplier":  2.0
+                                            }
+                               }
+                },
+    "discovery":  {
+                      "scopeProjectionEnabled":  true,
+                      "scopeTopic":  "/fabric/entitlements",
+                      "includeGlobalEntitlements":  false
+                  },
+    "cadence":  {
+                    "serviceHeartbeatSeconds":  10,
+                    "serviceStatusSeconds":  30,
+                    "dataStatusSeconds":  30
+                }
+}
+===================================================================================
 
-  private static List<String> parseDiscovery(String value) {
-    String raw = trim(value);
-    if (raw == null) {
-      return List.of();
-    }
-    String[] parts = raw.split(",");
-    List<String> endpoints = new ArrayList<>(parts.length);
-    for (String part : parts) {
-      String item = trim(part);
-      if (item != null) {
-        endpoints.add(normalizeEndpoint(item));
-      }
-    }
-    return List.copyOf(endpoints);
-  }
 
-  private static String normalizeEndpoint(String value) {
-    if (value.contains("://")) {
-      return value;
-    }
-    int index = value.lastIndexOf(':');
-    if (index <= 0 || index >= value.length() - 1) {
-      throw new IllegalArgumentException(
-          "Invalid discovery endpoint '" + value + "'. Expected host:port or full URI.");
-    }
-    String host = value.substring(0, index).trim();
-    String portPart = value.substring(index + 1).trim();
-    if (host.isEmpty()) {
-      throw new IllegalArgumentException("Discovery endpoint host is required: " + value);
-    }
-    try {
-      Integer.parseInt(portPart);
-    } catch (NumberFormatException ex) {
-      throw new IllegalArgumentException("Discovery endpoint port is invalid: " + value, ex);
-    }
-    return "tcp://" + host + ":" + portPart + "/amps/json";
-  }
-
-  private static String pointerText(JsonNode node, String pointer) {
-    if (node == null) {
-      return null;
-    }
-    JsonNode value = node.at(pointer);
-    if (value == null || value.isMissingNode() || value.isNull()) {
-      return null;
-    }
-    return trim(value.asText(null));
-  }
-
-  /**
-   * Supports:
-   * - group|TYPE|name
-   * - group|DATASET|namespace|name
-   *
-   * Returns [group, type, name] for envelope inference.
-   */
-  private static String[] parseCompositeSowKey(String sowKey) {
-    String normalized = trim(sowKey);
-    if (normalized == null) {
-      return null;
-    }
-    String[] parts = normalized.split("\\|", -1);
-    if (parts.length < 3) {
-      return null;
-    }
-    String group = trim(parts[0]);
-    String type = trim(parts[1]);
-    if (group == null || type == null) {
-      return null;
-    }
-
-    String upper = type.toUpperCase(Locale.ROOT);
-    if ("DATASET".equals(upper) && parts.length >= 4) {
-      // group|DATASET|namespace|name
-      String name = trim(parts[3]);
-      if (name == null) {
-        return null;
-      }
-      return new String[] {group, type, name};
-    }
-
-    // group|TYPE|name
-    String name = trim(parts[2]);
-    if (name == null) {
-      return null;
-    }
-    return new String[] {group, type, name};
-  }
-
-  private static String abbreviate(String value, int max) {
-    if (value == null) {
-      return "";
-    }
-    String normalized = value.replace('\n', ' ').replace('\r', ' ');
-    if (normalized.length() <= max) {
-      return normalized;
-    }
-    return normalized.substring(0, Math.max(1, max)) + "...";
-  }
-
-  private static String requireNonBlank(String value, String field) {
-    String trimmed = trim(value);
-    if (trimmed == null) {
-      throw new IllegalArgumentException(field + " is required");
-    }
-    return trimmed;
-  }
-
-  protected record EnvelopeKey(String group, String type, String name) {}
-
-  private static boolean isInvalidPathChar(char ch) {
-    if (ch < 32) {
-      return true;
-    }
-    return switch (ch) {
-      case '/', '\\', '<', '>', ':', '"', '|', '?', '*' -> true;
-      default -> false;
-    };
-  }
-
-  private static String trimTrailingDotsAndSpaces(String value) {
-    if (value == null || value.isEmpty()) {
-      return value;
-    }
-    int end = value.length();
-    while (end > 0) {
-      char ch = value.charAt(end - 1);
-      if (ch == ' ' || ch == '.') {
-        end--;
-      } else {
-        break;
-      }
-    }
-    return end == value.length() ? value : value.substring(0, end);
+vault\git\dev\platform\krb5\krb5-data-lakes.json
+{
+  "config" : {
+    "type" : "KRB5",
+    "lines" : [ "# Data lake krb5.conf", "[libdefaults]", "  default_realm = FABRIC.TEST.REALM", "  dns_lookup_kdc = false", "  udp_preference_limit = 1", "", "[realms]", "  FABRIC.TEST.REALM = {", "    kdc = 127.0.0.1:61088", "    admin_server = 127.0.0.1:61088", "  }", "", "[domain_realm]", "  .fabric.test = FABRIC.TEST.REALM", "  fabric.test = FABRIC.TEST.REALM" ]
+  },
+  "configId" : "platform-krb5-data-lakes",
+  "effectiveConfigId" : "platform-krb5-data-lakes",
+  "envelope" : {
+    "group" : "platform",
+    "type" : "KRB5",
+    "name" : "krb5-data-lakes",
+    "uuid" : "f1622bbd-81bd-4391-aa16-e0eacdbdbaa4",
+    "enabled" : true,
+    "lifecycleStatus" : "ACTIVE",
+    "createdTimeUtc" : "2026-02-06T14:10:23.362Z",
+    "createdBy" : "codex",
+    "updatedTimeUtc" : "2026-02-06T14:10:23.362Z",
+    "updatedBy" : "codex"
   }
 }
 
 
 
+===================================================================================
+vault\git\dev\platform\platform\platform.json
+{
+    "configId":  "platform-platform",
+    "effectiveConfigId":  "platform-platform",
+    "envelope":  {
+                     "group":  "platform",
+                     "type":  "PLATFORM",
+                     "name":  "platform",
+                     "uuid":  "85b50e36-2fc2-4cc8-afa3-6f2f997d24d2",
+                     "enabled":  true,
+                     "lifecycleStatus":  "ACTIVE",
+                     "createdTimeUtc":  "2026-01-02T20:19:15.788Z",
+                     "createdBy":  "import/fixup",
+                     "updatedTimeUtc":  "2026-01-02T21:26:18.476Z",
+                     "updatedBy":  "import/fixup"
+                 },
+    "users":  {
+                  "alice":  {
+                                "id":  "alice",
+                                "firstName":  "Alice",
+                                "lastName":  "P",
+                                "email":  "alice@corp.com"
+                            },
+                  "bella":  {
+                                "id":  "bella",
+                                "firstName":  "Bella",
+                                "lastName":  "B",
+                                "email":  "bella@corp.com"
+                            },
+                  "bob":  {
+                              "id":  "bob",
+                              "firstName":  "Bob",
+                              "lastName":  "T",
+                              "email":  "bob@corp.com"
+                          },
+                  "charlie":  {
+                                  "id":  "charlie",
+                                  "firstName":  "Charlie",
+                                  "lastName":  "B",
+                                  "email":  "charlie@corp.com"
+                              },
+                  "lenny":  {
+                                "id":  "lenny",
+                                "firstName":  "Lenny",
+                                "lastName":  "L",
+                                "email":  "lenny@corp.com"
+                            }
+              },
+    "services":  {
+                     "dcore":  {
+                                   "id":  "dcore",
+                                   "displayName":  "dcore"
+                               },
+                     "dfabric":  {
+                                     "id":  "dfabric",
+                                     "displayName":  "dfabric"
+                                 },
+                     "dlab":  {
+                                  "id":  "dlab",
+                                  "displayName":  "dlab"
+                              }
+                 },
+    "root":  {
+                 "name":  "root",
+                 "nodeName":  "root",
+                 "displayName":  "root",
+                 "type":  "OU",
+                 "description":  "Synthetic root for the organization tree",
+                 "ous":  [
+                             {
+                                 "name":  "fabric",
+                                 "nodeName":  "fabric",
+                                 "displayName":  "Fabric",
+                                 "type":  "OU",
+                                 "description":  "Fabric platform organizational unit",
+                                 "groups":  [
+                                                {
+                                                    "name":  "platform",
+                                                    "nodeName":  "platform",
+                                                    "displayName":  "Platform",
+                                                    "type":  "USER",
+                                                    "description":  "Platform operators group",
+                                                    "userIds":  [
+                                                                    "alice"
+                                                                ],
+                                                    "serviceIds":  [
+                                                                       "dfabric"
+                                                                   ]
+                                                },
+                                                {
+                                                    "name":  "lab",
+                                                    "nodeName":  "lab",
+                                                    "displayName":  "Lab",
+                                                    "type":  "USER",
+                                                    "description":  "Fabric lab users group",
+                                                    "userIds":  [
+                                                                    "lenny"
+                                                                ],
+                                                    "serviceIds":  [
+                                                                       "dlab"
+                                                                   ]
+                                                }
+                                            ]
+                             },
+                             {
+                                 "name":  "lob1",
+                                 "nodeName":  "lob1",
+                                 "displayName":  "Lob1",
+                                 "type":  "OU",
+                                 "description":  "Lob1 organizational unit",
+                                 "groups":  [
+                                                {
+                                                    "name":  "core",
+                                                    "nodeName":  "core",
+                                                    "displayName":  "Core",
+                                                    "type":  "USER",
+                                                    "description":  "Core team",
+                                                    "userIds":  [
+                                                                    "charlie"
+                                                                ],
+                                                    "serviceIds":  [
+
+                                                                   ]
+                                                }
+                                            ],
+                                 "ous":  [
+                                             {
+                                                 "name":  "group1",
+                                                 "nodeName":  "group1",
+                                                 "displayName":  "Group1",
+                                                 "type":  "OU",
+                                                 "description":  "Group1 sub-OU under Lob1",
+                                                 "groups":  [
+
+                                                            ],
+                                                 "ous":  [
+                                                             {
+                                                                 "name":  "group1_amrs",
+                                                                 "nodeName":  "group1_amrs",
+                                                                 "displayName":  "Group1 AMRS",
+                                                                 "type":  "OU",
+                                                                 "description":  "Group1 AMRS sub-OU",
+                                                                 "groups":  [
+                                                                                {
+                                                                                    "name":  "desk1",
+                                                                                    "nodeName":  "desk1",
+                                                                                    "displayName":  "Desk1",
+                                                                                    "type":  "USER",
+                                                                                    "description":  "Group1 Desk1 team",
+                                                                                    "userIds":  [
+                                                                                                    "bob"
+                                                                                                ],
+                                                                                    "serviceIds":  [
+
+                                                                                                   ]
+                                                                                },
+                                                                                {
+                                                                                    "name":  "desk2",
+                                                                                    "nodeName":  "desk2",
+                                                                                    "displayName":  "Desk2",
+                                                                                    "type":  "USER",
+                                                                                    "description":  "Group1 Desk2 team",
+                                                                                    "userIds":  [
+                                                                                                    "bella"
+                                                                                                ],
+                                                                                    "serviceIds":  [
+
+                                                                                                   ]
+                                                                                }
+                                                                            ]
+                                                             },
+                                                             {
+                                                                 "name":  "group1_emea",
+                                                                 "nodeName":  "group1_emea",
+                                                                 "displayName":  "Group1 EMEA",
+                                                                 "type":  "OU",
+                                                                 "description":  "Group1 EMEA sub-OU",
+                                                                 "groups":  [
+
+                                                                            ]
+                                                             },
+                                                             {
+                                                                 "name":  "group1_apac",
+                                                                 "nodeName":  "group1_apac",
+                                                                 "displayName":  "Group1 APAC",
+                                                                 "type":  "OU",
+                                                                 "description":  "Group1 APAC sub-OU",
+                                                                 "groups":  [
+
+                                                                            ]
+                                                             }
+                                                         ]
+                                             }
+                                         ]
+                             }
+                         ]
+             }
+}
 
 
-
-
-
-
-
-
-
-
-package org.pronzato.fabric.lite.config;
-
-import org.pronzato.fabric.api.control.discovery.DiscoveryUrl;
-import com.crankuptheamps.client.Command;
-import com.crankuptheamps.client.HAClient;
-import com.crankuptheamps.client.Message;
-import com.crankuptheamps.client.MessageStream;
-import com.fasterxml.jackson.databind.JsonNode;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.time.Duration;
-import java.util.ArrayList;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Locale;
-import java.util.Objects;
-import java.util.Set;
-import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
-import org.pronzato.fabric.api.control.discovery.definitions.Definition;
-
-public final class FabricConfigImport extends FabricConfig {
-  private FabricConfigImport(
-      String discovery, String kerberosUsername, String kerberosKeytab, Path jsonRoot) {
-    super(discovery, kerberosUsername, kerberosKeytab, jsonRoot);
+===================================================================================
+vault\git\dev\lab\app\client.json
+{
+  "displayName" : "Lab Client",
+  "appType" : "APP",
+  "delegatedUserEnabled" : false,
+  "controlEnabled" : true,
+  "instances" : {
+    "instance1" : {
+      "host" : "localhost"
+    }
+  },
+  "tags" : { },
+  "envelope" : {
+    "group" : "lab",
+    "type" : "APP",
+    "name" : "client",
+    "uuid" : "2d7a3e69-6db1-41f0-9d59-316ab18c24ee",
+    "enabled" : true,
+    "lifecycleStatus" : "ACTIVE",
+    "createdTimeUtc" : "2025-12-15T03:00:24.352Z",
+    "createdBy" : "codex",
+    "updatedTimeUtc" : "2026-01-02T21:26:18.457Z",
+    "updatedBy" : "codex"
   }
+}
 
-  public static void main(String[] args) {
-    String discovery = DiscoveryUrl.URL;
-    String kerberosUsername = "dfabric";
-    String kerberosKeytab = "vault/kerberos/dfabric.keytab";
-    Path jsonRoot = Path.of("vault", "git", "dev");
-
-    boolean wipe = true;
-    String envOverride = null;
-    for (String arg : args == null ? new String[0] : args) {
-      if ("--wipe".equals(arg)) {
-        wipe = true;
-      } else if (arg.startsWith("--env=")) {
-        envOverride = trim(arg.substring("--env=".length()));
-      } else if ("--help".equals(arg) || "-h".equals(arg)) {
-        printUsage();
-        return;
-      } else {
-        System.err.println("[LITE_CONFIG_IMPORT][ERROR] Unknown argument: " + arg);
-        printUsage();
-        System.exit(2);
-      }
+===================================================================================
+vault\git\dev\lab\app\server.json
+{
+  "displayName" : "Lab Server",
+  "appType" : "APP",
+  "delegatedUserEnabled" : false,
+  "controlEnabled" : true,
+  "instances" : {
+    "instance1" : {
+      "host" : "localhost"
     }
-
-    int code = 0;
-    try {
-      code = new FabricConfigImport(discovery, kerberosUsername, kerberosKeytab, jsonRoot).run(wipe, envOverride);
-    } catch (Exception ex) {
-      System.err.println("[LITE_CONFIG_IMPORT][ERROR] " + rootCauseMessage(ex));
-      code = 1;
-    }
-    if (code != 0) {
-      System.exit(code);
-    }
+  },
+  "tags" : { },
+  "envelope" : {
+    "group" : "lab",
+    "type" : "APP",
+    "name" : "server",
+    "uuid" : "f6ff9e93-c6f5-4cf2-b816-ea4f074bbe7e",
+    "enabled" : true,
+    "lifecycleStatus" : "ACTIVE",
+    "createdTimeUtc" : "2025-12-15T03:00:24.352Z",
+    "createdBy" : "codex",
+    "updatedTimeUtc" : "2026-01-02T21:26:18.464Z",
+    "updatedBy" : "codex"
   }
+}
 
-  private int run(boolean wipe, String envOverride) throws Exception {
-    long started = System.nanoTime();
-    ScanResult scan = scanInputFiles();
-    List<Path> files = scan.files();
-    List<ImportEntry> validated = new ArrayList<>(files.size());
-    boolean hasValidationErrors = false;
-    int duplicateKeys = 0;
-    LinkedHashSet<String> seenKeys = new LinkedHashSet<>();
+===================================================================================
+vault\git\dev\lab\app\data.json
+{
+  "displayName" : "Lab Data Service",
+  "appType" : "APP",
+  "delegatedUserEnabled" : false,
+  "controlEnabled" : true,
+  "tags" : {
+    "protocol" : "arrow_flight_sql",
+    "service" : "service-data"
+  },
+  "envelope" : {
+    "group" : "lab",
+    "type" : "APP",
+    "name" : "data",
+    "uuid" : "8ce8e413-341a-4afa-b6fd-eb93f4f02650",
+    "enabled" : true,
+    "lifecycleStatus" : "ACTIVE",
+    "createdTimeUtc" : "2026-01-09T19:11:06.136Z",
+    "createdBy" : "codex",
+    "updatedTimeUtc" : "2026-01-09T19:11:06.136Z",
+    "updatedBy" : "codex"
+  }
+}
 
-    System.out.println(
-        "[LiteConfigImport][Scan] env="
-            + scan.env()
-            + " groups="
-            + scan.groups()
-            + " schemasFiles="
-            + scan.schemasFiles()
-            + " configFiles="
-            + scan.configFiles());
-    System.out.println(
-        "[LITE_CONFIG_IMPORT][SCAN] root="
-            + jsonRoot().toAbsolutePath().normalize()
-            + " discoveredFiles="
-            + files.size());
-
-    for (Path file : files) {
-      String rawPayload = Files.readString(file, StandardCharsets.UTF_8);
-      String payload = stripUtf8Bom(rawPayload);
-      if (!Objects.equals(rawPayload, payload)) {
-        System.out.println("[LiteConfigImport][Sanitize] file=" + file + " strippedBom=true");
-      }
-      try {
-        JsonNode node = MAPPER.readTree(payload);
-        EnvelopeKey envelope = extractEnvelope(node, null, payload);
-        String envelopeKey = toEnvelopeKey(envelope);
-        String normalizedPayload = normalizePayload(node);
-
-        boolean duplicate = !seenKeys.add(envelopeKey);
-        if (duplicate) {
-          duplicateKeys++;
+===================================================================================
+vault\git\dev\lab\config\vwap.json
+{
+  "envelope": {
+    "group": "lab",
+    "type": "CONFIG",
+    "name": "config__vwap",
+    "uuid": "5ea64648-71a3-4950-9826-00ee9bc7ea2a",
+    "enabled": true,
+    "lifecycleStatus": "ACTIVE",
+    "createdTimeUtc": "2026-02-25T00:00:00Z",
+    "createdBy": "studio/demo",
+    "updatedTimeUtc": "2026-02-25T00:00:00Z",
+    "updatedBy": "studio/demo"
+  },
+  "recordType": "config",
+  "resourceId": "config:lab/vwap",
+  "id": "vwap",
+  "domain": "config",
+  "group": "lab",
+  "tags": [
+    "group:lab",
+    "config:vwap"
+  ],
+  "configId": "vwap",
+  "semantic": {
+    "title": "VWAP Base Strategy Config",
+    "description": "Baseline VWAP/TWAP execution parameter layer shared by lab trading strategies.",
+    "businessMeaning": "Establishes default participation, routing, and risk controls for algorithmic order execution.",
+    "domain": "trading",
+    "subdomain": "execution",
+    "tags": [
+      "config",
+      "vwap",
+      "execution",
+      "strategy"
+    ],
+    "aliases": [
+      "vwap-base-config"
+    ],
+    "keywords": [
+      "vwap",
+      "twap",
+      "strategy",
+      "execution"
+    ],
+    "ownership": {
+      "ownerId": "group:lab-trading",
+      "stewardId": "group:lab-trading",
+      "teamId": "group:lab",
+      "contactIds": [
+        "group:lab-trading"
+      ]
+    },
+    "dataShape": {
+      "type": "CONFIG",
+      "grain": "one strategy config document per {configId, layerId}",
+      "keyFields": [
+        "configId",
+        "layerId"
+      ],
+      "timeFields": [
+        "updatedTimeUtc"
+      ],
+      "measureFields": [
+        "maxParticipationPct",
+        "maxNotionalUsd"
+      ],
+      "dimensionFields": [
+        "participationMode",
+        "venuePreference"
+      ],
+      "fieldRoles": [
+        {
+          "fieldName": "maxParticipationPct",
+          "roleType": "MEASURE",
+          "businessTerm": "Maximum Participation Ratio",
+          "unit": "ratio",
+          "sensitivity": "INTERNAL"
+        },
+        {
+          "fieldName": "venuePreference",
+          "roleType": "DIMENSION",
+          "businessTerm": "Preferred Routing Venue Policy",
+          "unit": "none",
+          "sensitivity": "INTERNAL"
         }
-        validated.add(new ImportEntry(file, normalizedPayload, envelopeKey, duplicate));
-        System.out.println(
-            "[LiteConfigImport][Key] file="
-                + file
-                + " envelopeKey="
-                + envelopeKey
-                + " status="
-                + (duplicate ? "DUPLICATE" : "NEW"));
-      } catch (Exception ex) {
-        hasValidationErrors = true;
-        System.err.println(
-            "[LITE_CONFIG_IMPORT][ERROR] invalid-json path="
-                + file
-                + " message="
-                + rootCauseMessage(ex));
-      }
-    }
-
-    if (hasValidationErrors) {
-      System.err.println("[LITE_CONFIG_IMPORT][ABORT] JSON validation failed. Nothing published.");
-      return 2;
-    }
-
-    String env = isBlank(envOverride) ? scan.env() : envOverride;
-    System.out.println("[LITE_CONFIG_IMPORT][MODE] wipe=" + wipe + " topic=" + TOPIC + " env=" + env);
-    int published = 0;
-
-    LinkedHashSet<String> expectedEnvelopeKeys = new LinkedHashSet<>();
-    for (ImportEntry entry : validated) {
-      expectedEnvelopeKeys.add(entry.envelopeKey());
-    }
-
-    try (HAClient client = connect("fabric-lite-config-import")) {
-      if (wipe) {
-        System.out.println("[LITE_CONFIG_IMPORT][CLEAR] deleting all records from " + TOPIC);
-        clearTopic(client);
-      }
-
-      for (ImportEntry entry : validated) {
-        Command publish = new Command("publish");
-        publish.setTopic(TOPIC);
-        publish.setData(entry.payload());
-        client.execute(publish);
-        published++;
-      }
-
-      SowSnapshot sow = loadSowSnapshot(client);
-      LinkedHashSet<String> missing = new LinkedHashSet<>(expectedEnvelopeKeys);
-      missing.removeAll(sow.actualEnvelopeKeys());
-      LinkedHashSet<String> extra = new LinkedHashSet<>(sow.actualEnvelopeKeys());
-      extra.removeAll(expectedEnvelopeKeys);
-
-      System.out.println(
-          "[LITE_CONFIG_IMPORT][SOW] topic="
-              + TOPIC
-              + " sowRowCount="
-              + sow.sowRowCount()
-              + " envelopeKeysSample="
-              + firstN(sow.actualEnvelopeKeys(), 20));
-      System.out.println(
-          "[LITE_CONFIG_IMPORT][DIFF] expectedKeys="
-              + expectedEnvelopeKeys.size()
-              + " actualKeys="
-              + sow.actualEnvelopeKeys().size()
-              + " missingKeys="
-              + missing.size()
-              + " missingSample="
-              + firstN(missing, 20)
-              + " extraKeys="
-              + extra.size()
-              + " extraSample="
-              + firstN(extra, 20));
-    }
-
-    long durationMs = Duration.ofNanos(System.nanoTime() - started).toMillis();
-    System.out.println(
-        "[LITE_CONFIG_IMPORT][SUMMARY] files="
-            + files.size()
-            + " validJson="
-            + validated.size()
-            + " published="
-            + published
-            + " uniqueKeys="
-            + seenKeys.size()
-            + " duplicateKeys="
-            + duplicateKeys
-            + " wipe="
-            + wipe
-            + " durationMs="
-            + durationMs);
-    return 0;
-  }
-
-  private ScanResult scanInputFiles() throws Exception {
-    Path root = jsonRoot().toAbsolutePath().normalize();
-    if (Files.notExists(root)) {
-      return new ScanResult(
-          root.getFileName() == null ? "unknown" : root.getFileName().toString(),
-          List.of(),
-          0,
-          0,
-          List.of());
-    }
-    List<Path> groupDirs =
-        Files.list(root)
-            .filter(Files::isDirectory)
-            .sorted()
-            .toList();
-    List<String> groups = new ArrayList<>();
-    List<Path> files = new ArrayList<>();
-    int schemasFiles = 0;
-    int configFiles = 0;
-
-    for (Path groupDir : groupDirs) {
-      String group = groupDir.getFileName() == null ? null : groupDir.getFileName().toString();
-      if (group == null || group.isBlank()) {
-        continue;
-      }
-      groups.add(group);
-      try (var stream = Files.walk(groupDir)) {
-        List<Path> groupFiles =
-            stream
-                .filter(Files::isRegularFile)
-                .filter(
-                    path ->
-                        path.getFileName()
-                            .toString()
-                            .toLowerCase(Locale.ROOT)
-                            .endsWith(".json"))
-                .sorted()
-                .toList();
-        files.addAll(groupFiles);
-        for (Path file : groupFiles) {
-          Path relative = groupDir.relativize(file);
-          if (relative.getNameCount() > 1) {
-            String top = relative.getName(0).toString();
-            if ("schemas".equalsIgnoreCase(top)) {
-              schemasFiles++;
-            } else {
-              configFiles++;
-            }
-          }
-        }
-      }
-    }
-    files.sort((left, right) -> left.toString().compareTo(right.toString()));
-    String env = root.getFileName() == null ? "unknown" : root.getFileName().toString();
-    return new ScanResult(env, List.copyOf(groups), schemasFiles, configFiles, List.copyOf(files));
-  }
-
-  private SowSnapshot loadSowSnapshot(HAClient client) throws Exception {
-    LinkedHashSet<String> actualEnvelopeKeys = new LinkedHashSet<>();
-    int rows = 0;
-    try (MessageStream stream = client.sow(TOPIC)) {
-      for (Message message : stream) {
-        if (message == null || message.getCommand() != Message.Command.SOW) {
-          continue;
-        }
-        String payload = message.getData();
-        if (isBlank(payload)) {
-          continue;
-        }
-        payload = stripUtf8Bom(payload);
-        rows++;
-        JsonNode node =
-            parseOrThrow(payload, "SOW payload parse failed for key=" + trim(message.getSowKey()));
-        EnvelopeKey envelope = extractEnvelope(node, null, payload);
-        actualEnvelopeKeys.add(toEnvelopeKey(envelope));
-      }
-    }
-    return new SowSnapshot(rows, Set.copyOf(actualEnvelopeKeys));
-  }
-
-  private static String toEnvelopeKey(EnvelopeKey envelope) {
-    return envelope.group() + "|" + envelope.type() + "|" + envelope.name();
-  }
-
-  private static String rootCauseMessage(Throwable throwable) {
-    if (throwable == null) {
-      return "<unknown>";
-    }
-    Throwable root = throwable;
-    while (root.getCause() != null && root.getCause() != root) {
-      root = root.getCause();
-    }
-    String message = trim(root.getMessage());
-    return message == null
-        ? root.getClass().getSimpleName()
-        : root.getClass().getSimpleName() + ": " + message;
-  }
-
-  private static List<String> firstN(Iterable<String> values, int max) {
-    if (values == null || max <= 0) {
-      return List.of();
-    }
-    List<String> out = new ArrayList<>();
-    for (String value : values) {
-      if (value == null) {
-        continue;
-      }
-      out.add(value);
-      if (out.size() >= max) {
-        break;
-      }
-    }
-    return List.copyOf(out);
-  }
-
-  private static String stripUtf8Bom(String value) {
-    if (value == null || value.isEmpty()) {
-      return value;
-    }
-    return value.charAt(0) == '\uFEFF' ? value.substring(1) : value;
-  }
-
-  private static String normalizePayload(JsonNode node) throws Exception {
-    Definition decoded = DiscoveryCodec.decode(node);
-    if (decoded == null) {
-      return MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(node);
-    }
-    return DiscoveryCodec.mapper().writerWithDefaultPrettyPrinter().writeValueAsString(decoded);
-  }
-
-  private record ImportEntry(Path file, String payload, String envelopeKey, boolean duplicate) {}
-
-  private record ScanResult(
-      String env, List<String> groups, int schemasFiles, int configFiles, List<Path> files) {}
-
-  private record SowSnapshot(int sowRowCount, Set<String> actualEnvelopeKeys) {}
-
-  private static void printUsage() {
-    System.out.println("Usage: import [--wipe] [--env=<dev|uat|prod|...>]");
+      ]
+    },
+    "freshness": {
+      "updateCadence": "on-change",
+      "freshnessSla": "PT5M",
+      "latencyClass": "near-real-time"
+    },
+    "trust": {
+      "certification": "CERTIFIED",
+      "qualityStatus": "GOOD",
+      "sourceOfTruth": "Config workflow published layer for config:lab/vwap/base",
+      "usageRestrictions": "Trading demo only; modifications require desk approval"
+    },
+    "usage": {
+      "exampleQuestions": [
+        "What participation cap is used by the default VWAP strategy?"
+      ],
+      "exampleQueries": [
+        "config.get(\"config:lab/vwap/base\", \"maxParticipationPct\")"
+      ],
+      "usageHints": [
+        "Create desk/algo child layers instead of editing base for temporary experiments."
+      ],
+      "knownPitfalls": [
+        "Aggressive participation settings can violate simulation assumptions."
+      ]
+    },
+    "toolHints": {
+      "actionClass": "READ",
+      "readOnly": true,
+      "idempotent": true,
+      "safeDefaultLimit": 200,
+      "safeDefaultTimeout": "PT10S",
+      "riskClass": "LOW"
+    },
+    "relationshipHints": []
   }
 }
 
 
-
-
-
-
-
-
-
-
-
-
-
-package org.pronzato.fabric.lite.config;
-
-import org.pronzato.fabric.api.control.discovery.DiscoveryUrl;
-import com.crankuptheamps.client.HAClient;
-import com.crankuptheamps.client.Message;
-import com.crankuptheamps.client.MessageStream;
-import com.fasterxml.jackson.databind.JsonNode;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
-import java.util.HashSet;
-import java.util.Set;
-import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
-import org.pronzato.fabric.api.control.discovery.definitions.Definition;
-
-public final class FabricConfigExport extends FabricConfig {
-  private FabricConfigExport(
-      String discovery, String kerberosUsername, String kerberosKeytab, Path jsonRoot) {
-    super(discovery, kerberosUsername, kerberosKeytab, jsonRoot);
+===================================================================================
+vault\git\dev\lab\entitlement\services_echo-secure.json
+{
+  "scopeType" : "service",
+  "scopeId" : "service:lab/echo-secure",
+  "policies" : [ {
+    "schemaVersion" : "1.0",
+    "policyId" : "service:lab/echo-secure",
+    "group" : "lab",
+    "name" : "service-echo-secure",
+    "type" : "SERVICE",
+    "scopeType" : "SERVICE",
+    "resourceId" : "service:lab/echo-secure",
+    "policyUsage" : "SERVICE",
+    "usageGroup" : "service-echo-secure",
+    "description" : "Allow lab secure echo service to start and allow lab clients to invoke Echo/say.",
+    "version" : "1",
+    "enabled" : true,
+    "lifecycleStatus" : "ACTIVE",
+    "metadata" : { },
+    "bindings" : [ {
+      "subject" : "app:lab/server",
+      "action" : "service.start",
+      "effect" : "ALLOW",
+      "enabled" : true,
+      "obligations" : {
+        "rowFilters" : [ ],
+        "columnsAllow" : [ ],
+        "columnsMask" : [ ],
+        "datasetScope" : [ ],
+        "methodsAllow" : [ ],
+        "parameters" : { }
+      },
+      "attributes" : { },
+      "context" : { }
+    }, {
+      "subject" : "group:lab",
+      "action" : "service.invoke",
+      "effect" : "ALLOW",
+      "enabled" : true,
+      "obligations" : {
+        "rowFilters" : [ ],
+        "columnsAllow" : [ ],
+        "columnsMask" : [ ],
+        "datasetScope" : [ ],
+        "methodsAllow" : [ ],
+        "parameters" : { }
+      },
+      "attributes" : { },
+      "context" : { }
+    } ]
+  } ],
+  "relationships" : [ ],
+  "envelope" : {
+    "group" : "lab",
+    "type" : "ENTITLEMENT",
+    "name" : "overrides/services/echo-secure",
+    "uuid" : "178fc3c0-c21e-48b5-a07c-1300fe9e1b31",
+    "enabled" : true,
+    "createdTimeUtc" : "2026-02-17T18:47:06.352100100Z",
+    "createdBy" : "pronz",
+    "updatedTimeUtc" : "2026-02-17T18:47:06.352100100Z",
+    "updatedBy" : "pronz"
   }
+}
 
-  public static void main(String[] args) {
-    String discovery = DiscoveryUrl.URL;
-    String kerberosUsername = "dfabric";
-    String kerberosKeytab = "vault/kerberos/dfabric.keytab";
-    Path jsonRoot = Path.of("vault", "git", "dev");
-
-    for (String arg : args == null ? new String[0] : args) {
-      if ("--help".equals(arg) || "-h".equals(arg)) {
-        printUsage();
-        return;
-      }
-      System.err.println("[LITE_CONFIG_EXPORT][ERROR] Unknown argument: " + arg);
-      printUsage();
-      System.exit(2);
-    }
-
-    int code = 0;
-    try {
-      code =
-          new FabricConfigExport(discovery, kerberosUsername, kerberosKeytab, jsonRoot).run();
-    } catch (Exception ex) {
-      System.err.println("[LITE_CONFIG_EXPORT][ERROR] " + ex.getMessage());
-      ex.printStackTrace(System.err);
-      code = 1;
-    }
-    if (code != 0) {
-      System.exit(code);
-    }
+===================================================================================
+vault\git\dev\lab\schema\config_vwap.json
+{
+  "versionSemantic" : "1.0.0",
+  "versionNum" : 1,
+  "artifactType" : "CONFIG_SCHEMA",
+  "format" : "FABRIC_SCHEMA_CONFIG",
+  "schema" : "{\"displayName\":\"VWAP / TWAP\",\"description\":\"VWAP/TWAP execution controls with layered desk overrides.\",\"groups\":[{\"id\":\"execution\",\"label\":\"Execution\",\"description\":\"Core algo behavior and child slicing controls.\",\"order\":10},{\"id\":\"risk\",\"label\":\"Risk\",\"description\":\"Trading risk and kill-switch controls.\",\"order\":20},{\"id\":\"scheduling\",\"label\":\"Scheduling\",\"description\":\"Bucket scheduling and clocked participation targets.\",\"order\":30},{\"id\":\"market\",\"label\":\"Market\",\"description\":\"Market interaction and slippage limits.\",\"order\":40},{\"id\":\"routing\",\"label\":\"Routing\",\"description\":\"Venue and routing path preferences.\",\"order\":50}],\"fields\":[{\"key\":\"algoName\",\"label\":\"Algo name\",\"description\":\"Desk-visible algorithm name.\",\"groupId\":\"execution\",\"order\":10,\"type\":\"STRING\",\"required\":true},{\"key\":\"strategyCode\",\"label\":\"Strategy code\",\"description\":\"Internal strategy code used for routing and analytics.\",\"groupId\":\"execution\",\"order\":20,\"type\":\"STRING\",\"required\":false},{\"key\":\"side\",\"label\":\"Side\",\"description\":\"Default execution side.\",\"groupId\":\"execution\",\"order\":30,\"type\":\"STRING\",\"required\":false,\"enum\":[\"BUY\",\"SELL\"]},{\"key\":\"participationMode\",\"label\":\"Participation mode\",\"description\":\"Execution aggression policy.\",\"groupId\":\"execution\",\"order\":40,\"type\":\"STRING\",\"required\":false,\"enum\":[\"PASSIVE\",\"AGGRESSIVE\",\"DARK_FIRST\"]},{\"key\":\"maxChildOrdersPerMin\",\"label\":\"Max child orders/min\",\"description\":\"Submission throttle per minute.\",\"groupId\":\"execution\",\"order\":50,\"type\":\"INTEGER\",\"required\":false,\"min\":1},{\"key\":\"minChildSliceQty\",\"label\":\"Min child slice qty\",\"description\":\"Minimum quantity for each child order.\",\"groupId\":\"execution\",\"order\":60,\"type\":\"INTEGER\",\"required\":false,\"min\":1},{\"key\":\"maxCancelReplacePerMin\",\"label\":\"Max cancel/replace per min\",\"description\":\"Cancel/replace throttle per minute.\",\"groupId\":\"execution\",\"order\":70,\"type\":\"INTEGER\",\"required\":false,\"min\":1},{\"key\":\"maxParticipationPct\",\"label\":\"Max participation pct\",\"description\":\"Maximum participation ratio (0-1).\",\"groupId\":\"market\",\"order\":10,\"type\":\"NUMBER\",\"required\":true,\"min\":0,\"max\":1},{\"key\":\"priceOffsetBps\",\"label\":\"Price offset bps\",\"description\":\"Limit offset from reference price.\",\"groupId\":\"market\",\"order\":20,\"type\":\"NUMBER\",\"required\":false,\"min\":0},{\"key\":\"arrivalPriceSlippageBps\",\"label\":\"Arrival slippage bps\",\"description\":\"Allowed slippage from arrival price.\",\"groupId\":\"market\",\"order\":30,\"type\":\"NUMBER\",\"required\":false,\"min\":0},{\"key\":\"maxNotionalUsd\",\"label\":\"Max notional USD\",\"description\":\"Maximum parent order notional in USD.\",\"groupId\":\"risk\",\"order\":10,\"type\":\"NUMBER\",\"required\":false,\"min\":1},{\"key\":\"urgencyFactor\",\"label\":\"Urgency factor\",\"description\":\"Urgency multiplier for child schedule bias.\",\"groupId\":\"execution\",\"order\":80,\"type\":\"NUMBER\",\"required\":false,\"min\":0.1},{\"key\":\"enableDarkRouting\",\"label\":\"Enable dark routing\",\"description\":\"Allow routing to dark venues.\",\"groupId\":\"routing\",\"order\":10,\"type\":\"BOOLEAN\",\"required\":false},{\"key\":\"enforceLocateCheck\",\"label\":\"Enforce locate check\",\"description\":\"Require locate check before submit.\",\"groupId\":\"risk\",\"order\":20,\"type\":\"BOOLEAN\",\"required\":false},{\"key\":\"killSwitchEnabled\",\"label\":\"Kill switch enabled\",\"description\":\"Global emergency kill switch.\",\"groupId\":\"risk\",\"order\":30,\"type\":\"BOOLEAN\",\"required\":false},{\"key\":\"allowCrossing\",\"label\":\"Allow crossing\",\"description\":\"Permit crossing opportunities.\",\"groupId\":\"routing\",\"order\":20,\"type\":\"BOOLEAN\",\"required\":false},{\"key\":\"venuePreference\",\"label\":\"Venue preference\",\"description\":\"Preferred venue routing mode.\",\"groupId\":\"routing\",\"order\":30,\"type\":\"STRING\",\"required\":false,\"enum\":[\"LIT_ONLY\",\"DARK_ONLY\",\"SMART\"]},{\"key\":\"scheduleBuckets\",\"label\":\"Schedule buckets\",\"description\":\"Number of child schedule buckets.\",\"groupId\":\"scheduling\",\"order\":10,\"type\":\"INTEGER\",\"required\":false,\"min\":1},{\"key\":\"childSchedule\",\"label\":\"Child schedule\",\"description\":\"Per-bucket schedule targets.\",\"groupId\":\"scheduling\",\"order\":20,\"type\":\"ARRAY\",\"required\":false,\"itemType\":\"STRUCT\",\"fields\":[{\"key\":\"bucketStartMin\",\"label\":\"Bucket start minute\",\"description\":\"Bucket start offset in minutes.\",\"groupId\":\"\",\"order\":10,\"type\":\"INTEGER\",\"required\":true,\"min\":0},{\"key\":\"bucketEndMin\",\"label\":\"Bucket end minute\",\"description\":\"Bucket end offset in minutes.\",\"groupId\":\"\",\"order\":20,\"type\":\"INTEGER\",\"required\":true,\"min\":1},{\"key\":\"targetPct\",\"label\":\"Target pct\",\"description\":\"Target percentage for this bucket.\",\"groupId\":\"\",\"order\":30,\"type\":\"NUMBER\",\"required\":true,\"min\":0}]},{\"key\":\"throttle\",\"label\":\"Throttle\",\"description\":\"Per-second order and cancel throttle.\",\"groupId\":\"risk\",\"order\":40,\"type\":\"STRUCT\",\"required\":false,\"fields\":[{\"key\":\"maxOrdersPerSecond\",\"label\":\"Max orders/sec\",\"description\":\"Maximum order submits per second.\",\"groupId\":\"\",\"order\":10,\"type\":\"INTEGER\",\"required\":true,\"min\":1},{\"key\":\"maxCancelsPerSecond\",\"label\":\"Max cancels/sec\",\"description\":\"Maximum cancel actions per second.\",\"groupId\":\"\",\"order\":20,\"type\":\"INTEGER\",\"required\":true,\"min\":1}]}],\"requiredKeys\":[\"algoName\",\"maxParticipationPct\"]}",
+  "status" : "ACTIVE",
+  "compatibility" : "NONE",
+  "refs" : [ ],
+  "tags" : [ ],
+  "hash" : "gIIcIrHjYecfoVel+quQL2+Snh2oTTawTC4tA6XlqUo=",
+  "createdTimeUtc" : "2026-02-25T00:00:00Z",
+  "schemaUsage" : "SERVICE",
+  "schemaType" : "CONFIG",
+  "semantic" : {
+    "title" : "VWAP Config Schema",
+    "description" : "Schema for VWAP/TWAP execution strategy controls and desk-level overrides.",
+    "businessMeaning" : "Defines trading execution parameters used by algorithmic VWAP and TWAP routing policies.",
+    "domain" : "trading",
+    "subdomain" : "execution",
+    "tags" : [ "schema", "config", "vwap", "trading" ],
+    "aliases" : [ "vwap-config-schema" ],
+    "keywords" : [ "vwap", "twap", "algo", "execution" ],
+    "ownership" : {
+      "ownerId" : "group:lab-trading",
+      "stewardId" : "group:lab-trading",
+      "teamId" : "group:lab",
+      "contactIds" : [ "group:lab-trading" ]
+    },
+    "dataShape" : {
+      "type" : "SCHEMA",
+      "grain" : "one algo config document per {configId, layerId}",
+      "keyFields" : [ "configId", "layerId" ],
+      "timeFields" : [ "updatedTimeUtc" ],
+      "measureFields" : [ "maxParticipationPct", "maxNotionalUsd" ],
+      "dimensionFields" : [ "venuePreference", "participationMode" ],
+      "fieldRoles" : [ {
+        "fieldName" : "maxParticipationPct",
+        "roleType" : "MEASURE",
+        "businessTerm" : "Max Participation Percent",
+        "unit" : "ratio",
+        "sensitivity" : "INTERNAL"
+      }, {
+        "fieldName" : "venuePreference",
+        "roleType" : "DIMENSION",
+        "businessTerm" : "Venue Routing Preference",
+        "unit" : "none",
+        "sensitivity" : "INTERNAL"
+      } ]
+    },
+    "freshness" : {
+      "updateCadence" : "on-change",
+      "freshnessSla" : "PT5M",
+      "latencyClass" : "near-real-time"
+    },
+    "trust" : {
+      "certification" : "CANDIDATE",
+      "qualityStatus" : "GOOD",
+      "sourceOfTruth" : "Lab trading config schema registry",
+      "usageRestrictions" : "Internal trading demo and test workloads"
+    },
+    "usage" : {
+      "exampleQuestions" : [ "Which VWAP fields control child order throttling?", "What participation cap is configured for this desk?" ],
+      "exampleQueries" : [ "schema(config_vwap).fields[\"maxParticipationPct\"]" ],
+      "usageHints" : [ "Validate strategy-specific layers against this schema before publish." ],
+      "knownPitfalls" : [ "Changing enum values can invalidate existing layered configs." ]
+    },
+    "toolHints" : {
+      "actionClass" : "READ",
+      "readOnly" : true,
+      "idempotent" : true,
+      "safeDefaultLimit" : 1000,
+      "safeDefaultTimeout" : "PT15S",
+      "riskClass" : "LOW"
+    },
+    "relationshipHints" : [ ]
+  },
+  "envelope" : {
+    "group" : "lab",
+    "type" : "SCHEMA",
+    "name" : "config_vwap",
+    "uuid" : "07f671eb-64fc-8488-af04-bd25504d24ae",
+    "enabled" : true,
+    "lifecycleStatus" : "ACTIVE",
+    "createdTimeUtc" : "2026-02-25T00:00:00Z",
+    "createdBy" : "studio/demo",
+    "updatedTimeUtc" : "2026-02-25T00:00:00Z",
+    "updatedBy" : "studio/demo"
   }
+}
 
-  private int run() throws Exception {
-    if (Files.notExists(jsonRoot())) {
-      Files.createDirectories(jsonRoot());
-    }
+===================================================================================
+vault\git\dev\lab\config_layer\vwap__base.json
+{
+    "envelope":  {
+                     "group":  "lab",
+                     "type":  "CONFIG_LAYER",
+                     "name":  "config__vwap__base",
+                     "uuid":  "54a566f0-503d-8a8d-7349-1bfe16bb4727",
+                     "enabled":  true,
+                     "lifecycleStatus":  "ACTIVE",
+                     "createdTimeUtc":  "2026-02-25T00:00:00Z",
+                     "createdBy":  "studio/demo",
+                     "updatedTimeUtc":  "2026-02-25T00:00:00Z",
+                     "updatedBy":  "studio/demo"
+                 },
+    "resourceId":  "config:lab/vwap/base",
+    "parentId":  null,
+    "shortName":  "BASE",
+    "configType":  "layer",
+    "schemaKey":  "config_vwap",
+    "displayName":  "VWAP - Base",
+    "declared":  {
+                     "algoName":  "VWAP_TWAP_CORE",
+                     "strategyCode":  "VWAP01",
+                     "side":  "BUY",
+                     "participationMode":  "PASSIVE",
+                     "venuePreference":  "SMART",
+                     "maxParticipationPct":  0.12,
+                     "priceOffsetBps":  1.5,
+                     "arrivalPriceSlippageBps":  3,
+                     "maxNotionalUsd":  25000000,
+                     "urgencyFactor":  1,
+                     "enableDarkRouting":  true,
+                     "enforceLocateCheck":  true,
+                     "killSwitchEnabled":  false,
+                     "allowCrossing":  false,
+                     "maxChildOrdersPerMin":  120,
+                     "minChildSliceQty":  500,
+                     "maxCancelReplacePerMin":  300,
+                     "scheduleBuckets":  6,
+                     "throttle":  {
+                                      "maxOrdersPerSecond":  15,
+                                      "maxCancelsPerSecond":  30
+                                  },
+                     "childSchedule":  [
+                                           {
+                                               "bucketStartMin":  0,
+                                               "bucketEndMin":  65,
+                                               "targetPct":  0.1667
+                                           },
+                                           {
+                                               "bucketStartMin":  65,
+                                               "bucketEndMin":  130,
+                                               "targetPct":  0.1667
+                                           },
+                                           {
+                                               "bucketStartMin":  130,
+                                               "bucketEndMin":  195,
+                                               "targetPct":  0.1667
+                                           },
+                                           {
+                                               "bucketStartMin":  195,
+                                               "bucketEndMin":  260,
+                                               "targetPct":  0.1667
+                                           },
+                                           {
+                                               "bucketStartMin":  260,
+                                               "bucketEndMin":  325,
+                                               "targetPct":  0.1667
+                                           },
+                                           {
+                                               "bucketStartMin":  325,
+                                               "bucketEndMin":  390,
+                                               "targetPct":  0.1667
+                                           }
+                                       ]
+                 },
+    "effective":  null,
+    "history":  null,
+    "configId":  "config:lab/vwap/base",
+    "effectiveConfigId":  "config:lab/vwap/base"
+}
 
-    Set<Path> exported = new HashSet<>();
-    int exportedCount = 0;
+===================================================================================
+vault\git\dev\lab\config_layer\vwap__twap.json
+{
+    "envelope":  {
+                     "group":  "lab",
+                     "type":  "CONFIG_LAYER",
+                     "name":  "config__vwap__twap",
+                     "uuid":  "5422d70e-f567-a2f7-8adf-03426a2ff210",
+                     "enabled":  true,
+                     "lifecycleStatus":  "ACTIVE",
+                     "createdTimeUtc":  "2026-02-25T00:00:00Z",
+                     "createdBy":  "studio/demo",
+                     "updatedTimeUtc":  "2026-02-25T00:00:00Z",
+                     "updatedBy":  "studio/demo"
+                 },
+    "resourceId":  "config:lab/vwap/twap",
+    "parentId":  "config:lab/vwap/base",
+    "shortName":  "TWAP",
+    "configType":  "layer",
+    "schemaKey":  "config_vwap",
+    "displayName":  "VWAP - TWAP",
+    "declared":  {
+                     "participationMode":  "AGGRESSIVE",
+                     "strategyCode":  "VWAP01_TWAP",
+                     "maxParticipationPct":  0.1047,
+                     "urgencyFactor":  1.222,
+                     "throttle":  {
+                                      "maxOrdersPerSecond":  13,
+                                      "maxCancelsPerSecond":  35
+                                  }
+                 },
+    "effective":  null,
+    "history":  null,
+    "configId":  "config:lab/vwap/twap",
+    "effectiveConfigId":  "config:lab/vwap/twap"
+}
+===================================================================================
+vault\git\dev\lab\service\echo-secure.json
 
-    try (HAClient client = connect("fabric-lite-config-export");
-        MessageStream stream = client.sow(TOPIC)) {
-      for (Message message : stream) {
-        if (message == null || message.getCommand() != Message.Command.SOW) {
-          continue;
-        }
-        String payload = message.getData();
-        if (isBlank(payload)) {
-          continue;
-        }
-        JsonNode node = parseOrThrow(payload, "SOW payload parse failed for key=" + message.getSowKey());
-        EnvelopeKey key = extractEnvelope(node, null, payload);
-        String prettyPayload = normalizePayload(node);
-
-        Path target = toExportPath(key);
-        Files.createDirectories(target.getParent());
-        Files.writeString(
-            target,
-            prettyPayload,
-            StandardCharsets.UTF_8,
-            StandardOpenOption.CREATE,
-            StandardOpenOption.TRUNCATE_EXISTING,
-            StandardOpenOption.WRITE);
-
-        exported.add(target.normalize().toAbsolutePath());
-        exportedCount++;
-      }
+{
+  "resourceId" : "service:lab/echo-secure",
+  "connectionRefs" : [ ],
+  "serviceType" : "GRPC",
+  "grpc" : {
+    "bind" : {
+      "port" : 5502
+    },
+    "portFailback" : false,
+    "tls" : {
+      "enabled" : true,
+      "termination" : "PASSTHROUGH"
+    },
+    "kerberos" : {
+      "enabled" : true
+    },
+    "routing" : {
+      "mode" : "ROUND_ROBIN"
     }
-
-    int deletedCount = 0;
-    for (Path file : listJsonFiles()) {
-      Path normalized = file.normalize().toAbsolutePath();
-      if (!exported.contains(normalized)) {
-        Files.deleteIfExists(file);
-        deletedCount++;
-        System.out.println("[LITE_CONFIG_EXPORT][DELETE] path=" + file);
-      }
-    }
-
-    System.out.println(
-        "[LITE_CONFIG_EXPORT][SUMMARY] exported=" + exportedCount + " deleted=" + deletedCount);
-    return 0;
-  }
-
-  private static void printUsage() {
-    System.out.println("Usage: export");
-  }
-
-  private Path toExportPath(EnvelopeKey key) {
-    if (key == null) {
-      throw new IllegalArgumentException("envelope key is required");
-    }
-    String normalizedName = key.name();
-    if ("CONFIG".equalsIgnoreCase(key.type())) {
-      normalizedName = stripConfigFilePrefix(normalizedName);
-    }
-    normalizedName = normalizeExportName(key.type(), normalizedName);
-    EnvelopeKey normalizedKey = new EnvelopeKey(key.group(), key.type(), normalizedName);
-    return toFilePath(normalizedKey);
-  }
-
-  private static String stripConfigFilePrefix(String name) {
-    if (name == null) {
-      return null;
-    }
-    if (name.regionMatches(true, 0, "config__", 0, "config__".length())) {
-      return name.substring("config__".length());
-    }
-    return name;
-  }
-
-  private static String normalizeExportName(String type, String name) {
-    if (name == null) {
-      return null;
-    }
-    if (!"ENTITLEMENT".equalsIgnoreCase(type)) {
-      return name;
-    }
-    if (name.startsWith("overrides/services/")) {
-      return name.substring("overrides/".length());
-    }
-    if (name.startsWith("overrides/namespaces/")) {
-      return name.substring("overrides/".length());
-    }
-    return name;
-  }
-
-  private static String normalizePayload(JsonNode node) throws Exception {
-    Definition decoded = DiscoveryCodec.decode(node);
-    if (decoded == null) {
-      return MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(node);
-    }
-    return DiscoveryCodec.mapper().writerWithDefaultPrettyPrinter().writeValueAsString(decoded);
+  },
+  "semantic" : {
+    "title" : "Echo Secure gRPC Service",
+    "description" : "Kerberos and TLS protected echo service used to validate secure request identity propagation.",
+    "businessMeaning" : "Demonstrates secure transport and authenticated caller context for service integrations.",
+    "domain" : "platform",
+    "subdomain" : "connectivity",
+    "tags" : [ "service", "grpc", "security", "echo" ],
+    "aliases" : [ "echo-secure-service" ],
+    "keywords" : [ "echo", "grpc", "kerberos", "tls" ],
+    "ownership" : {
+      "ownerId" : "group:lab-platform",
+      "stewardId" : "group:lab-platform-security",
+      "teamId" : "group:lab-platform",
+      "contactIds" : [ "group:lab-platform-security" ]
+    },
+    "dataShape" : {
+      "type" : "SERVICE",
+      "grain" : "one response message per request message",
+      "keyFields" : [ "request_id" ],
+      "timeFields" : [ "event_time" ],
+      "measureFields" : [ ],
+      "dimensionFields" : [ "caller_app", "caller_user" ],
+      "fieldRoles" : [ {
+        "fieldName" : "request_id",
+        "roleType" : "KEY",
+        "businessTerm" : "Request Identifier",
+        "unit" : "none",
+        "sensitivity" : "INTERNAL"
+      } ]
+    },
+    "freshness" : {
+      "updateCadence" : "on-request",
+      "freshnessSla" : "PT2S",
+      "latencyClass" : "interactive"
+    },
+    "trust" : {
+      "certification" : "CANDIDATE",
+      "qualityStatus" : "GOOD",
+      "sourceOfTruth" : "Echo service runtime response payload",
+      "usageRestrictions" : "Authenticated callers only; intended for transport validation"
+    },
+    "usage" : {
+      "exampleQuestions" : [ "Is secure gRPC identity propagation working end-to-end?" ],
+      "exampleQueries" : [ "grpc.echo.say(msg=\"ping\", username=\"user:alice\")" ],
+      "usageHints" : [ "Use this service for security and transport smoke tests, not business analytics." ],
+      "knownPitfalls" : [ "Response payload is synthetic and should not be used as business data." ]
+    },
+    "toolHints" : {
+      "actionClass" : "READ",
+      "readOnly" : true,
+      "idempotent" : true,
+      "safeDefaultLimit" : 100,
+      "safeDefaultTimeout" : "PT10S",
+      "riskClass" : "LOW"
+    },
+    "relationshipHints" : [ ]
+  },
+  "entitlements" : {
+    "providerId" : "demo-static"
+  },
+  "envelope" : {
+    "group" : "lab",
+    "type" : "SERVICE",
+    "name" : "echo-secure",
+    "uuid" : "a32d658f-8084-4682-97a4-752bf09f8431",
+    "enabled" : true,
+    "lifecycleStatus" : "ACTIVE",
+    "createdTimeUtc" : "2026-02-12T22:05:00Z",
+    "createdBy" : "codex",
+    "updatedTimeUtc" : "2026-02-12T22:05:00Z",
+    "updatedBy" : "codex"
+  },
+  "schemaRef" : {
+    "group" : "lab",
+    "type" : "SCHEMA",
+    "name" : "service-echo-secure-transport"
   }
 }
 
 
-
-
-
-
-
-
-
-
-package org.pronzato.fabric.lite.config;
-
-import org.pronzato.fabric.api.control.discovery.DiscoveryUrl;
-import com.crankuptheamps.client.HAClient;
-import com.crankuptheamps.client.Message;
-import com.crankuptheamps.client.MessageStream;
-import com.fasterxml.jackson.databind.JsonNode;
-import java.nio.file.Path;
-
-public final class FabricConfigDump extends FabricConfig {
-  private FabricConfigDump(
-      String discovery, String kerberosUsername, String kerberosKeytab, Path jsonRoot) {
-    super(discovery, kerberosUsername, kerberosKeytab, jsonRoot);
-  }
-
-  public static void main(String[] args) {
-    String discovery = DiscoveryUrl.URL;
-    String kerberosUsername = "dfabric";
-    String kerberosKeytab = "vault/kerberos/dfabric.keytab";
-    Path jsonRoot = Path.of("vault", "git", "dev");
-
-    for (String arg : args == null ? new String[0] : args) {
-      if ("--help".equals(arg) || "-h".equals(arg)) {
-        printUsage();
-        return;
-      }
-      System.err.println("[LITE_CONFIG_DUMP][ERROR] Unknown argument: " + arg);
-      printUsage();
-      System.exit(2);
-    }
-
-    int code = 0;
-    try {
-      code = new FabricConfigDump(discovery, kerberosUsername, kerberosKeytab, jsonRoot).run();
-    } catch (Exception ex) {
-      System.err.println("[LITE_CONFIG_DUMP][ERROR] " + ex.getMessage());
-      ex.printStackTrace(System.err);
-      code = 1;
-    }
-    if (code != 0) {
-      System.exit(code);
-    }
-  }
-
-  private int run() throws Exception {
-    try (HAClient client = connect("fabric-lite-config-dump");
-        MessageStream stream = client.sow(TOPIC)) {
-      for (Message message : stream) {
-        if (message == null || message.getCommand() != Message.Command.SOW) {
-          continue;
-        }
-        String payload = message.getData();
-        if (isBlank(payload)) {
-          continue;
-        }
-        JsonNode node =
-            parseOrThrow(payload, "SOW payload parse failed for key=" + message.getSowKey());
-        EnvelopeKey key = extractEnvelope(node, message.getSowKey(), payload);
-        System.out.println("[DUMP] group=" + key.group() + " type=" + key.type() + " name=" + key.name());
-      }
-    }
-    return 0;
-  }
-
-  private static void printUsage() {
-    System.out.println("Usage: dump");
+===================================================================================
+vault\git\dev\lab\entitlement\namespaces_default.json
+{
+  "scopeType" : "namespace",
+  "scopeId" : "namespace:lab/default",
+  "policies" : [ {
+    "schemaVersion" : "1.0",
+    "policyId" : "namespace:lab/default",
+    "group" : "lab",
+    "name" : "default",
+    "type" : "NAMESPACE",
+    "scopeType" : "NAMESPACE",
+    "resourceId" : "namespace:lab/default",
+    "policyUsage" : "DATASET",
+    "usageGroup" : "namespace-default",
+    "description" : "Namespace entitlements",
+    "version" : "1",
+    "enabled" : true,
+    "lifecycleStatus" : "ACTIVE",
+    "metadata" : { },
+    "bindings" : [ {
+      "bindingId" : "namespace-read-allow-group-0",
+      "subject" : "group:lab",
+      "action" : "read",
+      "effect" : "ALLOW",
+      "enabled" : true,
+      "obligations" : {
+        "rowFilters" : [ ],
+        "columnsAllow" : [ ],
+        "columnsMask" : [ ],
+        "datasetScope" : [ ],
+        "methodsAllow" : [ ],
+        "parameters" : { }
+      },
+      "attributes" : { },
+      "context" : { }
+    }, {
+      "bindingId" : "namespace-read-allow-group-1",
+      "subject" : "group:platform",
+      "action" : "read",
+      "effect" : "ALLOW",
+      "enabled" : true,
+      "obligations" : {
+        "rowFilters" : [ ],
+        "columnsAllow" : [ ],
+        "columnsMask" : [ ],
+        "datasetScope" : [ ],
+        "methodsAllow" : [ ],
+        "parameters" : { }
+      },
+      "attributes" : { },
+      "context" : { }
+    }, {
+      "bindingId" : "namespace-write-allow-group-0",
+      "subject" : "group:lab",
+      "action" : "write",
+      "effect" : "ALLOW",
+      "enabled" : true,
+      "obligations" : {
+        "rowFilters" : [ ],
+        "columnsAllow" : [ ],
+        "columnsMask" : [ ],
+        "datasetScope" : [ ],
+        "methodsAllow" : [ ],
+        "parameters" : { }
+      },
+      "attributes" : { },
+      "context" : { }
+    } ]
+  } ],
+  "relationships" : [ ],
+  "labels" : {
+    "managedBy" : "fabric-lite-defaults",
+    "defaultPlatformRead" : "true"
+  },
+  "notes" : [ "Auto-created namespace entitlement" ],
+  "envelope" : {
+    "group" : "lab",
+    "type" : "ENTITLEMENT",
+    "name" : "overrides/namespaces/default",
+    "uuid" : "ent-namespace-default-lab",
+    "enabled" : true,
+    "lifecycleStatus" : "ACTIVE",
+    "createdTimeUtc" : "2026-03-04T16:38:28.141700400Z",
+    "createdBy" : "fabric-lite",
+    "updatedTimeUtc" : "2026-03-04T16:38:28.141700400Z",
+    "updatedBy" : "fabric-lite"
   }
 }
-
-
-
-
-
-
+===================================================================================
+===================================================================================
+===================================================================================
+===================================================================================
+===================================================================================
+===================================================================================
+===================================================================================
+===================================================================================
