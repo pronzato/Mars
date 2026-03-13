@@ -1,680 +1,629 @@
-package org.pronzato.fabric.api.util;
+package org.pronzato.fabric.api.catalog.semantics;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.nio.ByteBuffer;
-import java.util.Objects;
+import org.pronzato.fabric.api.control.discovery.definitions.common.Semantic;
 
-public final class Bytes {
-  private static final int DEFAULT_DIRECT_OUTPUT_CAPACITY = 8 * 1024;
-  private static final int MAX_DIRECT_OUTPUT_CAPACITY = Integer.MAX_VALUE - 8;
+import java.util.ArrayList;
+import java.util.EnumMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import org.pronzato.fabric.api.control.discovery.definitions.Definition;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfig;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfigLayer;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngest;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngestSource;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionSchema;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionService;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStream;
+import org.pronzato.fabric.api.util.Strings;
 
-  private Bytes() {}
+public final class SemanticCompletenessAuditor {
+  private SemanticCompletenessAuditor() {}
 
-  public static ByteBuffer toDirectBuffer(byte[] bytes) {
-    Objects.requireNonNull(bytes, "bytes");
-    ByteBuffer direct = ByteBuffer.allocateDirect(bytes.length);
-    direct.put(bytes);
-    direct.flip();
-    assert direct.isDirect();
-    assert direct.position() == 0;
-    assert direct.limit() == bytes.length;
-    return direct;
-  }
+  public record AuditInput(String source, Definition definition) {}
 
-  public static ByteBuffer toDirectBuffer(ByteBuffer source) {
-    Objects.requireNonNull(source, "source");
-    ByteBuffer copy = source.asReadOnlyBuffer();
-    int expectedLimit = copy.remaining();
-    ByteBuffer direct = ByteBuffer.allocateDirect(copy.remaining());
-    direct.put(copy);
-    direct.flip();
-    assert direct.isDirect();
-    assert direct.position() == 0;
-    assert direct.limit() == expectedLimit;
-    return direct;
-  }
-
-  public static byte[] toByteArray(ByteBuffer buffer) {
-    Objects.requireNonNull(buffer, "buffer");
-    ByteBuffer copy = buffer.asReadOnlyBuffer();
-    byte[] bytes = new byte[copy.remaining()];
-    copy.get(bytes);
-    return bytes;
-  }
-
-  public static InputStream asInputStream(ByteBuffer buffer) {
-    Objects.requireNonNull(buffer, "buffer");
-    return new ByteBufferInputStream(buffer.asReadOnlyBuffer());
-  }
-
-  public static DirectBufferOutputStream directOutputStream() {
-    return new DirectBufferOutputStream(DEFAULT_DIRECT_OUTPUT_CAPACITY);
-  }
-
-  public static DirectBufferOutputStream directOutputStream(int initialCapacity) {
-    return new DirectBufferOutputStream(initialCapacity);
-  }
-
-  public static final class DirectBufferOutputStream extends OutputStream {
-    private ByteBuffer buffer;
-
-    private DirectBufferOutputStream(int initialCapacity) {
-      if (initialCapacity <= 0) {
-        throw new IllegalArgumentException("initialCapacity must be > 0");
+  public static SemanticAuditReport auditDefinitions(
+      Iterable<Definition> definitions, SemanticValidationPolicy policy) {
+    List<AuditInput> inputs = new ArrayList<>();
+    if (definitions != null) {
+      int index = 0;
+      for (Definition definition : definitions) {
+        inputs.add(new AuditInput("definition#" + index, definition));
+        index++;
       }
-      this.buffer = ByteBuffer.allocateDirect(initialCapacity);
     }
+    return auditAssets(inputs, policy);
+  }
 
-    @Override
-    public void write(int value) throws IOException {
-      ensureRemaining(1);
-      buffer.put((byte) value);
-    }
+  public static SemanticAuditReport auditAssets(
+      Iterable<AuditInput> inputs, SemanticValidationPolicy policy) {
+    SemanticValidationPolicy effectivePolicy =
+        policy == null ? SemanticValidationPolicy.fromTier("dev") : policy;
+    List<SemanticAssetAudit> assets = new ArrayList<>();
+    Map<String, Integer> countsByType = new LinkedHashMap<>();
+    Map<SemanticFindingSeverity, Integer> countsBySeverity =
+        new EnumMap<>(SemanticFindingSeverity.class);
+    countsBySeverity.put(SemanticFindingSeverity.ERROR, 0);
+    countsBySeverity.put(SemanticFindingSeverity.WARN, 0);
+    countsBySeverity.put(SemanticFindingSeverity.INFO, 0);
 
-    @Override
-    public void write(byte[] bytes, int offset, int length) throws IOException {
-      Objects.requireNonNull(bytes, "bytes");
-      if (offset < 0 || length < 0 || length > bytes.length - offset) {
-        throw new IndexOutOfBoundsException(
-            "offset=" + offset + ", length=" + length + ", arrayLength=" + bytes.length);
-      }
-      if (length == 0) {
-        return;
-      }
-      ensureRemaining(length);
-      buffer.put(bytes, offset, length);
-    }
+    int placeholderFindings = 0;
+    int totalFindings = 0;
+    int totalScore = 0;
+    boolean enforcementFailed = false;
 
-    public ByteBuffer toDirectByteBuffer() {
-      int expectedSize = buffer.position();
-      ByteBuffer view = buffer.asReadOnlyBuffer();
-      view.flip();
-      assert view.isDirect();
-      assert view.position() == 0;
-      assert view.limit() == expectedSize;
-      return view;
-    }
-
-    public int size() {
-      return buffer.position();
-    }
-
-    private void ensureRemaining(int additionalBytes) throws IOException {
-      if (additionalBytes <= buffer.remaining()) {
-        return;
-      }
-      int required;
-      try {
-        required = Math.addExact(buffer.position(), additionalBytes);
-      } catch (ArithmeticException ex) {
-        throw new IOException("Direct IPC buffer size overflow", ex);
-      }
-      int expanded = buffer.capacity();
-      while (expanded < required) {
-        if (expanded >= MAX_DIRECT_OUTPUT_CAPACITY) {
-          throw new IOException("Direct IPC buffer exceeded max capacity");
+    List<AuditInput> normalizedInputs = new ArrayList<>();
+    if (inputs != null) {
+      for (AuditInput input : inputs) {
+        if (input != null && input.definition() != null) {
+          normalizedInputs.add(input);
         }
-        expanded = Math.min(MAX_DIRECT_OUTPUT_CAPACITY, Math.max(expanded << 1, required));
       }
-      ByteBuffer next = ByteBuffer.allocateDirect(expanded);
-      buffer.flip();
-      next.put(buffer);
-      buffer = next;
+    }
+    Map<String, Semantic> configSemanticByKey = indexConfigSemantic(normalizedInputs);
+
+    for (AuditInput input : normalizedInputs) {
+      if (input == null || input.definition() == null) {
+        continue;
+      }
+        Definition definition = input.definition();
+        String definitionType = targetedDefinitionType(definition);
+        if (definitionType == null) {
+          continue;
+        }
+        countsByType.merge(definitionType, 1, Integer::sum);
+        SemanticAssetAudit assetAudit =
+            auditAsset(
+                input.source(),
+                definitionType,
+                definition,
+                configSemanticByKey,
+                effectivePolicy);
+        assets.add(assetAudit);
+        totalScore += assetAudit.score();
+
+        for (SemanticAuditFinding finding : assetAudit.findings()) {
+          countsBySeverity.merge(finding.severity(), 1, Integer::sum);
+          totalFindings++;
+          if (finding.placeholder()) {
+            placeholderFindings++;
+          }
+        }
+        if (effectivePolicy.enforcePlaceholderRejection()
+            && assetAudit.findings().stream().anyMatch(finding -> finding.severity() == SemanticFindingSeverity.ERROR)) {
+          enforcementFailed = true;
+        }
+    }
+
+    double completenessPercentage = assets.isEmpty() ? 100.0 : (double) totalScore / assets.size();
+    SemanticAuditSummary summary =
+        new SemanticAuditSummary(
+            assets.size(),
+            Map.copyOf(countsByType),
+            Map.copyOf(countsBySeverity),
+            placeholderFindings,
+            totalFindings,
+            roundToTwoDecimals(completenessPercentage));
+    return new SemanticAuditReport(effectivePolicy, summary, enforcementFailed, List.copyOf(assets));
+  }
+
+  private static SemanticAssetAudit auditAsset(
+      String source,
+      String definitionType,
+      Definition definition,
+      Map<String, Semantic> configSemanticByKey,
+      SemanticValidationPolicy policy) {
+    Semantic semantic = semantic(definition, configSemanticByKey);
+    String assetId = assetId(definitionType, definition);
+    List<SemanticAuditFinding> findings = new ArrayList<>();
+
+    if (semantic == null) {
+      findings.add(
+          new SemanticAuditFinding(
+              "SEM_REQUIRED_METADATA",
+              SemanticFindingSeverity.ERROR,
+              "semantic",
+              "semantic metadata is missing",
+              false));
+      return finalizeAssetAudit(source, assetId, definitionType, findings);
+    }
+
+    validateGlobalRequired(findings, semantic);
+    validateGlobalPlaceholders(findings, semantic, policy);
+    validateTypeSpecific(findings, definitionType, semantic);
+
+    return finalizeAssetAudit(source, assetId, definitionType, findings);
+  }
+
+  private static SemanticAssetAudit finalizeAssetAudit(
+      String source, String assetId, String definitionType, List<SemanticAuditFinding> findings) {
+    int score = calculateScore(findings);
+    int placeholderCount = 0;
+    for (SemanticAuditFinding finding : findings) {
+      if (finding.placeholder()) {
+        placeholderCount++;
+      }
+    }
+    SemanticCompletenessClass classification = classify(score, placeholderCount);
+    return new SemanticAssetAudit(
+        Strings.firstNonBlank(Strings.trimToNull(source), assetId),
+        assetId,
+        definitionType,
+        score,
+        classification,
+        placeholderCount,
+        List.copyOf(findings));
+  }
+
+  private static void validateGlobalRequired(List<SemanticAuditFinding> findings, Semantic semantic) {
+    requireText(findings, "SEM_REQUIRED_TITLE", "semantic.title", semantic.title());
+    requireText(findings, "SEM_REQUIRED_DESCRIPTION", "semantic.description", semantic.description());
+    requireText(findings, "SEM_REQUIRED_BUSINESS_MEANING", "semantic.businessMeaning", semantic.businessMeaning());
+    requireText(findings, "SEM_REQUIRED_DOMAIN", "semantic.domain", semantic.domain());
+    requireNonEmptyList(findings, "SEM_REQUIRED_TAGS", "semantic.tags", semantic.tags());
+
+    if (semantic.ownership() == null) {
+      findings.add(
+          new SemanticAuditFinding(
+              "SEM_REQUIRED_OWNERSHIP",
+              SemanticFindingSeverity.ERROR,
+              "semantic.ownership",
+              "semantic.ownership is required",
+              false));
+    } else {
+      requireText(findings, "SEM_REQUIRED_OWNER_ID", "semantic.ownership.ownerId", semantic.ownership().ownerId());
+    }
+
+    if (semantic.dataShape() == null || semantic.dataShape().type() == null) {
+      findings.add(
+          new SemanticAuditFinding(
+              "SEM_REQUIRED_DATASHAPE_TYPE",
+              SemanticFindingSeverity.ERROR,
+              "semantic.dataShape.type",
+              "semantic.dataShape.type is required",
+              false));
+    }
+    if (semantic.trust() == null || semantic.trust().certification() == null) {
+      findings.add(
+          new SemanticAuditFinding(
+              "SEM_REQUIRED_TRUST_CERTIFICATION",
+              SemanticFindingSeverity.ERROR,
+              "semantic.trust.certification",
+              "semantic.trust.certification is required",
+              false));
+    }
+    if (semantic.trust() == null || semantic.trust().qualityStatus() == null) {
+      findings.add(
+          new SemanticAuditFinding(
+              "SEM_REQUIRED_TRUST_QUALITY",
+              SemanticFindingSeverity.ERROR,
+              "semantic.trust.qualityStatus",
+              "semantic.trust.qualityStatus is required",
+              false));
+    }
+    if (semantic.toolHints() == null || semantic.toolHints().actionClass() == null) {
+      findings.add(
+          new SemanticAuditFinding(
+              "SEM_REQUIRED_ACTION_CLASS",
+              SemanticFindingSeverity.ERROR,
+              "semantic.toolHints.actionClass",
+              "semantic.toolHints.actionClass is required",
+              false));
     }
   }
 
-  private static final class ByteBufferInputStream extends InputStream {
-    private final ByteBuffer buffer;
-
-    private ByteBufferInputStream(ByteBuffer buffer) {
-      this.buffer = Objects.requireNonNull(buffer, "buffer");
-    }
-
-    @Override
-    public int read() {
-      if (!buffer.hasRemaining()) {
-        return -1;
-      }
-      return buffer.get() & 0xFF;
-    }
-
-    @Override
-    public int read(byte[] b, int off, int len) {
-      Objects.requireNonNull(b, "b");
-      if (off < 0 || len < 0 || len > b.length - off) {
-        throw new IndexOutOfBoundsException(
-            "off=" + off + ", len=" + len + ", arrayLength=" + b.length);
-      }
-      if (len == 0) {
-        return 0;
-      }
-      if (!buffer.hasRemaining()) {
-        return -1;
-      }
-      int read = Math.min(len, buffer.remaining());
-      buffer.get(b, off, read);
-      return read;
-    }
-
-    @Override
-    public long skip(long n) {
-      if (n <= 0) {
-        return 0L;
-      }
-      int skipped = (int) Math.min(n, buffer.remaining());
-      buffer.position(buffer.position() + skipped);
-      return skipped;
-    }
-
-    @Override
-    public int available() {
-      return buffer.remaining();
-    }
+  private static void validateGlobalPlaceholders(
+      List<SemanticAuditFinding> findings, Semantic semantic, SemanticValidationPolicy policy) {
+    addPlaceholderIf(
+        findings,
+        policy,
+        "SEM_PLACEHOLDER_TITLE",
+        "semantic.title",
+        SemanticMetadataValidator.isPlaceholderText(semantic.title()));
+    addPlaceholderIf(
+        findings,
+        policy,
+        "SEM_PLACEHOLDER_DESCRIPTION",
+        "semantic.description",
+        SemanticMetadataValidator.isPlaceholderText(semantic.description()));
+    addPlaceholderIf(
+        findings,
+        policy,
+        "SEM_PLACEHOLDER_BUSINESS_MEANING",
+        "semantic.businessMeaning",
+        SemanticMetadataValidator.isPlaceholderText(semantic.businessMeaning()));
+    addPlaceholderIf(
+        findings,
+        policy,
+        "SEM_PLACEHOLDER_DOMAIN_DEFAULT",
+        "semantic.domain",
+        SemanticMetadataValidator.isDefaultDomain(semantic.domain()));
+    addPlaceholderIf(
+        findings,
+        policy,
+        "SEM_PLACEHOLDER_TAGS_DEFAULT",
+        "semantic.tags",
+        SemanticMetadataValidator.containsDefaultTag(semantic.tags()));
+    addPlaceholderIf(
+        findings,
+        policy,
+        "SEM_PLACEHOLDER_OWNER_DEFAULT",
+        "semantic.ownership.ownerId",
+        semantic.ownership() != null && SemanticMetadataValidator.isDefaultOwnerId(semantic.ownership().ownerId()));
+    addPlaceholderIf(
+        findings,
+        policy,
+        "SEM_PLACEHOLDER_TRUST_CERT_NONE",
+        "semantic.trust.certification",
+        semantic.trust() != null && semantic.trust().certification() == Semantic.Certification.NONE);
+    addPlaceholderIf(
+        findings,
+        policy,
+        "SEM_PLACEHOLDER_TRUST_QUALITY_UNKNOWN",
+        "semantic.trust.qualityStatus",
+        semantic.trust() != null && semantic.trust().qualityStatus() == Semantic.QualityStatus.UNKNOWN);
+    addPlaceholderIf(
+        findings,
+        policy,
+        "SEM_PLACEHOLDER_GRAIN",
+        "semantic.dataShape.grain",
+        semantic.dataShape() != null && SemanticMetadataValidator.isPlaceholderText(semantic.dataShape().grain()));
+    addPlaceholderIf(
+        findings,
+        policy,
+        "SEM_PLACEHOLDER_USAGE",
+        "semantic.usage",
+        hasPlaceholderUsage(semantic));
   }
-}
 
-
-
-
-package org.pronzato.fabric.api.util;
-
-public final class CloseSupport {
-  private CloseSupport() {}
-
-  public static void closeQuietly(AutoCloseable closeable) {
-    if (closeable == null) {
+  private static void validateTypeSpecific(
+      List<SemanticAuditFinding> findings, String definitionType, Semantic semantic) {
+    if ("DATASET".equals(definitionType) || "STREAM".equals(definitionType) || "SCHEMA".equals(definitionType)) {
+      if (semantic.dataShape() == null || isBlank(semantic.dataShape().grain())) {
+        findings.add(
+            new SemanticAuditFinding(
+                "SEM_WEAK_GRAIN",
+                SemanticFindingSeverity.WARN,
+                "semantic.dataShape.grain",
+                "grain should be explicitly defined",
+                false));
+      }
+      if (semantic.dataShape() == null || semantic.dataShape().keyFields().isEmpty()) {
+        findings.add(
+            new SemanticAuditFinding(
+                "SEM_WEAK_KEYS",
+                SemanticFindingSeverity.WARN,
+                "semantic.dataShape.keyFields",
+                "keyFields should include business keys",
+                false));
+      }
+      if (!hasSemanticFieldRichness(semantic)) {
+        findings.add(
+            new SemanticAuditFinding(
+                "SEM_WEAK_FIELD_RICHNESS",
+                SemanticFindingSeverity.WARN,
+                "semantic.dataShape",
+                "add dimension/measure/time fields or fieldRoles for better semantic coverage",
+                false));
+      }
+      if (!hasUsefulUsage(semantic)) {
+        findings.add(
+            new SemanticAuditFinding(
+                "SEM_WEAK_USAGE",
+                SemanticFindingSeverity.WARN,
+                "semantic.usage",
+                "add at least one useful example question or usage hint",
+                false));
+      }
       return;
     }
-    try {
-      closeable.close();
-    } catch (Exception ignore) {
+
+    if ("CONFIG".equals(definitionType)) {
+      if (!hasUsefulUsage(semantic)) {
+        findings.add(
+            new SemanticAuditFinding(
+                "SEM_WEAK_CONFIG_USAGE",
+                SemanticFindingSeverity.WARN,
+                "semantic.usage",
+                "add at least one useful example question or usage hint for config semantics",
+                false));
+      }
+      return;
+    }
+
+    if ("SERVICE".equals(definitionType)) {
+      if (semantic.toolHints() == null || semantic.toolHints().readOnly() == null) {
+        findings.add(
+            new SemanticAuditFinding(
+                "SEM_REQUIRED_SERVICE_READ_ONLY",
+                SemanticFindingSeverity.ERROR,
+                "semantic.toolHints.readOnly",
+                "service semantic toolHints.readOnly is required",
+                false));
+      }
+      if (semantic.toolHints() == null || semantic.toolHints().idempotent() == null) {
+        findings.add(
+            new SemanticAuditFinding(
+                "SEM_REQUIRED_SERVICE_IDEMPOTENT",
+                SemanticFindingSeverity.ERROR,
+                "semantic.toolHints.idempotent",
+                "service semantic toolHints.idempotent is required",
+                false));
+      }
+      if (!hasUsefulUsage(semantic)) {
+        findings.add(
+            new SemanticAuditFinding(
+                "SEM_WEAK_SERVICE_USAGE",
+                SemanticFindingSeverity.WARN,
+                "semantic.usage",
+                "add at least one useful service example question or usage hint",
+                false));
+      }
+      return;
+    }
+
+    if ("INGEST".equals(definitionType) || "INGEST_SOURCE".equals(definitionType)) {
+      if (!hasUsefulUsage(semantic)) {
+        findings.add(
+            new SemanticAuditFinding(
+                "SEM_WEAK_INGEST_USAGE",
+                SemanticFindingSeverity.WARN,
+                "semantic.usage",
+                "add at least one useful usage hint for ingest operations",
+                false));
+      }
     }
   }
-}
 
-
-
-
-
-package org.pronzato.fabric.api.util;
-
-import java.time.Instant;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
-
-public final class DefinitionModelMapperSupport {
-  public static final String DEFAULT_LIFECYCLE_STATUS = "ACTIVE";
-  public static final String DEFAULT_ACTOR = "fabric-lite";
-
-  private DefinitionModelMapperSupport() {}
-
-  public static String requireNonBlank(String value, String fieldName) {
-    return Strings.requireNonBlank(value, fieldName);
-  }
-
-  public static String normalizeLifecycleStatus(String lifecycleStatus) {
-    return Strings.firstNonBlank(lifecycleStatus, DEFAULT_LIFECYCLE_STATUS);
-  }
-
-  public static String normalizeActor(String actor) {
-    return Strings.firstNonBlank(actor, DEFAULT_ACTOR);
-  }
-
-  public static String buildDefinitionId(String kind, String group, String name) {
-    return requireNonBlank(kind, "kind")
-        + ":"
-        + requireNonBlank(group, "group")
-        + "/"
-        + requireNonBlank(name, "name");
-  }
-
-  public static String buildScopedName(
-      String namespace, String name, String namespaceFieldName, String nameFieldName) {
-    return requireNonBlank(namespace, namespaceFieldName)
-        + "/"
-        + requireNonBlank(name, nameFieldName);
-  }
-
-  public static DefinitionEnvelope envelopeNow(
-      String group,
-      DefinitionType type,
-      String name,
-      String uuid,
-      boolean enabled,
-      String lifecycleStatus,
-      String actor) {
-    return envelopeAt(
-        group,
-        type,
-        name,
-        uuid,
-        enabled,
-        lifecycleStatus,
-        actor,
-        Instant.now().toString());
-  }
-
-  public static DefinitionEnvelope envelopeAt(
-      String group,
-      DefinitionType type,
-      String name,
-      String uuid,
-      boolean enabled,
-      String lifecycleStatus,
-      String actor,
-      String timestampIso) {
-    String now = requireNonBlank(timestampIso, "timestampIso");
-    String resolvedActor = normalizeActor(actor);
-    return new DefinitionEnvelope(
-        requireNonBlank(group, "group"),
-        type,
-        requireNonBlank(name, "name"),
-        requireNonBlank(uuid, "uuid"),
-        enabled,
-        normalizeLifecycleStatus(lifecycleStatus),
-        now,
-        resolvedActor,
-        now,
-        resolvedActor);
-  }
-}
-
-
-
-package org.pronzato.fabric.api.util;
-
-public final class Exceptions {
-
-  private Exceptions() {}
-
-  public static Throwable rootCause(Throwable error) {
-    Throwable cursor = error;
-    while (cursor != null && cursor.getCause() != null && cursor.getCause() != cursor) {
-      cursor = cursor.getCause();
-    }
-    return cursor;
-  }
-
-  public static boolean hasCause(Throwable error, Class<? extends Throwable> type) {
-    if (type == null) {
+  private static boolean hasSemanticFieldRichness(Semantic semantic) {
+    if (semantic == null || semantic.dataShape() == null) {
       return false;
     }
-    Throwable cursor = error;
-    while (cursor != null) {
-      if (type.isInstance(cursor)) {
+    return !semantic.dataShape().dimensionFields().isEmpty()
+        || !semantic.dataShape().measureFields().isEmpty()
+        || !semantic.dataShape().timeFields().isEmpty()
+        || !semantic.dataShape().fieldRoles().isEmpty();
+  }
+
+  private static boolean hasUsefulUsage(Semantic semantic) {
+    if (semantic == null || semantic.usage() == null) {
+      return false;
+    }
+    return hasNonPlaceholderText(semantic.usage().exampleQuestions())
+        || hasNonPlaceholderText(semantic.usage().usageHints());
+  }
+
+  private static boolean hasNonPlaceholderText(List<String> values) {
+    if (values == null || values.isEmpty()) {
+      return false;
+    }
+    for (String value : values) {
+      String normalized = Strings.trimToNull(value);
+      if (normalized != null && !SemanticMetadataValidator.isPlaceholderText(normalized)) {
         return true;
       }
-      Throwable next = cursor.getCause();
-      if (next == cursor) {
-        break;
-      }
-      cursor = next;
     }
     return false;
   }
 
-  public static String rootMessageNullable(Throwable error) {
-    Throwable root = rootCause(error);
-    return root == null ? null : Strings.trimToNull(root.getMessage());
-  }
-
-  public static String rootMessage(Throwable error) {
-    Throwable root = rootCause(error);
-    if (root == null) {
-      return "unknown error";
+  private static boolean hasPlaceholderUsage(Semantic semantic) {
+    if (semantic == null || semantic.usage() == null) {
+      return false;
     }
-    String message = Strings.trimToNull(root.getMessage());
-    return message == null ? root.getClass().getSimpleName() : message;
+    return listHasPlaceholder(semantic.usage().exampleQuestions())
+        || listHasPlaceholder(semantic.usage().exampleQueries())
+        || listHasPlaceholder(semantic.usage().usageHints())
+        || listHasPlaceholder(semantic.usage().knownPitfalls());
   }
 
-  public static String normalizeMessage(Throwable error) {
-    if (error == null) {
-      return "unknown failure";
+  private static boolean listHasPlaceholder(List<String> values) {
+    if (values == null || values.isEmpty()) {
+      return false;
     }
-    String message = error.getMessage();
-    if (message == null || message.isBlank()) {
-      return error.getClass().getSimpleName();
+    for (String value : values) {
+      if (SemanticMetadataValidator.isPlaceholderText(value)) {
+        return true;
+      }
     }
-    return message;
-  }
-}
-
-
-
-package org.pronzato.fabric.api.util;
-
-public final class IdentityParsingSupport {
-  private IdentityParsingSupport() {}
-
-  public static String requireGroup(String group) {
-    return requireGroup(group, "session.group");
+    return false;
   }
 
-  public static String requireGroup(String group, String fieldName) {
-    return Strings.requireNonBlank(group, fieldName);
-  }
-
-  public static String requireNamespace(String namespace, String fieldName) {
-    return Strings.requireNonBlank(namespace, fieldName);
-  }
-
-  public static String requireName(String name, String fieldName) {
-    return Strings.requireNonBlank(name, fieldName);
-  }
-
-  public static <T> T requireNonNullRuntime(T value, String message) {
-    if (value == null) {
-      throw new IllegalStateException(message);
-    }
-    return value;
-  }
-
-  public static ScopedName parseScopedName(
-      String scopedName, String namespaceFieldName, String nameFieldName) {
-    String normalized = Strings.requireNonBlank(scopedName, "scopedName");
-    int slash = normalized.indexOf('/');
-    if (slash < 0) {
-      return new ScopedName(null, requireName(normalized, nameFieldName));
-    }
-    String namespace = requireNamespace(normalized.substring(0, slash), namespaceFieldName);
-    String name = requireName(normalized.substring(slash + 1), nameFieldName);
-    return new ScopedName(namespace, name);
-  }
-
-  public record ScopedName(String namespace, String name) {}
-}
-
-
-
-package org.pronzato.fabric.api.util;
-
-import java.io.IOException;
-import java.io.InputStream;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
-
-public final class Io {
-
-  private Io() {}
-
-  public static Path writeTempFile(String prefix, String suffix, byte[] data) throws IOException {
-    if (data == null) {
-      throw new IllegalArgumentException("data is required");
-    }
-    Path temp = Files.createTempFile(prefix, suffix);
-    Files.write(temp, data, StandardOpenOption.TRUNCATE_EXISTING);
-    temp.toFile().deleteOnExit();
-    return temp.toAbsolutePath().normalize();
-  }
-
-  public static byte[] readClasspathBytes(String resourcePath, Class<?> anchor) throws IOException {
-    if (anchor == null) {
-      throw new IllegalArgumentException("anchor is required");
-    }
-    String normalized = normalizeResourcePath(resourcePath);
-    ClassLoader tccl = Thread.currentThread().getContextClassLoader();
-    InputStream in = tccl == null ? null : tccl.getResourceAsStream(normalized);
-    if (in == null) {
-      ClassLoader anchorLoader = anchor.getClassLoader();
-      in = anchorLoader == null ? ClassLoader.getSystemResourceAsStream(normalized) : anchorLoader.getResourceAsStream(normalized);
-    }
-    if (in == null) {
-      throw new IllegalArgumentException("Classpath resource not found: " + resourcePath);
-    }
-    try (InputStream stream = in) {
-      return stream.readAllBytes();
-    }
-  }
-
-  public static void deleteIfExists(Path path) {
-    if (path == null) {
+  private static void addPlaceholderIf(
+      List<SemanticAuditFinding> findings,
+      SemanticValidationPolicy policy,
+      String code,
+      String field,
+      boolean condition) {
+    if (!condition) {
       return;
     }
-    try {
-      Files.deleteIfExists(path);
-    } catch (IOException ignore) {
-    }
+    findings.add(
+        new SemanticAuditFinding(
+            code,
+            policy.placeholderSeverity(),
+            field,
+            "placeholder/default semantic value detected: " + field,
+            true));
   }
 
-  private static String normalizeResourcePath(String resourcePath) {
-    String path = Strings.trimToNull(resourcePath);
-    if (path == null) {
-      throw new IllegalArgumentException("resourcePath is required");
-    }
-    return path.startsWith("/") ? path.substring(1) : path;
-  }
-}
-
-package org.pronzato.fabric.api.util;
-
-/** Shared namespace utilities for normalization. */
-public final class Namespaces {
-
-  public static final String DEFAULT_NAMESPACE = "default";
-
-  private Namespaces() {}
-
-  public static String resolveNamespace(String namespace) {
-    return Strings.requireNonBlank(namespace, "namespace");
-  }
-
-  public static String normalizeNamespace(String namespace) {
-    return Strings.trimToNull(namespace);
-  }
-}
-
-
-
-package org.pronzato.fabric.api.util;
-
-import java.util.Collection;
-import java.util.Map;
-
-public final class Strings {
-
-  private Strings() {
-    // utility
-  }
-
-  /**
-   * Returns {@code true} when the value is {@code null} or contains only whitespace.
-   */
-  public static boolean isBlank(String value) {
-    return value == null || value.isBlank();
-  }
-
-  /**
-   * Returns {@code true} when the value is not {@code null} and has non-whitespace content.
-   */
-  public static boolean isNotBlank(String value) {
-    return !isBlank(value);
-  }
-
-  /**
-   * Returns {@code true} when the value is {@code null} or empty (no trim).
-   */
-  public static boolean isEmpty(String value) {
-    return value == null || value.isEmpty();
-  }
-
-  /**
-   * Returns {@code true} when the value is not {@code null} and not empty (no trim).
-   */
-  public static boolean isNotEmpty(String value) {
-    return !isEmpty(value);
-  }
-
-  /**
-   * Returns {@code true} when the collection is {@code null} or empty.
-   */
-  public static boolean isEmpty(Collection<?> value) {
-    return value == null || value.isEmpty();
-  }
-
-  /**
-   * Returns {@code true} when the collection is not {@code null} and not empty.
-   */
-  public static boolean isNotEmpty(Collection<?> value) {
-    return value != null && !value.isEmpty();
-  }
-
-  /**
-   * Returns {@code true} when the map is {@code null} or empty.
-   */
-  public static boolean isEmpty(Map<?, ?> value) {
-    return value == null || value.isEmpty();
-  }
-
-  /**
-   * Returns {@code true} when the map is not {@code null} and not empty.
-   */
-  public static boolean isNotEmpty(Map<?, ?> value) {
-    return value != null && !value.isEmpty();
-  }
-
-  /**
-   * Returns {@code true} when the array is {@code null} or empty.
-   */
-  public static boolean isEmpty(Object[] value) {
-    return value == null || value.length == 0;
-  }
-
-  /**
-   * Returns {@code true} when the array is not {@code null} and not empty.
-   */
-  public static boolean isNotEmpty(Object[] value) {
-    return value != null && value.length > 0;
-  }
-
-  /**
-   * Trims the value, returning {@code null} when the input is {@code null} or blank after trim.
-   */
-  public static String trimToNull(String value) {
-    if (value == null) {
-      return null;
-    }
-    String trimmed = value.trim();
-    return trimmed.isEmpty() ? null : trimmed;
-  }
-
-  /**
-   * Trims the value, returning an empty string when the input is {@code null}.
-   */
-  public static String trimToEmpty(String value) {
-    return value == null ? "" : value.trim();
-  }
-
-  /**
-   * Returns an empty string when the input is {@code null}.
-   */
-  public static String nullToEmpty(String value) {
-    return value == null ? "" : value;
-  }
-
-  /**
-   * Returns {@code null} when the input is an empty string; leaves whitespace unchanged.
-   */
-  public static String emptyToNull(String value) {
-    if (value == null) {
-      return null;
-    }
-    return value.isEmpty() ? null : value;
-  }
-
-  /**
-   * Returns {@code null} when the input is {@code null} or blank; leaves non-blank values unchanged.
-   */
-  public static String blankToNull(String value) {
-    return isBlank(value) ? null : value;
-  }
-
-  /**
-   * Returns a normalized string with trimmed edges and single spaces between tokens.
-   * Returns {@code null} when the input is {@code null}.
-   */
-  public static String normalizeSpace(String value) {
-    if (value == null) {
-      return null;
-    }
-    return value.trim().replaceAll("\\s+", " ");
-  }
-
-  /**
-   * Returns the trimmed value or throws {@link IllegalArgumentException} when blank.
-   */
-  public static String requireNonBlank(String value, String name) {
+  private static void requireText(
+      List<SemanticAuditFinding> findings, String code, String field, String value) {
     if (isBlank(value)) {
-      String label = name == null ? "value" : name;
-      throw new IllegalArgumentException(label + " is required");
+      findings.add(
+          new SemanticAuditFinding(
+              code,
+              SemanticFindingSeverity.ERROR,
+              field,
+              field + " is required",
+              false));
     }
-    return value.trim();
   }
 
-  /**
-   * Returns the value or throws {@link IllegalArgumentException} when null or empty.
-   */
-  public static String requireNonEmpty(String value, String name) {
-    if (isEmpty(value)) {
-      String label = name == null ? "value" : name;
-      throw new IllegalArgumentException(label + " is required");
+  private static void requireNonEmptyList(
+      List<SemanticAuditFinding> findings, String code, String field, List<String> values) {
+    if (values == null || values.isEmpty()) {
+      findings.add(
+          new SemanticAuditFinding(
+              code,
+              SemanticFindingSeverity.ERROR,
+              field,
+              field + " must be non-empty",
+              false));
     }
-    return value;
   }
 
-  /**
-   * Null-safe equality check.
-   */
-  public static boolean equals(String left, String right) {
-    if (left == null) {
-      return right == null;
-    }
-    return left.equals(right);
-  }
-
-  /**
-   * Null-safe case-insensitive equality check.
-   */
-  public static boolean equalsIgnoreCase(String left, String right) {
-    if (left == null) {
-      return right == null;
-    }
-    return right != null && left.equalsIgnoreCase(right);
-  }
-
-  /**
-   * Returns the first non-blank value (after trimming) or {@code null} if none.
-   */
-  public static String firstNonBlank(String... values) {
-    if (values == null) {
-      return null;
-    }
-    for (String value : values) {
-      String trimmed = trimToNull(value);
-      if (trimmed != null) {
-        return trimmed;
+  private static int calculateScore(List<SemanticAuditFinding> findings) {
+    int deductions = 0;
+    for (SemanticAuditFinding finding : findings) {
+      if (finding.severity() == SemanticFindingSeverity.ERROR) {
+        deductions += 20;
+      } else if (finding.severity() == SemanticFindingSeverity.WARN) {
+        deductions += 8;
+      } else if (finding.severity() == SemanticFindingSeverity.INFO) {
+        deductions += 2;
       }
+    }
+    return Math.max(0, 100 - deductions);
+  }
+
+  private static SemanticCompletenessClass classify(int score, int placeholderCount) {
+    if (placeholderCount > 0) {
+      return SemanticCompletenessClass.PLACEHOLDER;
+    }
+    if (score >= 90) {
+      return SemanticCompletenessClass.STRONG;
+    }
+    if (score >= 75) {
+      return SemanticCompletenessClass.COMPLETE;
+    }
+    return SemanticCompletenessClass.WEAK;
+  }
+
+  private static String targetedDefinitionType(Definition definition) {
+    if (definition instanceof DefinitionDataset) {
+      return "DATASET";
+    }
+    if (definition instanceof DefinitionService) {
+      return "SERVICE";
+    }
+    if (definition instanceof DefinitionStream) {
+      return "STREAM";
+    }
+    if (definition instanceof DefinitionIngest) {
+      return "INGEST";
+    }
+    if (definition instanceof DefinitionIngestSource) {
+      return "INGEST_SOURCE";
+    }
+    if (definition instanceof DefinitionSchema) {
+      return "SCHEMA";
+    }
+    if (definition instanceof DefinitionConfigLayer) {
+      return "CONFIG";
     }
     return null;
   }
 
-  /**
-   * Returns the first non-null value or {@code null} if none.
-   */
-  public static String firstNonNull(String... values) {
-    if (values == null) {
+  private static Semantic semantic(
+      Definition definition, Map<String, Semantic> configSemanticByKey) {
+    if (definition instanceof DefinitionDataset dataset) {
+      return dataset.semantic();
+    }
+    if (definition instanceof DefinitionService service) {
+      return service.semantic();
+    }
+    if (definition instanceof DefinitionStream stream) {
+      return stream.semantic();
+    }
+    if (definition instanceof DefinitionIngest ingest) {
+      return ingest.semantic();
+    }
+    if (definition instanceof DefinitionIngestSource ingestSource) {
+      return ingestSource.semantic();
+    }
+    if (definition instanceof DefinitionSchema schema) {
+      return schema.semantic();
+    }
+    if (definition instanceof DefinitionConfigLayer config) {
+      String group =
+          Strings.trimToNull(
+              config == null || config.envelope() == null ? null : config.envelope().group());
+      String configSetId = normalizeConfigSetId(config == null ? null : config.configId());
+      if (group != null && configSetId != null && configSemanticByKey != null) {
+        Semantic fromMeta = configSemanticByKey.get(configSemanticKey(group, configSetId));
+        if (fromMeta != null) {
+          return fromMeta;
+        }
+      }
       return null;
     }
-    for (String value : values) {
-      if (value != null) {
-        return value;
-      }
-    }
     return null;
+  }
+
+  private static Map<String, Semantic> indexConfigSemantic(List<AuditInput> inputs) {
+    if (inputs == null || inputs.isEmpty()) {
+      return Map.of();
+    }
+    LinkedHashMap<String, Semantic> indexed = new LinkedHashMap<>();
+    for (AuditInput input : inputs) {
+      Definition definition = input == null ? null : input.definition();
+      if (!(definition instanceof DefinitionConfig configMeta)
+          || configMeta.semantic() == null) {
+        continue;
+      }
+      String group =
+          Strings.firstNonBlank(
+              Strings.trimToNull(configMeta.envelope() == null ? null : configMeta.envelope().group()),
+              Strings.trimToNull(configMeta.group()));
+      String configSetId = normalizeConfigSetId(configMeta.configId());
+      if (group == null || configSetId == null) {
+        continue;
+      }
+      indexed.put(configSemanticKey(group, configSetId), configMeta.semantic());
+    }
+    return indexed.isEmpty() ? Map.of() : Map.copyOf(indexed);
+  }
+
+  private static String configSemanticKey(String group, String configSetId) {
+    return group + "|" + configSetId;
+  }
+
+  private static String normalizeConfigSetId(String value) {
+    String normalized = Strings.trimToNull(value);
+    if (normalized == null) {
+      return null;
+    }
+    if (!normalized.startsWith("config:")) {
+      return normalized;
+    }
+    String payload = normalized.substring("config:".length());
+    String[] parts = payload.split("/");
+    if (parts.length < 2) {
+      return null;
+    }
+    return Strings.trimToNull(parts[1]);
+  }
+
+  private static String assetId(String definitionType, Definition definition) {
+    String group =
+        Strings.firstNonBlank(
+            definition == null || definition.envelope() == null ? null : definition.envelope().group(),
+            "unknown");
+    String name =
+        Strings.firstNonBlank(
+            definition == null || definition.envelope() == null ? null : definition.envelope().name(),
+            "unknown");
+    return definitionType.toLowerCase(Locale.ROOT) + ":" + group + "/" + name;
+  }
+
+  private static boolean isBlank(String value) {
+    return Strings.trimToNull(value) == null;
+  }
+
+  private static double roundToTwoDecimals(double value) {
+    return Math.round(value * 100.0d) / 100.0d;
   }
 }
-
-
 
