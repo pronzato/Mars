@@ -1,688 +1,652 @@
-package org.pronzato.fabric.api.data.manager;
+package org.pronzato.fabric.api.data.catalog;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
-import org.apache.arrow.vector.VectorLoader;
-import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.VectorUnloader;
-import org.apache.arrow.vector.ipc.ArrowStreamReader;
-import org.apache.arrow.vector.ipc.ArrowStreamWriter;
-import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
-import org.apache.arrow.vector.types.pojo.Schema;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngest;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngestSource;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionSchema;
+import java.util.Set;
 import org.pronzato.fabric.api.data.dataset.DatasetId;
-import org.pronzato.fabric.api.data.dataset.DatasetType;
-import org.pronzato.fabric.api.data.format.FormatDecodeRequest;
-import org.pronzato.fabric.api.data.format.FormatDecoder;
-import org.pronzato.fabric.api.data.format.FormatDecoderJson;
-import org.pronzato.fabric.api.data.format.FormatDecoderNvFix;
-import org.pronzato.fabric.api.data.duckdb.OdbcRuntimeGuard;
-import org.pronzato.fabric.api.data.ingest.IngestPayload;
-import org.pronzato.fabric.api.data.ingest.IngestPayloadJson;
-import org.pronzato.fabric.api.data.ingest.IngestPayloadNvFix;
-import org.pronzato.fabric.api.control.entitlements.core.data.DataWriteAuthorization;
-import org.pronzato.fabric.api.control.plugins.IngestTargetAppendContext;
-import org.pronzato.fabric.api.control.plugins.IngestTargetProvider;
 import org.pronzato.fabric.api.util.Strings;
 
-final class IngestManagerImplAppend {
-  private IngestManagerImplAppend() {}
+public final class DatasetNameResolver {
+  private static final Comparator<DatasetId> DATASET_ID_ORDER =
+      Comparator.comparing(DatasetId::toString, String.CASE_INSENSITIVE_ORDER)
+          .thenComparing(DatasetId::toString);
+  private static final Set<String> TABLE_CLAUSE_KEYWORDS =
+      Set.of("from", "join", "update", "into");
+  private static final Set<String> STOP_KEYWORDS =
+      Set.of(
+          "where",
+          "group",
+          "order",
+          "having",
+          "qualify",
+          "window",
+          "union",
+          "except",
+          "intersect",
+          "limit",
+          "offset",
+          "fetch",
+          "on",
+          "using",
+          "set",
+          "values",
+          "returning");
 
-  static void append(IngestManagerImpl manager, String ingestName, IngestPayload payload) {
-    append(manager, ingestName, payload, DuckDbActiveMutation.UPSERT, true);
+  private final String sessionGroup;
+  private final String defaultNamespace;
+  private final CatalogSnapshot snapshot;
+
+  public DatasetNameResolver(String sessionGroup, String defaultNamespace, CatalogSnapshot snapshot) {
+    this.sessionGroup = Strings.requireNonBlank(sessionGroup, "sessionGroup");
+    this.defaultNamespace = Strings.requireNonBlank(defaultNamespace, "defaultNamespace");
+    this.snapshot = Objects.requireNonNull(snapshot, "snapshot");
   }
 
-  static void append(
-      IngestManagerImpl manager, String ingestName, IngestPayload payload, DuckDbActiveMutation mutation) {
-    append(manager, ingestName, payload, mutation, true);
-  }
-
-  static void append(
-      IngestManagerImpl manager,
-      String ingestName,
-      IngestPayload payload,
-      DuckDbActiveMutation mutation,
-      boolean enforceWriteGate) {
-    String normalizedName = Strings.trimToNull(ingestName);
-    if (normalizedName == null) {
-      throw new IllegalArgumentException("ingest name is required");
-    }
-    Objects.requireNonNull(payload, "payload");
-    DuckDbActiveMutation resolvedMutation =
-        mutation == null ? DuckDbActiveMutation.UPSERT : mutation;
-
-    DefinitionIngest ingest = IngestManagerImplDataset.resolveIngestDefinition(manager, normalizedName);
-    Optional<DefinitionIngestSource> sourceDefinition =
-        manager.DiscoveryCache.get(DefinitionIngestSource.class, manager.group, normalizedName);
-    if (sourceDefinition.isEmpty()) {
-      throw new IllegalStateException(
-          "IngestSource not found for ingest: " + manager.group + "/" + normalizedName);
-    }
-
-    DefinitionIngestSource ingestSource = sourceDefinition.get();
-    DefinitionEnvelope sourceEnvelope = ingestSource.envelope();
-    if (sourceEnvelope != null && Boolean.FALSE.equals(sourceEnvelope.enabled())) {
-      throw new IllegalStateException("IngestSource is disabled: " + manager.group + "/" + normalizedName);
-    }
-
-    String actualFormat =
-        Strings.requireNonBlank(ingestSource.format(), "ingestSource.format")
-            .toUpperCase(Locale.ROOT);
-    String expectedFormat;
-    FormatDecoder decoder;
-    byte[] payloadUtf8Bytes;
-
-    if (payload instanceof IngestPayloadJson jsonPayload) {
-      expectedFormat = IngestManagerImpl.FORMAT_JSON;
-      decoder = new FormatDecoderJson(ingestSource.json());
-      payloadUtf8Bytes = jsonPayload.json().getBytes(StandardCharsets.UTF_8);
-    } else if (payload instanceof IngestPayloadNvFix nvfixPayload) {
-      expectedFormat = IngestManagerImpl.FORMAT_NVFIX;
-      decoder = new FormatDecoderNvFix(ingestSource.nvfix());
-      payloadUtf8Bytes = nvfixPayload.nvfix().getBytes(StandardCharsets.UTF_8);
-    } else {
-      throw new IllegalArgumentException(
-          "Unsupported payload type: " + payload.getClass().getName());
-    }
-
-    if (!expectedFormat.equals(actualFormat)) {
-      throw new IllegalStateException(
-          "IngestSource format mismatch: ingest="
-              + manager.group
-              + "/"
-              + normalizedName
-              + " expected="
-              + expectedFormat
-              + " actual="
-              + actualFormat);
-    }
-
-    String datasetId = Strings.trimToNull(ingest.datasetId());
-    if (datasetId == null) {
-      throw new IllegalArgumentException(
-          "Ingest datasetId is required: " + manager.group + "/" + normalizedName);
-    }
-    DatasetId parsedDatasetId = DatasetId.parse(datasetId);
-    if (enforceWriteGate) {
-      enforceWrite(manager, parsedDatasetId.toString(), IngestManagerImpl.OPERATION_APPEND, null);
-    }
-
-    String outputSchemaId = Strings.trimToNull(ingest.outputSchemaId());
-    if (outputSchemaId == null) {
-      throw new IllegalArgumentException(
-          "Ingest outputSchemaId is required: " + manager.group + "/" + normalizedName);
-    }
-    DefinitionIngest.SchemaMode schemaMode = ingest.effectiveSchemaMode();
-    String ingestId = manager.group + "/" + normalizedName;
-    DefinitionSchema expectedSchemaDefinition =
-        IngestSchemaResolver.resolveExpectedSchema(
-            manager.DiscoveryCache, manager.group, outputSchemaId, ingestId);
-
-    byte[] ipcBytes =
-        decoder.decodeToArrowIpc(
-            new FormatDecodeRequest(
-                ingestId,
-                outputSchemaId,
-                expectedSchemaDefinition,
-                payloadUtf8Bytes,
-                schemaMode,
-                FormatDecodeRequest.DEFAULT_ROW_LIMIT_PER_BATCH));
-    appendIpc(manager, normalizedName, ipcBytes, resolvedMutation, false);
-  }
-
-  static void appendIpc(IngestManagerImpl manager, String ingestName, byte[] arrowIpcStreamBytes) {
-    appendIpc(manager, ingestName, arrowIpcStreamBytes, DuckDbActiveMutation.UPSERT, true);
-  }
-
-  static void appendIpc(
-      IngestManagerImpl manager,
-      String ingestName,
-      byte[] arrowIpcStreamBytes,
-      DuckDbActiveMutation mutation) {
-    appendIpc(manager, ingestName, arrowIpcStreamBytes, mutation, true);
-  }
-
-  static void appendIpc(
-      IngestManagerImpl manager,
-      String ingestName,
-      byte[] arrowIpcStreamBytes,
-      DuckDbActiveMutation mutation,
-      boolean enforceWriteGate) {
-    String normalizedName = Strings.trimToNull(ingestName);
-    if (normalizedName == null) {
-      throw new IllegalArgumentException("ingest name is required");
-    }
-    DuckDbActiveMutation resolvedMutation =
-        mutation == null ? DuckDbActiveMutation.UPSERT : mutation;
-
-    DefinitionIngest ingest = IngestManagerImplDataset.resolveIngestDefinition(manager, normalizedName);
-    DefinitionEnvelope envelope = ingest.envelope();
-    if (envelope != null && Boolean.FALSE.equals(envelope.enabled())) {
-      throw new IllegalStateException("Ingest is disabled: " + manager.group + "/" + normalizedName);
-    }
-
-    String inputType = ingest.input() == null ? null : Strings.trimToNull(ingest.input().type());
-    if (!IngestManagerImpl.INPUT_TYPE_API_IPC.equals(inputType)) {
-      throw new IllegalArgumentException(
-          "Unsupported ingest input.type for "
-              + manager.group
-              + "/"
-              + normalizedName
-              + ": "
-              + inputType
-              + " (expected "
-              + IngestManagerImpl.INPUT_TYPE_API_IPC
-              + ")");
-    }
-
-    String datasetId = Strings.trimToNull(ingest.datasetId());
-    if (datasetId == null) {
-      throw new IllegalArgumentException(
-          "Ingest datasetId is required: " + manager.group + "/" + normalizedName);
-    }
-    DatasetId parsedDatasetId = DatasetId.parse(datasetId);
-    if (enforceWriteGate) {
-      enforceWrite(manager, parsedDatasetId.toString(), IngestManagerImpl.OPERATION_INGEST, null);
-    }
-
-    String outputSchemaId = Strings.trimToNull(ingest.outputSchemaId());
-    if (outputSchemaId == null) {
-      throw new IllegalArgumentException(
-          "Ingest outputSchemaId is required: " + manager.group + "/" + normalizedName);
-    }
-
-    String ingestId = manager.group + "/" + normalizedName;
-    DefinitionIngest.SchemaMode schemaMode = ingest.effectiveSchemaMode();
-    DefinitionSchema expectedSchemaDefinition =
-        IngestSchemaResolver.resolveExpectedSchema(
-            manager.DiscoveryCache, manager.group, outputSchemaId, ingestId);
-    IngestManagerImplSchema.ParsedExpectedSchema expectedSchema =
-        IngestManagerImplSchema.parseExpectedSchema(expectedSchemaDefinition, ingestId, outputSchemaId);
-    Schema actualSchema =
-        IngestManagerImplSchema.readArrowSchema(
-            arrowIpcStreamBytes, ingestId, manager.schemaIpcAllocator);
-    IngestManagerImplSchema.SchemaComparison comparison =
-        IngestManagerImplSchema.compareSchemas(expectedSchema, actualSchema, schemaMode);
-    if (!comparison.matches()) {
-      throw new IllegalStateException(
-          IngestManagerImplSchema.formatSchemaMismatch(
-              ingestId,
-              schemaMode,
-              outputSchemaId,
-              actualSchema,
-              comparison.missingFields(),
-              comparison.extraFields(),
-              comparison.typeMismatches(),
-              comparison.nullabilityMismatches(),
-              comparison.appendOnlyViolations(),
-              comparison.nonNullableExtraFields(),
-              comparison.expectedFieldCount(),
-              comparison.actualFieldCount()));
-    }
-
-    DefinitionDataset datasetDefinition =
-        IngestManagerImplDataset.resolveDatasetDefinition(manager, datasetId);
-    appendToDatasetWithRolling(
-        manager,
-        normalizedName,
-        parsedDatasetId,
-        datasetDefinition,
-        arrowIpcStreamBytes,
-        resolvedMutation);
-  }
-
-  static void flushPendingParquetBuffer(IngestManagerImpl manager, String ingestName, String reason) {
-    if (Strings.isBlank(ingestName)) {
-      return;
-    }
-    IngestManagerImpl.ParquetRollBuffer buffer = manager.parquetRollBuffers.get(ingestName);
-    if (buffer == null) {
-      return;
-    }
-    synchronized (buffer.monitor) {
-      flushBufferLocked(manager, ingestName, buffer, reason);
-      if (buffer.pendingIpcBatches.isEmpty()) {
-        manager.parquetRollBuffers.remove(ingestName, buffer);
+  public DatasetId resolveTableToken(String token) {
+    String normalizedToken = normalizeToken(token);
+    if (normalizedToken.indexOf('.') >= 0) {
+      DatasetId qualified = snapshot.qualifiedNameMap().get(normalizedToken.toLowerCase(Locale.ROOT));
+      if (qualified == null) {
+        throw unknownTableToken(token);
       }
+      return qualified;
     }
+
+    List<DatasetId> candidates = snapshot.unqualifiedNameMap().get(normalizedToken.toLowerCase(Locale.ROOT));
+    if (candidates == null || candidates.isEmpty()) {
+      throw unknownTableToken(token);
+    }
+    if (candidates.size() == 1) {
+      return candidates.get(0);
+    }
+    DatasetId preferred = preferDefaultNamespaceCandidate(candidates);
+    if (preferred != null) {
+      return preferred;
+    }
+    List<String> ids = new ArrayList<>(candidates.size());
+    List<DatasetId> sorted = new ArrayList<>(candidates);
+    sorted.sort(DATASET_ID_ORDER);
+    for (DatasetId candidate : sorted) {
+      ids.add(candidate.toString());
+    }
+    throw new IllegalArgumentException(
+        "Ambiguous table token '"
+            + token
+            + "' resolves to multiple datasets: ["
+            + String.join(",", ids)
+            + "]. Use namespace.foo or fully qualify group.namespace.foo");
   }
 
-  static void flushAllPendingParquetBuffers(IngestManagerImpl manager, String reason) {
-    for (String ingestName : new ArrayList<>(manager.parquetRollBuffers.keySet())) {
-      flushPendingParquetBuffer(manager, ingestName, reason);
-    }
+  public List<DatasetId> resolveAllTableTokensInSql(String sql) {
+    return resolveAllTableTokensInSql(sql, false);
   }
 
-  static void flushIdleParquetBuffersSafe(IngestManagerImpl manager) {
-    long now = System.currentTimeMillis();
-    for (Map.Entry<String, IngestManagerImpl.ParquetRollBuffer> entry :
-        manager.parquetRollBuffers.entrySet()) {
-      String ingestName = entry.getKey();
-      IngestManagerImpl.ParquetRollBuffer buffer = entry.getValue();
-      try {
-        synchronized (buffer.monitor) {
-          if (buffer.pendingIpcBatches.isEmpty()) {
-            continue;
-          }
-          long maxIdleMillis = buffer.policy.maxIdleMillis();
-          if (maxIdleMillis <= 0L) {
-            continue;
-          }
-          long idleFor = now - buffer.lastAppendMillis;
-          if (idleFor < maxIdleMillis) {
-            continue;
-          }
-          flushBufferLocked(
-              manager,
-              ingestName,
-              buffer,
-              "maxIdleMillis=" + maxIdleMillis + " elapsed (idleFor=" + idleFor + "ms)");
-        }
-      } catch (RuntimeException ex) {
-        IngestManagerImpl.LOGGER.error(
-            "[IngestManager] idle parquet roll failed ingest={}: {}",
-            ingestName,
-            ex.getMessage(),
-            ex);
-      }
+  public List<DatasetId> resolveAllTableTokensInSql(String sql, boolean strict) {
+    List<DatasetToken> tokens = scanTableTokensInSql(sql, strict);
+    LinkedHashSet<DatasetId> resolved = new LinkedHashSet<>();
+    for (DatasetToken token : tokens) {
+      resolved.add(resolveTableToken(token.normalizedToken()));
     }
+    return List.copyOf(resolved);
   }
 
-  static void ensureRollScanTask(IngestManagerImpl manager) {
-    if (manager.rollScheduler == null) {
-      return;
-    }
-    ScheduledFuture<?> existing = manager.rollScanTask.get();
-    if (existing != null && !existing.isCancelled()) {
-      return;
-    }
-    ScheduledFuture<?> created;
-    try {
-      created =
-          manager.rollScheduler.scheduleWithFixedDelay(
-              () -> flushIdleParquetBuffersSafe(manager),
-              IngestManagerImpl.ROLL_SCAN_INTERVAL_MILLIS,
-              IngestManagerImpl.ROLL_SCAN_INTERVAL_MILLIS,
-              TimeUnit.MILLISECONDS);
-    } catch (RuntimeException ex) {
-      IngestManagerImpl.LOGGER.warn(
-          "[IngestManager] unable to start parquet idle roll scan: {}", ex.getMessage());
-      return;
-    }
-    if (!manager.rollScanTask.compareAndSet(existing, created)) {
-      created.cancel(false);
-    }
-  }
-
-  static void cancelRollScanTask(IngestManagerImpl manager) {
-    ScheduledFuture<?> task = manager.rollScanTask.getAndSet(null);
-    if (task != null) {
-      task.cancel(false);
-    }
-  }
-
-  static IngestManagerImpl.ParquetRollPolicy resolveParquetRollPolicy(
-      IngestManagerImpl manager, String ingestName, DefinitionDataset datasetDefinition) {
-    if (datasetDefinition == null || datasetDefinition.binding() == null) {
-      return IngestManagerImpl.ParquetRollPolicy.disabled();
-    }
-    DefinitionDataset.ParquetBinding parquet = datasetDefinition.binding().parquet();
-    if (parquet == null) {
-      return IngestManagerImpl.ParquetRollPolicy.disabled();
-    }
-    IngestManagerImpl.ParquetRollPolicy runtimePolicy =
-        Strings.isBlank(ingestName) ? null : manager.parquetRollPolicies.get(ingestName);
-    if (runtimePolicy != null) {
-      return runtimePolicy;
-    }
-    return new IngestManagerImpl.ParquetRollPolicy(
-        IngestManagerImpl.DEFAULT_PARQUET_MAX_ROWS_PER_FILE,
-        IngestManagerImpl.DEFAULT_PARQUET_MAX_IDLE_MILLIS);
-  }
-
-  static void requireWrite(IngestManagerImpl manager, String datasetId, String operation) {
-    enforceWrite(manager, datasetId, operation, null);
-  }
-
-  static void enforceWrite(
-      IngestManagerImpl manager, String datasetId, String operation, List<String> columnsOrNull) {
-    if (!(manager.rowManager instanceof RowManagerImpl localDataManager)) {
-      return;
-    }
-    DataWriteAuthorization.requireWrite(
-        localDataManager.dataEntitlementsForSqlPlanning(),
-        localDataManager.effectiveIdentityForSqlPlanning(),
-        datasetId,
-        operation,
-        columnsOrNull);
-  }
-
-  static int payloadBytes(IngestPayload payload) {
-    if (payload instanceof IngestPayloadJson json) {
-      return json.json().getBytes(StandardCharsets.UTF_8).length;
-    }
-    if (payload instanceof IngestPayloadNvFix nvfix) {
-      return nvfix.nvfix().getBytes(StandardCharsets.UTF_8).length;
-    }
-    return 0;
-  }
-
-  private static void appendToDataset(
-      IngestManagerImpl manager,
-      DatasetId datasetId,
-      byte[] arrowIpcStreamBytes,
-      DuckDbActiveMutation mutation,
-      String parquetFilenamePrefix) {
-    DuckDbActiveMutation resolvedMutation =
-        mutation == null ? DuckDbActiveMutation.UPSERT : mutation;
-    if (manager.rowManager instanceof RowManagerImpl local) {
-      local.appendIpc(datasetId, arrowIpcStreamBytes, resolvedMutation, parquetFilenamePrefix);
-      return;
-    }
-    if (resolvedMutation != DuckDbActiveMutation.UPSERT) {
-      throw new IllegalStateException(
-          "DuckDB ACTIVE mutation mode " + resolvedMutation + " requires DIRECT runtime");
-    }
-    if (manager.rowManager instanceof RemoteRowManager remote) {
-      remote.appendIpc(datasetId, arrowIpcStreamBytes);
-      return;
-    }
-    throw new IllegalStateException(
-        "Arrow IPC append requires a direct or remote row manager implementation");
-  }
-
-  private static void appendToDatasetWithRolling(
-      IngestManagerImpl manager,
-      String ingestName,
-      DatasetId datasetId,
-      DefinitionDataset datasetDefinition,
-      byte[] arrowIpcStreamBytes,
-      DuckDbActiveMutation mutation) {
-    if (datasetDefinition != null
-        && datasetDefinition.binding() != null
-        && datasetDefinition.binding().odbc() != null
-        && (datasetDefinition.type() == null || datasetDefinition.type() == DatasetType.EXTERNAL)) {
-      flushPendingParquetBuffer(manager, ingestName, "odbc-target");
-      OdbcRuntimeGuard.failIngestRuntime(ingestName, datasetDefinition.binding().odbc().databaseType());
-    }
-    if (datasetDefinition != null
-        && datasetDefinition.binding() != null
-        && datasetDefinition.binding().external() != null
-        && (datasetDefinition.type() == null || datasetDefinition.type() == DatasetType.EXTERNAL)) {
-      flushPendingParquetBuffer(manager, ingestName, "external-target");
-      appendToExternalTarget(
-          manager,
-          ingestName,
-          datasetId,
-          datasetDefinition,
-          datasetDefinition.binding().external(),
-          arrowIpcStreamBytes,
-          mutation);
-      return;
-    }
-
-    String parquetFilenamePrefix = resolveParquetFilenamePrefix(manager, ingestName);
-    DuckDbActiveMutation resolvedMutation =
-        mutation == null ? DuckDbActiveMutation.UPSERT : mutation;
-    if (resolvedMutation != DuckDbActiveMutation.UPSERT) {
-      flushPendingParquetBuffer(manager, ingestName, "mutation=" + resolvedMutation.name());
-      appendToDataset(manager, datasetId, arrowIpcStreamBytes, resolvedMutation, parquetFilenamePrefix);
-      return;
-    }
-
-    IngestManagerImpl.ParquetRollPolicy policy =
-        resolveParquetRollPolicy(manager, ingestName, datasetDefinition);
-    if (manager.rollScheduler == null && policy.maxIdleMillis() > 0L) {
-      policy = new IngestManagerImpl.ParquetRollPolicy(policy.maxRowsPerFile(), 0L);
-    }
-    if (!policy.enabled()) {
-      flushPendingParquetBuffer(manager, ingestName, "rolling-disabled");
-      manager.parquetRollBuffers.remove(ingestName);
-      appendToDataset(
-          manager,
-          datasetId,
-          arrowIpcStreamBytes,
-          DuckDbActiveMutation.UPSERT,
-          parquetFilenamePrefix);
-      return;
-    }
-
-    IngestManagerImpl.ArrowIpcBatchMeta batchMeta =
-        inspectArrowIpcBatch(manager, arrowIpcStreamBytes, manager.group + "/" + ingestName);
-    if (batchMeta.rowCount() <= 0L) {
-      return;
-    }
-    if (policy.maxIdleMillis() > 0L) {
-      ensureRollScanTask(manager);
-    }
-
-    IngestManagerImpl.ParquetRollPolicy effectivePolicy = policy;
-    IngestManagerImpl.ParquetRollBuffer buffer =
-        manager.parquetRollBuffers.computeIfAbsent(
-            ingestName,
-            key -> new IngestManagerImpl.ParquetRollBuffer(datasetId, effectivePolicy, parquetFilenamePrefix));
-    synchronized (buffer.monitor) {
-      if (!datasetId.equals(buffer.datasetId)
-          || !buffer.policy.equals(policy)
-          || !Objects.equals(buffer.parquetFilenamePrefix, parquetFilenamePrefix)) {
-        flushBufferLocked(manager, ingestName, buffer, "policy-change");
-        buffer.datasetId = datasetId;
-        buffer.policy = policy;
-        buffer.parquetFilenamePrefix = parquetFilenamePrefix;
-        buffer.schema = null;
-      }
-      if (buffer.schema != null && batchMeta.schema() != null && !buffer.schema.equals(batchMeta.schema())) {
-        flushBufferLocked(manager, ingestName, buffer, "schema-change");
-      }
-      buffer.pendingIpcBatches.add(arrowIpcStreamBytes);
-      buffer.pendingRows += batchMeta.rowCount();
-      buffer.lastAppendMillis = System.currentTimeMillis();
-      if (buffer.schema == null && batchMeta.schema() != null) {
-        buffer.schema = batchMeta.schema();
-      }
-      if (policy.maxRowsPerFile() > 0 && buffer.pendingRows >= policy.maxRowsPerFile()) {
-        flushBufferLocked(
-            manager,
-            ingestName,
-            buffer,
-            "maxRowsPerFile="
-                + policy.maxRowsPerFile()
-                + " reached (rows="
-                + buffer.pendingRows
-                + ")");
-      }
-    }
-  }
-
-  private static void appendToExternalTarget(
-      IngestManagerImpl manager,
-      String ingestName,
-      DatasetId datasetId,
-      DefinitionDataset datasetDefinition,
-      DefinitionDataset.ExternalBinding externalBinding,
-      byte[] arrowIpcStreamBytes,
-      DuckDbActiveMutation mutation) {
-    if (manager.session == null) {
-      throw new IllegalStateException(
-          "External ingest target requires a session-backed ingest manager");
-    }
-    String providerId =
-        Strings.requireNonBlank(
-            externalBinding == null ? null : externalBinding.externalType(),
-            "dataset.binding.external.externalType");
-    if (OdbcRuntimeGuard.isOdbcType(providerId)) {
-      OdbcRuntimeGuard.failIngestRuntime(
-          ingestName,
-          Strings.trimToNull(
-              externalBinding.options() == null ? null : externalBinding.options().get("databaseType")));
-    }
-    IngestTargetProvider provider = manager.plugins.findIngestTargetProvider(providerId);
-    if (provider == null) {
-      throw new IllegalStateException(
-          "No ingest target provider registered for externalType '" + providerId + "'");
-    }
-    List<Map<String, Object>> rows =
-        ArrowIpcRowDecoder.decodeToRowMaps(arrowIpcStreamBytes, manager.schemaIpcAllocator);
-    try {
-      provider.append(
-          new IngestTargetAppendContext(
-              manager.session,
-              ingestName,
-              datasetId,
-              datasetDefinition,
-              externalBinding,
-              arrowIpcStreamBytes,
-              rows,
-              mutation == null ? DuckDbActiveMutation.UPSERT.name() : mutation.name()));
-    } catch (RuntimeException ex) {
-      throw ex;
-    } catch (Exception ex) {
-      throw new IllegalStateException(
-          "External ingest target append failed for provider '" + provider.providerId() + "'",
-          ex);
-    }
-  }
-
-  private static String resolveParquetFilenamePrefix(IngestManagerImpl manager, String ingestName) {
-    String override = Strings.trimToNull(manager.parquetFilenamePrefixOverride.get());
-    if (override != null) {
-      return override;
-    }
-    String normalizedIngest = Strings.trimToNull(ingestName);
-    if (normalizedIngest == null) {
+  private DatasetId preferDefaultNamespaceCandidate(List<DatasetId> candidates) {
+    if (candidates == null || candidates.isEmpty()) {
       return null;
     }
-    return Strings.trimToNull(manager.parquetFilenamePrefixes.get(normalizedIngest));
-  }
-
-  private static void flushBufferLocked(
-      IngestManagerImpl manager,
-      String ingestName,
-      IngestManagerImpl.ParquetRollBuffer buffer,
-      String reason) {
-    if (buffer.pendingIpcBatches.isEmpty()) {
-      return;
-    }
-    byte[] merged =
-        mergeArrowIpcBatches(
-            manager,
-            buffer.pendingIpcBatches,
-            buffer.schema,
-            manager.group + "/" + Strings.firstNonBlank(ingestName, "<unknown>"));
-    if (merged.length > 0) {
-      appendToDataset(
-          manager,
-          buffer.datasetId,
-          merged,
-          DuckDbActiveMutation.UPSERT,
-          buffer.parquetFilenamePrefix);
-    }
-    IngestManagerImpl.LOGGER.info(
-        "[IngestManager] rolled parquet ingest={} reason={} rows={} batches={}",
-        ingestName,
-        reason,
-        buffer.pendingRows,
-        buffer.pendingIpcBatches.size());
-    buffer.pendingIpcBatches.clear();
-    buffer.pendingRows = 0L;
-    buffer.lastAppendMillis = 0L;
-    buffer.schema = null;
-  }
-
-  private static IngestManagerImpl.ArrowIpcBatchMeta inspectArrowIpcBatch(
-      IngestManagerImpl manager, byte[] arrowIpcStreamBytes, String ingestId) {
-    try (ArrowStreamReader reader =
-        new ArrowStreamReader(new ByteArrayInputStream(arrowIpcStreamBytes), manager.schemaIpcAllocator)) {
-      VectorSchemaRoot root = reader.getVectorSchemaRoot();
-      Schema schema = root == null ? null : root.getSchema();
-      long rowCount = 0L;
-      while (reader.loadNextBatch()) {
-        rowCount += root.getRowCount();
+    for (DatasetId candidate : candidates) {
+      if (candidate == null) {
+        continue;
       }
-      return new IngestManagerImpl.ArrowIpcBatchMeta(rowCount, schema);
-    } catch (IOException | RuntimeException ex) {
-      throw new IllegalStateException(
-          "Failed to inspect Arrow IPC rows for ingest=" + ingestId + ": " + ex.getMessage(), ex);
+      if (!sessionGroup.equals(candidate.group())) {
+        continue;
+      }
+      if (defaultNamespace.equals(candidate.namespace())) {
+        return candidate;
+      }
     }
+    return null;
   }
 
-  private static byte[] mergeArrowIpcBatches(
-      IngestManagerImpl manager, List<byte[]> batches, Schema expectedSchema, String ingestId) {
-    if (batches == null || batches.isEmpty()) {
-      return new byte[0];
+  List<DatasetToken> scanTableTokensInSql(String sql) {
+    return scanTableTokensInSql(sql, false);
+  }
+
+  List<DatasetToken> scanTableTokensInSql(String sql, boolean strict) {
+    String query = Strings.requireNonBlank(sql, "sql");
+    List<SqlToken> tokens = tokenize(query);
+    Set<String> cteNames = collectLeadingCteNames(tokens);
+    List<DatasetToken> resolved = new ArrayList<>();
+    for (int index = 0; index < tokens.size(); index++) {
+      SqlToken token = tokens.get(index);
+      if (!token.word()) {
+        continue;
+      }
+      String keyword = token.normalizedLower();
+      if (!TABLE_CLAUSE_KEYWORDS.contains(keyword)) {
+        continue;
+      }
+      switch (keyword) {
+        case "from" -> index = scanFromClause(query, tokens, cteNames, strict, index + 1, resolved) - 1;
+        case "join", "update", "into" -> {
+          int next = scanSingleTableReference(query, tokens, cteNames, keyword, strict, index + 1, resolved);
+          index = Math.max(index, next - 1);
+        }
+        default -> {
+          // no-op
+        }
+      }
     }
-    if (batches.size() == 1) {
-      return batches.get(0);
+    return List.copyOf(resolved);
+  }
+
+  private int scanFromClause(
+      String sql,
+      List<SqlToken> tokens,
+      Set<String> cteNames,
+      boolean strict,
+      int start,
+      List<DatasetToken> resolved) {
+    int index = start;
+    while (index < tokens.size()) {
+      SqlToken token = tokens.get(index);
+      if (isStopKeyword(token)) {
+        return index;
+      }
+      if (token.symbol("(")) {
+        if (strict) {
+          throw unsupportedSql("from", token.start(), "derived table reference", null);
+        }
+        return index;
+      }
+      int next = addTableReference(sql, tokens, cteNames, "from", strict, index, resolved);
+      if (next < 0) {
+        return index + 1;
+      }
+      index = next;
+      if (index < tokens.size() && tokens.get(index).symbol(",")) {
+        index++;
+        continue;
+      }
+      return index;
     }
-    try (ByteArrayOutputStream output = new ByteArrayOutputStream()) {
-      Schema resolvedSchema = expectedSchema;
-      VectorSchemaRoot outputRoot = null;
-      ArrowStreamWriter writer = null;
-      try {
-        for (byte[] batchBytes : batches) {
-          try (ArrowStreamReader reader =
-              new ArrowStreamReader(new ByteArrayInputStream(batchBytes), manager.rollIpcAllocator)) {
-            VectorSchemaRoot inputRoot = reader.getVectorSchemaRoot();
-            Schema inputSchema = inputRoot == null ? null : inputRoot.getSchema();
-            if (resolvedSchema == null) {
-              resolvedSchema = inputSchema;
-            } else if (inputSchema != null && !resolvedSchema.equals(inputSchema)) {
-              throw new IllegalStateException(
-                  "Arrow IPC schema mismatch while rolling ingest="
-                      + ingestId
-                      + " expected="
-                      + resolvedSchema
-                      + " actual="
-                      + inputSchema);
-            }
-            if (resolvedSchema == null) {
-              continue;
-            }
-            if (outputRoot == null) {
-              outputRoot = VectorSchemaRoot.create(resolvedSchema, manager.rollIpcAllocator);
-              writer = new ArrowStreamWriter(outputRoot, null, output);
-              writer.start();
-            }
-            VectorLoader loader = new VectorLoader(outputRoot);
-            while (reader.loadNextBatch()) {
-              try (ArrowRecordBatch recordBatch = new VectorUnloader(inputRoot).getRecordBatch()) {
-                loader.load(recordBatch);
-                writer.writeBatch();
+    return index;
+  }
+
+  private int scanSingleTableReference(
+      String sql,
+      List<SqlToken> tokens,
+      Set<String> cteNames,
+      String keyword,
+      boolean strict,
+      int start,
+      List<DatasetToken> resolved) {
+    return Math.max(start, addTableReference(sql, tokens, cteNames, keyword, strict, start, resolved));
+  }
+
+  private int addTableReference(
+      String sql,
+      List<SqlToken> tokens,
+      Set<String> cteNames,
+      String keyword,
+      boolean strict,
+      int start,
+      List<DatasetToken> resolved) {
+    if (start >= tokens.size()) {
+      if (strict) {
+        throw unsupportedSql(keyword, sql.length(), "unable to parse table reference", null);
+      }
+      return -1;
+    }
+    SqlToken token = tokens.get(start);
+    if (token.symbol("(")) {
+      if (strict) {
+        throw unsupportedSql(keyword, token.start(), "derived table reference", null);
+      }
+      return -1;
+    }
+    ParsedIdentifier parsed = parseIdentifier(sql, tokens, start, strict);
+    if (parsed == null) {
+      if (strict) {
+        throw unsupportedSql(keyword, token.start(), "unable to parse table reference", null);
+      }
+      return -1;
+    }
+    if (parsed.nextIndex() < tokens.size() && tokens.get(parsed.nextIndex()).symbol("(")) {
+      if (strict) {
+        throw unsupportedSql(null, parsed.startOffset(), "table function reference", parsed.rawToken());
+      }
+      return -1;
+    }
+    AliasReference alias = parseAlias(sql, tokens, parsed.nextIndex(), strict);
+    int referenceEnd = alias == null ? parsed.endOffset() : alias.endOffset();
+    int nextIndex = alias == null ? parsed.nextIndex() : alias.nextIndex();
+    String normalizedLower = parsed.normalizedToken().toLowerCase(Locale.ROOT);
+    if (cteNames.contains(normalizedLower)) {
+      return nextIndex;
+    }
+    resolved.add(
+        new DatasetToken(
+            parsed.rawToken(),
+            parsed.normalizedToken(),
+            parsed.startOffset(),
+            referenceEnd,
+            alias == null ? null : alias.aliasToken(),
+            alias != null && alias.usesAsKeyword()));
+    return nextIndex;
+  }
+
+  private static boolean isStopKeyword(SqlToken token) {
+    return token != null && token.word() && STOP_KEYWORDS.contains(token.normalizedLower());
+  }
+
+  private static AliasReference parseAlias(String sql, List<SqlToken> tokens, int start) {
+    return parseAlias(sql, tokens, start, false);
+  }
+
+  private static AliasReference parseAlias(String sql, List<SqlToken> tokens, int start, boolean strict) {
+    if (start >= tokens.size()) {
+      return null;
+    }
+    SqlToken token = tokens.get(start);
+    if (token.word() && "as".equals(token.normalizedLower())) {
+      int aliasIndex = start + 1;
+      if (aliasIndex >= tokens.size()) {
+        return null;
+      }
+      SqlToken aliasToken = tokens.get(aliasIndex);
+      if (!isAliasToken(aliasToken)) {
+        return null;
+      }
+      return new AliasReference(
+          sql.substring(aliasToken.start(), aliasToken.end()), true, aliasToken.end(), aliasIndex + 1);
+    }
+    if (!isAliasToken(token)) {
+      return null;
+    }
+    return new AliasReference(sql.substring(token.start(), token.end()), false, token.end(), start + 1);
+  }
+
+  private static boolean isAliasToken(SqlToken token) {
+    if (token == null || (!token.word() && !token.quotedIdentifier())) {
+      return false;
+    }
+    String lower = token.normalizedLower();
+    if (isReservedWord(lower) || "join".equals(lower)) {
+      return false;
+    }
+    return true;
+  }
+
+  private static Set<String> collectLeadingCteNames(List<SqlToken> tokens) {
+    if (tokens.isEmpty()) {
+      return Set.of();
+    }
+    int index = 0;
+    SqlToken first = tokens.get(index);
+    if (!first.word() || !"with".equals(first.normalizedLower())) {
+      return Set.of();
+    }
+    index++;
+    if (index < tokens.size()
+        && tokens.get(index).word()
+        && "recursive".equals(tokens.get(index).normalizedLower())) {
+      index++;
+    }
+
+    LinkedHashSet<String> names = new LinkedHashSet<>();
+    while (index < tokens.size()) {
+      SqlToken cteName = tokens.get(index);
+      if (!cteName.word() && !cteName.quotedIdentifier()) {
+        break;
+      }
+      if (isReservedWord(cteName.normalizedLower())) {
+        break;
+      }
+      names.add(cteName.identifierValue().toLowerCase(Locale.ROOT));
+      index++;
+
+      if (index < tokens.size() && tokens.get(index).symbol("(")) {
+        int next = skipBalancedParentheses(tokens, index);
+        if (next < 0) {
+          break;
+        }
+        index = next;
+      }
+      if (index >= tokens.size() || !tokens.get(index).word() || !"as".equals(tokens.get(index).normalizedLower())) {
+        break;
+      }
+      index++;
+      if (index >= tokens.size() || !tokens.get(index).symbol("(")) {
+        break;
+      }
+      int next = skipBalancedParentheses(tokens, index);
+      if (next < 0) {
+        break;
+      }
+      index = next;
+
+      if (index < tokens.size() && tokens.get(index).symbol(",")) {
+        index++;
+        continue;
+      }
+      break;
+    }
+    return names.isEmpty() ? Set.of() : Set.copyOf(names);
+  }
+
+  private static int skipBalancedParentheses(List<SqlToken> tokens, int openIndex) {
+    if (openIndex >= tokens.size() || !tokens.get(openIndex).symbol("(")) {
+      return -1;
+    }
+    int depth = 0;
+    for (int index = openIndex; index < tokens.size(); index++) {
+      SqlToken token = tokens.get(index);
+      if (token.symbol("(")) {
+        depth++;
+        continue;
+      }
+      if (token.symbol(")")) {
+        depth--;
+        if (depth == 0) {
+          return index + 1;
+        }
+      }
+    }
+    return -1;
+  }
+
+  private static ParsedIdentifier parseIdentifier(String sql, List<SqlToken> tokens, int start) {
+    return parseIdentifier(sql, tokens, start, false);
+  }
+
+  private static ParsedIdentifier parseIdentifier(
+      String sql, List<SqlToken> tokens, int start, boolean strict) {
+    if (start >= tokens.size()) {
+      return null;
+    }
+    SqlToken first = tokens.get(start);
+    if (!first.word() && !first.quotedIdentifier()) {
+      return null;
+    }
+    if (isReservedWord(first.normalizedLower())) {
+      return null;
+    }
+    String firstPart = first.identifierValue();
+    if (firstPart == null) {
+      return null;
+    }
+    int end = first.end();
+    int next = start + 1;
+    String normalized = firstPart;
+    if (next + 1 < tokens.size() && tokens.get(next).symbol(".")) {
+      SqlToken second = tokens.get(next + 1);
+      if (!second.word() && !second.quotedIdentifier()) {
+        return null;
+      }
+      if (isReservedWord(second.normalizedLower())) {
+        return null;
+      }
+      String secondPart = second.identifierValue();
+      if (secondPart == null) {
+        return null;
+      }
+      normalized = firstPart + "." + secondPart;
+      end = second.end();
+      next = next + 2;
+      if (next + 1 < tokens.size() && tokens.get(next).symbol(".")) {
+        SqlToken third = tokens.get(next + 1);
+        if (!third.word() && !third.quotedIdentifier()) {
+          return null;
+        }
+        if (isReservedWord(third.normalizedLower())) {
+          return null;
+        }
+        String thirdPart = third.identifierValue();
+        if (thirdPart == null) {
+          return null;
+        }
+        normalized = normalized + "." + thirdPart;
+        end = third.end();
+        next = next + 2;
+        if (next + 1 < tokens.size() && tokens.get(next).symbol(".")) {
+          if (strict) {
+            int rawEnd = tokens.get(next).end();
+            if (next + 1 < tokens.size()) {
+              SqlToken extra = tokens.get(next + 1);
+              if (extra.word() || extra.quotedIdentifier()) {
+                rawEnd = extra.end();
               }
             }
+            String rawToken = sql.substring(first.start(), rawEnd);
+            throw unsupportedSql(null, first.start(), "identifier with more than 3 parts", rawToken);
           }
-        }
-        if (writer == null) {
-          return new byte[0];
-        }
-        writer.end();
-        return output.toByteArray();
-      } finally {
-        if (writer != null) {
-          writer.close();
-        }
-        if (outputRoot != null) {
-          outputRoot.close();
+          return null;
         }
       }
-    } catch (IOException | RuntimeException ex) {
-      throw new IllegalStateException(
-          "Failed to merge Arrow IPC batches for ingest=" + ingestId + ": " + ex.getMessage(), ex);
     }
+    String raw = sql.substring(first.start(), end);
+    return new ParsedIdentifier(raw, normalized, first.start(), end, next);
   }
 
+  private IllegalArgumentException unknownTableToken(String token) {
+    return new IllegalArgumentException(
+        "Unknown table token '"
+            + token
+            + "' (searched group="
+            + sessionGroup
+            + " defaultNamespace="
+            + defaultNamespace
+            + ")");
+  }
+
+  private static String normalizeToken(String token) {
+    String raw = Strings.requireNonBlank(token, "token");
+    ParsedIdentifier parsed = parseIdentifier(raw, tokenize(raw), 0);
+    if (parsed == null) {
+      return raw;
+    }
+    return parsed.normalizedToken();
+  }
+
+  private static boolean isReservedWord(String tokenLower) {
+    if (tokenLower == null) {
+      return true;
+    }
+    if (TABLE_CLAUSE_KEYWORDS.contains(tokenLower) || STOP_KEYWORDS.contains(tokenLower)) {
+      return true;
+    }
+    return switch (tokenLower) {
+      case "select",
+          "with",
+          "left",
+          "right",
+          "full",
+          "inner",
+          "outer",
+          "cross",
+          "lateral",
+          "as",
+          "and",
+          "or",
+          "not" -> true;
+      default -> false;
+    };
+  }
+
+  private static IllegalArgumentException unsupportedSql(
+      String keyword, int offset, String reason, String tokenOrNull) {
+    StringBuilder message =
+        new StringBuilder("Unsupported SQL for entitled queries: ").append(reason);
+    if (tokenOrNull != null) {
+      message.append(" '").append(tokenOrNull).append("'");
+    }
+    if (keyword != null) {
+      message.append(" after ").append(keyword.toUpperCase(Locale.ROOT));
+    }
+    message.append(" at offset=").append(Math.max(offset, 0));
+    return new IllegalArgumentException(message.toString());
+  }
+
+  private static List<SqlToken> tokenize(String sql) {
+    List<SqlToken> tokens = new ArrayList<>();
+    int index = 0;
+    while (index < sql.length()) {
+      char ch = sql.charAt(index);
+      if (Character.isWhitespace(ch)) {
+        index++;
+        continue;
+      }
+      if (ch == '-' && index + 1 < sql.length() && sql.charAt(index + 1) == '-') {
+        index += 2;
+        while (index < sql.length() && sql.charAt(index) != '\n') {
+          index++;
+        }
+        continue;
+      }
+      if (ch == '/' && index + 1 < sql.length() && sql.charAt(index + 1) == '*') {
+        index += 2;
+        while (index + 1 < sql.length()) {
+          if (sql.charAt(index) == '*' && sql.charAt(index + 1) == '/') {
+            index += 2;
+            break;
+          }
+          index++;
+        }
+        continue;
+      }
+      if (ch == '\'') {
+        index++;
+        while (index < sql.length()) {
+          if (sql.charAt(index) == '\'') {
+            if (index + 1 < sql.length() && sql.charAt(index + 1) == '\'') {
+              index += 2;
+              continue;
+            }
+            index++;
+            break;
+          }
+          index++;
+        }
+        continue;
+      }
+      if (ch == '"' || ch == '`' || ch == '[') {
+        int start = index;
+        ParsedQuotedIdentifier quoted = parseQuotedIdentifier(sql, index);
+        if (quoted == null) {
+          index++;
+          continue;
+        }
+        index = quoted.end();
+        tokens.add(
+            new SqlToken(
+                sql.substring(start, quoted.end()),
+                quoted.identifier(),
+                quoted.identifier().toLowerCase(Locale.ROOT),
+                start,
+                quoted.end(),
+                false,
+                true));
+        continue;
+      }
+      if (isIdentifierStart(ch)) {
+        int start = index;
+        index++;
+        while (index < sql.length() && isIdentifierPart(sql.charAt(index))) {
+          index++;
+        }
+        String text = sql.substring(start, index);
+        tokens.add(new SqlToken(text, text, text.toLowerCase(Locale.ROOT), start, index, true, false));
+        continue;
+      }
+      tokens.add(
+          new SqlToken(
+              String.valueOf(ch),
+              String.valueOf(ch),
+              String.valueOf(ch).toLowerCase(Locale.ROOT),
+              index,
+              index + 1,
+              false,
+              false));
+      index++;
+    }
+    return List.copyOf(tokens);
+  }
+
+  private static ParsedQuotedIdentifier parseQuotedIdentifier(String sql, int start) {
+    if (start >= sql.length()) {
+      return null;
+    }
+    char open = sql.charAt(start);
+    char close = open == '[' ? ']' : open;
+    int index = start + 1;
+    StringBuilder value = new StringBuilder();
+    while (index < sql.length()) {
+      char current = sql.charAt(index);
+      if (current == close) {
+        if (open != '['
+            && index + 1 < sql.length()
+            && sql.charAt(index + 1) == close
+            && close != '`') {
+          value.append(close);
+          index += 2;
+          continue;
+        }
+        return new ParsedQuotedIdentifier(value.toString(), index + 1);
+      }
+      value.append(current);
+      index++;
+    }
+    return null;
+  }
+
+  private static boolean isIdentifierStart(char ch) {
+    return Character.isLetter(ch) || ch == '_' || ch == '$';
+  }
+
+  private static boolean isIdentifierPart(char ch) {
+    return Character.isLetterOrDigit(ch) || ch == '_' || ch == '$';
+  }
+
+  private record ParsedQuotedIdentifier(String identifier, int end) {}
+
+  private record ParsedIdentifier(
+      String rawToken,
+      String normalizedToken,
+      int startOffset,
+      int endOffset,
+      int nextIndex) {}
+
+  private record AliasReference(
+      String aliasToken,
+      boolean usesAsKeyword,
+      int endOffset,
+      int nextIndex) {}
+
+  private record SqlToken(
+      String text,
+      String normalized,
+      String normalizedLower,
+      int start,
+      int end,
+      boolean word,
+      boolean quotedIdentifier) {
+    private boolean symbol(String candidate) {
+      return !word && !quotedIdentifier && Objects.equals(text, candidate);
+    }
+
+    private String identifierValue() {
+      if (word) {
+        return normalized;
+      }
+      if (quotedIdentifier) {
+        return normalized;
+      }
+      return null;
+    }
+  }
 }
