@@ -1,948 +1,959 @@
-package org.pronzato.fabric.api.data.duckdb;
+package org.pronzato.fabric.api.data.ingest.source;
 
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.ResultSetMetaData;
-import java.sql.SQLException;
-import java.sql.Statement;
+import com.crankuptheamps.client.Client;
+import com.crankuptheamps.client.Message;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.TreeMap;
-import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConnection;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngestSource;
-import org.pronzato.fabric.api.data.dataset.DatasetId;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiFunction;
+import java.util.function.UnaryOperator;
+import org.pronzato.fabric.api.Fabric;
+import org.pronzato.fabric.api.connections.ConnectionOptions;
+import org.pronzato.fabric.api.data.checkpoints.CheckpointKey;
+import org.pronzato.fabric.api.data.checkpoints.CheckpointRecord;
+import org.pronzato.fabric.api.data.checkpoints.CheckpointStore;
+import org.pronzato.fabric.api.data.checkpoints.CheckpointStores;
+import org.pronzato.fabric.api.data.checkpoints.CheckpointType;
+import org.pronzato.fabric.api.connectors.amps.AmpsConnection;
+import org.pronzato.fabric.api.data.ingest.IngestPayload;
+import org.pronzato.fabric.api.data.ingest.IngestPayloadJson;
+import org.pronzato.fabric.api.data.ingest.IngestPayloadNvFix;
 import org.pronzato.fabric.api.util.Strings;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-public final class OdbcSessionSupport {
-  private static final String PLATFORM_GROUP = "platform";
-  private static final String ODBC_QUERY_FUNCTION = "odbc_query(?, ?)";
-  private static final String ODBC_QUERY_SQL = "select * from odbc_query(?, ?)";
-  private static final String ODBC_CONNECTION_PROBE_SQL = "select 1 as fabric_odbc_probe";
+public final class IngestAmpsPump implements AutoCloseable {
+  private static final Logger LOGGER = LoggerFactory.getLogger(IngestAmpsPump.class);
+  private static final int MAX_VERBOSE_PAYLOAD_CHARS = 512;
 
-  private OdbcSessionSupport() {}
+  private final Fabric.Session session;
+  private final String ingestName;
+  private final String ingestSourceName;
+  private final String datasetId;
+  private final String connectionName;
+  private final String connectionInstanceName;
+  private final AmpsConnection.SubscriptionSpec subscriptionSpec;
+  private final AmpsConnection.BatchSpec batchSpec;
+  private final PayloadFormat payloadFormat;
+  private final OofHandling oofHandling;
+  private final String parquetFilenamePrefix;
+  private final boolean logIncomingMessages;
+  private final boolean logOutgoingMessages;
+  private final UnaryOperator<String> payloadTransformer;
+  private final BiFunction<String, Integer, String> payloadTransformerWithCommand;
+  private final boolean persistOofAsRows;
+  private final WriteAuthorizer writeAuthorizer;
+  private final AmpsMessageHandler ampsMessageHandler;
+  private final ErrorListener errorListener;
+  private final Runnable sowCompleteListener;
+  private final CheckpointStore checkpointStore;
+  private final CheckpointKey checkpointKey;
+  private final AtomicBoolean started = new AtomicBoolean(false);
+  private final AtomicBoolean closed = new AtomicBoolean(false);
+  private final Object pendingMessagesLock = new Object();
+  private final List<PendingBatchMessage> pendingBatchMessages = new ArrayList<>();
 
-  public static OdbcHandle installDatasetView(
-      DuckdbSession session,
-      DiscoveryCache cache,
-      DatasetId datasetId,
-      DefinitionDataset.OdbcBinding binding) {
-    Objects.requireNonNull(datasetId, "datasetId");
-    Objects.requireNonNull(binding, "binding");
-    String canonicalDatasetId = datasetId.toString();
-    OdbcConnectionSpec connection =
-        resolveConnection(
-            cache,
-            datasetId.group(),
-            binding.connectionName(),
-            binding.databaseType(),
-            canonicalDatasetId);
-    String remoteSql = datasetSql(binding, canonicalDatasetId);
-    try {
-      installDatasetViewUsingParameterizedQuery(session, datasetId, connection, remoteSql);
-      return OdbcHandle.noOp(session, connection.connectionName(), connection.databaseType());
-    } catch (RuntimeException ex) {
-      if (!shouldFallbackToOdbcScan(ex)) {
-        throw queryFailed(canonicalDatasetId, connection, ex);
-      }
-      try {
-        installDatasetViewUsingOdbcScan(session, datasetId, connection, remoteSql);
-        return OdbcHandle.noOp(session, connection.connectionName(), connection.databaseType());
-      } catch (RuntimeException fallbackEx) {
-        throw queryFailed(canonicalDatasetId, connection, fallbackEx);
-      }
-    }
-  }
+  private volatile AmpsConnection.Subscription subscription;
+  private volatile ScheduledExecutorService batchScheduler;
+  private volatile BatchAccumulator batchAccumulator;
+  private volatile String pendingBookmark;
+  private volatile String lastCheckpoint;
+  private volatile String lastCheckpointFlushUtc;
 
-  public static OdbcQueryResult openQueryResult(
-      DuckdbSession session, OdbcConnectionSpec spec, String remoteSql) {
-    Objects.requireNonNull(session, "session");
-    Objects.requireNonNull(spec, "spec");
-    String resolvedRemoteSql = Strings.requireNonBlank(remoteSql, "remoteSql");
-    try {
-      DuckdbExtensions.requireOdbc(session);
-    } catch (RuntimeException ex) {
-      throw ex;
-    }
-    String queryConnectionString = queryConnectionString(spec);
-    PreparedStatement preparedStatement = null;
-    try {
-      preparedStatement = session.prepareStatement(ODBC_QUERY_SQL);
-      preparedStatement.setString(1, queryConnectionString);
-      preparedStatement.setString(2, resolvedRemoteSql);
-      ResultSet resultSet = preparedStatement.executeQuery();
-      return new OdbcQueryResult(
-          preparedStatement, resultSet, OdbcQueryPath.ODBC_QUERY_PARAMETERIZED);
-    } catch (SQLException | RuntimeException ex) {
-      closeStatementQuietly(preparedStatement);
-      if (!shouldFallbackToOdbcScan(ex)) {
-        throw new IllegalStateException(compactReason(ex), ex);
-      }
-      Statement fallbackStatement = null;
-      try {
-        fallbackStatement = session.createStatement();
-        ResultSet fallbackResultSet =
-            fallbackStatement.executeQuery(
-                "select * from " + odbcScanExpression(queryConnectionString, resolvedRemoteSql));
-        return new OdbcQueryResult(
-            fallbackStatement, fallbackResultSet, OdbcQueryPath.ODBC_SCAN_LITERAL);
-      } catch (SQLException | RuntimeException fallbackEx) {
-        closeStatementQuietly(fallbackStatement);
-        throw new IllegalStateException(compactReason(fallbackEx), fallbackEx);
-      }
-    }
-  }
-
-  public static OdbcConnectionHealth probeConnection(DuckdbSession session, OdbcConnectionSpec spec) {
-    Objects.requireNonNull(session, "session");
-    Objects.requireNonNull(spec, "spec");
-    long startNanos = System.nanoTime();
-    List<String> warnings = new ArrayList<>();
-    DuckdbExtensions.OdbcExtensionLoadResult extensionResult = null;
-    try {
-      extensionResult = DuckdbExtensions.loadOdbc(session);
-      OdbcQueryPath queryPath;
-      String remoteProductName;
-      String remoteVersion;
-      try (OdbcQueryResult queryResult = openQueryResult(session, spec, ODBC_CONNECTION_PROBE_SQL)) {
-        queryPath = queryResult.path();
-        ResultSet resultSet = queryResult.resultSet();
-        if (!resultSet.next()) {
-          warnings.add("probe_query_returned_no_rows");
-        }
-        remoteProductName = resolveRemoteProductName(resultSet);
-        remoteVersion = resolveRemoteVersion(resultSet);
-        if (remoteProductName == null) {
-          warnings.add("remote_product_name_unavailable");
-        }
-        if (remoteVersion == null) {
-          warnings.add("remote_version_unavailable");
-        }
-      }
-      boolean fallbackInUse =
-          queryPath == OdbcQueryPath.ODBC_SCAN_LITERAL
-              || (extensionResult != null && extensionResult.fallbackInUse());
-      return new OdbcConnectionHealth(
-          true,
-          spec.connectionName(),
-          spec.databaseType(),
-          extensionResult == null ? null : extensionResult.extensionNameUsed(),
-          extensionResult != null && extensionResult.extensionLoaded(),
-          true,
-          queryPath,
-          "ODBC_CONNECTION_OK",
-          remoteProductName,
-          remoteVersion,
-          elapsedMillis(startNanos),
-          List.copyOf(warnings),
-          fallbackInUse);
-    } catch (SQLException | RuntimeException ex) {
-      String message = probeFailureMessage(spec, ex);
-      return new OdbcConnectionHealth(
-          false,
-          spec.connectionName(),
-          spec.databaseType(),
-          extensionResult == null ? null : extensionResult.extensionNameUsed(),
-          extensionResult != null && extensionResult.extensionLoaded(),
-          !isExtensionUnavailable(message),
-          null,
-          message,
-          null,
-          null,
-          elapsedMillis(startNanos),
-          List.copyOf(warnings),
-          extensionResult != null && extensionResult.fallbackInUse());
-    }
-  }
-
-  public static OdbcSchemaInspection inspectSchema(
-      DuckdbSession session, OdbcConnectionSpec spec, String remoteSql) {
-    Objects.requireNonNull(session, "session");
-    Objects.requireNonNull(spec, "spec");
-    String resolvedRemoteSql = Strings.requireNonBlank(remoteSql, "remoteSql");
-    long startNanos = System.nanoTime();
-    List<OdbcColumnMetadata> columns = new ArrayList<>();
-    List<String> warnings = new ArrayList<>();
-    try (OdbcQueryResult result =
-        openQueryResult(
-            session,
-            spec,
-            "select * from (" + resolvedRemoteSql + ") as fabric_odbc_schema_preview limit 0")) {
-      ResultSetMetaData metadata = result.resultSet().getMetaData();
-      int count = metadata.getColumnCount();
-      for (int index = 1; index <= count; index++) {
-        String name = Strings.firstNonBlank(metadata.getColumnLabel(index), metadata.getColumnName(index));
-        int nullableCode = metadata.isNullable(index);
-        String nullability =
-            nullableCode == ResultSetMetaData.columnNoNulls
-                ? "NOT_NULL"
-                : nullableCode == ResultSetMetaData.columnNullable ? "NULLABLE" : "UNKNOWN";
-        columns.add(
-            new OdbcColumnMetadata(
-                name,
-                metadata.getColumnType(index),
-                metadata.getColumnTypeName(index),
-                metadata.getPrecision(index),
-                metadata.getScale(index),
-                nullability));
-      }
-      return new OdbcSchemaInspection(
-          true,
-          spec.connectionName(),
-          spec.databaseType(),
-          result.path(),
-          "ODBC_SCHEMA_OK columns=" + columns.size(),
-          List.copyOf(columns),
-          elapsedMillis(startNanos),
-          List.copyOf(warnings));
-    } catch (SQLException ex) {
-      return new OdbcSchemaInspection(
-          false,
-          spec.connectionName(),
-          spec.databaseType(),
-          null,
-          compactReason(ex),
-          List.of(),
-          elapsedMillis(startNanos),
-          List.copyOf(warnings));
-    } catch (RuntimeException ex) {
-      return new OdbcSchemaInspection(
-          false,
-          spec.connectionName(),
-          spec.databaseType(),
-          null,
-          compactReason(ex),
-          List.of(),
-          elapsedMillis(startNanos),
-          List.copyOf(warnings));
-    }
-  }
-
-  public static OdbcRuntimeStatus runtimeStatus(boolean configured, OdbcConnectionHealth health) {
-    if (!configured) {
-      return new OdbcRuntimeStatus(
-          false,
-          false,
-          false,
-          false,
-          ODBC_QUERY_FUNCTION,
-          false,
-          null,
-          "NOT_CONFIGURED",
-          0L,
-          List.of());
-    }
-    if (health == null) {
-      return new OdbcRuntimeStatus(
-          true,
-          false,
-          false,
-          false,
-          ODBC_QUERY_FUNCTION,
-          false,
-          null,
-          "NOT_TESTED",
-          0L,
-          List.of());
-    }
-    return new OdbcRuntimeStatus(
-        true,
-        health.extensionAvailable(),
-        health.extensionLoaded(),
-        health.ok(),
-        ODBC_QUERY_FUNCTION,
-        health.fallbackInUse(),
-        health.extensionNameUsed(),
-        Strings.firstNonBlank(Strings.trimToNull(health.message()), health.ok() ? "OK" : "FAILED"),
-        health.roundTripMillis(),
-        health.warnings());
-  }
-
-  private static void installDatasetViewUsingParameterizedQuery(
-      DuckdbSession session, DatasetId datasetId, OdbcConnectionSpec spec, String remoteSql) {
-    Objects.requireNonNull(session, "session");
-    Objects.requireNonNull(datasetId, "datasetId");
-    Objects.requireNonNull(spec, "spec");
-    String normalizedRemoteSql = Strings.requireNonBlank(remoteSql, "remoteSql");
-    String queryConnectionString = queryConnectionString(spec);
-    try {
-      DuckdbExtensions.requireOdbc(session);
-    } catch (RuntimeException ex) {
-      throw ex;
-    }
-    String sql =
-        "create or replace view "
-            + quoteIdentifier(viewName(datasetId))
-            + " as select * from odbc_query(?, ?)";
-    try (PreparedStatement statement = session.prepareStatement(sql)) {
-      statement.setString(1, queryConnectionString);
-      statement.setString(2, normalizedRemoteSql);
-      statement.execute();
-    } catch (SQLException ex) {
-      throw new IllegalStateException(ex.getMessage(), ex);
-    }
-  }
-
-  private static void installDatasetViewUsingOdbcScan(
-      DuckdbSession session, DatasetId datasetId, OdbcConnectionSpec spec, String remoteSql) {
-    Objects.requireNonNull(session, "session");
-    Objects.requireNonNull(datasetId, "datasetId");
-    Objects.requireNonNull(spec, "spec");
-    String normalizedRemoteSql = Strings.requireNonBlank(remoteSql, "remoteSql");
-    String queryConnectionString = queryConnectionString(spec);
-    session.exec(
-        "create or replace view "
-            + quoteIdentifier(viewName(datasetId))
-            + " as select * from "
-            + odbcScanExpression(queryConnectionString, normalizedRemoteSql));
-  }
-
-  private static boolean shouldFallbackToOdbcScan(Throwable cause) {
-    String reason =
-        Strings.firstNonBlank(
-            Strings.trimToNull(cause == null ? null : cause.getMessage()),
-            cause == null ? null : cause.getClass().getSimpleName());
-    if (reason == null) {
-      return false;
-    }
-    String normalized = reason.toLowerCase();
-    if (!normalized.contains("odbc_query")) {
-      return false;
-    }
-    return normalized.contains("does not exist")
-        || normalized.contains("not found")
-        || normalized.contains("catalog error")
-        || normalized.contains("binder error")
-        || normalized.contains("no function matches")
-        || normalized.contains("unknown table function")
-        || (normalized.contains("parameter") && normalized.contains("not"));
-  }
-
-  private static String odbcScanExpression(String queryConnectionString, String remoteSql) {
-    return "odbc_scan('"
-        + escapeSqlLiteral(Strings.requireNonBlank(queryConnectionString, "queryConnectionString"))
-        + "', '"
-        + escapeSqlLiteral(Strings.requireNonBlank(remoteSql, "remoteSql"))
-        + "')";
-  }
-
-  private static String queryConnectionString(OdbcConnectionSpec spec) {
-    Objects.requireNonNull(spec, "spec");
-    String base = Strings.requireNonBlank(spec.connectionString(), "connectionString");
-    StringBuilder builder = new StringBuilder(base);
-    if (!base.endsWith(";")) {
-      builder.append(';');
-    }
-    appendCredentialOption(builder, "UID", spec.username(), "UID", "USER ID");
-    appendCredentialOption(builder, "PWD", spec.password(), "PWD", "PASSWORD");
-    return builder.toString();
-  }
-
-  private static void appendCredentialOption(
-      StringBuilder builder, String optionName, String value, String... aliases) {
-    String normalizedValue = Strings.trimToNull(value);
-    if (normalizedValue == null) {
-      return;
-    }
-    if (hasOption(builder.toString(), aliases)) {
-      return;
-    }
-    builder.append(optionName).append('=').append(normalizedValue).append(';');
-  }
-
-  private static boolean hasOption(String connectionString, String... aliases) {
-    String normalized = Strings.trimToNull(connectionString);
-    if (normalized == null || aliases == null || aliases.length == 0) {
-      return false;
-    }
-    for (String token : normalized.split(";")) {
-      int equalsIndex = token.indexOf('=');
-      if (equalsIndex <= 0) {
-        continue;
-      }
-      String key = Strings.trimToNull(token.substring(0, equalsIndex));
-      if (key == null) {
-        continue;
-      }
-      for (String alias : aliases) {
-        if (alias != null && key.equalsIgnoreCase(alias)) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-
-  private static void closeStatementQuietly(Statement statement) {
-    if (statement == null) {
-      return;
-    }
-    try {
-      statement.close();
-    } catch (SQLException | RuntimeException ignore) {
-      // best effort cleanup.
-    }
-  }
-
-  private static void closeResultSetQuietly(ResultSet resultSet) {
-    if (resultSet == null) {
-      return;
-    }
-    try {
-      resultSet.close();
-    } catch (SQLException | RuntimeException ignore) {
-      // best effort cleanup.
-    }
-  }
-
-  private static String compactReason(Throwable cause) {
-    String message =
-        Strings.firstNonBlank(
-            Strings.trimToNull(cause == null ? null : cause.getMessage()),
-            cause == null ? null : cause.getClass().getSimpleName());
-    if (message == null) {
-      return "unknown";
-    }
-    return message.replace('\n', ' ').replace('\r', ' ');
-  }
-
-  private static String probeFailureMessage(OdbcConnectionSpec spec, Throwable cause) {
-    String reason = compactReason(cause);
-    if (reason.startsWith("ODBC_EXTENSION_UNAVAILABLE") || reason.startsWith("ODBC_EXTENSION_LOAD_FAILED")) {
-      return reason;
-    }
-    return connectionFailed(
-            spec == null ? null : spec.connectionName(),
-            spec == null ? null : spec.databaseType(),
-            reason,
-            cause)
-        .getMessage();
-  }
-
-  private static boolean isExtensionUnavailable(String message) {
-    String normalized = Strings.firstNonBlank(Strings.trimToNull(message), "").toUpperCase();
-    return normalized.startsWith("ODBC_EXTENSION_UNAVAILABLE")
-        || normalized.startsWith("ODBC_EXTENSION_LOAD_FAILED");
-  }
-
-  private static String resolveRemoteProductName(ResultSet resultSet) {
-    if (resultSet == null) {
-      return null;
-    }
-    try {
-      String value = Strings.trimToNull(resultSet.getStatement().getConnection().getMetaData().getDatabaseProductName());
-      if (value == null || value.equalsIgnoreCase("duckdb")) {
-        return null;
-      }
-      return value;
-    } catch (SQLException | RuntimeException ignore) {
-      return null;
-    }
-  }
-
-  private static String resolveRemoteVersion(ResultSet resultSet) {
-    if (resultSet == null) {
-      return null;
-    }
-    try {
-      String value = Strings.trimToNull(resultSet.getStatement().getConnection().getMetaData().getDatabaseProductVersion());
-      if (value == null) {
-        return null;
-      }
-      if (value.toLowerCase().contains("duckdb")) {
-        return null;
-      }
-      return value;
-    } catch (SQLException | RuntimeException ignore) {
-      return null;
-    }
-  }
-
-  private static long elapsedMillis(long startNanos) {
-    return Math.max(0L, (System.nanoTime() - startNanos) / 1_000_000L);
-  }
-
-  public static String ingestSourceSql(
-      DefinitionIngestSource.OdbcSource source, String ingestName, String connectionName) {
-    Objects.requireNonNull(source, "source");
-    String remoteSql = Strings.trimToNull(source.querySql());
-    if (remoteSql != null) {
-      return remoteSql;
-    }
-    String tableName = Strings.trimToNull(source.tableName());
-    if (tableName != null) {
-      return "select * from " + tableName;
-    }
-    String resolvedConnectionName =
-        Strings.firstNonBlank(Strings.trimToNull(connectionName), Strings.trimToNull(source.connectionName()));
-    throw ingestSourceFailed(
-        ingestName,
-        resolvedConnectionName,
-        source.databaseType(),
-        "missing_table_or_query",
-        null);
-  }
-
-  public static String datasetSql(DefinitionDataset.OdbcBinding binding, String datasetId) {
-    Objects.requireNonNull(binding, "binding");
-    return datasetRemoteSql(binding, datasetId);
-  }
-
-  public static OdbcConnectionSpec resolveConnection(
-      DiscoveryCache cache,
-      String preferredGroup,
-      String connectionName,
-      DefinitionConnection.Odbc.DatabaseType requestedDatabaseType,
-      String datasetOrIngestId) {
-    Objects.requireNonNull(cache, "cache");
-    String resolvedConnectionName = Strings.requireNonBlank(connectionName, "connectionName");
-    String normalizedGroup = Strings.trimToNull(preferredGroup);
-    if (normalizedGroup == null) {
-      normalizedGroup = PLATFORM_GROUP;
-    }
-    Optional<DefinitionConnection> resolved =
-        cache.get(DefinitionConnection.class, normalizedGroup, resolvedConnectionName);
-    if (resolved.isEmpty() && !PLATFORM_GROUP.equals(normalizedGroup)) {
-      resolved = cache.get(DefinitionConnection.class, PLATFORM_GROUP, resolvedConnectionName);
-    }
-    if (resolved.isEmpty()) {
-      throw connectionFailed(
-          resolvedConnectionName,
-          requestedDatabaseType,
-          "connection_not_found id=" + Strings.firstNonBlank(datasetOrIngestId, "<unknown>"),
-          null);
-    }
-    DefinitionConnection connection = resolved.get();
-    if (connection.connectionType() != DefinitionConnection.ConnectionType.ODBC
-        || connection.odbc() == null) {
-      throw connectionFailed(
-          resolvedConnectionName,
-          requestedDatabaseType,
-          "connection_not_odbc",
-          null);
-    }
-    DefinitionConnection.Odbc odbc = connection.odbc();
-    DefinitionConnection.Odbc.DatabaseType databaseType =
-        requestedDatabaseType == null
-            ? (odbc.databaseType() == null ? DefinitionConnection.Odbc.DatabaseType.OTHER : odbc.databaseType())
-            : requestedDatabaseType;
-    String connectionString = buildConnectionString(odbc);
-    String username = Strings.trimToNull(odbc.username());
-    String password = Strings.firstNonBlank(Strings.trimToNull(odbc.password()), Strings.trimToNull(odbc.secretRef()));
-    return new OdbcConnectionSpec(resolvedConnectionName, databaseType, connectionString, username, password);
-  }
-
-  public static OdbcHandle openHandle(DuckdbSession session, OdbcConnectionSpec spec) {
-    Objects.requireNonNull(session, "session");
-    Objects.requireNonNull(spec, "spec");
-    try {
-      DuckdbExtensions.requireOdbc(session);
-    } catch (RuntimeException ex) {
-      throw ex;
-    }
-    String sql = connectSql(spec);
-    try (Statement statement = session.createStatement();
-        ResultSet resultSet = statement.executeQuery(sql)) {
-      if (!resultSet.next()) {
-        throw connectionFailed(spec.connectionName(), spec.databaseType(), "empty_handle_result", null);
-      }
-      long handle = resultSet.getLong(1);
-      if (resultSet.wasNull()) {
-        throw connectionFailed(spec.connectionName(), spec.databaseType(), "null_handle_result", null);
-      }
-      return new OdbcHandle(session, spec.connectionName(), spec.databaseType(), handle, true);
-    } catch (SQLException ex) {
-      throw connectionFailed(spec.connectionName(), spec.databaseType(), ex.getMessage(), ex);
-    } catch (RuntimeException ex) {
-      throw connectionFailed(spec.connectionName(), spec.databaseType(), ex.getMessage(), ex);
-    }
-  }
-
-  public static String queryExpression(long handle, String remoteSql) {
-    return "odbc_query(" + handle + ", '" + escapeSqlLiteral(Strings.requireNonBlank(remoteSql, "remoteSql")) + "')";
-  }
-
-  public static String viewName(DatasetId id) {
-    Objects.requireNonNull(id, "id");
-    return sanitizeIdentifier(id.group())
-        + "__"
-        + sanitizeIdentifier(id.namespace())
-        + "__"
-        + sanitizeIdentifier(id.name());
-  }
-
-  public static RuntimeException queryFailed(
-      String datasetId, OdbcConnectionSpec spec, Throwable cause) {
-    return queryFailed(
-        datasetId,
-        spec == null ? null : spec.connectionName(),
-        spec == null ? null : spec.databaseType(),
-        compactReason(cause),
-        cause);
-  }
-
-  public static RuntimeException queryFailed(
+  private IngestAmpsPump(
+      Fabric.Session session,
+      String ingestName,
+      String ingestSourceName,
       String datasetId,
       String connectionName,
-      DefinitionConnection.Odbc.DatabaseType databaseType,
-      String reason,
-      Throwable cause) {
-    return new IllegalStateException(
-        "ODBC_QUERY_FAILED datasetId="
-            + Strings.firstNonBlank(Strings.trimToNull(datasetId), "<unknown>")
-            + " connectionName="
-            + Strings.firstNonBlank(Strings.trimToNull(connectionName), "<unknown>")
-            + " databaseType="
-            + databaseTypeName(databaseType)
-            + " reason="
-            + Strings.firstNonBlank(Strings.trimToNull(reason), "unknown"),
-        cause);
+      String connectionInstanceName,
+      AmpsConnection.SubscriptionSpec subscriptionSpec,
+      AmpsConnection.BatchSpec batchSpec,
+      PayloadFormat payloadFormat,
+      OofHandling oofHandling,
+      String parquetFilenamePrefix,
+      boolean logIncomingMessages,
+      boolean logOutgoingMessages,
+      UnaryOperator<String> payloadTransformer,
+      BiFunction<String, Integer, String> payloadTransformerWithCommand,
+      boolean persistOofAsRows,
+      WriteAuthorizer writeAuthorizer,
+      AmpsMessageHandler ampsMessageHandler,
+      ErrorListener errorListener,
+      Runnable sowCompleteListener,
+      CheckpointStore checkpointStore,
+      CheckpointKey checkpointKey) {
+    this.session = Objects.requireNonNull(session, "session");
+    this.ingestName = Strings.requireNonBlank(ingestName, "ingestName");
+    this.ingestSourceName = Strings.requireNonBlank(ingestSourceName, "ingestSourceName");
+    this.datasetId = Strings.trimToNull(datasetId);
+    this.connectionName = Strings.requireNonBlank(connectionName, "connectionName");
+    this.connectionInstanceName = Strings.trimToNull(connectionInstanceName);
+    this.subscriptionSpec = Objects.requireNonNull(subscriptionSpec, "subscriptionSpec");
+    this.batchSpec = Objects.requireNonNull(batchSpec, "batchSpec");
+    this.payloadFormat = Objects.requireNonNull(payloadFormat, "payloadFormat");
+    this.oofHandling = oofHandling == null ? OofHandling.DELETE_EVENT : oofHandling;
+    this.parquetFilenamePrefix = Strings.trimToNull(parquetFilenamePrefix);
+    this.logIncomingMessages = logIncomingMessages;
+    this.logOutgoingMessages = logOutgoingMessages;
+    this.payloadTransformer = payloadTransformer;
+    this.payloadTransformerWithCommand = payloadTransformerWithCommand;
+    this.persistOofAsRows = persistOofAsRows;
+    this.writeAuthorizer = writeAuthorizer;
+    this.ampsMessageHandler = ampsMessageHandler;
+    this.errorListener = errorListener == null ? ErrorListener.NOOP : errorListener;
+    this.sowCompleteListener = sowCompleteListener;
+    this.checkpointStore = checkpointStore;
+    this.checkpointKey = checkpointKey;
+    if (checkpointStore != null && checkpointKey != null) {
+      Optional<CheckpointRecord> checkpoint = checkpointStore.load(checkpointKey);
+      this.lastCheckpoint =
+          checkpoint
+              .map(value -> Strings.trimToNull(value.payload().get("bookmark")))
+              .orElse(null);
+      this.lastCheckpointFlushUtc = checkpoint.map(CheckpointRecord::lastUpdatedUtc).orElse(null);
+    } else {
+      this.lastCheckpoint = null;
+      this.lastCheckpointFlushUtc = null;
+    }
   }
 
-  public static RuntimeException connectionFailed(
-      String connectionName,
-      DefinitionConnection.Odbc.DatabaseType databaseType,
-      String reason,
-      Throwable cause) {
-    return new IllegalStateException(
-        "ODBC_CONNECTION_FAILED connectionName="
-            + Strings.firstNonBlank(Strings.trimToNull(connectionName), "<unknown>")
-            + " databaseType="
-            + databaseTypeName(databaseType)
-            + " reason="
-            + Strings.firstNonBlank(Strings.trimToNull(reason), "unknown"),
-        cause);
+  public static Builder builder(Fabric.Session session) {
+    return new Builder(session);
   }
 
-  public static RuntimeException ingestSourceFailed(
-      String ingestName,
-      String connectionName,
-      DefinitionConnection.Odbc.DatabaseType databaseType,
-      String reason,
-      Throwable cause) {
-    return new IllegalStateException(
-        "ODBC_INGEST_SOURCE_FAILED ingestName="
-            + Strings.firstNonBlank(Strings.trimToNull(ingestName), "<unknown>")
-            + " connectionName="
-            + Strings.firstNonBlank(Strings.trimToNull(connectionName), "<unknown>")
-            + " databaseType="
-            + databaseTypeName(databaseType)
-            + " reason="
-            + Strings.firstNonBlank(Strings.trimToNull(reason), "unknown"),
-        cause);
+  public IngestAmpsPump start() throws Exception {
+    if (!started.compareAndSet(false, true)) {
+      return this;
+    }
+    try {
+      AmpsConnection amps =
+          connectionInstanceName == null
+              ? session.connections().amps(connectionName)
+              : session
+                  .connections()
+                  .amps(
+                      connectionName,
+                      ConnectionOptions.builder().withPinnedInstance(connectionInstanceName).build());
+      BatchAccumulator accumulator = null;
+      if (batchSpec.mode() == AmpsConnection.BatchMode.BATCH) {
+        accumulator =
+            new BatchAccumulator(
+                batchSpec,
+                SystemClock.INSTANCE,
+                (payloads, messages, bytes, elapsedMs) -> {
+                  List<PendingBatchMessage> batchMessages = drainPendingBatchMessages(payloads.size());
+                  for (int index = 0; index < payloads.size(); index++) {
+                    PendingBatchMessage batchMessage = batchMessages.get(index);
+                    append(batchMessage.message(), payloads.get(index), batchMessage.ampsCommand());
+                  }
+                  flushPendingCheckpoint();
+                  LOGGER.info("[IngestAmpsPump] batch flush ingestName={} messageCount={} totalBytes={}", ingestName, messages, bytes);
+                });
+        batchAccumulator = accumulator;
+        batchScheduler = createBatchScheduler();
+        long intervalMs = Math.max(1L, batchSpec.batchFlushMillis());
+        batchScheduler.scheduleAtFixedRate(
+            accumulator::flushIfDue, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
+      }
+      BatchAccumulator resolvedAccumulator = accumulator;
+      subscription =
+          amps.subscribe(
+              subscriptionSpec,
+              (AmpsConnection.SubscriptionListener)
+                  message -> onMessage(message, resolvedAccumulator));
+      LOGGER.info("[IngestAmpsPump] start ingestName={} ingestSourceName={} connectionName={} connectionInstance={} topic={} sowSubscribe={} sowOnly={} mode={} batchMaxMessages={} batchMaxBytes={} batchFlushMillis={} logIncoming={} logOutgoing={} transformerEnabled={}", ingestName, ingestSourceName, connectionName, connectionInstanceName, subscriptionSpec.topic(), subscriptionSpec.sow(), subscriptionSpec.sowOnly(), batchSpec.mode(), batchSpec.batchMaxMessages(), batchSpec.batchMaxBytes(), batchSpec.batchFlushMillis(), logIncomingMessages, logOutgoingMessages, payloadTransformer != null || payloadTransformerWithCommand != null);
+      return this;
+    } catch (Exception ex) {
+      started.set(false);
+      closeScheduler();
+      batchAccumulator = null;
+      subscription = null;
+      throw ex;
+    }
   }
 
-  public static void closeQuietly(OdbcHandle handle) {
-    if (handle == null) {
+  public String lastCheckpoint() {
+    String pending = Strings.trimToNull(pendingBookmark);
+    return pending == null ? lastCheckpoint : pending;
+  }
+
+  public String lastCheckpointFlushUtc() {
+    return lastCheckpointFlushUtc;
+  }
+
+  @Override
+  public void close() {
+    if (!closed.compareAndSet(false, true)) {
+      return;
+    }
+    closeScheduler();
+    BatchAccumulator accumulator = batchAccumulator;
+    if (accumulator != null) {
+      try {
+        accumulator.flush();
+      } catch (Exception ex) {
+        LOGGER.info("[IngestAmpsPump] error ingestName={} topic={} exceptionClass={} message={}", ingestName, subscriptionSpec.topic(), ex.getClass().getName(), ex.getMessage());
+      }
+    }
+    flushPendingCheckpoint();
+    AmpsConnection.Subscription active = subscription;
+    subscription = null;
+    if (active != null) {
+      active.close();
+    }
+    synchronized (pendingMessagesLock) {
+      pendingBatchMessages.clear();
+    }
+  }
+
+  private void onMessage(AmpsConnection.AmpsMessage message, BatchAccumulator accumulator) {
+    try {
+      Message raw = message.raw();
+      if (raw != null && raw.getCommand() == Message.Command.GroupEnd) {
+        notifySowComplete();
+        if (subscriptionSpec.sowOnly()) {
+          close();
+        }
+        return;
+      }
+      if (!isMutationCommand(raw)) {
+        return;
+      }
+      String line = toSingleLinePayload(message);
+      if (line == null) {
+        return;
+      }
+      if (logIncomingMessages) {
+        logIncomingMessage(raw, message, line);
+      }
+      int command = messageCommand(raw);
+      String transformed = applyPayloadTransformer(line, command);
+      if (transformed == null) {
+        persistBookmarkIfPresent(message);
+        if (accumulator == null || !hasPendingBatchMessages()) {
+          flushPendingCheckpoint();
+        }
+        return;
+      }
+      int effectiveCommand = effectiveCommand(command);
+      requireWrite(commandOperation(effectiveCommand));
+      if (accumulator != null) {
+        synchronized (pendingMessagesLock) {
+          pendingBatchMessages.add(new PendingBatchMessage(message, effectiveCommand));
+        }
+        try {
+          accumulator.onMessage(transformed);
+        } catch (RuntimeException ex) {
+          rollbackPendingBatchMessage(message);
+          throw ex;
+        }
+        return;
+      }
+      append(message, transformed, effectiveCommand);
+    } catch (RuntimeException ex) {
+      notifyError(ex);
+      LOGGER.info("[IngestAmpsPump] error ingestName={} topic={} exceptionClass={} message={}", ingestName, subscriptionSpec.topic(), ex.getClass().getName(), ex.getMessage());
+      throw ex;
+    }
+  }
+
+  private String toSingleLinePayload(AmpsConnection.AmpsMessage message) {
+    Objects.requireNonNull(message, "message");
+    String data = message.data();
+    if (data == null) {
+      return null;
+    }
+    return AmpsConnection.ensureTrailingNewline(data);
+  }
+
+  private String applyPayloadTransformer(String payloadText, int ampsCommand) {
+    if (payloadText == null) {
+      return null;
+    }
+    if (payloadTransformerWithCommand != null) {
+      String transformed =
+          Strings.trimToNull(payloadTransformerWithCommand.apply(payloadText, ampsCommand));
+      if (transformed == null) {
+        return null;
+      }
+      return AmpsConnection.ensureTrailingNewline(transformed);
+    }
+    if (payloadTransformer == null) {
+      return payloadText;
+    }
+    String transformed = Strings.trimToNull(payloadTransformer.apply(payloadText));
+    if (transformed == null) {
+      return null;
+    }
+    return AmpsConnection.ensureTrailingNewline(transformed);
+  }
+
+  private void requireWrite(String operation) {
+    if (writeAuthorizer == null) {
+      return;
+    }
+    writeAuthorizer.requireWrite(
+        Strings.requireNonBlank(datasetId, "datasetId"),
+        Strings.requireNonBlank(operation, "operation"));
+  }
+
+  private void notifyError(Throwable error) {
+    try {
+      errorListener.onError(error);
+    } catch (Exception ignore) {
+    }
+  }
+
+  private void notifySowComplete() {
+    if (sowCompleteListener == null) {
       return;
     }
     try {
-      handle.close();
-    } catch (RuntimeException ignore) {
-      // keep query path deterministic and do not mask upstream failures.
+      sowCompleteListener.run();
+    } catch (Exception ignore) {
     }
   }
 
-  private static String datasetRemoteSql(DefinitionDataset.OdbcBinding binding, String datasetId) {
-    String querySql = Strings.trimToNull(binding.querySql());
-    if (querySql != null) {
-      return querySql;
+  private void append(AmpsConnection.AmpsMessage message, String payloadText, int ampsCommand) {
+    Message raw = message == null ? null : message.raw();
+    int command = ampsCommand;
+    if (logOutgoingMessages) {
+      logOutgoingMessage(message, payloadText, command);
     }
-    String tableName = Strings.trimToNull(binding.tableName());
-    if (tableName == null) {
-      throw queryFailed(
-          datasetId,
-          binding.connectionName(),
-          binding.databaseType(),
-          "missing_table_or_query",
-          null);
-    }
-    String catalogName = Strings.trimToNull(binding.catalogName());
-    String schemaName = Strings.trimToNull(binding.schemaName());
-    StringBuilder sql = new StringBuilder("select * from ");
-    appendQualifiedTable(sql, catalogName, schemaName, tableName);
-    return sql.toString();
-  }
-
-  private static void appendQualifiedTable(
-      StringBuilder sql, String catalogName, String schemaName, String tableName) {
-    if (catalogName != null) {
-      sql.append(quoteRemoteIdentifier(catalogName)).append('.');
-    }
-    if (schemaName != null) {
-      sql.append(quoteRemoteIdentifier(schemaName)).append('.');
-    }
-    sql.append(quoteRemoteIdentifier(Strings.requireNonBlank(tableName, "tableName")));
-  }
-
-  private static String buildConnectionString(DefinitionConnection.Odbc odbc) {
-    String explicit = Strings.trimToNull(odbc.connectionString());
-    StringBuilder builder = new StringBuilder();
-    if (explicit != null) {
-      builder.append(explicit);
-      if (!explicit.endsWith(";")) {
-        builder.append(';');
-      }
-    } else {
-      String dsn = Strings.trimToNull(odbc.dsn());
-      if (dsn != null) {
-        appendOption(builder, "DSN", dsn);
-      }
-      String driver = Strings.trimToNull(odbc.driverName());
-      if (driver != null) {
-        appendOption(builder, "Driver", "{" + driver + "}");
-      }
-    }
-    if (builder.length() == 0) {
-      throw connectionFailed(
-          odbc.connectionName(),
-          odbc.databaseType(),
-          "missing_connection_string_or_dsn",
-          null);
-    }
-    if (odbc.sslEnabled() != null) {
-      appendOption(builder, "SSL", Boolean.TRUE.equals(odbc.sslEnabled()) ? "1" : "0");
-    }
-    if (odbc.connectTimeoutSeconds() != null) {
-      appendOption(builder, "ConnectTimeout", String.valueOf(odbc.connectTimeoutSeconds()));
-    }
-    if (odbc.queryTimeoutSeconds() != null) {
-      appendOption(builder, "QueryTimeout", String.valueOf(odbc.queryTimeoutSeconds()));
-    }
-    if (odbc.fetchSize() != null) {
-      appendOption(builder, "FetchSize", String.valueOf(odbc.fetchSize()));
-    }
-    appendOptions(builder, odbc.properties());
-    appendOptions(builder, odbc.options());
-    return builder.toString();
-  }
-
-  private static void appendOptions(StringBuilder builder, Map<String, String> values) {
-    if (values == null || values.isEmpty()) {
+    if (ampsMessageHandler != null) {
+      ampsMessageHandler.onMessage(
+          ingestName,
+          payloadText,
+          payloadFormat,
+          command,
+          oofHandling,
+          parquetFilenamePrefix);
+      persistBookmarkIfPresent(message);
       return;
     }
-    TreeMap<String, String> ordered = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
-    ordered.putAll(values);
-    for (Map.Entry<String, String> entry : ordered.entrySet()) {
-      appendOption(builder, entry.getKey(), entry.getValue());
-    }
-  }
-
-  private static void appendOption(StringBuilder builder, String key, String value) {
-    String normalizedKey = Strings.trimToNull(key);
-    String normalizedValue = Strings.trimToNull(value);
-    if (normalizedKey == null || normalizedValue == null) {
+    if (isDeleteCommand(command)) {
       return;
     }
-    builder.append(normalizedKey).append('=').append(normalizedValue).append(';');
+    IngestPayload payload = toIngestPayload(payloadText);
+    session.data().direct().ingest().append(ingestName, payload);
+    persistBookmarkIfPresent(message);
   }
 
-  private static String connectSql(OdbcConnectionSpec spec) {
-    String connectionString = escapeSqlLiteral(spec.connectionString());
-    String username = Strings.trimToNull(spec.username());
-    String password = Strings.trimToNull(spec.password());
-    if (username == null && password == null) {
-      return "select odbc_connect('" + connectionString + "')";
+  private IngestPayload toIngestPayload(String payloadText) {
+    return payloadFormat == PayloadFormat.JSON
+        ? new IngestPayloadJson(payloadText)
+        : new IngestPayloadNvFix(payloadText);
+  }
+
+  private void persistBookmarkIfPresent(AmpsConnection.AmpsMessage message) {
+    if (message == null || !isBookmarkCandidate(message)) {
+      return;
     }
-    return "select odbc_connect('"
-        + connectionString
-        + "', '"
-        + escapeSqlLiteral(Strings.firstNonBlank(username, ""))
-        + "', '"
-        + escapeSqlLiteral(Strings.firstNonBlank(password, ""))
-        + "')";
+    String bookmark = Strings.trimToNull(message.bookmark());
+    if (bookmark == null) {
+      return;
+    }
+    pendingBookmark = bookmark;
+    if (batchSpec.mode() == AmpsConnection.BatchMode.STREAM) {
+      flushPendingCheckpoint();
+    }
   }
 
-  private static String quoteIdentifier(String identifier) {
-    return "\"" + Strings.requireNonBlank(identifier, "identifier").replace("\"", "\"\"") + "\"";
+  private synchronized void flushPendingCheckpoint() {
+    String bookmark = Strings.trimToNull(pendingBookmark);
+    if (bookmark == null || checkpointStore == null || checkpointKey == null) {
+      return;
+    }
+    checkpointStore.save(
+        CheckpointRecord.of(
+            checkpointKey,
+            Map.of(
+                "bookmark", bookmark,
+                "ingestName", ingestName,
+                "connectionName", connectionName,
+                "topic", subscriptionSpec.topic())));
+    lastCheckpoint = bookmark;
+    lastCheckpointFlushUtc = Instant.now().toString();
+    pendingBookmark = null;
   }
 
-  private static String quoteRemoteIdentifier(String identifier) {
-    return "\"" + Strings.requireNonBlank(identifier, "identifier").replace("\"", "\"\"") + "\"";
+  private List<PendingBatchMessage> drainPendingBatchMessages(int expected) {
+    synchronized (pendingMessagesLock) {
+      if (pendingBatchMessages.size() < expected) {
+        throw new IllegalStateException(
+            "Ingest AMPS batch state mismatch: expected="
+                + expected
+                + " buffered="
+                + pendingBatchMessages.size());
+      }
+      List<PendingBatchMessage> drained = new ArrayList<>(expected);
+      for (int index = 0; index < expected; index++) {
+        drained.add(pendingBatchMessages.remove(0));
+      }
+      return drained;
+    }
   }
 
-  private static String sanitizeIdentifier(String value) {
-    String token = Strings.requireNonBlank(value, "identifier");
-    StringBuilder normalized = new StringBuilder(token.length());
-    for (int index = 0; index < token.length(); index++) {
-      char ch = token.charAt(index);
-      if (Character.isLetterOrDigit(ch) || ch == '_') {
-        normalized.append(ch);
-      } else {
-        normalized.append('_');
+  private void rollbackPendingBatchMessage(AmpsConnection.AmpsMessage message) {
+    synchronized (pendingMessagesLock) {
+      int last = pendingBatchMessages.size() - 1;
+      if (last >= 0 && pendingBatchMessages.get(last).message() == message) {
+        pendingBatchMessages.remove(last);
       }
     }
-    String resolved = Strings.trimToNull(normalized.toString());
-    return resolved == null ? "dataset" : resolved;
   }
 
-  private static String databaseTypeName(DefinitionConnection.Odbc.DatabaseType databaseType) {
-    return databaseType == null ? DefinitionConnection.Odbc.DatabaseType.OTHER.name() : databaseType.name();
-  }
-
-  private static String escapeSqlLiteral(String value) {
-    return value.replace("'", "''");
-  }
-
-  public record OdbcConnectionSpec(
-      String connectionName,
-      DefinitionConnection.Odbc.DatabaseType databaseType,
-      String connectionString,
-      String username,
-      String password) {}
-
-  public record OdbcConnectionHealth(
-      boolean ok,
-      String connectionName,
-      DefinitionConnection.Odbc.DatabaseType databaseType,
-      String extensionNameUsed,
-      boolean extensionLoaded,
-      boolean extensionAvailable,
-      OdbcQueryPath queryPath,
-      String message,
-      String remoteProductName,
-      String remoteVersion,
-      long roundTripMillis,
-      List<String> warnings,
-      boolean fallbackInUse) {
-    public OdbcConnectionHealth {
-      warnings = warnings == null ? List.of() : List.copyOf(warnings);
+  private boolean hasPendingBatchMessages() {
+    synchronized (pendingMessagesLock) {
+      return !pendingBatchMessages.isEmpty();
     }
   }
 
-  public record OdbcRuntimeStatus(
-      boolean configured,
-      boolean extensionAvailable,
-      boolean extensionLoaded,
-      boolean connectionTestOk,
-      String canonicalPath,
-      boolean fallbackInUse,
-      String extensionNameUsed,
-      String message,
-      long roundTripMillis,
-      List<String> warnings) {
-    public OdbcRuntimeStatus {
-      warnings = warnings == null ? List.of() : List.copyOf(warnings);
+  private static boolean isMutationCommand(Message message) {
+    if (message == null) {
+      return true;
     }
+    int command = message.getCommand();
+    return command == Message.Command.Publish
+        || command == Message.Command.SOW
+        || command == Message.Command.OOF
+        || command == Message.Command.SOWDelete;
   }
 
-  public record OdbcColumnMetadata(
-      String name,
-      int jdbcType,
-      String jdbcTypeName,
-      int precision,
-      int scale,
-      String nullability) {}
-
-  public record OdbcSchemaInspection(
-      boolean ok,
-      String connectionName,
-      DefinitionConnection.Odbc.DatabaseType databaseType,
-      OdbcQueryPath queryPath,
-      String message,
-      List<OdbcColumnMetadata> columns,
-      long roundTripMillis,
-      List<String> warnings) {
-    public OdbcSchemaInspection {
-      columns = columns == null ? List.of() : List.copyOf(columns);
-      warnings = warnings == null ? List.of() : List.copyOf(warnings);
+  private static boolean isBookmarkCandidate(AmpsConnection.AmpsMessage message) {
+    Message raw = message == null ? null : message.raw();
+    if (raw == null) {
+      return false;
     }
+    int command = raw.getCommand();
+    if (command != Message.Command.Publish
+        && command != Message.Command.SOW
+        && command != Message.Command.OOF
+        && command != Message.Command.SOWDelete) {
+      return false;
+    }
+    if (Strings.isBlank(message.topic())) {
+      return false;
+    }
+    return Strings.isNotBlank(message.data());
   }
 
-  public enum OdbcQueryPath {
-    ODBC_QUERY_PARAMETERIZED,
-    ODBC_SCAN_LITERAL
+  private static String commandOperation(int command) {
+    if (isDeleteCommand(command)) {
+      return "DELETE";
+    }
+    return "INGEST";
   }
 
-  public static final class OdbcQueryResult implements AutoCloseable {
-    private final Statement statement;
-    private final ResultSet resultSet;
-    private final OdbcQueryPath path;
-    private boolean closed;
-
-    private OdbcQueryResult(Statement statement, ResultSet resultSet, OdbcQueryPath path) {
-      this.statement = Objects.requireNonNull(statement, "statement");
-      this.resultSet = Objects.requireNonNull(resultSet, "resultSet");
-      this.path = Objects.requireNonNull(path, "path");
+  private int effectiveCommand(int command) {
+    if (persistOofAsRows && isDeleteCommand(command)) {
+      return Message.Command.Publish;
     }
-
-    public ResultSet resultSet() {
-      return resultSet;
-    }
-
-    public OdbcQueryPath path() {
-      return path;
-    }
-
-    @Override
-    public void close() {
-      if (closed) {
-        return;
-      }
-      closed = true;
-      closeResultSetQuietly(resultSet);
-      closeStatementQuietly(statement);
-    }
+    return command;
   }
 
-  public static final class OdbcHandle implements AutoCloseable {
-    private final DuckdbSession session;
-    private final String connectionName;
-    private final DefinitionConnection.Odbc.DatabaseType databaseType;
-    private final long handle;
-    private final boolean closeOnClose;
-    private boolean closed;
+  private void logIncomingMessage(Message raw, AmpsConnection.AmpsMessage message, String payloadText) {
+    LOGGER.info("[IngestAmpsPump][incoming] ingestName={} connectionName={} connectionInstance={} topic={} command={} bytes={} bookmark={} payload={}", ingestName, connectionName, connectionInstanceName, subscriptionSpec.topic(), commandLabel(raw), payloadText == null ? 0 : payloadText.length(), message == null ? null : Strings.trimToNull(message.bookmark()), payloadPreview(payloadText));
+  }
 
-    private OdbcHandle(
-        DuckdbSession session,
-        String connectionName,
-        DefinitionConnection.Odbc.DatabaseType databaseType,
-        long handle,
-        boolean closeOnClose) {
+  private void logOutgoingMessage(
+      AmpsConnection.AmpsMessage message, String payloadText, int command) {
+    LOGGER.info("[IngestAmpsPump][outgoing] ingestName={} datasetId={} payloadFormat={} command={} oofHandling={} bookmark={} payload={}", ingestName, datasetId, payloadFormat, commandLabel(command), oofHandling, message == null ? null : Strings.trimToNull(message.bookmark()), payloadPreview(payloadText));
+  }
+
+  private static String commandLabel(Message message) {
+    return commandLabel(message == null ? Message.Command.Publish : message.getCommand());
+  }
+
+  private static String commandLabel(int command) {
+    return switch (command) {
+      case Message.Command.Publish -> "PUBLISH";
+      case Message.Command.SOW -> "SOW";
+      case Message.Command.OOF -> "OOF";
+      case Message.Command.SOWDelete -> "SOW_DELETE";
+      case Message.Command.GroupEnd -> "GROUP_END";
+      default -> Integer.toString(command);
+    };
+  }
+
+  private static int messageCommand(Message message) {
+    return message == null ? Message.Command.Publish : message.getCommand();
+  }
+
+  private static boolean isDeleteCommand(int command) {
+    return command == Message.Command.OOF || command == Message.Command.SOWDelete;
+  }
+
+  private static String payloadPreview(String payloadText) {
+    String normalized = Strings.trimToNull(payloadText);
+    if (normalized == null) {
+      return null;
+    }
+    String singleLine = normalized.replace('\n', ' ').replace('\r', ' ').trim();
+    if (singleLine.length() <= MAX_VERBOSE_PAYLOAD_CHARS) {
+      return singleLine;
+    }
+    return singleLine.substring(0, MAX_VERBOSE_PAYLOAD_CHARS) + "...";
+  }
+
+  private ScheduledExecutorService createBatchScheduler() {
+    ThreadFactory threadFactory =
+        runnable -> {
+          Thread thread = new Thread(runnable, "ingest-amps-pump-" + ingestName);
+          thread.setDaemon(true);
+          return thread;
+        };
+    return Executors.newSingleThreadScheduledExecutor(threadFactory);
+  }
+
+  private void closeScheduler() {
+    ScheduledExecutorService scheduler = batchScheduler;
+    batchScheduler = null;
+    if (scheduler == null) {
+      return;
+    }
+    scheduler.shutdownNow();
+  }
+
+  public enum PayloadFormat {
+    JSON,
+    NVFIX
+  }
+
+  public enum OofHandling {
+    DELETE_EVENT,
+    MARK_AS_DELETED
+  }
+
+  @FunctionalInterface
+  public interface AmpsMessageHandler {
+    void onMessage(
+        String ingestName,
+        String payloadText,
+        PayloadFormat payloadFormat,
+        int ampsCommand,
+        OofHandling oofHandling,
+        String parquetFilenamePrefix);
+  }
+
+  @FunctionalInterface
+  public interface WriteAuthorizer {
+    void requireWrite(String datasetId, String operation);
+  }
+
+  public static final class Builder {
+    private final Fabric.Session session;
+    private String ingestName;
+    private String ingestSourceName;
+    private String datasetId;
+    private String connectionName;
+    private String connectionInstanceName;
+    private String topic;
+    private Boolean sow;
+    private Boolean sowOnly;
+    private String options;
+    private String filter;
+    private AmpsConnection.BatchMode mode;
+    private int batchMaxMessages = AmpsConnection.DEFAULT_BATCH_MAX_MESSAGES;
+    private int batchMaxBytes = AmpsConnection.DEFAULT_BATCH_MAX_BYTES;
+    private long batchFlushMillis = AmpsConnection.DEFAULT_BATCH_FLUSH_MILLIS;
+    private PayloadFormat payloadFormat;
+    private OofHandling oofHandling = OofHandling.DELETE_EVENT;
+    private boolean oofHandlingConfigured;
+    private String parquetFilenamePrefix;
+    private boolean logIncomingMessages;
+    private boolean logOutgoingMessages;
+    private UnaryOperator<String> payloadTransformer;
+    private BiFunction<String, Integer, String> payloadTransformerWithCommand;
+    private boolean persistOofAsRows;
+    private WriteAuthorizer writeAuthorizer;
+    private AmpsMessageHandler ampsMessageHandler;
+    private ErrorListener errorListener = ErrorListener.NOOP;
+    private Runnable sowCompleteListener;
+    private CheckpointStore checkpointStore;
+    private boolean bookmarkResume = true;
+
+    private Builder(Fabric.Session session) {
       this.session = Objects.requireNonNull(session, "session");
-      this.connectionName = connectionName;
-      this.databaseType = databaseType;
-      this.handle = handle;
-      this.closeOnClose = closeOnClose;
     }
 
-    private static OdbcHandle noOp(
-        DuckdbSession session,
-        String connectionName,
-        DefinitionConnection.Odbc.DatabaseType databaseType) {
-      return new OdbcHandle(session, connectionName, databaseType, -1L, false);
+    public Builder withIngestName(String value) {
+      ingestName = Strings.trimToNull(value);
+      return this;
     }
 
-    public long handle() {
-      return handle;
+    public Builder withIngestSourceName(String value) {
+      ingestSourceName = Strings.trimToNull(value);
+      return this;
     }
 
-    public String connectionName() {
-      return connectionName;
+    public Builder withConnectionName(String value) {
+      connectionName = Strings.trimToNull(value);
+      return this;
     }
 
-    public DefinitionConnection.Odbc.DatabaseType databaseType() {
-      return databaseType;
+    public Builder withConnectionInstanceName(String value) {
+      connectionInstanceName = Strings.trimToNull(value);
+      return this;
     }
+
+    public Builder withDatasetId(String value) {
+      datasetId = Strings.trimToNull(value);
+      return this;
+    }
+
+    public Builder withTopic(String value) {
+      topic = Strings.trimToNull(value);
+      return this;
+    }
+
+    public Builder withSowSubscribe(Boolean value) {
+      sow = value;
+      if (Boolean.TRUE.equals(value)) {
+        sowOnly = Boolean.FALSE;
+      }
+      return this;
+    }
+
+    public Builder withSow(Boolean value) {
+      sowOnly = value;
+      if (Boolean.TRUE.equals(value)) {
+        sow = Boolean.FALSE;
+      }
+      return this;
+    }
+
+    public Builder withSow() {
+      return withSow(Boolean.TRUE);
+    }
+
+    public Builder withOptions(String value) {
+      options = Strings.trimToNull(value);
+      return this;
+    }
+
+    public Builder withFilter(String value) {
+      filter = Strings.trimToNull(value);
+      return this;
+    }
+
+    public Builder withMode(AmpsConnection.BatchMode value) {
+      mode = value;
+      return this;
+    }
+
+    public Builder withBatchMaxMessages(int value) {
+      batchMaxMessages = value;
+      return this;
+    }
+
+    public Builder withBatchMaxBytes(int value) {
+      batchMaxBytes = value;
+      return this;
+    }
+
+    public Builder withBatchFlushMillis(long value) {
+      batchFlushMillis = value;
+      return this;
+    }
+
+    public Builder withPayloadFormat(PayloadFormat value) {
+      payloadFormat = value;
+      return this;
+    }
+
+    public Builder withPayloadFormat(String value) {
+      String normalized =
+          Strings.requireNonBlank(value, "payloadFormat").toUpperCase(Locale.ROOT);
+      payloadFormat = PayloadFormat.valueOf(normalized);
+      return this;
+    }
+
+    public Builder withOofHandling(OofHandling value) {
+      this.oofHandling = value == null ? OofHandling.DELETE_EVENT : value;
+      this.oofHandlingConfigured = true;
+      return this;
+    }
+
+    public Builder withParquetFilenamePrefix(String value) {
+      parquetFilenamePrefix = Strings.trimToNull(value);
+      return this;
+    }
+
+    public Builder withLogIncomingMessages(boolean value) {
+      logIncomingMessages = value;
+      return this;
+    }
+
+    public Builder withLogOutgoingMessages(boolean value) {
+      logOutgoingMessages = value;
+      return this;
+    }
+
+    public Builder withPayloadTransformer(UnaryOperator<String> value) {
+      payloadTransformer = value;
+      return this;
+    }
+
+    public Builder withPayloadTransformerWithCommand(BiFunction<String, Integer, String> value) {
+      payloadTransformerWithCommand = value;
+      return this;
+    }
+
+    public Builder withPersistOofAsRows(boolean value) {
+      persistOofAsRows = value;
+      return this;
+    }
+
+    public Builder withWriteAuthorizer(WriteAuthorizer value) {
+      writeAuthorizer = value;
+      return this;
+    }
+
+    public Builder withAmpsMessageHandler(AmpsMessageHandler value) {
+      this.ampsMessageHandler = value;
+      return this;
+    }
+
+    public Builder withErrorListener(ErrorListener value) {
+      errorListener = value == null ? ErrorListener.NOOP : value;
+      return this;
+    }
+
+    public Builder withSowCompleteListener(Runnable value) {
+      sowCompleteListener = value;
+      return this;
+    }
+
+    public Builder withCheckpointStore(CheckpointStore value) {
+      checkpointStore = value;
+      return this;
+    }
+
+    public Builder withBookmarkResume(boolean value) {
+      bookmarkResume = value;
+      return this;
+    }
+
+    public IngestAmpsPump build() {
+      String resolvedIngestName = Strings.requireNonBlank(ingestName, "ingestName");
+      String resolvedIngestSourceName =
+          Strings.firstNonBlank(ingestSourceName, resolvedIngestName);
+      String resolvedDatasetId = Strings.trimToNull(datasetId);
+      if (writeAuthorizer != null) {
+        resolvedDatasetId = Strings.requireNonBlank(resolvedDatasetId, "datasetId");
+      }
+      String resolvedConnectionName = Strings.requireNonBlank(connectionName, "connectionName");
+      String resolvedTopic = Strings.requireNonBlank(topic, "topic");
+      PayloadFormat resolvedPayloadFormat =
+          Objects.requireNonNull(payloadFormat, "payloadFormat");
+      String bookmarkGroup =
+          session.context() == null
+              ? null
+              : Strings.trimToNull(session.context().getGroup());
+      String bookmarkStart = null;
+      CheckpointStore resolvedCheckpointStore = null;
+      CheckpointKey checkpointKey = null;
+      if (bookmarkResume && bookmarkGroup != null) {
+        String checkpointConnectionName =
+            connectionInstanceName == null
+                ? resolvedConnectionName
+                : resolvedConnectionName + "@" + connectionInstanceName;
+        String subscriptionKey =
+            AmpsConnection.BookmarkStoreLocal.subscriptionKey(
+                resolvedIngestName, checkpointConnectionName, resolvedTopic);
+        checkpointKey =
+            new CheckpointKey(
+                bookmarkGroup,
+                CheckpointType.INGEST,
+                resolvedIngestName,
+                checkpointConnectionName + ":" + subscriptionKey);
+        resolvedCheckpointStore =
+            checkpointStore == null
+                ? CheckpointStores.failFast(
+                    "Ingest AMPS checkpoint store is not configured. Configure session with withCheckpointPath(...)")
+                : checkpointStore;
+        bookmarkStart =
+            resolvedCheckpointStore
+                .load(checkpointKey)
+                .map(record -> Strings.trimToNull(record.payload().get("bookmark")))
+                .orElse(null);
+        if (bookmarkStart == null) {
+          bookmarkStart = Client.Bookmarks.NOW;
+        }
+      }
+      boolean isSowSubscription = Boolean.TRUE.equals(sow) || Boolean.TRUE.equals(sowOnly);
+      String resolvedOptions =
+          (oofHandlingConfigured && isSowSubscription)
+              ? ensureSubscribeOption(options, "oof")
+              : options;
+      AmpsConnection.SubscriptionSpec subscriptionSpec =
+          new AmpsConnection.SubscriptionSpec(
+              Boolean.TRUE.equals(sow),
+              Boolean.TRUE.equals(sowOnly),
+              resolvedTopic,
+              resolvedOptions,
+              filter,
+              bookmarkStart,
+              null);
+      AmpsConnection.BatchSpec batchSpec =
+          new AmpsConnection.BatchSpec(mode, batchMaxMessages, batchMaxBytes, batchFlushMillis);
+      return new IngestAmpsPump(
+          session,
+          resolvedIngestName,
+          resolvedIngestSourceName,
+          resolvedDatasetId,
+          resolvedConnectionName,
+          connectionInstanceName,
+          subscriptionSpec,
+          batchSpec,
+          resolvedPayloadFormat,
+          oofHandling,
+          parquetFilenamePrefix,
+          logIncomingMessages,
+          logOutgoingMessages,
+          payloadTransformer,
+          payloadTransformerWithCommand,
+          persistOofAsRows,
+          writeAuthorizer,
+          ampsMessageHandler,
+          errorListener,
+          sowCompleteListener,
+          resolvedCheckpointStore,
+          checkpointKey);
+    }
+
+    private static String ensureSubscribeOption(String options, String optionToken) {
+      String normalizedToken = Strings.requireNonBlank(optionToken, "optionToken");
+      String normalizedOptions = Strings.trimToNull(options);
+      if (normalizedOptions == null) {
+        return normalizedToken;
+      }
+      for (String token : normalizedOptions.split(";")) {
+        String normalized = Strings.trimToNull(token);
+        if (normalized != null && normalizedToken.equalsIgnoreCase(normalized)) {
+          return normalizedOptions;
+        }
+      }
+      return normalizedOptions + ";" + normalizedToken;
+    }
+  }
+
+  @FunctionalInterface
+  interface Clock {
+    long nowMillis();
+  }
+
+  enum SystemClock implements Clock {
+    INSTANCE;
 
     @Override
-    public void close() {
-      if (closed) {
+    public long nowMillis() {
+      return System.currentTimeMillis();
+    }
+  }
+
+  @FunctionalInterface
+  interface FlushHandler {
+    void flush(List<String> payloads, int messageCount, int byteCount, long elapsedMs);
+  }
+
+  record PendingBatchMessage(AmpsConnection.AmpsMessage message, int ampsCommand) {}
+
+  @FunctionalInterface
+  public interface ErrorListener {
+    ErrorListener NOOP = ignored -> {};
+
+    void onError(Throwable error);
+  }
+
+  static final class BatchAccumulator {
+    private final AmpsConnection.BatchSpec batchSpec;
+    private final Clock clock;
+    private final FlushHandler flushHandler;
+    private final List<String> payloads = new ArrayList<>();
+    private int messageCount;
+    private int byteCount;
+    private long lastFlushMs;
+
+    BatchAccumulator(AmpsConnection.BatchSpec batchSpec, Clock clock, FlushHandler flushHandler) {
+      this.batchSpec = Objects.requireNonNull(batchSpec, "batchSpec");
+      this.clock = Objects.requireNonNull(clock, "clock");
+      this.flushHandler = Objects.requireNonNull(flushHandler, "flushHandler");
+      this.lastFlushMs = clock.nowMillis();
+    }
+
+    synchronized void onMessage(String line) {
+      String payloadLine = Objects.requireNonNull(line, "line");
+      if (payloadLine.isEmpty()) {
+        throw new IllegalArgumentException("line is required");
+      }
+      int lineBytes = payloadLine.getBytes(StandardCharsets.UTF_8).length;
+      if (batchSpec.mode() == AmpsConnection.BatchMode.STREAM) {
+        long now = clock.nowMillis();
+        long elapsedMs = Math.max(0L, now - lastFlushMs);
+        flushHandler.flush(List.of(payloadLine), 1, lineBytes, elapsedMs);
+        lastFlushMs = now;
         return;
       }
-      closed = true;
-      if (!closeOnClose || handle < 0L) {
+      if (lineBytes > batchSpec.batchMaxBytes()) {
+        throw new IllegalStateException(
+            "single message bytes="
+                + lineBytes
+                + " exceeds batchMaxBytes="
+                + batchSpec.batchMaxBytes()
+                + " mode="
+                + batchSpec.mode());
+      }
+      flushIfDue();
+      payloads.add(payloadLine);
+      messageCount++;
+      byteCount += lineBytes;
+      if (messageCount >= batchSpec.batchMaxMessages() || byteCount >= batchSpec.batchMaxBytes()) {
+        flush();
+      }
+    }
+
+    synchronized void flushIfDue() {
+      if (batchSpec.mode() != AmpsConnection.BatchMode.BATCH || messageCount <= 0) {
         return;
       }
-      try (Statement statement = session.createStatement()) {
-        statement.execute("select odbc_close(" + handle + ")");
-      } catch (SQLException | RuntimeException ignore) {
-        // best-effort close.
+      long now = clock.nowMillis();
+      if (now - lastFlushMs >= batchSpec.batchFlushMillis()) {
+        flushInternal(now);
       }
+    }
+
+    synchronized void flush() {
+      if (messageCount <= 0) {
+        return;
+      }
+      flushInternal(clock.nowMillis());
+    }
+
+    private void flushInternal(long nowMs) {
+      List<String> batchPayloads = List.copyOf(payloads);
+      int messages = messageCount;
+      int bytes = byteCount;
+      long elapsedMs = Math.max(0L, nowMs - lastFlushMs);
+      payloads.clear();
+      messageCount = 0;
+      byteCount = 0;
+      lastFlushMs = nowMs;
+      flushHandler.flush(batchPayloads, messages, bytes, elapsedMs);
     }
   }
 }
+
+
