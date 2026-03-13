@@ -1,674 +1,629 @@
-package org.pronzato.fabric.api.control.entitlements.simple.services;
+package org.pronzato.fabric.api.catalog.semantics;
+
+import org.pronzato.fabric.api.control.discovery.definitions.common.Semantic;
 
 import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Comparator;
+import java.util.EnumMap;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
-import java.util.Objects;
-import java.util.Set;
-import java.util.concurrent.atomic.AtomicReference;
-import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
-import org.pronzato.fabric.api.control.discovery.cache.DiscoveryListener;
 import org.pronzato.fabric.api.control.discovery.definitions.Definition;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEntitlement;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionPlatform;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
-import org.pronzato.fabric.api.control.entitlements.core.services.ServiceEntitlements;
-import org.pronzato.fabric.api.control.entitlements.provider.DefaultEntitlementProviderRegistry;
-import org.pronzato.fabric.api.control.entitlements.provider.EntitlementProviderRegistry;
-import org.pronzato.fabric.api.control.entitlements.provider.EntitlementProviderSelector;
-import org.pronzato.fabric.api.control.entitlements.provider.EntitlementSubjectProvider;
-import org.pronzato.fabric.api.control.entitlements.provider.EntitlementSubjectProviderPlatform;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfig;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfigLayer;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngest;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngestSource;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionSchema;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionService;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStream;
 import org.pronzato.fabric.api.util.Strings;
 
-public final class ServiceEntitlementsSimpleManager implements AutoCloseable {
-  private static final String PLATFORM_GROUP = "platform";
-  private static final String PLATFORM_NAME = "platform";
+public final class SemanticCompletenessAuditor {
+  private SemanticCompletenessAuditor() {}
 
-  private final DiscoveryCache DiscoveryCache;
-  private final String sessionGroup;
-  private final EntitlementSubjectProvider provider;
-  private final DiscoveryListener listener;
-  private final ServiceEntitlementsSimple serviceEntitlements;
-  private final AtomicReference<Map<String, Set<String>>> membershipIndexRef =
-      new AtomicReference<>(Map.of());
-  private final AtomicReference<Map<String, Rules>> entitlementsIndexRef =
-      new AtomicReference<>(Map.of());
-  private final AtomicReference<String> platformModelVersionKeyRef = new AtomicReference<>("");
-  private final AtomicReference<String> entitlementsVersionKeyRef = new AtomicReference<>("");
-  private final Object rebuildLock = new Object();
+  public record AuditInput(String source, Definition definition) {}
 
-  public ServiceEntitlementsSimpleManager(DiscoveryCache DiscoveryCache, String sessionGroup, boolean logDecisions) {
-    this(
-        DiscoveryCache,
-        sessionGroup,
-        logDecisions,
-        new DefaultEntitlementProviderRegistry(DiscoveryCache));
-  }
-
-  public ServiceEntitlementsSimpleManager(
-      DiscoveryCache DiscoveryCache,
-      String sessionGroup,
-      boolean logDecisions,
-      EntitlementSubjectProvider provider) {
-    this(
-        DiscoveryCache,
-        sessionGroup,
-        logDecisions,
-        new DefaultEntitlementProviderRegistry(provider));
-  }
-
-  public ServiceEntitlementsSimpleManager(
-      DiscoveryCache DiscoveryCache,
-      String sessionGroup,
-      boolean logDecisions,
-      EntitlementProviderRegistry providerRegistry) {
-    this(
-        DiscoveryCache,
-        sessionGroup,
-        logDecisions,
-        providerRegistry,
-        new EntitlementProviderSelector(DiscoveryCache, providerRegistry));
-  }
-
-  public ServiceEntitlementsSimpleManager(
-      DiscoveryCache DiscoveryCache,
-      String sessionGroup,
-      boolean logDecisions,
-      EntitlementProviderRegistry providerRegistry,
-      EntitlementProviderSelector providerSelector) {
-    this.DiscoveryCache = Objects.requireNonNull(DiscoveryCache, "DiscoveryCache");
-    this.sessionGroup = sessionGroup;
-    Objects.requireNonNull(providerRegistry, "providerRegistry");
-    Objects.requireNonNull(providerSelector, "providerSelector");
-    this.provider = Objects.requireNonNull(providerRegistry.defaultProvider(), "providerRegistry.defaultProvider");
-    this.serviceEntitlements =
-        new ServiceEntitlementsSimple(
-            membershipIndexRef, entitlementsIndexRef, providerSelector, logDecisions);
-    this.listener =
-        new DiscoveryListener() {
-          @Override
-          public void onUpsert(Definition definition) {
-            handleUpsert(definition);
-          }
-
-          @Override
-          public void onDelete(DefinitionEnvelope envelope) {
-            handleDelete(envelope);
-          }
-        };
-
-    this.DiscoveryCache.addListener(listener);
-    try {
-      rebuildMembershipIndex(true);
-      rebuildEntitlementsIndex(true);
-    } catch (RuntimeException ex) {
-      this.DiscoveryCache.removeListener(listener);
-      throw ex;
+  public static SemanticAuditReport auditDefinitions(
+      Iterable<Definition> definitions, SemanticValidationPolicy policy) {
+    List<AuditInput> inputs = new ArrayList<>();
+    if (definitions != null) {
+      int index = 0;
+      for (Definition definition : definitions) {
+        inputs.add(new AuditInput("definition#" + index, definition));
+        index++;
+      }
     }
+    return auditAssets(inputs, policy);
   }
 
-  public ServiceEntitlementsSimple serviceEntitlements() {
-    return serviceEntitlements;
-  }
+  public static SemanticAuditReport auditAssets(
+      Iterable<AuditInput> inputs, SemanticValidationPolicy policy) {
+    SemanticValidationPolicy effectivePolicy =
+        policy == null ? SemanticValidationPolicy.fromTier("dev") : policy;
+    List<SemanticAssetAudit> assets = new ArrayList<>();
+    Map<String, Integer> countsByType = new LinkedHashMap<>();
+    Map<SemanticFindingSeverity, Integer> countsBySeverity =
+        new EnumMap<>(SemanticFindingSeverity.class);
+    countsBySeverity.put(SemanticFindingSeverity.ERROR, 0);
+    countsBySeverity.put(SemanticFindingSeverity.WARN, 0);
+    countsBySeverity.put(SemanticFindingSeverity.INFO, 0);
 
-  @Override
-  public void close() {
-    DiscoveryCache.removeListener(listener);
-  }
+    int placeholderFindings = 0;
+    int totalFindings = 0;
+    int totalScore = 0;
+    boolean enforcementFailed = false;
 
-  private void handleUpsert(Definition definition) {
-    if (definition instanceof DefinitionPlatform platformModel
-        && isPlatformModel(platformModel.envelope())) {
-      rebuildMembershipIndex(false);
-      return;
-    }
-    if (definition instanceof DefinitionEntitlement entitlement && isInScope(entitlement.envelope())) {
-      rebuildEntitlementsIndex(false);
-    }
-  }
-
-  private void handleDelete(DefinitionEnvelope envelope) {
-    if (envelope == null || envelope.type() == null) {
-      return;
-    }
-    if (envelope.type() == DefinitionType.PLATFORM && isPlatformModel(envelope)) {
-      rebuildMembershipIndex(false);
-      return;
-    }
-    if (envelope.type() == DefinitionType.ENTITLEMENT && isInScope(envelope)) {
-      rebuildEntitlementsIndex(false);
-    }
-  }
-
-  private void rebuildMembershipIndex(boolean required) {
-    synchronized (rebuildLock) {
-      String nextVersionKey = provider.versionKey();
-      if ("MISSING".equals(nextVersionKey)) {
-        if (required) {
-          throw new IllegalStateException(
-              "Missing required platform model " + PLATFORM_GROUP + "/" + PLATFORM_NAME);
+    List<AuditInput> normalizedInputs = new ArrayList<>();
+    if (inputs != null) {
+      for (AuditInput input : inputs) {
+        if (input != null && input.definition() != null) {
+          normalizedInputs.add(input);
         }
-        membershipIndexRef.set(Map.of());
-        platformModelVersionKeyRef.set(nextVersionKey);
-        return;
       }
-      if (nextVersionKey.equals(platformModelVersionKeyRef.get())) {
-        return;
-      }
-      membershipIndexRef.set(membershipIndexFromProvider(required));
-      platformModelVersionKeyRef.set(nextVersionKey);
     }
-  }
+    Map<String, Semantic> configSemanticByKey = indexConfigSemantic(normalizedInputs);
 
-  private Map<String, Set<String>> membershipIndexFromProvider(boolean required) {
-    if (provider instanceof EntitlementSubjectProviderPlatform platformProvider) {
-      return platformProvider.membershipIndex();
-    }
-    return Map.of();
-  }
-
-  private void rebuildEntitlementsIndex(boolean required) {
-    synchronized (rebuildLock) {
-      List<DefinitionEntitlement> assetEntitlements = collectAssetEntitlements();
-      if (assetEntitlements.isEmpty()) {
-        entitlementsIndexRef.set(Map.of());
-        entitlementsVersionKeyRef.set("MISSING");
-        return;
-      }
-
-      String nextVersionKey = entitlementsVersionKey(assetEntitlements);
-      if (nextVersionKey.equals(entitlementsVersionKeyRef.get())) {
-        return;
-      }
-
-      entitlementsIndexRef.set(compileRulesIndex(assetEntitlements));
-      entitlementsVersionKeyRef.set(nextVersionKey);
-    }
-  }
-
-  private List<DefinitionEntitlement> collectAssetEntitlements() {
-    List<DefinitionEntitlement> all = DiscoveryCache.list(DefinitionEntitlement.class);
-    List<DefinitionEntitlement> assetEntitlements = new ArrayList<>();
-    for (DefinitionEntitlement entitlement : all) {
-      if (entitlement == null || !enabled(entitlement.envelope() == null ? null : entitlement.envelope().enabled())) {
+    for (AuditInput input : normalizedInputs) {
+      if (input == null || input.definition() == null) {
         continue;
       }
-      if (!isInScope(entitlement.envelope())) {
-        continue;
-      }
-      if (canonicalAssetScopeId(entitlement.scopeId()) == null) {
-        continue;
-      }
-      assetEntitlements.add(entitlement);
-    }
-    return List.copyOf(assetEntitlements);
-  }
-
-  static Map<String, Rules> compileRulesIndex(List<DefinitionEntitlement> definitions) {
-    Map<String, MutableRules> mutable = new LinkedHashMap<>();
-    for (DefinitionEntitlement entitlement : definitions) {
-      String scopeId = canonicalAssetScopeId(entitlement.scopeId());
-      if (scopeId == null) {
-        continue;
-      }
-      MutableRules target =
-          mutable.computeIfAbsent(scopeId, ignored -> new MutableRules());
-      appendPolicyRules(target, entitlement.policies());
-      appendRelationshipRules(target, entitlement.relationships(), scopeId);
-    }
-
-    Map<String, Rules> built = new LinkedHashMap<>();
-    for (Map.Entry<String, MutableRules> entry : mutable.entrySet()) {
-      built.put(entry.getKey(), entry.getValue().freeze());
-    }
-    return Map.copyOf(built);
-  }
-
-  private static void appendPolicyRules(
-      MutableRules rules, List<DefinitionEntitlement.PolicyDocument> policies) {
-    if (rules == null || policies == null) {
-      return;
-    }
-    for (DefinitionEntitlement.PolicyDocument policy : policies) {
-      if (policy == null || !enabled(policy.enabled()) || policy.bindings() == null) {
-        continue;
-      }
-      String policyId = normalize(policy.policyId());
-      String policyName = normalize(policy.name());
-      rules.addPolicy(policyId, policyName);
-      for (DefinitionEntitlement.PolicyBinding binding : policy.bindings()) {
-        if (binding == null || !enabled(binding.enabled())) {
+        Definition definition = input.definition();
+        String definitionType = targetedDefinitionType(definition);
+        if (definitionType == null) {
           continue;
         }
-        List<ActionSlot> slots = actionSlots(binding.action());
-        if (slots.isEmpty()) {
-          continue;
-        }
-        SubjectSlot subjectSlot = subjectSlot(binding.subject());
-        if (subjectSlot == null) {
-          continue;
-        }
-        Set<String> methodsAllow = methodsAllow(binding.obligations());
-        BindingSummary summary =
-            new BindingSummary(policyId, policyName, subjectSlot.id(), subjectSlot.group(), methodsAllow);
-        rules.addBindingSummary(slots, summary);
-        String effect = binding.effect();
-        if ("DENY".equalsIgnoreCase(effect)) {
-          for (ActionSlot slot : slots) {
-            rules.addDeny(slot, subjectSlot, methodsAllow);
-          }
-          continue;
-        }
-        if ("ALLOW".equalsIgnoreCase(effect)) {
-          for (ActionSlot slot : slots) {
-            rules.addAllow(slot, subjectSlot, methodsAllow);
+        countsByType.merge(definitionType, 1, Integer::sum);
+        SemanticAssetAudit assetAudit =
+            auditAsset(
+                input.source(),
+                definitionType,
+                definition,
+                configSemanticByKey,
+                effectivePolicy);
+        assets.add(assetAudit);
+        totalScore += assetAudit.score();
+
+        for (SemanticAuditFinding finding : assetAudit.findings()) {
+          countsBySeverity.merge(finding.severity(), 1, Integer::sum);
+          totalFindings++;
+          if (finding.placeholder()) {
+            placeholderFindings++;
           }
         }
+        if (effectivePolicy.enforcePlaceholderRejection()
+            && assetAudit.findings().stream().anyMatch(finding -> finding.severity() == SemanticFindingSeverity.ERROR)) {
+          enforcementFailed = true;
+        }
+    }
+
+    double completenessPercentage = assets.isEmpty() ? 100.0 : (double) totalScore / assets.size();
+    SemanticAuditSummary summary =
+        new SemanticAuditSummary(
+            assets.size(),
+            Map.copyOf(countsByType),
+            Map.copyOf(countsBySeverity),
+            placeholderFindings,
+            totalFindings,
+            roundToTwoDecimals(completenessPercentage));
+    return new SemanticAuditReport(effectivePolicy, summary, enforcementFailed, List.copyOf(assets));
+  }
+
+  private static SemanticAssetAudit auditAsset(
+      String source,
+      String definitionType,
+      Definition definition,
+      Map<String, Semantic> configSemanticByKey,
+      SemanticValidationPolicy policy) {
+    Semantic semantic = semantic(definition, configSemanticByKey);
+    String assetId = assetId(definitionType, definition);
+    List<SemanticAuditFinding> findings = new ArrayList<>();
+
+    if (semantic == null) {
+      findings.add(
+          new SemanticAuditFinding(
+              "SEM_REQUIRED_METADATA",
+              SemanticFindingSeverity.ERROR,
+              "semantic",
+              "semantic metadata is missing",
+              false));
+      return finalizeAssetAudit(source, assetId, definitionType, findings);
+    }
+
+    validateGlobalRequired(findings, semantic);
+    validateGlobalPlaceholders(findings, semantic, policy);
+    validateTypeSpecific(findings, definitionType, semantic);
+
+    return finalizeAssetAudit(source, assetId, definitionType, findings);
+  }
+
+  private static SemanticAssetAudit finalizeAssetAudit(
+      String source, String assetId, String definitionType, List<SemanticAuditFinding> findings) {
+    int score = calculateScore(findings);
+    int placeholderCount = 0;
+    for (SemanticAuditFinding finding : findings) {
+      if (finding.placeholder()) {
+        placeholderCount++;
       }
+    }
+    SemanticCompletenessClass classification = classify(score, placeholderCount);
+    return new SemanticAssetAudit(
+        Strings.firstNonBlank(Strings.trimToNull(source), assetId),
+        assetId,
+        definitionType,
+        score,
+        classification,
+        placeholderCount,
+        List.copyOf(findings));
+  }
+
+  private static void validateGlobalRequired(List<SemanticAuditFinding> findings, Semantic semantic) {
+    requireText(findings, "SEM_REQUIRED_TITLE", "semantic.title", semantic.title());
+    requireText(findings, "SEM_REQUIRED_DESCRIPTION", "semantic.description", semantic.description());
+    requireText(findings, "SEM_REQUIRED_BUSINESS_MEANING", "semantic.businessMeaning", semantic.businessMeaning());
+    requireText(findings, "SEM_REQUIRED_DOMAIN", "semantic.domain", semantic.domain());
+    requireNonEmptyList(findings, "SEM_REQUIRED_TAGS", "semantic.tags", semantic.tags());
+
+    if (semantic.ownership() == null) {
+      findings.add(
+          new SemanticAuditFinding(
+              "SEM_REQUIRED_OWNERSHIP",
+              SemanticFindingSeverity.ERROR,
+              "semantic.ownership",
+              "semantic.ownership is required",
+              false));
+    } else {
+      requireText(findings, "SEM_REQUIRED_OWNER_ID", "semantic.ownership.ownerId", semantic.ownership().ownerId());
+    }
+
+    if (semantic.dataShape() == null || semantic.dataShape().type() == null) {
+      findings.add(
+          new SemanticAuditFinding(
+              "SEM_REQUIRED_DATASHAPE_TYPE",
+              SemanticFindingSeverity.ERROR,
+              "semantic.dataShape.type",
+              "semantic.dataShape.type is required",
+              false));
+    }
+    if (semantic.trust() == null || semantic.trust().certification() == null) {
+      findings.add(
+          new SemanticAuditFinding(
+              "SEM_REQUIRED_TRUST_CERTIFICATION",
+              SemanticFindingSeverity.ERROR,
+              "semantic.trust.certification",
+              "semantic.trust.certification is required",
+              false));
+    }
+    if (semantic.trust() == null || semantic.trust().qualityStatus() == null) {
+      findings.add(
+          new SemanticAuditFinding(
+              "SEM_REQUIRED_TRUST_QUALITY",
+              SemanticFindingSeverity.ERROR,
+              "semantic.trust.qualityStatus",
+              "semantic.trust.qualityStatus is required",
+              false));
+    }
+    if (semantic.toolHints() == null || semantic.toolHints().actionClass() == null) {
+      findings.add(
+          new SemanticAuditFinding(
+              "SEM_REQUIRED_ACTION_CLASS",
+              SemanticFindingSeverity.ERROR,
+              "semantic.toolHints.actionClass",
+              "semantic.toolHints.actionClass is required",
+              false));
     }
   }
 
-  private static void appendRelationshipRules(
-      MutableRules rules,
-      List<DefinitionEntitlement.RelationshipTuple> relationships,
-      String resourceId) {
-    if (rules == null || relationships == null || resourceId == null) {
+  private static void validateGlobalPlaceholders(
+      List<SemanticAuditFinding> findings, Semantic semantic, SemanticValidationPolicy policy) {
+    addPlaceholderIf(
+        findings,
+        policy,
+        "SEM_PLACEHOLDER_TITLE",
+        "semantic.title",
+        SemanticMetadataValidator.isPlaceholderText(semantic.title()));
+    addPlaceholderIf(
+        findings,
+        policy,
+        "SEM_PLACEHOLDER_DESCRIPTION",
+        "semantic.description",
+        SemanticMetadataValidator.isPlaceholderText(semantic.description()));
+    addPlaceholderIf(
+        findings,
+        policy,
+        "SEM_PLACEHOLDER_BUSINESS_MEANING",
+        "semantic.businessMeaning",
+        SemanticMetadataValidator.isPlaceholderText(semantic.businessMeaning()));
+    addPlaceholderIf(
+        findings,
+        policy,
+        "SEM_PLACEHOLDER_DOMAIN_DEFAULT",
+        "semantic.domain",
+        SemanticMetadataValidator.isDefaultDomain(semantic.domain()));
+    addPlaceholderIf(
+        findings,
+        policy,
+        "SEM_PLACEHOLDER_TAGS_DEFAULT",
+        "semantic.tags",
+        SemanticMetadataValidator.containsDefaultTag(semantic.tags()));
+    addPlaceholderIf(
+        findings,
+        policy,
+        "SEM_PLACEHOLDER_OWNER_DEFAULT",
+        "semantic.ownership.ownerId",
+        semantic.ownership() != null && SemanticMetadataValidator.isDefaultOwnerId(semantic.ownership().ownerId()));
+    addPlaceholderIf(
+        findings,
+        policy,
+        "SEM_PLACEHOLDER_TRUST_CERT_NONE",
+        "semantic.trust.certification",
+        semantic.trust() != null && semantic.trust().certification() == Semantic.Certification.NONE);
+    addPlaceholderIf(
+        findings,
+        policy,
+        "SEM_PLACEHOLDER_TRUST_QUALITY_UNKNOWN",
+        "semantic.trust.qualityStatus",
+        semantic.trust() != null && semantic.trust().qualityStatus() == Semantic.QualityStatus.UNKNOWN);
+    addPlaceholderIf(
+        findings,
+        policy,
+        "SEM_PLACEHOLDER_GRAIN",
+        "semantic.dataShape.grain",
+        semantic.dataShape() != null && SemanticMetadataValidator.isPlaceholderText(semantic.dataShape().grain()));
+    addPlaceholderIf(
+        findings,
+        policy,
+        "SEM_PLACEHOLDER_USAGE",
+        "semantic.usage",
+        hasPlaceholderUsage(semantic));
+  }
+
+  private static void validateTypeSpecific(
+      List<SemanticAuditFinding> findings, String definitionType, Semantic semantic) {
+    if ("DATASET".equals(definitionType) || "STREAM".equals(definitionType) || "SCHEMA".equals(definitionType)) {
+      if (semantic.dataShape() == null || isBlank(semantic.dataShape().grain())) {
+        findings.add(
+            new SemanticAuditFinding(
+                "SEM_WEAK_GRAIN",
+                SemanticFindingSeverity.WARN,
+                "semantic.dataShape.grain",
+                "grain should be explicitly defined",
+                false));
+      }
+      if (semantic.dataShape() == null || semantic.dataShape().keyFields().isEmpty()) {
+        findings.add(
+            new SemanticAuditFinding(
+                "SEM_WEAK_KEYS",
+                SemanticFindingSeverity.WARN,
+                "semantic.dataShape.keyFields",
+                "keyFields should include business keys",
+                false));
+      }
+      if (!hasSemanticFieldRichness(semantic)) {
+        findings.add(
+            new SemanticAuditFinding(
+                "SEM_WEAK_FIELD_RICHNESS",
+                SemanticFindingSeverity.WARN,
+                "semantic.dataShape",
+                "add dimension/measure/time fields or fieldRoles for better semantic coverage",
+                false));
+      }
+      if (!hasUsefulUsage(semantic)) {
+        findings.add(
+            new SemanticAuditFinding(
+                "SEM_WEAK_USAGE",
+                SemanticFindingSeverity.WARN,
+                "semantic.usage",
+                "add at least one useful example question or usage hint",
+                false));
+      }
       return;
     }
-    for (DefinitionEntitlement.RelationshipTuple tuple : relationships) {
-      if (tuple == null) {
-        continue;
+
+    if ("CONFIG".equals(definitionType)) {
+      if (!hasUsefulUsage(semantic)) {
+        findings.add(
+            new SemanticAuditFinding(
+                "SEM_WEAK_CONFIG_USAGE",
+                SemanticFindingSeverity.WARN,
+                "semantic.usage",
+                "add at least one useful example question or usage hint for config semantics",
+                false));
       }
-      String tupleResourceId = canonicalAssetScopeId(tuple.resourceId());
-      String tupleResourceSubject = canonicalAssetScopeId(tuple.resourceSubject());
-      if (!Objects.equals(resourceId, tupleResourceId) && !Objects.equals(resourceId, tupleResourceSubject)) {
-        continue;
+      return;
+    }
+
+    if ("SERVICE".equals(definitionType)) {
+      if (semantic.toolHints() == null || semantic.toolHints().readOnly() == null) {
+        findings.add(
+            new SemanticAuditFinding(
+                "SEM_REQUIRED_SERVICE_READ_ONLY",
+                SemanticFindingSeverity.ERROR,
+                "semantic.toolHints.readOnly",
+                "service semantic toolHints.readOnly is required",
+                false));
       }
-      SubjectSlot subjectSlot = subjectSlot(tuple.subject());
-      if (subjectSlot == null) {
-        continue;
+      if (semantic.toolHints() == null || semantic.toolHints().idempotent() == null) {
+        findings.add(
+            new SemanticAuditFinding(
+                "SEM_REQUIRED_SERVICE_IDEMPOTENT",
+                SemanticFindingSeverity.ERROR,
+                "semantic.toolHints.idempotent",
+                "service semantic toolHints.idempotent is required",
+                false));
       }
-      String relation = tuple.relation();
-      if (relation == null) {
-        continue;
+      if (!hasUsefulUsage(semantic)) {
+        findings.add(
+            new SemanticAuditFinding(
+                "SEM_WEAK_SERVICE_USAGE",
+                SemanticFindingSeverity.WARN,
+                "semantic.usage",
+                "add at least one useful service example question or usage hint",
+                false));
       }
-      if ("DENY".equalsIgnoreCase(relation) || "service.deny".equalsIgnoreCase(relation)) {
-        rules.addDeny(ActionSlot.START, subjectSlot, Set.of());
-        rules.addDeny(ActionSlot.INVOKE, subjectSlot, Set.of());
-        continue;
-      }
-      if ("ALLOW".equalsIgnoreCase(relation) || "service.allow".equalsIgnoreCase(relation)) {
-        rules.addAllow(ActionSlot.START, subjectSlot, Set.of());
-        rules.addAllow(ActionSlot.INVOKE, subjectSlot, Set.of());
-        continue;
-      }
-      for (ActionSlot slot : actionSlots(relation)) {
-        rules.addAllow(slot, subjectSlot, Set.of());
+      return;
+    }
+
+    if ("INGEST".equals(definitionType) || "INGEST_SOURCE".equals(definitionType)) {
+      if (!hasUsefulUsage(semantic)) {
+        findings.add(
+            new SemanticAuditFinding(
+                "SEM_WEAK_INGEST_USAGE",
+                SemanticFindingSeverity.WARN,
+                "semantic.usage",
+                "add at least one useful usage hint for ingest operations",
+                false));
       }
     }
   }
 
-  static List<ActionSlot> actionSlots(String action) {
-    if (action == null) {
-      return List.of();
+  private static boolean hasSemanticFieldRichness(Semantic semantic) {
+    if (semantic == null || semantic.dataShape() == null) {
+      return false;
     }
-    if ("*".equals(action)) {
-      return List.of(ActionSlot.START, ActionSlot.INVOKE, ActionSlot.READ);
-    }
-    if ("service.start".equalsIgnoreCase(action) || "START".equalsIgnoreCase(action)) {
-      return List.of(ActionSlot.START);
-    }
-    if ("service.invoke".equalsIgnoreCase(action)
-        || "INVOKE".equalsIgnoreCase(action)
-        || "WRITE".equalsIgnoreCase(action)) {
-      return List.of(ActionSlot.INVOKE);
-    }
-    if ("service.read".equalsIgnoreCase(action) || "READ".equalsIgnoreCase(action)) {
-      return List.of(ActionSlot.READ);
-    }
-    return List.of();
+    return !semantic.dataShape().dimensionFields().isEmpty()
+        || !semantic.dataShape().measureFields().isEmpty()
+        || !semantic.dataShape().timeFields().isEmpty()
+        || !semantic.dataShape().fieldRoles().isEmpty();
   }
 
-  private static SubjectSlot subjectSlot(String subject) {
-    String normalized = normalize(subject);
+  private static boolean hasUsefulUsage(Semantic semantic) {
+    if (semantic == null || semantic.usage() == null) {
+      return false;
+    }
+    return hasNonPlaceholderText(semantic.usage().exampleQuestions())
+        || hasNonPlaceholderText(semantic.usage().usageHints());
+  }
+
+  private static boolean hasNonPlaceholderText(List<String> values) {
+    if (values == null || values.isEmpty()) {
+      return false;
+    }
+    for (String value : values) {
+      String normalized = Strings.trimToNull(value);
+      if (normalized != null && !SemanticMetadataValidator.isPlaceholderText(normalized)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static boolean hasPlaceholderUsage(Semantic semantic) {
+    if (semantic == null || semantic.usage() == null) {
+      return false;
+    }
+    return listHasPlaceholder(semantic.usage().exampleQuestions())
+        || listHasPlaceholder(semantic.usage().exampleQueries())
+        || listHasPlaceholder(semantic.usage().usageHints())
+        || listHasPlaceholder(semantic.usage().knownPitfalls());
+  }
+
+  private static boolean listHasPlaceholder(List<String> values) {
+    if (values == null || values.isEmpty()) {
+      return false;
+    }
+    for (String value : values) {
+      if (SemanticMetadataValidator.isPlaceholderText(value)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static void addPlaceholderIf(
+      List<SemanticAuditFinding> findings,
+      SemanticValidationPolicy policy,
+      String code,
+      String field,
+      boolean condition) {
+    if (!condition) {
+      return;
+    }
+    findings.add(
+        new SemanticAuditFinding(
+            code,
+            policy.placeholderSeverity(),
+            field,
+            "placeholder/default semantic value detected: " + field,
+            true));
+  }
+
+  private static void requireText(
+      List<SemanticAuditFinding> findings, String code, String field, String value) {
+    if (isBlank(value)) {
+      findings.add(
+          new SemanticAuditFinding(
+              code,
+              SemanticFindingSeverity.ERROR,
+              field,
+              field + " is required",
+              false));
+    }
+  }
+
+  private static void requireNonEmptyList(
+      List<SemanticAuditFinding> findings, String code, String field, List<String> values) {
+    if (values == null || values.isEmpty()) {
+      findings.add(
+          new SemanticAuditFinding(
+              code,
+              SemanticFindingSeverity.ERROR,
+              field,
+              field + " must be non-empty",
+              false));
+    }
+  }
+
+  private static int calculateScore(List<SemanticAuditFinding> findings) {
+    int deductions = 0;
+    for (SemanticAuditFinding finding : findings) {
+      if (finding.severity() == SemanticFindingSeverity.ERROR) {
+        deductions += 20;
+      } else if (finding.severity() == SemanticFindingSeverity.WARN) {
+        deductions += 8;
+      } else if (finding.severity() == SemanticFindingSeverity.INFO) {
+        deductions += 2;
+      }
+    }
+    return Math.max(0, 100 - deductions);
+  }
+
+  private static SemanticCompletenessClass classify(int score, int placeholderCount) {
+    if (placeholderCount > 0) {
+      return SemanticCompletenessClass.PLACEHOLDER;
+    }
+    if (score >= 90) {
+      return SemanticCompletenessClass.STRONG;
+    }
+    if (score >= 75) {
+      return SemanticCompletenessClass.COMPLETE;
+    }
+    return SemanticCompletenessClass.WEAK;
+  }
+
+  private static String targetedDefinitionType(Definition definition) {
+    if (definition instanceof DefinitionDataset) {
+      return "DATASET";
+    }
+    if (definition instanceof DefinitionService) {
+      return "SERVICE";
+    }
+    if (definition instanceof DefinitionStream) {
+      return "STREAM";
+    }
+    if (definition instanceof DefinitionIngest) {
+      return "INGEST";
+    }
+    if (definition instanceof DefinitionIngestSource) {
+      return "INGEST_SOURCE";
+    }
+    if (definition instanceof DefinitionSchema) {
+      return "SCHEMA";
+    }
+    if (definition instanceof DefinitionConfigLayer) {
+      return "CONFIG";
+    }
+    return null;
+  }
+
+  private static Semantic semantic(
+      Definition definition, Map<String, Semantic> configSemanticByKey) {
+    if (definition instanceof DefinitionDataset dataset) {
+      return dataset.semantic();
+    }
+    if (definition instanceof DefinitionService service) {
+      return service.semantic();
+    }
+    if (definition instanceof DefinitionStream stream) {
+      return stream.semantic();
+    }
+    if (definition instanceof DefinitionIngest ingest) {
+      return ingest.semantic();
+    }
+    if (definition instanceof DefinitionIngestSource ingestSource) {
+      return ingestSource.semantic();
+    }
+    if (definition instanceof DefinitionSchema schema) {
+      return schema.semantic();
+    }
+    if (definition instanceof DefinitionConfigLayer config) {
+      String group =
+          Strings.trimToNull(
+              config == null || config.envelope() == null ? null : config.envelope().group());
+      String configSetId = normalizeConfigSetId(config == null ? null : config.configId());
+      if (group != null && configSetId != null && configSemanticByKey != null) {
+        Semantic fromMeta = configSemanticByKey.get(configSemanticKey(group, configSetId));
+        if (fromMeta != null) {
+          return fromMeta;
+        }
+      }
+      return null;
+    }
+    return null;
+  }
+
+  private static Map<String, Semantic> indexConfigSemantic(List<AuditInput> inputs) {
+    if (inputs == null || inputs.isEmpty()) {
+      return Map.of();
+    }
+    LinkedHashMap<String, Semantic> indexed = new LinkedHashMap<>();
+    for (AuditInput input : inputs) {
+      Definition definition = input == null ? null : input.definition();
+      if (!(definition instanceof DefinitionConfig configMeta)
+          || configMeta.semantic() == null) {
+        continue;
+      }
+      String group =
+          Strings.firstNonBlank(
+              Strings.trimToNull(configMeta.envelope() == null ? null : configMeta.envelope().group()),
+              Strings.trimToNull(configMeta.group()));
+      String configSetId = normalizeConfigSetId(configMeta.configId());
+      if (group == null || configSetId == null) {
+        continue;
+      }
+      indexed.put(configSemanticKey(group, configSetId), configMeta.semantic());
+    }
+    return indexed.isEmpty() ? Map.of() : Map.copyOf(indexed);
+  }
+
+  private static String configSemanticKey(String group, String configSetId) {
+    return group + "|" + configSetId;
+  }
+
+  private static String normalizeConfigSetId(String value) {
+    String normalized = Strings.trimToNull(value);
     if (normalized == null) {
       return null;
     }
-    if (normalized.startsWith("group:")) {
-      return new SubjectSlot(normalized, true);
+    if (!normalized.startsWith("config:")) {
+      return normalized;
     }
-    return new SubjectSlot(normalized, false);
-  }
-
-  private static Set<String> methodsAllow(DefinitionEntitlement.ObligationSet obligations) {
-    if (obligations == null || obligations.methodsAllow() == null || obligations.methodsAllow().isEmpty()) {
-      return Set.of();
-    }
-    LinkedHashSet<String> normalized = new LinkedHashSet<>();
-    for (String method : obligations.methodsAllow()) {
-      String value = normalize(method);
-      if (value != null) {
-        normalized.add(value);
-      }
-    }
-    return normalized.isEmpty() ? Set.of() : Set.copyOf(normalized);
-  }
-
-  private static String normalize(String value) {
-    return Strings.trimToNull(value);
-  }
-
-  private static boolean isPlatformModel(DefinitionEnvelope envelope) {
-    if (envelope == null) {
-      return false;
-    }
-    return Objects.equals(PLATFORM_GROUP, envelope.group()) && Objects.equals(PLATFORM_NAME, envelope.name());
-  }
-
-  private boolean isInScope(DefinitionEnvelope envelope) {
-    return envelope != null && normalize(envelope.group()) != null;
-  }
-
-  private static String canonicalAssetScopeId(String scopeId) {
-    if (scopeId == null) {
+    String payload = normalized.substring("config:".length());
+    String[] parts = payload.split("/");
+    if (parts.length < 2) {
       return null;
     }
-    try {
-      return ServiceEntitlements.requireAssetResourceId(scopeId);
-    } catch (RuntimeException ex) {
-      return null;
-    }
+    return Strings.trimToNull(parts[1]);
   }
 
-  private static String entitlementsVersionKey(List<DefinitionEntitlement> definitions) {
-    if (definitions == null || definitions.isEmpty()) {
-      return "EMPTY";
-    }
-    List<String> keys = new ArrayList<>(definitions.size());
-    for (DefinitionEntitlement definition : definitions) {
-      if (definition == null) {
-        continue;
-      }
-      DefinitionEnvelope envelope = definition.envelope();
-      String group = envelope == null ? null : envelope.group();
-      String name = envelope == null ? null : envelope.name();
-      String uuid = envelope == null ? null : envelope.uuid();
-      String updated = envelope == null ? null : envelope.updatedTimeUtc();
-      keys.add(
-          String.valueOf(group)
-              + "/"
-              + String.valueOf(name)
-              + "|"
-              + String.valueOf(uuid)
-              + "|"
-              + String.valueOf(updated)
-              + "|"
-              + definition.hashCode());
-    }
-    keys.sort(Comparator.naturalOrder());
-    return String.join(";", keys);
+  private static String assetId(String definitionType, Definition definition) {
+    String group =
+        Strings.firstNonBlank(
+            definition == null || definition.envelope() == null ? null : definition.envelope().group(),
+            "unknown");
+    String name =
+        Strings.firstNonBlank(
+            definition == null || definition.envelope() == null ? null : definition.envelope().name(),
+            "unknown");
+    return definitionType.toLowerCase(Locale.ROOT) + ":" + group + "/" + name;
   }
 
-  private static boolean enabled(Boolean value) {
-    return value == null || value.booleanValue();
+  private static boolean isBlank(String value) {
+    return Strings.trimToNull(value) == null;
   }
 
-  enum ActionSlot {
-    START,
-    INVOKE,
-    READ
+  private static double roundToTwoDecimals(double value) {
+    return Math.round(value * 100.0d) / 100.0d;
   }
-
-  static final class Rules {
-    private final RuleSet start;
-    private final RuleSet invoke;
-    private final RuleSet read;
-    private final int policyCount;
-
-    private Rules(RuleSet start, RuleSet invoke, RuleSet read, int policyCount) {
-      this.start = start;
-      this.invoke = invoke;
-      this.read = read;
-      this.policyCount = policyCount;
-    }
-
-    RuleSet forAction(ActionSlot actionSlot) {
-      return switch (actionSlot) {
-        case START -> start;
-        case INVOKE -> invoke;
-        case READ -> read;
-      };
-    }
-
-    int policyCount() {
-      return policyCount;
-    }
-  }
-
-  static final class RuleSet {
-    private final Set<String> allowSubjects;
-    private final Set<String> allowGroups;
-    private final Set<String> denySubjects;
-    private final Set<String> denyGroups;
-    private final List<BindingRule> allowBindings;
-    private final List<BindingRule> denyBindings;
-    private final List<BindingSummary> bindingSummaries;
-
-    private RuleSet(
-        Set<String> allowSubjects,
-        Set<String> allowGroups,
-        Set<String> denySubjects,
-        Set<String> denyGroups,
-        List<BindingRule> allowBindings,
-        List<BindingRule> denyBindings,
-        List<BindingSummary> bindingSummaries) {
-      this.allowSubjects = allowSubjects;
-      this.allowGroups = allowGroups;
-      this.denySubjects = denySubjects;
-      this.denyGroups = denyGroups;
-      this.allowBindings = allowBindings;
-      this.denyBindings = denyBindings;
-      this.bindingSummaries = bindingSummaries;
-    }
-
-    Set<String> allowSubjects() {
-      return allowSubjects;
-    }
-
-    Set<String> allowGroups() {
-      return allowGroups;
-    }
-
-    Set<String> denySubjects() {
-      return denySubjects;
-    }
-
-    Set<String> denyGroups() {
-      return denyGroups;
-    }
-
-    List<BindingRule> allowBindings() {
-      return allowBindings;
-    }
-
-    List<BindingRule> denyBindings() {
-      return denyBindings;
-    }
-
-    List<BindingSummary> bindingSummaries() {
-      return bindingSummaries;
-    }
-  }
-
-  private static final class MutableRules {
-    private final MutableRuleSet start = new MutableRuleSet();
-    private final MutableRuleSet invoke = new MutableRuleSet();
-    private final MutableRuleSet read = new MutableRuleSet();
-    private final Set<String> policies = new LinkedHashSet<>();
-
-    private void addAllow(ActionSlot actionSlot, SubjectSlot subject, Set<String> methodsAllow) {
-      target(actionSlot).addAllow(subject, methodsAllow);
-    }
-
-    private void addDeny(ActionSlot actionSlot, SubjectSlot subject, Set<String> methodsAllow) {
-      target(actionSlot).addDeny(subject, methodsAllow);
-    }
-
-    private void addPolicy(String policyId, String policyName) {
-      policies.add((policyId == null ? "-" : policyId) + "|" + (policyName == null ? "-" : policyName));
-    }
-
-    private void addBindingSummary(List<ActionSlot> actionSlots, BindingSummary summary) {
-      if (actionSlots == null || actionSlots.isEmpty() || summary == null) {
-        return;
-      }
-      for (ActionSlot actionSlot : actionSlots) {
-        target(actionSlot).addBindingSummary(summary);
-      }
-    }
-
-    private MutableRuleSet target(ActionSlot actionSlot) {
-      return switch (actionSlot) {
-        case START -> start;
-        case INVOKE -> invoke;
-        case READ -> read;
-      };
-    }
-
-    private Rules freeze() {
-      return new Rules(start.freeze(), invoke.freeze(), read.freeze(), policies.size());
-    }
-  }
-
-  private static final class MutableRuleSet {
-    private final Set<String> allowSubjects = new LinkedHashSet<>();
-    private final Set<String> allowGroups = new LinkedHashSet<>();
-    private final Set<String> denySubjects = new LinkedHashSet<>();
-    private final Set<String> denyGroups = new LinkedHashSet<>();
-    private final List<BindingRule> allowBindings = new ArrayList<>();
-    private final List<BindingRule> denyBindings = new ArrayList<>();
-    private final List<BindingSummary> bindingSummaries = new ArrayList<>();
-
-    private void addAllow(SubjectSlot subject, Set<String> methodsAllow) {
-      allowBindings.add(new BindingRule(subject.id(), subject.group(), methodsAllow));
-      if (subject.group()) {
-        allowGroups.add(subject.id());
-      } else {
-        allowSubjects.add(subject.id());
-      }
-    }
-
-    private void addDeny(SubjectSlot subject, Set<String> methodsAllow) {
-      denyBindings.add(new BindingRule(subject.id(), subject.group(), methodsAllow));
-      if (subject.group()) {
-        denyGroups.add(subject.id());
-      } else {
-        denySubjects.add(subject.id());
-      }
-    }
-
-    private void addBindingSummary(BindingSummary summary) {
-      bindingSummaries.add(summary);
-    }
-
-    private RuleSet freeze() {
-      return new RuleSet(
-          immutable(allowSubjects),
-          immutable(allowGroups),
-          immutable(denySubjects),
-          immutable(denyGroups),
-          immutableList(allowBindings),
-          immutableList(denyBindings),
-          immutableList(bindingSummaries));
-    }
-  }
-
-  private static Set<String> immutable(Collection<String> values) {
-    if (values == null || values.isEmpty()) {
-      return Set.of();
-    }
-    return Collections.unmodifiableSet(new LinkedHashSet<>(values));
-  }
-
-  private static <T> List<T> immutableList(Collection<T> values) {
-    if (values == null || values.isEmpty()) {
-      return List.of();
-    }
-    return Collections.unmodifiableList(new ArrayList<>(values));
-  }
-
-  static final class BindingRule {
-    private final String subject;
-    private final boolean group;
-    private final Set<String> methodsAllow;
-
-    private BindingRule(String subject, boolean group, Set<String> methodsAllow) {
-      this.subject = subject;
-      this.group = group;
-      this.methodsAllow = methodsAllow == null || methodsAllow.isEmpty() ? Set.of() : Set.copyOf(methodsAllow);
-    }
-
-    String subject() {
-      return subject;
-    }
-
-    boolean group() {
-      return group;
-    }
-
-    Set<String> methodsAllow() {
-      return methodsAllow;
-    }
-  }
-
-  static final class BindingSummary {
-    private final String policyId;
-    private final String policyName;
-    private final String subject;
-    private final boolean group;
-    private final Set<String> methodsAllow;
-
-    private BindingSummary(
-        String policyId, String policyName, String subject, boolean group, Set<String> methodsAllow) {
-      this.policyId = policyId;
-      this.policyName = policyName;
-      this.subject = subject;
-      this.group = group;
-      this.methodsAllow = methodsAllow == null || methodsAllow.isEmpty() ? Set.of() : Set.copyOf(methodsAllow);
-    }
-
-    String policyId() {
-      return policyId;
-    }
-
-    String policyName() {
-      return policyName;
-    }
-
-    String subject() {
-      return subject;
-    }
-
-    boolean group() {
-      return group;
-    }
-
-    Set<String> methodsAllow() {
-      return methodsAllow;
-    }
-  }
-
-  private record SubjectSlot(String id, boolean group) {}
 }
-
-
-
-
-
 
