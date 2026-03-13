@@ -1,1553 +1,1519 @@
-package org.pronzato.fabric.api.configs.presentation;
+package org.pronzato.fabric.api.control.discovery.lifecycle;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import java.io.ByteArrayOutputStream;
-import java.math.BigDecimal;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.EnumMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Set;
-import java.util.TreeMap;
-import java.util.regex.Pattern;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipOutputStream;
-import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
-import org.pronzato.fabric.api.configs.ConfigManager.ConfigCodegen;
-import org.pronzato.fabric.api.configs.ConfigManager.Language;
-import org.pronzato.fabric.api.configs.presentation.ConfigSchemaDoc.Field;
-import org.pronzato.fabric.api.configs.presentation.ConfigSchemaDoc.FieldType;
-import org.pronzato.fabric.api.configs.presentation.ConfigSchemaDoc.Group;
-import org.pronzato.fabric.api.configs.presentation.ConfigSchemaDoc.Struct;
+import org.pronzato.fabric.api.control.discovery.definitions.Definition;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfig;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfigLayer;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConnection;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEntitlement;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngest;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngestSource;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionSchema;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionService;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStream;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
+import org.pronzato.fabric.api.control.discovery.definitions.common.Semantic;
+import org.pronzato.fabric.api.control.discovery.definitions.common.Semantic.RelationshipHint;
 
+public final class AssetLifecycleGraphBuilder {
+  private AssetLifecycleGraphBuilder() {}
 
-
-public class ConfigCodegenService {
-
-  private static final String CONFIG_PREFIX = "config_";
-  private static final String DEFAULT_PACKAGE_ROOT = "org.pronzato.fabric.configs.";
-  private static final Pattern MODULE_PATTERN =
-      Pattern.compile("^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$");
-  private static final ObjectMapper MAPPER = DiscoveryCodec.mapper();
-
-  private static final Set<String> JAVA_KEYWORDS =
-      Set.of(
-          "abstract",
-          "assert",
-          "boolean",
-          "break",
-          "byte",
-          "case",
-          "catch",
-          "char",
-          "class",
-          "const",
-          "continue",
-          "default",
-          "do",
-          "double",
-          "else",
-          "enum",
-          "extends",
-          "final",
-          "finally",
-          "float",
-          "for",
-          "goto",
-          "if",
-          "implements",
-          "import",
-          "instanceof",
-          "int",
-          "interface",
-          "long",
-          "native",
-          "new",
-          "package",
-          "private",
-          "protected",
-          "public",
-          "return",
-          "short",
-          "static",
-          "strictfp",
-          "super",
-          "switch",
-          "synchronized",
-          "this",
-          "throw",
-          "throws",
-          "transient",
-          "try",
-          "void",
-          "volatile",
-          "while");
-
-  public ConfigCodegen generate(
-      ConfigSchemaDoc schemaDoc,
-      String group,
-      String schemaName,
-      Language language,
-      String basePackageOrModule) {
-    Objects.requireNonNull(schemaDoc, "schemaDoc");
-    String requiredGroup = requireValue(group, "group");
-    String requiredSchemaName = requireValue(schemaName, "schemaName");
-    Language requiredLanguage = Objects.requireNonNull(language, "language");
-    String requiredBasePackageOrModule =
-        resolveBasePackageOrModule(basePackageOrModule, requiredSchemaName);
-    validateModuleName(requiredBasePackageOrModule);
-
-    ConfigSchemaDoc normalized = normalizeSchemaDoc(schemaDoc);
-    String className = resolveClassName(normalized.displayName(), requiredSchemaName);
-    List<FieldModel> fields = buildFieldModels(normalized.fields());
-
-    Map<String, String> files = new LinkedHashMap<>();
-    if (requiredLanguage == Language.JAVA) {
-      files.putAll(generateJavaFiles(requiredBasePackageOrModule, className, fields));
-    } else {
-      files.putAll(generatePythonFiles(requiredBasePackageOrModule, className, fields));
+  public static AssetLifecycleGraph build(List<Definition> definitions) {
+    if (definitions == null || definitions.isEmpty()) {
+      return new AssetLifecycleGraph(Map.of(), List.of(), Map.of(), Map.of());
     }
-    files.put(
-        "README.md",
-        emitReadme(
-            normalized,
-            requiredGroup,
-            requiredSchemaName,
-            requiredLanguage,
-            requiredBasePackageOrModule,
-            className,
-            files));
-    files.put("schema.json", prettyJson(ConfigSchemaCodec.toCanonicalJsonNode(normalized)));
 
-    byte[] zipBytes = buildZip(files);
-    String filename = buildFilename(requiredGroup, requiredSchemaName, requiredLanguage);
-    Map<String, String> stats = new LinkedHashMap<>();
-    stats.put("group", requiredGroup);
-    stats.put("schema", requiredSchemaName);
-    stats.put("language", requiredLanguage.name());
-    stats.put("base", requiredBasePackageOrModule);
-    stats.put("className", className);
-    stats.put("files", Integer.toString(files.size()));
-    stats.put("bytes", Integer.toString(zipBytes.length));
-    return new ConfigCodegen(zipBytes, filename, stats);
-  }
+    Map<String, Semantic> configSemanticByKey = indexConfigSemantic(definitions);
+    Map<String, AssetLifecycleNode> nodes = new LinkedHashMap<>();
+    List<DefinitionContext> contexts = new ArrayList<>();
+    NodeIndex index = new NodeIndex();
 
-  private Map<String, String> generateJavaFiles(
-      String basePackage, String className, List<FieldModel> fields) {
-    String packagePath = basePackage.replace('.', '/');
-    String baseDir = "src/main/java/" + packagePath + "/";
-    Map<String, String> files = new LinkedHashMap<>();
-    files.put(baseDir + className + ".java", emitJavaConfig(basePackage, className, fields));
-    files.put(baseDir + className + "Defaults.java", emitJavaDefaults(basePackage, className, fields));
-    files.put(baseDir + className + "Codec.java", emitJavaCodec(basePackage, className));
-    files.put(baseDir + className + "Validator.java", emitJavaValidator(basePackage, className, fields));
-    return files;
-  }
-
-  private Map<String, String> generatePythonFiles(
-      String baseModule, String className, List<FieldModel> fields) {
-    String modulePath = baseModule.replace('.', '/');
-    String baseDir = "src/main/python/" + modulePath + "/";
-    String baseFile = toSnakeCase(className);
-    Map<String, String> files = new LinkedHashMap<>();
-    files.put(baseDir + baseFile + ".py", emitPythonModel(className, fields));
-    files.put(baseDir + baseFile + "_codec.py", emitPythonCodec(baseFile, className, fields));
-    files.put(baseDir + baseFile + "_validator.py", emitPythonValidator(baseFile, className, fields));
-    addPythonInitFiles(files, baseModule);
-    return files;
-  }
-
-  private void addPythonInitFiles(Map<String, String> files, String baseModule) {
-    if (baseModule == null || baseModule.isBlank()) {
-      return;
-    }
-    String[] segments = baseModule.split("\\.");
-    StringBuilder path = new StringBuilder("src/main/python/");
-    for (String segment : segments) {
-      if (segment == null || segment.isBlank()) {
+    for (Definition definition : definitions) {
+      if (definition == null) {
         continue;
       }
-      path.append(segment).append('/');
-      files.put(path + "__init__.py", "");
+      DefinitionContext context = toContext(definition);
+      if (context == null) {
+        continue;
+      }
+      if (nodes.putIfAbsent(context.assetId(), context.node()) == null) {
+        contexts.add(context);
+        index.register(context);
+      }
     }
+
+    Map<String, Integer> datasetProducerCounts = countIngestDatasetProducers(contexts, index, nodes);
+    List<AssetLifecycleEdge> edges = new ArrayList<>();
+    Set<String> dedupe = new LinkedHashSet<>();
+
+    for (DefinitionContext context : contexts) {
+      Definition definition = context.definition();
+      if (definition instanceof DefinitionDataset dataset) {
+        inferDatasetEdges(context, dataset, index, nodes, edges, dedupe);
+      } else if (definition instanceof DefinitionService service) {
+        inferServiceEdges(context, service, index, nodes, edges, dedupe);
+      } else if (definition instanceof DefinitionStream stream) {
+        inferStreamEdges(context, stream, index, nodes, edges, dedupe);
+      } else if (definition instanceof DefinitionIngest ingest) {
+        inferIngestEdges(context, ingest, index, nodes, datasetProducerCounts, edges, dedupe);
+      } else if (definition instanceof DefinitionIngestSource ingestSource) {
+        inferIngestSourceEdges(context, ingestSource, index, nodes, edges, dedupe);
+      } else if (definition instanceof DefinitionSchema schema) {
+        inferSchemaEdges(context, schema, index, nodes, edges, dedupe);
+      } else if (definition instanceof DefinitionConfigLayer config) {
+        inferConfigEdges(context, config, index, nodes, edges, dedupe);
+      } else if (definition instanceof DefinitionEntitlement entitlement) {
+        inferEntitlementEdges(context, entitlement, index, nodes, edges, dedupe);
+      } else if (definition instanceof DefinitionConnection connection) {
+        inferConnectionEdges(context, connection, index, nodes, edges, dedupe);
+      }
+      inferSemanticHintEdges(
+          context, definition, configSemanticByKey, index, nodes, edges, dedupe);
+    }
+
+    edges.sort(
+        Comparator.comparing(AssetLifecycleEdge::fromAssetId)
+            .thenComparing(AssetLifecycleEdge::toAssetId)
+            .thenComparing(AssetLifecycleEdge::relationshipType));
+    Map<String, List<AssetLifecycleEdge>> outgoing = new LinkedHashMap<>();
+    Map<String, List<AssetLifecycleEdge>> incoming = new LinkedHashMap<>();
+    for (AssetLifecycleEdge edge : edges) {
+      outgoing.computeIfAbsent(edge.fromAssetId(), ignored -> new ArrayList<>()).add(edge);
+      incoming.computeIfAbsent(edge.toAssetId(), ignored -> new ArrayList<>()).add(edge);
+    }
+    return new AssetLifecycleGraph(nodes, edges, outgoing, incoming);
   }
 
-  private String emitJavaConfig(String packageName, String className, List<FieldModel> fields) {
-    boolean hasEnums = fields.stream().anyMatch(field -> field.enumTypeName() != null);
-    boolean hasRequiredReference = fields.stream().anyMatch(FieldModel::requiredReference);
-    boolean hasJsonNode = fields.stream().anyMatch(FieldModel::usesJsonNode);
+  private static DefinitionContext toContext(Definition definition) {
+    DefinitionEnvelope envelope = definition.envelope();
+    if (envelope == null || !hasText(envelope.group()) || !hasText(envelope.name())) {
+      return null;
+    }
+    DefinitionType type = envelope.type() == null ? DefinitionType.UNKNOWN : envelope.type();
+    String group = envelope.group().trim();
+    String name = envelope.name().trim();
+    String namespace = "";
+    String assetId;
 
-    StringBuilder builder = new StringBuilder();
-    builder.append("package ").append(packageName).append(";\n\n");
-    builder.append("import com.fasterxml.jackson.annotation.JsonProperty;\n");
-    if (hasEnums) {
-      builder.append("import com.fasterxml.jackson.annotation.JsonCreator;\n");
-      builder.append("import com.fasterxml.jackson.annotation.JsonValue;\n");
+    if (definition instanceof DefinitionConfigLayer) {
+      return null;
     }
-    if (hasJsonNode) {
-      builder.append("import com.fasterxml.jackson.databind.JsonNode;\n");
-    }
-    if (hasRequiredReference) {
-      builder.append("import java.util.Objects;\n");
-    }
-    builder.append("\n");
-    if (fields.isEmpty()) {
-      builder.append("public record ").append(className).append("() {}\n");
-      return builder.toString();
+    if (definition instanceof DefinitionDataset dataset) {
+      namespace = hasText(dataset.namespace()) ? dataset.namespace().trim() : "default";
+      assetId = "dataset:" + group + "/" + namespace + "/" + name;
+    } else if (definition instanceof DefinitionService service) {
+      assetId = hasText(service.resourceId()) ? service.resourceId().trim() : "service:" + group + "/" + name;
+    } else if (definition instanceof DefinitionStream stream) {
+      namespace = hasText(stream.namespace()) ? stream.namespace().trim() : "default";
+      assetId = hasText(stream.streamId()) ? stream.streamId().trim() : "stream:" + group + "/" + namespace + "/" + name;
+    } else if (definition instanceof DefinitionIngest ingest) {
+      String[] datasetParts = splitDatasetId(ingest.datasetId());
+      if (datasetParts != null) {
+        namespace = datasetParts[1];
+      }
+      assetId = "ingest:" + group + "/" + name;
+    } else if (definition instanceof DefinitionIngestSource ingestSource) {
+      namespace = hasText(ingestSource.namespace()) ? ingestSource.namespace().trim() : "default";
+      assetId = "ingest-source:" + group + "/" + name;
+    } else if (definition instanceof DefinitionSchema) {
+      assetId = "schema:" + group + "/" + name;
+    } else if (definition instanceof DefinitionConfigLayer config) {
+      if (!isBaseConfig(config)) {
+        return null;
+      }
+      assetId = hasText(config.configId()) ? config.configId().trim() : "config:" + group + "/" + name + "/base";
+      String[] configParts = splitConfigId(assetId);
+      if (configParts != null) {
+        namespace = configParts[1];
+      }
+    } else if (definition instanceof DefinitionEntitlement) {
+      assetId = "entitlement:" + group + "/" + name;
+    } else if (definition instanceof DefinitionConnection) {
+      assetId = "connection:" + group + "/" + name;
+    } else {
+      assetId = type.name().toLowerCase(Locale.ROOT) + ":" + group + "/" + name;
     }
 
-    builder.append("public record ").append(className).append("(\n");
-    for (int i = 0; i < fields.size(); i++) {
-      FieldModel field = fields.get(i);
-      builder
-          .append("    @JsonProperty(\"")
-          .append(escapeJava(field.jsonKey()))
-          .append("\") ")
-          .append(field.javaType())
-          .append(" ")
-          .append(field.propertyName());
-      builder.append(i + 1 < fields.size() ? ",\n" : "\n");
+    return new DefinitionContext(
+        definition,
+        assetId,
+        new AssetLifecycleNode(assetId, type, group, name, namespace, "definition"),
+        group,
+        namespace);
+  }
+
+  private static Semantic semantic(
+      Definition definition, Map<String, Semantic> configSemanticByKey) {
+    if (definition instanceof DefinitionDataset dataset) {
+      return dataset.semantic();
     }
-    builder.append(") {\n");
-    if (hasRequiredReference) {
-      builder.append("\n");
-      builder.append("  public ").append(className).append(" {\n");
-      for (FieldModel field : fields) {
-        if (field.requiredReference()) {
-          builder
-              .append("    Objects.requireNonNull(")
-              .append(field.propertyName())
-              .append(", \"")
-              .append(escapeJava(field.jsonKey()))
-              .append(" is required\");\n");
+    if (definition instanceof DefinitionService service) {
+      return service.semantic();
+    }
+    if (definition instanceof DefinitionStream stream) {
+      return stream.semantic();
+    }
+    if (definition instanceof DefinitionIngest ingest) {
+      return ingest.semantic();
+    }
+    if (definition instanceof DefinitionIngestSource ingestSource) {
+      return ingestSource.semantic();
+    }
+    if (definition instanceof DefinitionSchema schema) {
+      return schema.semantic();
+    }
+    if (definition instanceof DefinitionConfigLayer config) {
+      String group =
+          trimToNull(config == null || config.envelope() == null ? null : config.envelope().group());
+      String configSetId = normalizeConfigSetId(config == null ? null : config.configId());
+      if (group != null && configSetId != null && configSemanticByKey != null) {
+        Semantic fromMeta = configSemanticByKey.get(configSemanticKey(group, configSetId));
+        if (fromMeta != null) {
+          return fromMeta;
         }
       }
-      builder.append("  }\n");
-    }
-    for (FieldModel field : fields) {
-      if (field.enumTypeName() != null) {
-        builder.append("\n");
-        builder.append(emitJavaEnum(field));
-      }
-    }
-    builder.append("}\n");
-    return builder.toString();
-  }
-
-  private String emitJavaEnum(FieldModel field) {
-    StringBuilder builder = new StringBuilder();
-    builder.append("  public enum ").append(field.enumTypeName()).append(" {\n");
-    for (int i = 0; i < field.enumValues().size(); i++) {
-      EnumValueModel enumValue = field.enumValues().get(i);
-      builder
-          .append("    ")
-          .append(enumValue.constant())
-          .append("(\"")
-          .append(escapeJava(enumValue.raw()))
-          .append("\")");
-      builder.append(i + 1 < field.enumValues().size() ? ",\n" : ";\n");
-    }
-    builder.append("\n");
-    builder.append("    private final String value;\n\n");
-    builder
-        .append("    ")
-        .append(field.enumTypeName())
-        .append("(String value) {\n")
-        .append("      this.value = value;\n")
-        .append("    }\n\n");
-    builder
-        .append("    @JsonValue\n")
-        .append("    public String value() {\n")
-        .append("      return value;\n")
-        .append("    }\n\n");
-    builder
-        .append("    @JsonCreator\n")
-        .append("    public static ")
-        .append(field.enumTypeName())
-        .append(" fromValue(String value) {\n")
-        .append("      if (value == null) {\n")
-        .append("        return null;\n")
-        .append("      }\n")
-        .append("      for (")
-        .append(field.enumTypeName())
-        .append(" candidate : values()) {\n")
-        .append("        if (candidate.value.equals(value)) {\n")
-        .append("          return candidate;\n")
-        .append("        }\n")
-        .append("      }\n")
-        .append("      throw new IllegalArgumentException(\"Unsupported ")
-        .append(escapeJava(field.enumTypeName()))
-        .append(" value: \" + value);\n")
-        .append("    }\n\n");
-    builder
-        .append("    public static boolean isValid(String value) {\n")
-        .append("      if (value == null) {\n")
-        .append("        return false;\n")
-        .append("      }\n")
-        .append("      for (")
-        .append(field.enumTypeName())
-        .append(" candidate : values()) {\n")
-        .append("        if (candidate.value.equals(value)) {\n")
-        .append("          return true;\n")
-        .append("        }\n")
-        .append("      }\n")
-        .append("      return false;\n")
-        .append("    }\n");
-    builder.append("  }\n");
-    return builder.toString();
-  }
-
-  private String emitJavaDefaults(String packageName, String className, List<FieldModel> fields) {
-    boolean hasStringDefaults =
-        fields.stream()
-            .anyMatch(
-                field ->
-                    field.hasOptionalDefault()
-                        && field.field().type() == FieldType.STRING
-                        && field.enumTypeName() == null);
-    boolean hasJsonNodeField = fields.stream().anyMatch(FieldModel::usesJsonNode);
-    List<FieldModel> jsonDefaults =
-        fields.stream().filter(this::needsJsonDefaultConstant).toList();
-
-    StringBuilder builder = new StringBuilder();
-    builder.append("package ").append(packageName).append(";\n\n");
-    if (hasJsonNodeField) {
-      builder.append("import com.fasterxml.jackson.databind.JsonNode;\n");
-    }
-    if (!jsonDefaults.isEmpty()) {
-      builder.append("import com.fasterxml.jackson.databind.ObjectMapper;\n");
-    }
-    builder.append("\n");
-    builder.append("public final class ").append(className).append("Defaults {\n\n");
-    if (!jsonDefaults.isEmpty()) {
-      builder.append("  private static final ObjectMapper MAPPER = new ObjectMapper();\n");
-      for (FieldModel field : jsonDefaults) {
-        builder
-            .append("  private static final JsonNode ")
-            .append(defaultConstantName(field))
-            .append(" = readNode(\"")
-            .append(escapeJava(field.field().defaultValue().toString()))
-            .append("\");\n");
-      }
-      builder.append("\n");
-    }
-    builder
-        .append("  private ")
-        .append(className)
-        .append("Defaults() {}\n\n")
-        .append("  public static ")
-        .append(className)
-        .append(" apply(")
-        .append(className)
-        .append(" in) {\n")
-        .append("    if (in == null) {\n")
-        .append("      return null;\n")
-        .append("    }\n");
-    if (!fields.stream().anyMatch(FieldModel::hasOptionalDefault)) {
-      builder.append("    return in;\n");
-      builder.append("  }\n");
-      builder.append("}\n");
-      return builder.toString();
-    }
-
-    builder.append("    return new ").append(className).append("(\n");
-    for (int i = 0; i < fields.size(); i++) {
-      FieldModel field = fields.get(i);
-      String expression = javaDefaultExpression(className, field);
-      builder.append("        ").append(expression);
-      builder.append(i + 1 < fields.size() ? ",\n" : "\n");
-    }
-    builder.append("    );\n");
-    builder.append("  }\n");
-    if (hasStringDefaults) {
-      builder
-          .append("\n")
-          .append("  private static boolean isBlank(String value) {\n")
-          .append("    return value == null || value.trim().isEmpty();\n")
-          .append("  }\n");
-    }
-    if (!jsonDefaults.isEmpty()) {
-      builder
-          .append("\n")
-          .append("  private static JsonNode readNode(String value) {\n")
-          .append("    try {\n")
-          .append("      return MAPPER.readTree(value);\n")
-          .append("    } catch (Exception ex) {\n")
-          .append("      throw new IllegalStateException(\"Failed to parse default JSON\", ex);\n")
-          .append("    }\n")
-          .append("  }\n");
-    }
-    builder.append("}\n");
-    return builder.toString();
-  }
-
-  private String emitJavaCodec(String packageName, String className) {
-    StringBuilder builder = new StringBuilder();
-    builder.append("package ").append(packageName).append(";\n\n");
-    builder.append("import com.fasterxml.jackson.databind.JsonNode;\n");
-    builder.append("import com.fasterxml.jackson.databind.ObjectMapper;\n\n");
-    builder.append("public final class ").append(className).append("Codec {\n\n");
-    builder.append("  private static final ObjectMapper MAPPER = new ObjectMapper();\n\n");
-    builder
-        .append("  private ")
-        .append(className)
-        .append("Codec() {}\n\n")
-        .append("  public static ")
-        .append(className)
-        .append(" fromJson(String json) {\n")
-        .append("    try {\n")
-        .append("      return MAPPER.readValue(json, ")
-        .append(className)
-        .append(".class);\n")
-        .append("    } catch (Exception ex) {\n")
-        .append("      throw new IllegalArgumentException(\"Invalid JSON for ")
-        .append(className)
-        .append(": \" + ex.getMessage(), ex);\n")
-        .append("    }\n")
-        .append("  }\n\n")
-        .append("  public static String toJson(")
-        .append(className)
-        .append(" value) {\n")
-        .append("    try {\n")
-        .append("      return MAPPER.writeValueAsString(value);\n")
-        .append("    } catch (Exception ex) {\n")
-        .append("      throw new IllegalStateException(\"Failed to write ")
-        .append(className)
-        .append(" JSON\", ex);\n")
-        .append("    }\n")
-        .append("  }\n\n")
-        .append("  public static ")
-        .append(className)
-        .append(" fromNode(JsonNode node) {\n")
-        .append("    try {\n")
-        .append("      return MAPPER.treeToValue(node, ")
-        .append(className)
-        .append(".class);\n")
-        .append("    } catch (Exception ex) {\n")
-        .append("      throw new IllegalArgumentException(\"Invalid JsonNode for ")
-        .append(className)
-        .append(": \" + ex.getMessage(), ex);\n")
-        .append("    }\n")
-        .append("  }\n\n")
-        .append("  public static JsonNode toNode(")
-        .append(className)
-        .append(" value) {\n")
-        .append("    return MAPPER.valueToTree(value);\n")
-        .append("  }\n");
-    builder.append("}\n");
-    return builder.toString();
-  }
-
-  private String emitJavaValidator(String packageName, String className, List<FieldModel> fields) {
-    boolean hasPattern =
-        fields.stream()
-            .anyMatch(
-                field ->
-                    field.field().type() == FieldType.STRING
-                        && field.enumTypeName() == null
-                        && field.field().pattern() != null
-                        && !field.field().pattern().isBlank());
-    boolean hasEnum = fields.stream().anyMatch(field -> field.enumTypeName() != null);
-
-    StringBuilder builder = new StringBuilder();
-    builder.append("package ").append(packageName).append(";\n\n");
-    builder.append("import java.util.ArrayList;\n");
-    builder.append("import java.util.List;\n");
-    if (hasPattern) {
-      builder.append("import java.util.regex.Pattern;\n");
-    }
-    if (hasEnum) {
-      builder.append("import java.util.Set;\n");
-    }
-    builder.append("\n");
-    builder.append("public final class ").append(className).append("Validator {\n\n");
-    for (FieldModel field : fields) {
-      if (field.enumTypeName() != null) {
-        builder
-            .append("  private static final Set<String> ")
-            .append(enumAllowedConstantName(field))
-            .append(" = Set.of(")
-            .append(
-                String.join(
-                    ", ",
-                    field.enumValues().stream()
-                        .map(value -> "\"" + escapeJava(value.raw()) + "\"")
-                        .toList()))
-            .append(");\n");
-      }
-    }
-    for (FieldModel field : fields) {
-      String pattern = field.field().pattern();
-      if (field.field().type() == FieldType.STRING
-          && field.enumTypeName() == null
-          && pattern != null
-          && !pattern.isBlank()) {
-        builder
-            .append("  private static final Pattern ")
-            .append(patternConstantName(field))
-            .append(" = Pattern.compile(\"")
-            .append(escapeJava(pattern))
-            .append("\");\n");
-      }
-    }
-    if (hasEnum || hasPattern) {
-      builder.append("\n");
-    }
-    builder
-        .append("  private ")
-        .append(className)
-        .append("Validator() {}\n\n")
-        .append("  public static List<String> validate(")
-        .append(className)
-        .append(" in) {\n")
-        .append("    List<String> issues = new ArrayList<>();\n")
-        .append("    if (in == null) {\n")
-        .append("      issues.add(\"config is required\");\n")
-        .append("      return List.copyOf(issues);\n")
-        .append("    }\n");
-    for (FieldModel field : fields) {
-      emitJavaValidatorChecks(builder, field);
-    }
-    builder.append("    return List.copyOf(issues);\n");
-    builder.append("  }\n");
-    builder.append("}\n");
-    return builder.toString();
-  }
-
-  private void emitJavaValidatorChecks(StringBuilder builder, FieldModel field) {
-    String accessor = "in." + field.propertyName() + "()";
-    String key = escapeJava(field.jsonKey());
-    if (field.requiredReference()) {
-      builder
-          .append("    if (")
-          .append(accessor)
-          .append(" == null) {\n")
-          .append("      issues.add(\"")
-          .append(key)
-          .append(" is required\");\n")
-          .append("    }\n");
-    }
-    if (field.enumTypeName() != null) {
-      builder
-          .append("    if (")
-          .append(accessor)
-          .append(" != null && !")
-          .append(enumAllowedConstantName(field))
-          .append(".contains(")
-          .append(accessor)
-          .append(".value())) {\n")
-          .append("      issues.add(\"")
-          .append(key)
-          .append(" must be one of ")
-          .append(escapeJava(field.enumValues().stream().map(EnumValueModel::raw).toList().toString()))
-          .append("\");\n")
-          .append("    }\n");
-    }
-    if (field.field().type() == FieldType.STRING
-        && field.enumTypeName() == null
-        && field.field().pattern() != null
-        && !field.field().pattern().isBlank()) {
-      builder
-          .append("    if (")
-          .append(accessor)
-          .append(" != null && !")
-          .append(patternConstantName(field))
-          .append(".matcher(")
-          .append(accessor)
-          .append(").matches()) {\n")
-          .append("      issues.add(\"")
-          .append(key)
-          .append(" does not match pattern ")
-          .append(escapeJava(field.field().pattern()))
-          .append("\");\n")
-          .append("    }\n");
-    }
-    if (field.field().type() == FieldType.INTEGER) {
-      emitJavaNumericCheck(builder, field, accessor, key, true);
-    } else if (field.field().type() == FieldType.NUMBER) {
-      emitJavaNumericCheck(builder, field, accessor, key, false);
-    }
-  }
-
-  private void emitJavaNumericCheck(
-      StringBuilder builder, FieldModel field, String accessor, String key, boolean integerType) {
-    BigDecimal min = field.field().min();
-    BigDecimal max = field.field().max();
-    String minLiteral = min == null ? null : numericLiteral(min, integerType);
-    String maxLiteral = max == null ? null : numericLiteral(max, integerType);
-    if (minLiteral == null && maxLiteral == null) {
-      return;
-    }
-    if (field.javaPrimitive()) {
-      if (minLiteral != null) {
-        builder
-            .append("    if (")
-            .append(accessor)
-            .append(" < ")
-            .append(minLiteral)
-            .append(") {\n")
-            .append("      issues.add(\"")
-            .append(key)
-            .append(" must be >= ")
-            .append(formatNumber(min))
-            .append("\");\n")
-            .append("    }\n");
-      }
-      if (maxLiteral != null) {
-        builder
-            .append("    if (")
-            .append(accessor)
-            .append(" > ")
-            .append(maxLiteral)
-            .append(") {\n")
-            .append("      issues.add(\"")
-            .append(key)
-            .append(" must be <= ")
-            .append(formatNumber(max))
-            .append("\");\n")
-            .append("    }\n");
-      }
-      return;
-    }
-    if (minLiteral != null) {
-      builder
-          .append("    if (")
-          .append(accessor)
-          .append(" != null && ")
-          .append(accessor)
-          .append(" < ")
-          .append(minLiteral)
-          .append(") {\n")
-          .append("      issues.add(\"")
-          .append(key)
-          .append(" must be >= ")
-          .append(formatNumber(min))
-          .append("\");\n")
-          .append("    }\n");
-    }
-    if (maxLiteral != null) {
-      builder
-          .append("    if (")
-          .append(accessor)
-          .append(" != null && ")
-          .append(accessor)
-          .append(" > ")
-          .append(maxLiteral)
-          .append(") {\n")
-          .append("      issues.add(\"")
-          .append(key)
-          .append(" must be <= ")
-          .append(formatNumber(max))
-          .append("\");\n")
-          .append("    }\n");
-    }
-  }
-
-  private String emitPythonModel(String className, List<FieldModel> fields) {
-    boolean hasAny = fields.stream().anyMatch(field -> "Any".equals(field.pythonType()));
-    boolean hasOptional = fields.stream().anyMatch(field -> !field.required());
-    List<FieldModel> ordered = pythonFieldOrder(fields);
-
-    StringBuilder builder = new StringBuilder();
-    builder.append("from dataclasses import dataclass\n");
-    if (hasAny || hasOptional) {
-      List<String> imports = new ArrayList<>();
-      if (hasAny) {
-        imports.add("Any");
-      }
-      if (hasOptional) {
-        imports.add("Optional");
-      }
-      builder.append("from typing import ").append(String.join(", ", imports)).append("\n");
-    }
-    builder.append("\n\n");
-    builder.append("@dataclass\n");
-    builder.append("class ").append(className).append(":\n");
-    if (ordered.isEmpty()) {
-      builder.append("    pass\n");
-      return builder.toString();
-    }
-    for (FieldModel field : ordered) {
-      String type = field.pythonType();
-      if (!field.required()) {
-        type = "Optional[" + type + "]";
-      }
-      builder.append("    ").append(field.propertyName()).append(": ").append(type);
-      if (!field.required()) {
-        builder.append(" = None");
-      }
-      if (field.enumTypeName() != null) {
-        builder
-            .append("  # allowed: ")
-            .append(String.join(", ", field.enumValues().stream().map(EnumValueModel::raw).toList()));
-      }
-      builder.append("\n");
-    }
-    return builder.toString();
-  }
-
-  private String emitPythonCodec(String modelFile, String className, List<FieldModel> fields) {
-    StringBuilder builder = new StringBuilder();
-    builder.append("import json\n");
-    builder.append("from typing import Any, Dict, Optional\n\n");
-    builder.append("try:\n");
-    builder.append("    from .").append(modelFile).append(" import ").append(className).append("\n");
-    builder.append("except ImportError:\n");
-    builder.append("    from ").append(modelFile).append(" import ").append(className).append("\n\n");
-    builder.append("def from_dict(data: Dict[str, Any]) -> ").append(className).append(":\n");
-    builder.append("    payload = {} if data is None else dict(data)\n");
-    builder.append("    config = ").append(className).append("(\n");
-    List<FieldModel> ordered = pythonFieldOrder(fields);
-    for (FieldModel field : ordered) {
-      builder
-          .append("        ")
-          .append(field.propertyName())
-          .append("=payload.get(\"")
-          .append(escapePython(field.jsonKey()))
-          .append("\"),\n");
-    }
-    builder.append("    )\n");
-    builder.append("    return apply_defaults(config)\n\n");
-    builder.append("def from_json(data: str) -> ").append(className).append(":\n");
-    builder.append("    return from_dict(json.loads(data))\n\n");
-    builder.append("def to_dict(config: ").append(className).append(") -> Dict[str, Any]:\n");
-    builder.append("    if config is None:\n");
-    builder.append("        return {}\n");
-    builder.append("    return {\n");
-    for (FieldModel field : ordered) {
-      builder
-          .append("        \"")
-          .append(escapePython(field.jsonKey()))
-          .append("\": config.")
-          .append(field.propertyName())
-          .append(",\n");
-    }
-    builder.append("    }\n\n");
-    builder.append("def to_json(config: ").append(className).append(") -> str:\n");
-    builder.append("    return json.dumps(to_dict(config), indent=2, sort_keys=True)\n\n");
-    builder
-        .append("def apply_defaults(config: Optional[")
-        .append(className)
-        .append("]) -> Optional[")
-        .append(className)
-        .append("]:\n");
-    builder.append("    if config is None:\n");
-    builder.append("        return None\n");
-    if (!fields.stream().anyMatch(FieldModel::hasOptionalDefault)) {
-      builder.append("    return config\n");
-      return builder.toString();
-    }
-    builder.append("    return ").append(className).append("(\n");
-    for (FieldModel field : ordered) {
-      builder
-          .append("        ")
-          .append(field.propertyName())
-          .append("=")
-          .append(pythonDefaultExpression(field))
-          .append(",\n");
-    }
-    builder.append("    )\n");
-    return builder.toString();
-  }
-
-  private String emitPythonValidator(String modelFile, String className, List<FieldModel> fields) {
-    boolean hasPattern =
-        fields.stream()
-            .anyMatch(
-                field ->
-                    field.field().type() == FieldType.STRING
-                        && field.enumTypeName() == null
-                        && field.field().pattern() != null
-                        && !field.field().pattern().isBlank());
-    boolean hasEnum = fields.stream().anyMatch(field -> field.enumTypeName() != null);
-    StringBuilder builder = new StringBuilder();
-    if (hasPattern) {
-      builder.append("import re\n");
-    }
-    builder.append("from typing import List, Optional\n\n");
-    builder.append("try:\n");
-    builder.append("    from .").append(modelFile).append(" import ").append(className).append("\n");
-    builder.append("except ImportError:\n");
-    builder.append("    from ").append(modelFile).append(" import ").append(className).append("\n\n");
-    for (FieldModel field : fields) {
-      if (field.enumTypeName() != null) {
-        builder
-            .append("_")
-            .append(enumAllowedConstantName(field))
-            .append(" = {")
-            .append(
-                String.join(
-                    ", ",
-                    field.enumValues().stream()
-                        .map(value -> "'" + escapePython(value.raw()) + "'")
-                        .toList()))
-            .append("}\n");
-      }
-    }
-    for (FieldModel field : fields) {
-      String pattern = field.field().pattern();
-      if (field.field().type() == FieldType.STRING
-          && field.enumTypeName() == null
-          && pattern != null
-          && !pattern.isBlank()) {
-        builder
-            .append("_")
-            .append(patternConstantName(field))
-            .append(" = re.compile(r'")
-            .append(escapePythonRegex(pattern))
-            .append("')\n");
-      }
-    }
-    if (hasEnum || hasPattern) {
-      builder.append("\n");
-    }
-    builder
-        .append("def validate(config: Optional[")
-        .append(className)
-        .append("]) -> List[str]:\n");
-    builder.append("    issues: List[str] = []\n");
-    builder.append("    if config is None:\n");
-    builder.append("        issues.append('config is required')\n");
-    builder.append("        return issues\n");
-    for (FieldModel field : fields) {
-      emitPythonValidatorChecks(builder, field);
-    }
-    builder.append("    return issues\n");
-    return builder.toString();
-  }
-
-  private void emitPythonValidatorChecks(StringBuilder builder, FieldModel field) {
-    String access = "config." + field.propertyName();
-    String key = escapePython(field.jsonKey());
-    if (field.required()) {
-      builder
-          .append("    if ")
-          .append(access)
-          .append(" is None:\n")
-          .append("        issues.append('")
-          .append(key)
-          .append(" is required')\n");
-    }
-    if (field.enumTypeName() != null) {
-      builder
-          .append("    if ")
-          .append(access)
-          .append(" is not None and ")
-          .append(access)
-          .append(" not in _")
-          .append(enumAllowedConstantName(field))
-          .append(":\n")
-          .append("        issues.append('")
-          .append(key)
-          .append(" must be one of ")
-          .append(escapePython(field.enumValues().stream().map(EnumValueModel::raw).toList().toString()))
-          .append("')\n");
-    }
-    if (field.field().type() == FieldType.STRING
-        && field.enumTypeName() == null
-        && field.field().pattern() != null
-        && !field.field().pattern().isBlank()) {
-      builder
-          .append("    if ")
-          .append(access)
-          .append(" is not None and _")
-          .append(patternConstantName(field))
-          .append(".fullmatch(str(")
-          .append(access)
-          .append(")) is None:\n")
-          .append("        issues.append('")
-          .append(key)
-          .append(" does not match pattern ")
-          .append(escapePython(field.field().pattern()))
-          .append("')\n");
-    }
-    if (field.field().type() == FieldType.INTEGER || field.field().type() == FieldType.NUMBER) {
-      BigDecimal min = field.field().min();
-      BigDecimal max = field.field().max();
-      if (min != null) {
-        builder
-            .append("    if ")
-            .append(access)
-            .append(" is not None and ")
-            .append(access)
-            .append(" < ")
-            .append(formatPythonNumber(min, field.field().type() == FieldType.INTEGER))
-            .append(":\n")
-            .append("        issues.append('")
-            .append(key)
-            .append(" must be >= ")
-            .append(formatNumber(min))
-            .append("')\n");
-      }
-      if (max != null) {
-        builder
-            .append("    if ")
-            .append(access)
-            .append(" is not None and ")
-            .append(access)
-            .append(" > ")
-            .append(formatPythonNumber(max, field.field().type() == FieldType.INTEGER))
-            .append(":\n")
-            .append("        issues.append('")
-            .append(key)
-            .append(" must be <= ")
-            .append(formatNumber(max))
-            .append("')\n");
-      }
-    }
-  }
-
-  private String emitReadme(
-      ConfigSchemaDoc doc,
-      String group,
-      String schemaName,
-      Language language,
-      String basePackageOrModule,
-      String className,
-      Map<String, String> generatedFiles) {
-    StringBuilder builder = new StringBuilder();
-    builder.append("# Config Schema Codegen\n\n");
-    builder.append("- Group: ").append(group).append("\n");
-    builder.append("- Schema: ").append(schemaName).append("\n");
-    builder.append("- Display Name: ").append(nullToValue(doc.displayName(), "n/a")).append("\n");
-    builder.append("- Description: ").append(nullToValue(doc.description(), "n/a")).append("\n");
-    builder.append("- Language: ").append(language.name()).append("\n");
-    builder.append("- Base Package/Module: ").append(basePackageOrModule).append("\n");
-    builder.append("- Generated Root Type: ").append(className).append("\n\n");
-    builder.append("## Java Usage\n\n");
-    builder.append("```java\n");
-    builder.append(className).append(" config = ").append(className).append("Codec.fromJson(jsonText);\n");
-    builder.append(className).append(" withDefaults = ").append(className).append("Defaults.apply(config);\n");
-    builder.append("List<String> issues = ").append(className).append("Validator.validate(withDefaults);\n");
-    builder.append("```\n\n");
-    builder.append("## Python Usage\n\n");
-    builder.append("```python\n");
-    builder.append("config = ").append(toSnakeCase(className)).append("_codec.from_json(json_text)\n");
-    builder.append("issues = ").append(toSnakeCase(className)).append("_validator.validate(config)\n");
-    builder.append("```\n\n");
-    builder.append("## Future Resolve Signature\n\n");
-    builder.append("```java\n");
-    builder.append("// Current client shape:\n");
-    builder.append("// <T> T resolve(String configId, String layerId, ConfigDecoder<T> decoder)\n");
-    builder
-        .append(className)
-        .append(" resolved = session.configs().resolve(\n")
-        .append("    \"<configId>\",\n")
-        .append("    \"<layerId>\",\n")
-        .append("    ConfigDecoder.asPojo(")
-        .append(className)
-        .append(".class));\n");
-    builder.append("```\n\n");
-    builder.append("## Files\n\n");
-    for (String file : new TreeMap<>(generatedFiles).keySet()) {
-      builder.append("- `").append(file).append("`\n");
-    }
-    return builder.toString();
-  }
-
-  private String javaDefaultExpression(String className, FieldModel field) {
-    String accessor = "in." + field.propertyName() + "()";
-    if (!field.hasOptionalDefault()) {
-      return accessor;
-    }
-    JsonNode defaultValue = field.field().defaultValue();
-    if (defaultValue == null || defaultValue.isNull()) {
-      return accessor;
-    }
-    if (field.enumTypeName() != null) {
-      String enumValue = defaultValue.asText(null);
-      if (enumValue == null) {
-        return accessor;
-      }
-      String constant = resolveEnumConstant(field, enumValue);
-      String enumRef =
-          constant == null
-              ? className + "." + field.enumTypeName() + ".fromValue(\"" + escapeJava(enumValue) + "\")"
-              : className + "." + field.enumTypeName() + "." + constant;
-      return "(" + accessor + " == null ? " + enumRef + " : " + accessor + ")";
-    }
-    if (field.field().type() == FieldType.STRING) {
-      String literal = "\"" + escapeJava(defaultValue.asText()) + "\"";
-      return "(isBlank(" + accessor + ") ? " + literal + " : " + accessor + ")";
-    }
-    if (field.field().type() == FieldType.INTEGER) {
-      return "(" + accessor + " == null ? " + defaultValue.asInt() + " : " + accessor + ")";
-    }
-    if (field.field().type() == FieldType.NUMBER) {
-      return "("
-          + accessor
-          + " == null ? "
-          + numericLiteral(defaultValue.decimalValue(), false)
-          + " : "
-          + accessor
-          + ")";
-    }
-    if (field.field().type() == FieldType.BOOLEAN) {
-      return "(" + accessor + " == null ? " + (defaultValue.asBoolean() ? "true" : "false") + " : " + accessor + ")";
-    }
-    if (needsJsonDefaultConstant(field)) {
-      String constant = defaultConstantName(field);
-      return "(" + accessor + " == null ? " + constant + ".deepCopy() : " + accessor + ")";
-    }
-    return accessor;
-  }
-
-  private String pythonDefaultExpression(FieldModel field) {
-    String accessor = "config." + field.propertyName();
-    if (!field.hasOptionalDefault()) {
-      return accessor;
-    }
-    JsonNode defaultValue = field.field().defaultValue();
-    if (defaultValue == null || defaultValue.isNull()) {
-      return accessor;
-    }
-    if (field.field().type() == FieldType.STRING) {
-      String defaultLiteral = "'" + escapePython(defaultValue.asText()) + "'";
-      return "(" + defaultLiteral + " if " + accessor + " is None or str(" + accessor + ").strip() == '' else " + accessor + ")";
-    }
-    if (field.field().type() == FieldType.INTEGER) {
-      return "(" + defaultValue.asInt() + " if " + accessor + " is None else " + accessor + ")";
-    }
-    if (field.field().type() == FieldType.NUMBER) {
-      return "(" + formatPythonNumber(defaultValue.decimalValue(), false) + " if " + accessor + " is None else " + accessor + ")";
-    }
-    if (field.field().type() == FieldType.BOOLEAN) {
-      return "(" + (defaultValue.asBoolean() ? "True" : "False") + " if " + accessor + " is None else " + accessor + ")";
-    }
-    return accessor;
-  }
-
-  private boolean needsJsonDefaultConstant(FieldModel field) {
-    if (!field.hasOptionalDefault()) {
-      return false;
-    }
-    FieldType type = field.field().type();
-    return type == FieldType.STRUCT || type == FieldType.ARRAY;
-  }
-
-  private String defaultConstantName(FieldModel field) {
-    return "DEFAULT_" + upperIdentifier(field.propertyName());
-  }
-
-  private String enumAllowedConstantName(FieldModel field) {
-    return "ALLOWED_" + upperIdentifier(field.propertyName());
-  }
-
-  private String patternConstantName(FieldModel field) {
-    return "PATTERN_" + upperIdentifier(field.propertyName());
-  }
-
-  private String resolveEnumConstant(FieldModel field, String value) {
-    for (EnumValueModel enumValue : field.enumValues()) {
-      if (enumValue.raw().equals(value)) {
-        return enumValue.constant();
-      }
+      return null;
     }
     return null;
   }
 
-  private String buildFilename(String group, String schemaName, Language language) {
-    return "config-"
-        + slug(group)
-        + "-"
-        + slug(schemaName)
-        + "-"
-        + language.name().toLowerCase(Locale.ROOT)
-        + ".zip";
-  }
-
-  private String prettyJson(JsonNode node) {
-    try {
-      return MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(node);
-    } catch (Exception ex) {
-      throw new IllegalStateException("Failed to serialize schema JSON", ex);
+  private static boolean isBaseConfig(DefinitionConfigLayer config) {
+    if (config == null) {
+      return true;
     }
+    return !hasText(config.parentId());
   }
 
-  private byte[] buildZip(Map<String, String> files) {
-    TreeMap<String, String> sorted = new TreeMap<>(files);
-    try {
-      ByteArrayOutputStream output = new ByteArrayOutputStream();
-      try (ZipOutputStream zip = new ZipOutputStream(output, StandardCharsets.UTF_8)) {
-        for (Map.Entry<String, String> entry : sorted.entrySet()) {
-          String path = normalizeZipPath(entry.getKey());
-          ZipEntry zipEntry = new ZipEntry(path);
-          zipEntry.setTime(0L);
-          zip.putNextEntry(zipEntry);
-          byte[] bytes =
-              entry.getValue() == null
-                  ? new byte[0]
-                  : entry.getValue().getBytes(StandardCharsets.UTF_8);
-          zip.write(bytes);
-          zip.closeEntry();
+  private static String[] splitConfigId(String configId) {
+    if (!hasText(configId) || !configId.startsWith("config:")) {
+      return null;
+    }
+    String[] parts = configId.substring("config:".length()).split("/");
+    if (parts.length < 3) {
+      return null;
+    }
+    return new String[] {parts[0], parts[1], parts[2]};
+  }
+
+  private static String[] splitDatasetId(String datasetId) {
+    if (!hasText(datasetId) || !datasetId.startsWith("dataset:")) {
+      return null;
+    }
+    String[] parts = datasetId.substring("dataset:".length()).split("/");
+    if (parts.length < 3) {
+      return null;
+    }
+    return new String[] {parts[0], parts[1], parts[2]};
+  }
+
+  private static boolean hasText(String value) {
+    return value != null && !value.trim().isEmpty();
+  }
+
+  private static String normalizeToken(String value) {
+    if (value == null || value.trim().isEmpty()) {
+      return "unknown";
+    }
+    return value.trim().replace('\\', '/');
+  }
+
+  private static Map<String, Semantic> indexConfigSemantic(List<Definition> definitions) {
+    if (definitions == null || definitions.isEmpty()) {
+      return Map.of();
+    }
+    LinkedHashMap<String, Semantic> indexed = new LinkedHashMap<>();
+    for (Definition definition : definitions) {
+      if (!(definition instanceof DefinitionConfig configMeta)
+          || configMeta.semantic() == null) {
+        continue;
+      }
+      String group =
+          trimToNull(
+              configMeta.envelope() == null ? null : configMeta.envelope().group());
+      if (group == null) {
+        group = trimToNull(configMeta.group());
+      }
+      String configSetId = normalizeConfigSetId(configMeta.configId());
+      if (group == null || configSetId == null) {
+        continue;
+      }
+      indexed.put(configSemanticKey(group, configSetId), configMeta.semantic());
+    }
+    return indexed.isEmpty() ? Map.of() : Map.copyOf(indexed);
+  }
+
+  private static String configSemanticKey(String group, String configSetId) {
+    return group + "|" + configSetId;
+  }
+
+  private static String normalizeConfigSetId(String value) {
+    String normalized = trimToNull(value);
+    if (normalized == null) {
+      return null;
+    }
+    if (!normalized.startsWith("config:")) {
+      return normalized;
+    }
+    String payload = normalized.substring("config:".length());
+    String[] parts = payload.split("/");
+    if (parts.length < 2) {
+      return null;
+    }
+    return trimToNull(parts[1]);
+  }
+
+  private static String trimToNull(String value) {
+    if (value == null) {
+      return null;
+    }
+    String trimmed = value.trim();
+    return trimmed.isEmpty() ? null : trimmed;
+  }
+
+  private static String storageAssetId(String locator) {
+    return "storage:" + normalizeToken(locator);
+  }
+
+  private record DefinitionContext(
+      Definition definition,
+      String assetId,
+      AssetLifecycleNode node,
+      String group,
+      String namespace) {}
+
+  private static final class NodeIndex {
+    private final Map<DefinitionType, Map<String, String>> byTypeGroupName =
+        new EnumMap<>(DefinitionType.class);
+    private final Map<String, String> byDatasetKey = new LinkedHashMap<>();
+    private final Map<String, String> byStreamKey = new LinkedHashMap<>();
+    private final Map<String, String> byConfigId = new LinkedHashMap<>();
+    private final Map<String, String> byConfigFamily = new LinkedHashMap<>();
+    private final Map<String, String> bySchemaId = new LinkedHashMap<>();
+    private final Map<String, String> byIngestKey = new LinkedHashMap<>();
+    private final Map<String, String> byIngestSourceKey = new LinkedHashMap<>();
+    private final Map<String, String> byRawAssetId = new LinkedHashMap<>();
+
+    private void register(DefinitionContext context) {
+      byRawAssetId.put(context.assetId(), context.assetId());
+      byTypeGroupName
+          .computeIfAbsent(context.node().type(), ignored -> new LinkedHashMap<>())
+          .put(groupNameKey(context.group(), context.node().name()), context.assetId());
+      if (context.definition() instanceof DefinitionDataset dataset) {
+        String namespace = hasText(dataset.namespace()) ? dataset.namespace().trim() : "default";
+        byDatasetKey.put(groupNamespaceNameKey(context.group(), namespace, context.node().name()), context.assetId());
+      } else if (context.definition() instanceof DefinitionStream stream) {
+        String namespace = hasText(stream.namespace()) ? stream.namespace().trim() : "default";
+        byStreamKey.put(groupNamespaceNameKey(context.group(), namespace, context.node().name()), context.assetId());
+      } else if (context.definition() instanceof DefinitionConfigLayer config) {
+        if (hasText(config.configId())) {
+          String configId = config.configId().trim();
+          byConfigId.put(configId, context.assetId());
+          String[] parts = splitConfigId(configId);
+          if (parts != null) {
+            byConfigFamily.put(parts[0] + "|" + parts[1], context.assetId());
+          }
+        }
+      } else if (context.definition() instanceof DefinitionSchema schema) {
+        bySchemaId.put("schema:" + context.group() + "/" + context.node().name(), context.assetId());
+        if (hasText(schema.hash())) {
+          bySchemaId.put("schema-hash:" + schema.hash().trim(), context.assetId());
+        }
+      } else if (context.definition() instanceof DefinitionIngest ingest) {
+        String namespace = context.namespace();
+        if (!hasText(namespace)) {
+          String[] datasetParts = splitDatasetId(ingest.datasetId());
+          namespace = datasetParts == null ? "default" : datasetParts[1];
+        }
+        byIngestKey.put(
+            groupNamespaceNameKey(context.group(), namespace, context.node().name()), context.assetId());
+      } else if (context.definition() instanceof DefinitionIngestSource ingestSource) {
+        String namespace = hasText(ingestSource.namespace()) ? ingestSource.namespace().trim() : "default";
+        byIngestSourceKey.put(
+            groupNamespaceNameKey(context.group(), namespace, context.node().name()), context.assetId());
+      }
+    }
+
+    private String resolveSchemaReference(
+        String schemaId,
+        String schemaGroup,
+        String schemaName,
+        String fallbackGroup,
+        Map<String, AssetLifecycleNode> nodes) {
+      if (hasText(schemaId)) {
+        return resolveReference(schemaId, DefinitionType.SCHEMA, fallbackGroup, null, nodes);
+      }
+      String group = hasText(schemaGroup) ? schemaGroup.trim() : fallbackGroup;
+      if (hasText(group) && hasText(schemaName)) {
+        String byName = resolveReference(schemaName, DefinitionType.SCHEMA, group, null, nodes);
+        if (hasText(byName)) {
+          return byName;
+        }
+        String explicit = "schema:" + group + "/" + schemaName.trim();
+        return bySchemaId.getOrDefault(explicit, explicit);
+      }
+      return null;
+    }
+
+    private String resolveReference(
+        String raw,
+        DefinitionType expectedType,
+        String sourceGroup,
+        String sourceNamespace,
+        Map<String, AssetLifecycleNode> nodes) {
+      if (!hasText(raw)) {
+        return null;
+      }
+      String normalized = raw.trim();
+      if (nodes.containsKey(normalized)) {
+        return normalized;
+      }
+      if (isCanonical(normalized)) {
+        if (normalized.startsWith("config:")) {
+          String[] parts = splitConfigId(normalized);
+          if (parts != null) {
+            String family = byConfigFamily.get(parts[0] + "|" + parts[1]);
+            if (hasText(family)) {
+              return family;
+            }
+          }
+        }
+        return normalized;
+      }
+      if (expectedType == DefinitionType.DATASET) {
+        String namespace = hasText(sourceNamespace) ? sourceNamespace : "default";
+        String candidate = byDatasetKey.get(groupNamespaceNameKey(sourceGroup, namespace, normalized));
+        return hasText(candidate) ? candidate : "dataset:" + sourceGroup + "/" + namespace + "/" + normalized;
+      }
+      if (expectedType == DefinitionType.STREAM) {
+        String namespace = hasText(sourceNamespace) ? sourceNamespace : "default";
+        String candidate = byStreamKey.get(groupNamespaceNameKey(sourceGroup, namespace, normalized));
+        return hasText(candidate) ? candidate : "stream:" + sourceGroup + "/" + namespace + "/" + normalized;
+      }
+      if (expectedType == DefinitionType.CONFIG_LAYER) {
+        if (normalized.startsWith("config:")) {
+          String[] parts = splitConfigId(normalized);
+          if (parts != null) {
+            String family = byConfigFamily.get(parts[0] + "|" + parts[1]);
+            if (hasText(family)) {
+              return family;
+            }
+          }
+          return normalized;
+        }
+        String candidate = byConfigId.get("config:" + sourceGroup + "/" + normalized + "/base");
+        return hasText(candidate) ? candidate : "config:" + sourceGroup + "/" + normalized + "/base";
+      }
+      if (expectedType == DefinitionType.CONNECTION) {
+        String candidate = byTypeGroupName(DefinitionType.CONNECTION, sourceGroup, normalized);
+        return hasText(candidate) ? candidate : "connection:" + sourceGroup + "/" + normalized;
+      }
+      if (expectedType == DefinitionType.INGEST) {
+        String namespace = hasText(sourceNamespace) ? sourceNamespace : "default";
+        String candidate = byIngestKey.get(groupNamespaceNameKey(sourceGroup, namespace, normalized));
+        if (!hasText(candidate)) {
+          candidate = byTypeGroupName(DefinitionType.INGEST, sourceGroup, normalized);
+        }
+        return hasText(candidate) ? candidate : "ingest:" + sourceGroup + "/" + normalized;
+      }
+      if (expectedType == DefinitionType.INGEST_SOURCE) {
+        String namespace = hasText(sourceNamespace) ? sourceNamespace : "default";
+        String candidate = byIngestSourceKey.get(groupNamespaceNameKey(sourceGroup, namespace, normalized));
+        if (!hasText(candidate)) {
+          candidate = byTypeGroupName(DefinitionType.INGEST_SOURCE, sourceGroup, normalized);
+        }
+        return hasText(candidate) ? candidate : "ingest-source:" + sourceGroup + "/" + normalized;
+      }
+      if (expectedType == DefinitionType.SCHEMA) {
+        String byName = byTypeGroupName(DefinitionType.SCHEMA, sourceGroup, normalized);
+        if (hasText(byName)) {
+          return byName;
+        }
+        String explicit = "schema:" + sourceGroup + "/" + normalized;
+        return bySchemaId.getOrDefault(explicit, explicit);
+      }
+      if (expectedType != null) {
+        String byName = byTypeGroupName(expectedType, sourceGroup, normalized);
+        if (hasText(byName)) {
+          return byName;
         }
       }
-      return output.toByteArray();
-    } catch (Exception ex) {
-      throw new IllegalStateException("Failed to build codegen ZIP", ex);
+      String fallback = byRawAssetId.get(normalized);
+      return hasText(fallback) ? fallback : normalized;
+    }
+
+    private String byTypeGroupName(DefinitionType type, String group, String name) {
+      Map<String, String> values = byTypeGroupName.get(type);
+      if (values == null || !hasText(group) || !hasText(name)) {
+        return null;
+      }
+      return values.get(groupNameKey(group, name));
+    }
+
+    private static String groupNameKey(String group, String name) {
+      return normalize(group) + "|" + normalize(name);
+    }
+
+    private static String groupNamespaceNameKey(String group, String namespace, String name) {
+      return normalize(group) + "|" + normalize(namespace) + "|" + normalize(name);
+    }
+
+    private static String normalize(String value) {
+      return value == null ? "" : value.trim().toLowerCase(Locale.ROOT);
+    }
+
+    private static boolean isCanonical(String value) {
+      if (!hasText(value)) {
+        return false;
+      }
+      String trimmed = value.trim();
+      int separator = trimmed.indexOf(':');
+      if (separator <= 0 || separator >= trimmed.length() - 1 || trimmed.contains(" ")) {
+        return false;
+      }
+      String prefix = trimmed.substring(0, separator).toLowerCase(Locale.ROOT);
+      return switch (prefix) {
+        case "dataset",
+            "stream",
+            "service",
+            "endpoint",
+            "materialized",
+            "feed",
+            "config",
+            "schema",
+            "connection",
+            "ingest",
+            "ingest-source",
+            "entitlement",
+            "namespace",
+            "app",
+            "user",
+            "group",
+            "role",
+            "doc",
+            "storage",
+            "external" -> true;
+        default -> false;
+      };
     }
   }
 
-  private String normalizeZipPath(String value) {
-    String path = value == null ? "" : value.trim();
-    path = path.replace('\\', '/');
-    while (path.startsWith("/")) {
-      path = path.substring(1);
+  private static void inferDatasetEdges(
+      DefinitionContext context,
+      DefinitionDataset dataset,
+      NodeIndex index,
+      Map<String, AssetLifecycleNode> nodes,
+      List<AssetLifecycleEdge> edges,
+      Set<String> dedupe) {
+    DefinitionDataset.View view = dataset.view();
+    if (view != null && view.dependencies() != null) {
+      for (String dependency : view.dependencies()) {
+        String target = index.resolveReference(dependency, null, context.group(), context.namespace(), nodes);
+        addEdge(
+            context.assetId(),
+            target,
+            RelationshipType.DERIVED_FROM,
+            OwnershipType.SHARED,
+            PromotionBehavior.REQUIRED_WITH_PARENT,
+            DeleteBehavior.BLOCK,
+            RetentionBehavior.KEEP_HISTORY,
+            true,
+            true,
+            "dataset.view.dependencies",
+            "Dataset view dependency",
+            null,
+            edges,
+            dedupe);
+      }
     }
-    return path;
+
+    DefinitionDataset.Binding binding = dataset.binding();
+    if (binding == null) {
+      return;
+    }
+    DefinitionDataset.ParquetBinding parquet = binding.parquet();
+    if (parquet != null) {
+      if (hasText(parquet.connectionName())) {
+        String connectionAsset =
+            index.resolveReference(
+                parquet.connectionName(), DefinitionType.CONNECTION, context.group(), null, nodes);
+        addEdge(
+            context.assetId(),
+            connectionAsset,
+            RelationshipType.USES_CONNECTION,
+            OwnershipType.SHARED,
+            PromotionBehavior.REBIND_IN_TARGET,
+            DeleteBehavior.DETACH,
+            RetentionBehavior.KEEP_HISTORY,
+            true,
+            true,
+            "dataset.binding.parquet.connectionName",
+            "Parquet dataset uses external connection",
+            null,
+            edges,
+            dedupe);
+      }
+      if (hasText(parquet.uri())) {
+        addEdge(
+            context.assetId(),
+            storageAssetId(parquet.uri()),
+            RelationshipType.STORES_IN,
+            OwnershipType.EXTERNAL,
+            PromotionBehavior.NEVER_PROMOTE,
+            DeleteBehavior.MANUAL,
+            RetentionBehavior.ARCHIVE_ONLY,
+            false,
+            true,
+            "dataset.binding.parquet.uri",
+            "Parquet dataset storage target",
+            parquet.uri(),
+            edges,
+            dedupe);
+      }
+    }
+    DefinitionDataset.DuckdbBinding duckdb = binding.duckdb();
+    if (duckdb != null && hasText(duckdb.databasePath())) {
+      addEdge(
+          context.assetId(),
+          storageAssetId(duckdb.databasePath()),
+          RelationshipType.STORES_IN,
+          OwnershipType.EXTERNAL,
+          PromotionBehavior.NEVER_PROMOTE,
+          DeleteBehavior.MANUAL,
+          RetentionBehavior.ARCHIVE_ONLY,
+          false,
+          true,
+          "dataset.binding.duckdb.databasePath",
+          "DuckDB file path backing dataset",
+          duckdb.databasePath(),
+          edges,
+          dedupe);
+    }
+    DefinitionDataset.ExternalBinding external = binding.external();
+    if (external != null && hasText(external.reference())) {
+      addEdge(
+          context.assetId(),
+          "external:" + external.reference().trim(),
+          RelationshipType.CONSUMES,
+          OwnershipType.EXTERNAL,
+          PromotionBehavior.REBIND_IN_TARGET,
+          DeleteBehavior.DETACH,
+          RetentionBehavior.KEEP_HISTORY,
+          false,
+          true,
+          "dataset.binding.external.reference",
+          "External dataset reference",
+          external.reference(),
+          edges,
+          dedupe);
+    }
+    DefinitionDataset.OdbcBinding odbc = binding.odbc();
+    if (odbc != null && hasText(odbc.connectionName())) {
+      String ref =
+          index.resolveReference(
+              odbc.connectionName(), DefinitionType.CONNECTION, context.group(), null, nodes);
+      addEdge(
+          context.assetId(),
+          ref,
+          RelationshipType.USES_CONNECTION,
+          OwnershipType.SHARED,
+          PromotionBehavior.REBIND_IN_TARGET,
+          DeleteBehavior.DETACH,
+          RetentionBehavior.KEEP_HISTORY,
+          true,
+          true,
+          "dataset.binding.odbc.connectionName",
+          "ODBC dataset source connection",
+          null,
+          edges,
+          dedupe);
+    }
   }
 
-  private ConfigSchemaDoc normalizeSchemaDoc(ConfigSchemaDoc doc) {
-    List<Group> groups = new ArrayList<>(safeList(doc.groups()));
-    groups.sort(
-        Comparator.comparingInt((Group group) -> group.order() == null ? Integer.MAX_VALUE : group.order())
-            .thenComparing(group -> group.id() == null ? "" : group.id()));
+  private static void inferServiceEdges(
+      DefinitionContext context,
+      DefinitionService service,
+      NodeIndex index,
+      Map<String, AssetLifecycleNode> nodes,
+      List<AssetLifecycleEdge> edges,
+      Set<String> dedupe) {
+    if (service.schemaRef() != null) {
+      String schemaId =
+          index.resolveSchemaReference(
+              service.schemaRef().schemaId(),
+              service.schemaRef().group(),
+              service.schemaRef().name(),
+              context.group(),
+              nodes);
+      addEdge(
+          context.assetId(),
+          schemaId,
+          RelationshipType.USES_SCHEMA,
+          OwnershipType.SHARED,
+          PromotionBehavior.REQUIRED_WITH_PARENT,
+          DeleteBehavior.BLOCK,
+          RetentionBehavior.KEEP_HISTORY,
+          true,
+          true,
+          "service.schemaRef",
+          "Service contract schema",
+          null,
+          edges,
+          dedupe);
+    }
+    if (service.connectionRefs() != null) {
+      for (String connectionRef : service.connectionRefs()) {
+        String connectionId =
+            index.resolveReference(connectionRef, DefinitionType.CONNECTION, context.group(), null, nodes);
+        addEdge(
+            context.assetId(),
+            connectionId,
+            RelationshipType.USES_CONNECTION,
+            OwnershipType.SHARED,
+            PromotionBehavior.REBIND_IN_TARGET,
+            DeleteBehavior.DETACH,
+            RetentionBehavior.KEEP_HISTORY,
+            true,
+            true,
+            "service.connectionRefs",
+            "Service connection dependency",
+            null,
+            edges,
+            dedupe);
+      }
+    }
+    if (service.amps() != null && hasText(service.amps().connection())) {
+      String connectionId =
+          index.resolveReference(service.amps().connection(), DefinitionType.CONNECTION, context.group(), null, nodes);
+      addEdge(
+          context.assetId(),
+          connectionId,
+          RelationshipType.USES_CONNECTION,
+          OwnershipType.SHARED,
+          PromotionBehavior.REBIND_IN_TARGET,
+          DeleteBehavior.DETACH,
+          RetentionBehavior.KEEP_HISTORY,
+          true,
+          true,
+          "service.amps.connection",
+          "AMPS transport connection",
+          null,
+          edges,
+          dedupe);
+    }
+  }
 
-    List<Struct> structs = new ArrayList<>(safeList(doc.structs()));
-    structs.sort(Comparator.comparing((Struct struct) -> struct.id() == null ? "" : struct.id()));
-    List<Struct> normalizedStructs = new ArrayList<>();
-    for (Struct struct : structs) {
-      if (struct == null) {
+  private static void inferStreamEdges(
+      DefinitionContext context,
+      DefinitionStream stream,
+      NodeIndex index,
+      Map<String, AssetLifecycleNode> nodes,
+      List<AssetLifecycleEdge> edges,
+      Set<String> dedupe) {
+    if (hasText(stream.schemaId()) || hasText(stream.schemaKey())) {
+      String schemaId =
+          index.resolveSchemaReference(stream.schemaId(), context.group(), stream.schemaKey(), context.group(), nodes);
+      addEdge(
+          context.assetId(),
+          schemaId,
+          RelationshipType.USES_SCHEMA,
+          OwnershipType.SHARED,
+          PromotionBehavior.REQUIRED_WITH_PARENT,
+          DeleteBehavior.BLOCK,
+          RetentionBehavior.KEEP_HISTORY,
+          true,
+          true,
+          "stream.schema",
+          "Stream payload schema",
+          null,
+          edges,
+          dedupe);
+    }
+    if (stream.connectionRefs() != null) {
+      for (String connectionRef : stream.connectionRefs()) {
+        String connectionId =
+            index.resolveReference(connectionRef, DefinitionType.CONNECTION, context.group(), null, nodes);
+        addEdge(
+            context.assetId(),
+            connectionId,
+            RelationshipType.USES_CONNECTION,
+            OwnershipType.SHARED,
+            PromotionBehavior.REBIND_IN_TARGET,
+            DeleteBehavior.DETACH,
+            RetentionBehavior.KEEP_HISTORY,
+            true,
+            true,
+            "stream.connectionRefs",
+            "Stream transport connection",
+            null,
+            edges,
+            dedupe);
+      }
+    }
+    if (stream.dependencyRefs() != null) {
+      for (String ref : stream.dependencyRefs()) {
+        String dependency = index.resolveReference(ref, null, context.group(), context.namespace(), nodes);
+        addEdge(
+            context.assetId(),
+            dependency,
+            RelationshipType.DEPENDS_ON,
+            OwnershipType.SHARED,
+            PromotionBehavior.OPTIONAL_WITH_PARENT,
+            DeleteBehavior.BLOCK,
+            RetentionBehavior.KEEP_HISTORY,
+            false,
+            true,
+            "stream.dependencyRefs",
+            "Stream dependency reference",
+            null,
+            edges,
+            dedupe);
+      }
+    }
+  }
+
+  private static void inferIngestEdges(
+      DefinitionContext context,
+      DefinitionIngest ingest,
+      NodeIndex index,
+      Map<String, AssetLifecycleNode> nodes,
+      Map<String, Integer> datasetProducerCounts,
+      List<AssetLifecycleEdge> edges,
+      Set<String> dedupe) {
+    String ingestSourceId =
+        index.resolveReference(
+            context.node().name(), DefinitionType.INGEST_SOURCE, context.group(), context.namespace(), nodes);
+    addEdge(
+        context.assetId(),
+        ingestSourceId,
+        RelationshipType.OWNS,
+        OwnershipType.OWNED,
+        PromotionBehavior.REQUIRED_WITH_PARENT,
+        DeleteBehavior.CASCADE_SOFT,
+        RetentionBehavior.KEEP_HISTORY,
+        true,
+        false,
+        "ingest.name->ingestSource",
+        "Ingest source definition paired by ingest name",
+        null,
+        edges,
+        dedupe);
+
+    if (hasText(ingest.datasetId())) {
+      String datasetId =
+          index.resolveReference(
+              ingest.datasetId(), DefinitionType.DATASET, context.group(), context.namespace(), nodes);
+      int producers = datasetProducerCounts.getOrDefault(datasetId, 0);
+      boolean ownedDataset = producers <= 1 && sameGroup(nodes, context.assetId(), datasetId);
+      addEdge(
+          context.assetId(),
+          datasetId,
+          RelationshipType.PRODUCES,
+          ownedDataset ? OwnershipType.OWNED : OwnershipType.SHARED,
+          ownedDataset ? PromotionBehavior.REQUIRED_WITH_PARENT : PromotionBehavior.REBIND_IN_TARGET,
+          ownedDataset ? DeleteBehavior.CASCADE_SOFT : DeleteBehavior.DETACH,
+          RetentionBehavior.KEEP_HISTORY,
+          true,
+          !ownedDataset,
+          "ingest.datasetId",
+          ownedDataset
+              ? "Dataset owned by single ingest pipeline"
+              : "Dataset is shared and should rebind in target lane",
+          null,
+          edges,
+          dedupe);
+    }
+
+    if (hasText(ingest.outputSchemaId())) {
+      String outputSchemaId =
+          index.resolveSchemaReference(
+              ingest.outputSchemaId(), context.group(), ingest.outputSchemaId(), context.group(), nodes);
+      boolean derivedSchema =
+          hasText(outputSchemaId)
+              && outputSchemaId.startsWith("schema:" + context.group() + "/ingest:");
+      addEdge(
+          context.assetId(),
+          outputSchemaId,
+          RelationshipType.USES_SCHEMA,
+          derivedSchema ? OwnershipType.DERIVED : OwnershipType.SHARED,
+          PromotionBehavior.REQUIRED_WITH_PARENT,
+          derivedSchema ? DeleteBehavior.CASCADE_SOFT : DeleteBehavior.BLOCK,
+          RetentionBehavior.KEEP_HISTORY,
+          true,
+          !derivedSchema,
+          "ingest.outputSchemaId",
+          "Ingest output schema contract",
+          null,
+          edges,
+          dedupe);
+    }
+  }
+
+  private static void inferIngestSourceEdges(
+      DefinitionContext context,
+      DefinitionIngestSource ingestSource,
+      NodeIndex index,
+      Map<String, AssetLifecycleNode> nodes,
+      List<AssetLifecycleEdge> edges,
+      Set<String> dedupe) {
+    String ingestName = hasText(ingestSource.ingestName()) ? ingestSource.ingestName().trim() : context.node().name();
+    String ingestId =
+        index.resolveReference(ingestName, DefinitionType.INGEST, context.group(), context.namespace(), nodes);
+    addEdge(
+        context.assetId(),
+        ingestId,
+        RelationshipType.PRODUCES,
+        OwnershipType.OWNED,
+        PromotionBehavior.REQUIRED_WITH_PARENT,
+        DeleteBehavior.BLOCK,
+        RetentionBehavior.KEEP_HISTORY,
+        true,
+        false,
+        "ingestSource.ingestName",
+        "Ingest source feeds ingest definition",
+        null,
+        edges,
+        dedupe);
+
+    if (ingestSource.amps() != null) {
+      DefinitionIngestSource.AmpsSource amps = ingestSource.amps();
+      if (hasText(amps.connectionName())) {
+        String connectionId =
+            index.resolveReference(amps.connectionName(), DefinitionType.CONNECTION, context.group(), null, nodes);
+        addEdge(
+            context.assetId(),
+            connectionId,
+            RelationshipType.USES_CONNECTION,
+            OwnershipType.SHARED,
+            PromotionBehavior.REBIND_IN_TARGET,
+            DeleteBehavior.DETACH,
+            RetentionBehavior.KEEP_HISTORY,
+            true,
+            true,
+            "ingestSource.amps.connectionName",
+            "AMPS ingest source transport connection",
+            null,
+            edges,
+            dedupe);
+      }
+    }
+
+    if (ingestSource.external() != null && hasText(ingestSource.external().reference())) {
+      String reference = ingestSource.external().reference().trim();
+      addEdge(
+          context.assetId(),
+          "external:" + reference,
+          RelationshipType.CONSUMES,
+          OwnershipType.EXTERNAL,
+          PromotionBehavior.REBIND_IN_TARGET,
+          DeleteBehavior.MANUAL,
+          RetentionBehavior.KEEP_HISTORY,
+          false,
+          true,
+          "ingestSource.external.reference",
+          "External ingest source reference",
+          reference,
+          edges,
+          dedupe);
+    }
+  }
+
+  private static void inferSchemaEdges(
+      DefinitionContext context,
+      DefinitionSchema schema,
+      NodeIndex index,
+      Map<String, AssetLifecycleNode> nodes,
+      List<AssetLifecycleEdge> edges,
+      Set<String> dedupe) {
+    if (schema.refs() != null) {
+      for (DefinitionSchema.Ref ref : schema.refs()) {
+        if (ref == null || !hasText(ref.refId())) {
+          continue;
+        }
+        DefinitionType expectedType = definitionTypeFromToken(ref.refType());
+        String target =
+            index.resolveReference(ref.refId(), expectedType, context.group(), context.namespace(), nodes);
+        RelationshipType relationshipType =
+            relationshipTypeForSchemaRef(expectedType, target, nodes);
+        addEdge(
+            context.assetId(),
+            target,
+            relationshipType,
+            OwnershipType.SHARED,
+            PromotionBehavior.OPTIONAL_WITH_PARENT,
+            expectedType == DefinitionType.SCHEMA ? DeleteBehavior.BLOCK : DeleteBehavior.DETACH,
+            RetentionBehavior.KEEP_HISTORY,
+            expectedType == DefinitionType.SCHEMA,
+            true,
+            "schema.refs",
+            "Schema reference",
+            null,
+            edges,
+            dedupe);
+      }
+    }
+    if (hasText(schema.doc())) {
+      addEdge(
+          context.assetId(),
+          "doc:" + normalizeToken(schema.doc()),
+          RelationshipType.DOCUMENTED_BY,
+          OwnershipType.EXTERNAL,
+          PromotionBehavior.NEVER_PROMOTE,
+          DeleteBehavior.MANUAL,
+          RetentionBehavior.ARCHIVE_ONLY,
+          false,
+          true,
+          "schema.doc",
+          "Schema documentation reference",
+          schema.doc(),
+          edges,
+          dedupe);
+    }
+  }
+
+  private static void inferConfigEdges(
+      DefinitionContext context,
+      DefinitionConfigLayer config,
+      NodeIndex index,
+      Map<String, AssetLifecycleNode> nodes,
+      List<AssetLifecycleEdge> edges,
+      Set<String> dedupe) {
+    if (config == null) {
+      return;
+    }
+    DefinitionConfigLayer payload = config;
+    if (hasText(payload.schemaKey())) {
+      String schemaId =
+          index.resolveSchemaReference(
+              null, context.group(), payload.schemaKey().trim(), context.group(), nodes);
+      addEdge(
+          context.assetId(),
+          schemaId,
+          RelationshipType.USES_SCHEMA,
+          OwnershipType.SHARED,
+          PromotionBehavior.REQUIRED_WITH_PARENT,
+          DeleteBehavior.BLOCK,
+          RetentionBehavior.KEEP_HISTORY,
+          true,
+          true,
+          "config.configPayload.schemaKey",
+          "Config schema binding",
+          null,
+          edges,
+          dedupe);
+    }
+    if (hasText(payload.parentId())) {
+      String parentId =
+          index.resolveReference(payload.parentId(), DefinitionType.CONFIG_LAYER, context.group(), null, nodes);
+      addEdge(
+          context.assetId(),
+          parentId,
+          RelationshipType.DEPENDS_ON,
+          OwnershipType.OWNED,
+          PromotionBehavior.REQUIRED_WITH_PARENT,
+          DeleteBehavior.BLOCK,
+          RetentionBehavior.KEEP_HISTORY,
+          true,
+          false,
+          "config.configPayload.parentId",
+          "Config parent inheritance dependency",
+          null,
+          edges,
+          dedupe);
+    }
+  }
+
+  private static void inferEntitlementEdges(
+      DefinitionContext context,
+      DefinitionEntitlement entitlement,
+      NodeIndex index,
+      Map<String, AssetLifecycleNode> nodes,
+      List<AssetLifecycleEdge> edges,
+      Set<String> dedupe) {
+    addEntitlementGovernedAssetEdge(
+        context, index, nodes, entitlement.scopeId(), definitionTypeFromToken(entitlement.scopeType()), "entitlement.scopeId", edges, dedupe);
+
+    if (entitlement.policies() != null) {
+      for (DefinitionEntitlement.PolicyDocument policy : entitlement.policies()) {
+        if (policy == null) {
+          continue;
+        }
+        addEntitlementGovernedAssetEdge(
+            context,
+            index,
+            nodes,
+            policy.resourceId(),
+            definitionTypeFromToken(policy.scopeType() == null ? policy.type() : policy.scopeType()),
+            "entitlement.policy.resourceId",
+            edges,
+            dedupe);
+        if (policy.bindings() != null) {
+          for (DefinitionEntitlement.PolicyBinding binding : policy.bindings()) {
+            if (binding == null || !hasText(binding.subject())) {
+              continue;
+            }
+            addEdge(
+                context.assetId(),
+                binding.subject().trim(),
+                RelationshipType.REFERENCES,
+                OwnershipType.EXTERNAL,
+                PromotionBehavior.NEVER_PROMOTE,
+                DeleteBehavior.DETACH,
+                RetentionBehavior.KEEP_HISTORY,
+                false,
+                true,
+                "entitlement.policy.bindings.subject",
+                "Policy subject reference",
+                null,
+                edges,
+                dedupe);
+            if (binding.obligations() != null && binding.obligations().datasetScope() != null) {
+              for (String datasetScope : binding.obligations().datasetScope()) {
+                addEntitlementGovernedAssetEdge(
+                    context,
+                    index,
+                    nodes,
+                    datasetScope,
+                    DefinitionType.DATASET,
+                    "entitlement.policy.bindings.obligations.datasetScope",
+                    edges,
+                    dedupe);
+              }
+            }
+          }
+        }
+      }
+    }
+    if (entitlement.relationships() != null) {
+      for (DefinitionEntitlement.RelationshipTuple relationship : entitlement.relationships()) {
+        if (relationship == null) {
+          continue;
+        }
+        addEntitlementGovernedAssetEdge(
+            context,
+            index,
+            nodes,
+            relationship.resourceId(),
+            definitionTypeFromToken(relationship.resourceType()),
+            "entitlement.relationships.resourceId",
+            edges,
+            dedupe);
+        addEntitlementGovernedAssetEdge(
+            context,
+            index,
+            nodes,
+            relationship.resourceSubject(),
+            null,
+            "entitlement.relationships.resourceSubject",
+            edges,
+            dedupe);
+      }
+    }
+  }
+
+  private static void inferConnectionEdges(
+      DefinitionContext context,
+      DefinitionConnection connection,
+      NodeIndex index,
+      Map<String, AssetLifecycleNode> nodes,
+      List<AssetLifecycleEdge> edges,
+      Set<String> dedupe) {
+    if (connection.client() != null && hasText(connection.client().physicalRef())) {
+      String physicalRef = connection.client().physicalRef().trim();
+      String resolvedPhysical =
+          index.resolveReference(physicalRef, DefinitionType.CONNECTION, context.group(), null, nodes);
+      if (!hasText(resolvedPhysical) || !nodes.containsKey(resolvedPhysical)) {
+        String[] slashParts = physicalRef.split("/");
+        if (slashParts.length == 2) {
+          resolvedPhysical =
+              index.resolveReference(
+                  slashParts[1], DefinitionType.CONNECTION, slashParts[0], null, nodes);
+        }
+      }
+      addEdge(
+          context.assetId(),
+          resolvedPhysical,
+          RelationshipType.USES_CONNECTION,
+          OwnershipType.SHARED,
+          PromotionBehavior.REBIND_IN_TARGET,
+          DeleteBehavior.DETACH,
+          RetentionBehavior.KEEP_HISTORY,
+          true,
+          true,
+          "connection.client.physicalRef",
+          "Client connection depends on physical connection",
+          null,
+          edges,
+          dedupe);
+    }
+    if (connection.bitbucketRepo() != null && hasText(connection.bitbucketRepo().authConnectionName())) {
+      String authConnection =
+          index.resolveReference(
+              connection.bitbucketRepo().authConnectionName(),
+              DefinitionType.CONNECTION,
+              context.group(),
+              null,
+              nodes);
+      addEdge(
+          context.assetId(),
+          authConnection,
+          RelationshipType.USES_CONNECTION,
+          OwnershipType.SHARED,
+          PromotionBehavior.REBIND_IN_TARGET,
+          DeleteBehavior.DETACH,
+          RetentionBehavior.KEEP_HISTORY,
+          true,
+          true,
+          "connection.bitbucketRepo.authConnectionName",
+          "Bitbucket auth connection",
+          null,
+          edges,
+          dedupe);
+    }
+    if (connection.odbc() != null && hasText(connection.odbc().connectionName())) {
+      String ref =
+          index.resolveReference(connection.odbc().connectionName(), DefinitionType.CONNECTION, context.group(), null, nodes);
+      addEdge(
+          context.assetId(),
+          ref,
+          RelationshipType.USES_CONNECTION,
+          OwnershipType.SHARED,
+          PromotionBehavior.REBIND_IN_TARGET,
+          DeleteBehavior.DETACH,
+          RetentionBehavior.KEEP_HISTORY,
+          false,
+          true,
+          "connection.odbc.connectionName",
+          "ODBC connection chain reference",
+          null,
+          edges,
+          dedupe);
+    }
+    if (connection.s3() != null && hasText(connection.s3().bucket())) {
+      String uri =
+          "s3://"
+              + connection.s3().bucket().trim()
+              + (hasText(connection.s3().basePrefix()) ? "/" + connection.s3().basePrefix().trim() : "");
+      addEdge(
+          context.assetId(),
+          storageAssetId(uri),
+          RelationshipType.STORES_IN,
+          OwnershipType.EXTERNAL,
+          PromotionBehavior.NEVER_PROMOTE,
+          DeleteBehavior.MANUAL,
+          RetentionBehavior.ARCHIVE_ONLY,
+          false,
+          true,
+          "connection.s3.bucket",
+          "S3 storage locator",
+          uri,
+          edges,
+          dedupe);
+    }
+    if (connection.physical() != null && hasText(connection.physical().uriOrEndpoint())) {
+      addEdge(
+          context.assetId(),
+          "endpoint:" + normalizeToken(connection.physical().uriOrEndpoint()),
+          RelationshipType.DEPENDS_ON,
+          OwnershipType.EXTERNAL,
+          PromotionBehavior.NEVER_PROMOTE,
+          DeleteBehavior.MANUAL,
+          RetentionBehavior.ARCHIVE_ONLY,
+          false,
+          true,
+          "connection.physical.uriOrEndpoint",
+          "Physical endpoint locator",
+          connection.physical().uriOrEndpoint(),
+          edges,
+          dedupe);
+    }
+  }
+
+  private static void inferSemanticHintEdges(
+      DefinitionContext context,
+      Definition definition,
+      Map<String, Semantic> configSemanticByKey,
+      NodeIndex index,
+      Map<String, AssetLifecycleNode> nodes,
+      List<AssetLifecycleEdge> edges,
+      Set<String> dedupe) {
+    Semantic metadata = semantic(definition, configSemanticByKey);
+    if (metadata == null || metadata.relationshipHints() == null || metadata.relationshipHints().isEmpty()) {
+      return;
+    }
+    for (Semantic.RelationshipHint hint : metadata.relationshipHints()) {
+      if (hint == null || !hasText(hint.targetAssetId())) {
         continue;
       }
-      normalizedStructs.add(
-          new Struct(
-              struct.id(),
-              struct.label(),
-              struct.description(),
-              sortFields(struct.fields())));
-    }
-
-    List<Field> fields = sortFields(doc.fields());
-    LinkedHashSet<String> requiredKeys = new LinkedHashSet<>();
-    for (String key : safeList(doc.requiredKeys())) {
-      if (key != null && !key.isBlank()) {
-        requiredKeys.add(key.trim());
-      }
-    }
-    List<String> required = new ArrayList<>(requiredKeys);
-    required.sort(String::compareTo);
-    return new ConfigSchemaDoc(
-        doc.displayName(),
-        doc.description(),
-        List.copyOf(groups),
-        List.copyOf(normalizedStructs),
-        List.copyOf(fields),
-        List.copyOf(required));
-  }
-
-  private List<Field> sortFields(List<Field> fields) {
-    List<Field> ordered = new ArrayList<>(safeList(fields));
-    ordered.sort(
-        Comparator.comparingInt((Field field) -> field.order() == null ? Integer.MAX_VALUE : field.order())
-            .thenComparing(field -> field.key() == null ? "" : field.key()));
-    List<Field> sorted = new ArrayList<>();
-    for (Field field : ordered) {
-      sorted.add(
-          new Field(
-              field.key(),
-              field.label(),
-              field.description(),
-              field.groupId(),
-              field.order(),
-              field.type(),
-              field.required(),
-              field.editable(),
-              field.enumValues(),
-              field.defaultValue(),
-              field.min(),
-              field.max(),
-              field.pattern(),
-              sortFields(field.fields()),
-              field.itemType(),
-              field.itemsEnum(),
-              field.structRef(),
-              field.minItems(),
-              field.maxItems()));
-    }
-    return List.copyOf(sorted);
-  }
-
-  private List<FieldModel> buildFieldModels(List<Field> fields) {
-    List<FieldModel> models = new ArrayList<>();
-    Set<String> usedProperties = new LinkedHashSet<>();
-    Set<String> usedEnumTypes = new LinkedHashSet<>();
-    for (Field field : safeList(fields)) {
-      if (field == null) {
+      String targetToken = hint.targetAssetId().trim();
+      if (targetToken.toLowerCase(Locale.ROOT).startsWith("todo:")) {
         continue;
       }
-      String key = requireValue(field.key(), "field.key");
-      String propertyName = allocateUnique(safeJavaIdentifier(toCamelCase(key)), usedProperties);
-      boolean required = Boolean.TRUE.equals(field.required());
-
-      List<EnumValueModel> enumValues = List.of();
-      String enumTypeName = null;
-      if (field.type() == FieldType.STRING && !safeList(field.enumValues()).isEmpty()) {
-        enumTypeName = allocateUnique(toPascalCase(propertyName) + "Enum", usedEnumTypes);
-        enumValues = buildEnumValues(field.enumValues());
-      }
-      TypeMapping mapping = resolveTypeMapping(field, required, enumTypeName);
-      models.add(
-          new FieldModel(
-              field,
-              key,
-              propertyName,
-              required,
-              mapping.javaType(),
-              mapping.javaPrimitive(),
-              mapping.pythonType(),
-              enumTypeName,
-              enumValues));
+      String target = index.resolveReference(targetToken, null, context.group(), context.namespace(), nodes);
+      addEdge(
+          context.assetId(),
+          target,
+          mapHintType(hint.relationshipType()),
+          OwnershipType.SHARED,
+          PromotionBehavior.OPTIONAL_WITH_PARENT,
+          DeleteBehavior.DETACH,
+          RetentionBehavior.KEEP_HISTORY,
+          false,
+          true,
+          "semantic.relationshipHints",
+          hint.description(),
+          hint.joinExpression(),
+          edges,
+          dedupe);
     }
-    return List.copyOf(models);
   }
 
-  private List<EnumValueModel> buildEnumValues(List<String> values) {
-    List<EnumValueModel> models = new ArrayList<>();
-    Set<String> used = new LinkedHashSet<>();
-    for (String value : safeList(values)) {
-      if (value == null || value.isBlank()) {
+  private static Map<String, Integer> countIngestDatasetProducers(
+      List<DefinitionContext> contexts, NodeIndex index, Map<String, AssetLifecycleNode> nodes) {
+    Map<String, Integer> counts = new LinkedHashMap<>();
+    for (DefinitionContext context : contexts) {
+      if (!(context.definition() instanceof DefinitionIngest ingest) || !hasText(ingest.datasetId())) {
         continue;
       }
-      String constant = allocateEnumConstant(value, used);
-      models.add(new EnumValueModel(value, constant));
+      String datasetId =
+          index.resolveReference(ingest.datasetId(), DefinitionType.DATASET, context.group(), context.namespace(), nodes);
+      counts.put(datasetId, counts.getOrDefault(datasetId, 0) + 1);
     }
-    return List.copyOf(models);
+    return counts;
   }
 
-  private TypeMapping resolveTypeMapping(Field field, boolean required, String enumTypeName) {
-    if (enumTypeName != null) {
-      return new TypeMapping(enumTypeName, false, "str");
-    }
-    FieldType type = field.type();
+  private static boolean sameGroup(
+      Map<String, AssetLifecycleNode> nodes, String leftAssetId, String rightAssetId) {
+    AssetLifecycleNode left = nodes.get(leftAssetId);
+    AssetLifecycleNode right = nodes.get(rightAssetId);
+    return left != null && right != null && left.group().equalsIgnoreCase(right.group());
+  }
+
+  private static RelationshipType mapHintType(Semantic.RelationshipType type) {
     if (type == null) {
-      return new TypeMapping("JsonNode", false, "Any");
+      return RelationshipType.DEPENDS_ON;
     }
     return switch (type) {
-      case STRING -> new TypeMapping("String", false, "str");
-      case INTEGER -> required ? new TypeMapping("int", true, "int") : new TypeMapping("Integer", false, "int");
-      case NUMBER -> required ? new TypeMapping("double", true, "float") : new TypeMapping("Double", false, "float");
-      case BOOLEAN ->
-          required ? new TypeMapping("boolean", true, "bool") : new TypeMapping("Boolean", false, "bool");
-      case STRUCT, ARRAY -> new TypeMapping("JsonNode", false, "Any");
+      case DEPENDS_ON -> RelationshipType.DEPENDS_ON;
+      case DERIVED_FROM -> RelationshipType.DERIVED_FROM;
+      case JOINS_TO -> RelationshipType.JOINS_TO;
+      case CONSUMES -> RelationshipType.CONSUMES;
+      case PRODUCES -> RelationshipType.PRODUCES;
+      case DOCUMENTED_BY -> RelationshipType.DOCUMENTED_BY;
+      case GOVERNED_BY -> RelationshipType.GOVERNED_BY;
     };
   }
 
-  private List<FieldModel> pythonFieldOrder(List<FieldModel> fields) {
-    List<FieldModel> required = new ArrayList<>();
-    List<FieldModel> optional = new ArrayList<>();
-    for (FieldModel field : fields) {
-      if (field.required()) {
-        required.add(field);
-      } else {
-        optional.add(field);
-      }
+  private static DefinitionType definitionTypeFromToken(String token) {
+    if (!hasText(token)) {
+      return null;
     }
-    List<FieldModel> ordered = new ArrayList<>(required.size() + optional.size());
-    ordered.addAll(required);
-    ordered.addAll(optional);
-    return ordered;
+    String normalized = token.trim().toLowerCase(Locale.ROOT);
+    return switch (normalized) {
+      case "dataset", "metaset", "materialized" -> DefinitionType.DATASET;
+      case "service" -> DefinitionType.SERVICE;
+      case "stream", "feed" -> DefinitionType.STREAM;
+      case "schema" -> DefinitionType.SCHEMA;
+      case "config" -> DefinitionType.CONFIG_LAYER;
+      case "connection" -> DefinitionType.CONNECTION;
+      case "entitlement" -> DefinitionType.ENTITLEMENT;
+      case "ingest" -> DefinitionType.INGEST;
+      case "ingest_source", "ingest-source" -> DefinitionType.INGEST_SOURCE;
+      default -> null;
+    };
   }
 
-  private String resolveClassName(String displayName, String schemaName) {
-    String base = displayName == null || displayName.isBlank() ? schemaName : displayName;
-    String className = toPascalCase(base);
-    if (className.isBlank()) {
-      className = "Config";
+  private static void addEntitlementGovernedAssetEdge(
+      DefinitionContext context,
+      NodeIndex index,
+      Map<String, AssetLifecycleNode> nodes,
+      String rawTarget,
+      DefinitionType expectedType,
+      String source,
+      List<AssetLifecycleEdge> edges,
+      Set<String> dedupe) {
+    if (!hasText(rawTarget)) {
+      return;
     }
-    if (!className.endsWith("Config")) {
-      className = className + "Config";
+    String target = index.resolveReference(rawTarget, expectedType, context.group(), context.namespace(), nodes);
+    if (!hasText(target)) {
+      return;
     }
-    if (!Character.isJavaIdentifierStart(className.charAt(0))) {
-      className = "Config" + className;
+    boolean governableTarget = isGovernableTarget(target, expectedType, nodes);
+    if (governableTarget) {
+      addEdge(
+          target,
+          context.assetId(),
+          RelationshipType.GOVERNED_BY,
+          OwnershipType.SHARED,
+          PromotionBehavior.OPTIONAL_WITH_PARENT,
+          DeleteBehavior.DETACH,
+          RetentionBehavior.KEEP_HISTORY,
+          false,
+          true,
+          source,
+          "Asset governed by entitlement policy",
+          null,
+          edges,
+          dedupe);
+      addEdge(
+          context.assetId(),
+          target,
+          RelationshipType.DEPENDS_ON,
+          OwnershipType.SHARED,
+          PromotionBehavior.OPTIONAL_WITH_PARENT,
+          DeleteBehavior.DETACH,
+          RetentionBehavior.KEEP_HISTORY,
+          false,
+          true,
+          source,
+          "Entitlement scope depends on governed asset",
+          null,
+          edges,
+          dedupe);
+      return;
     }
-    return className;
+    addEdge(
+        context.assetId(),
+        target,
+        RelationshipType.REFERENCES,
+        OwnershipType.EXTERNAL,
+        PromotionBehavior.OPTIONAL_WITH_PARENT,
+        DeleteBehavior.DETACH,
+        RetentionBehavior.KEEP_HISTORY,
+        false,
+        true,
+        source,
+        "Entitlement references non-governable target",
+        null,
+        edges,
+        dedupe);
   }
 
-  private String resolveBasePackageOrModule(String value, String schemaName) {
-    if (value == null || value.isBlank()) {
-      return defaultBasePackage(schemaName);
+  private static RelationshipType relationshipTypeForSchemaRef(
+      DefinitionType expectedType, String targetAssetId, Map<String, AssetLifecycleNode> nodes) {
+    if (expectedType == DefinitionType.SCHEMA) {
+      return RelationshipType.DEPENDS_ON;
     }
-    return value.trim();
+    if (expectedType == DefinitionType.DATASET) {
+      return RelationshipType.DERIVED_FROM;
+    }
+    if (expectedType == DefinitionType.SERVICE
+        || expectedType == DefinitionType.STREAM
+        || expectedType == DefinitionType.CONFIG_LAYER
+        || expectedType == DefinitionType.INGEST
+        || expectedType == DefinitionType.INGEST_SOURCE) {
+      return RelationshipType.DEPENDS_ON;
+    }
+    if (isInternalAssetId(targetAssetId, nodes)) {
+      return RelationshipType.DEPENDS_ON;
+    }
+    return RelationshipType.REFERENCES;
   }
 
-  public static String defaultBasePackage(String schemaNameOrconfigId) {
-    String token = schemaNameOrconfigId == null ? "" : schemaNameOrconfigId.trim();
-    String lower = token.toLowerCase(Locale.ROOT);
-    if (lower.startsWith(CONFIG_PREFIX)) {
-      token = token.substring(CONFIG_PREFIX.length());
-      lower = token.toLowerCase(Locale.ROOT);
+  private static boolean isGovernableTarget(
+      String assetId, DefinitionType expectedType, Map<String, AssetLifecycleNode> nodes) {
+    if (expectedType == DefinitionType.DATASET
+        || expectedType == DefinitionType.SERVICE
+        || expectedType == DefinitionType.STREAM
+        || expectedType == DefinitionType.CONFIG_LAYER
+        || expectedType == DefinitionType.INGEST) {
+      return true;
     }
-    if (lower.startsWith(CONFIG_PREFIX)) {
-      token = token.substring(CONFIG_PREFIX.length());
+    if (!hasText(assetId)) {
+      return false;
     }
-    if (token.isBlank()) {
-      token = "config";
+    AssetLifecycleNode node = nodes.get(assetId);
+    if (node != null) {
+      return node.type() == DefinitionType.DATASET
+          || node.type() == DefinitionType.SERVICE
+          || node.type() == DefinitionType.STREAM
+          || node.type() == DefinitionType.CONFIG_LAYER
+          || node.type() == DefinitionType.INGEST;
     }
-    token = token.replaceAll("[^A-Za-z0-9]+", "");
-    if (token.isBlank()) {
-      token = "config";
-    }
-    if (Character.isDigit(token.charAt(0))) {
-      token = "c" + token;
-    }
-    return DEFAULT_PACKAGE_ROOT + token.toLowerCase(Locale.ROOT);
+    return assetId.startsWith("dataset:")
+        || assetId.startsWith("service:")
+        || assetId.startsWith("stream:")
+        || assetId.startsWith("config:")
+        || assetId.startsWith("ingest:");
   }
 
-  private void validateModuleName(String value) {
-    if (value == null || value.isBlank()) {
-      throw new IllegalArgumentException("basePackageOrModule is required");
+  private static boolean isInternalAssetId(
+      String assetId, Map<String, AssetLifecycleNode> nodes) {
+    if (!hasText(assetId)) {
+      return false;
     }
-    if (!MODULE_PATTERN.matcher(value).matches()) {
-      throw new IllegalArgumentException("basePackageOrModule must be a dotted identifier path");
+    if (nodes.containsKey(assetId)) {
+      return true;
     }
+    return assetId.startsWith("dataset:")
+        || assetId.startsWith("service:")
+        || assetId.startsWith("stream:")
+        || assetId.startsWith("schema:")
+        || assetId.startsWith("config:")
+        || assetId.startsWith("connection:")
+        || assetId.startsWith("ingest:")
+        || assetId.startsWith("ingest-source:")
+        || assetId.startsWith("entitlement:")
+        || assetId.startsWith("app:")
+        || assetId.startsWith("platform:")
+        || assetId.startsWith("environment:");
   }
 
-  private String formatNumber(BigDecimal value) {
-    return value == null ? "" : value.stripTrailingZeros().toPlainString();
-  }
-
-  private String numericLiteral(BigDecimal value, boolean integer) {
-    if (value == null) {
-      return integer ? "0" : "0.0d";
-    }
-    if (integer) {
-      return Integer.toString(value.intValue());
-    }
-    String text = value.stripTrailingZeros().toPlainString();
-    if (!text.contains(".") && !text.contains("e") && !text.contains("E")) {
-      text = text + ".0";
-    }
-    return text + "d";
-  }
-
-  private String formatPythonNumber(BigDecimal value, boolean integer) {
-    if (value == null) {
-      return integer ? "0" : "0.0";
-    }
-    if (integer) {
-      return Integer.toString(value.intValue());
-    }
-    String text = value.stripTrailingZeros().toPlainString();
-    if (!text.contains(".") && !text.contains("e") && !text.contains("E")) {
-      text = text + ".0";
-    }
-    return text;
-  }
-
-  private String allocateEnumConstant(String rawValue, Set<String> used) {
-    String normalized = rawValue == null ? "VALUE" : rawValue.trim();
-    if (normalized.isEmpty()) {
-      normalized = "VALUE";
-    }
-    normalized = normalized.replaceAll("[^A-Za-z0-9]+", "_").toUpperCase(Locale.ROOT);
-    if (normalized.isEmpty()) {
-      normalized = "VALUE";
-    }
-    if (Character.isDigit(normalized.charAt(0))) {
-      normalized = "_" + normalized;
-    }
-    String candidate = normalized;
-    int suffix = 2;
-    while (used.contains(candidate)) {
-      candidate = normalized + "_" + suffix;
-      suffix++;
-    }
-    used.add(candidate);
-    return candidate;
-  }
-
-  private String allocateUnique(String base, Set<String> used) {
-    String candidate = base == null || base.isBlank() ? "field" : base;
-    if (!used.contains(candidate)) {
-      used.add(candidate);
-      return candidate;
-    }
-    int suffix = 2;
-    while (used.contains(candidate + suffix)) {
-      suffix++;
-    }
-    String resolved = candidate + suffix;
-    used.add(resolved);
-    return resolved;
-  }
-
-  private String safeJavaIdentifier(String value) {
-    String candidate = value == null || value.isBlank() ? "field" : value;
-    StringBuilder builder = new StringBuilder();
-    for (int i = 0; i < candidate.length(); i++) {
-      char ch = candidate.charAt(i);
-      if (i == 0 && !Character.isJavaIdentifierStart(ch)) {
-        builder.append('_');
-      }
-      builder.append(Character.isJavaIdentifierPart(ch) ? ch : '_');
-    }
-    String resolved = builder.toString();
-    if (JAVA_KEYWORDS.contains(resolved)) {
-      resolved = resolved + "_";
-    }
-    return resolved;
-  }
-
-  private String toCamelCase(String raw) {
-    if (raw == null || raw.isBlank()) {
-      return "field";
-    }
-    String value = raw.trim();
-    if (value.matches("[a-z][A-Za-z0-9]*")) {
-      return value;
-    }
-    if (value.matches("[A-Z][A-Za-z0-9]*")) {
-      return Character.toLowerCase(value.charAt(0)) + value.substring(1);
-    }
-    String[] tokens = value.split("[^A-Za-z0-9]+");
-    StringBuilder builder = new StringBuilder();
-    for (String token : tokens) {
-      if (token == null || token.isBlank()) {
-        continue;
-      }
-      if (builder.length() == 0) {
-        builder.append(Character.toLowerCase(token.charAt(0)));
-        if (token.length() > 1) {
-          builder.append(token.substring(1));
-        }
-      } else {
-        builder.append(Character.toUpperCase(token.charAt(0)));
-        if (token.length() > 1) {
-          builder.append(token.substring(1));
-        }
-      }
-    }
-    return builder.length() == 0 ? "field" : builder.toString();
-  }
-
-  private String toPascalCase(String raw) {
-    if (raw == null || raw.isBlank()) {
-      return "";
-    }
-    String[] tokens = raw.trim().split("[^A-Za-z0-9]+");
-    StringBuilder builder = new StringBuilder();
-    for (String token : tokens) {
-      if (token == null || token.isBlank()) {
-        continue;
-      }
-      builder.append(Character.toUpperCase(token.charAt(0)));
-      if (token.length() > 1) {
-        builder.append(token.substring(1));
-      }
-    }
-    return builder.toString();
-  }
-
-  private String toSnakeCase(String value) {
-    if (value == null || value.isBlank()) {
-      return "config_layer";
-    }
-    String normalized = value.replaceAll("([a-z0-9])([A-Z])", "$1_$2");
-    normalized = normalized.replaceAll("[^A-Za-z0-9]+", "_");
-    normalized = normalized.replaceAll("_+", "_");
-    normalized = normalized.replaceAll("^_", "");
-    normalized = normalized.replaceAll("_$", "");
-    return normalized.toLowerCase(Locale.ROOT);
-  }
-
-  private String upperIdentifier(String value) {
-    if (value == null || value.isBlank()) {
-      return "FIELD";
-    }
-    String normalized = value.replaceAll("[^A-Za-z0-9]+", "_").toUpperCase(Locale.ROOT);
-    if (normalized.isEmpty()) {
-      return "FIELD";
-    }
-    if (Character.isDigit(normalized.charAt(0))) {
-      return "_" + normalized;
-    }
-    return normalized;
-  }
-
-  private String escapeJava(String value) {
-    if (value == null) {
-      return "";
-    }
-    return value.replace("\\", "\\\\").replace("\"", "\\\"");
-  }
-
-  private String escapePython(String value) {
-    if (value == null) {
-      return "";
-    }
-    return value.replace("\\", "\\\\").replace("'", "\\'");
-  }
-
-  private String escapePythonRegex(String value) {
-    return escapePython(value);
-  }
-
-  private String slug(String value) {
-    if (value == null || value.isBlank()) {
-      return "unknown";
-    }
-    String normalized = value.trim().toLowerCase(Locale.ROOT);
-    normalized = normalized.replaceAll("[^a-z0-9._-]+", "-");
-    normalized = normalized.replaceAll("-+", "-");
-    normalized = normalized.replaceAll("^-", "");
-    normalized = normalized.replaceAll("-$", "");
-    return normalized.isBlank() ? "unknown" : normalized;
-  }
-
-  private String requireValue(String value, String field) {
-    if (value == null || value.isBlank()) {
-      throw new IllegalArgumentException(field + " is required");
-    }
-    return value.trim();
-  }
-
-  private String nullToValue(String value, String fallback) {
-    if (value == null || value.isBlank()) {
-      return fallback;
-    }
-    return value;
-  }
-
-  private <T> List<T> safeList(List<T> list) {
-    return list == null ? List.of() : list;
-  }
-
-  private record TypeMapping(String javaType, boolean javaPrimitive, String pythonType) {}
-
-  private record EnumValueModel(String raw, String constant) {}
-
-  private record FieldModel(
-      Field field,
-      String jsonKey,
-      String propertyName,
+  private static void addEdge(
+      String fromAssetId,
+      String toAssetId,
+      RelationshipType relationshipType,
+      OwnershipType ownershipType,
+      PromotionBehavior promotionBehavior,
+      DeleteBehavior deleteBehavior,
+      RetentionBehavior retentionBehavior,
       boolean required,
-      String javaType,
-      boolean javaPrimitive,
-      String pythonType,
-      String enumTypeName,
-      List<EnumValueModel> enumValues) {
-
-    private boolean usesJsonNode() {
-      return "JsonNode".equals(javaType);
+      boolean shared,
+      String source,
+      String notes,
+      String targetLocator,
+      List<AssetLifecycleEdge> edges,
+      Set<String> dedupe) {
+    if (!hasText(fromAssetId) || !hasText(toAssetId)) {
+      return;
     }
-
-    private boolean requiredReference() {
-      return required && !javaPrimitive;
-    }
-
-    private boolean hasOptionalDefault() {
-      return !required && field != null && field.defaultValue() != null && !field.defaultValue().isNull();
+    AssetLifecycleEdge edge =
+        new AssetLifecycleEdge(
+            fromAssetId.trim(),
+            toAssetId.trim(),
+            relationshipType,
+            ownershipType,
+            promotionBehavior,
+            deleteBehavior,
+            retentionBehavior,
+            required,
+            shared,
+            source,
+            notes,
+            targetLocator);
+    String key =
+        edge.fromAssetId()
+            + "|"
+            + edge.toAssetId()
+            + "|"
+            + edge.relationshipType()
+            + "|"
+            + edge.promotionBehavior()
+            + "|"
+            + edge.deleteBehavior();
+    if (dedupe.add(key)) {
+      edges.add(edge);
     }
   }
 }
-
-
-
 
