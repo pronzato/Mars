@@ -1,332 +1,316 @@
-package org.pronzato.fabric.api.control.discovery.scope;
+package org.pronzato.fabric.api.control.entitlements.simple.services;
 
-import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import org.pronzato.fabric.api.control.discovery.CanonicalIds;
-import org.pronzato.fabric.api.control.discovery.definitions.Definition;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEntitlement;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionPlatform;
-import org.pronzato.fabric.api.control.entitlements.simple.PlatformModelMembership;
-import org.pronzato.fabric.api.util.Strings;
+import java.util.concurrent.atomic.AtomicReference;
+import org.pronzato.fabric.api.control.entitlements.core.EntitlementsScopeType;
+import org.pronzato.fabric.api.control.entitlements.provider.EntitlementSubjectCandidates;
+import org.pronzato.fabric.api.control.entitlements.provider.EntitlementProviderSelector;
+import org.pronzato.fabric.api.control.entitlements.provider.ResolveRequest;
+import org.pronzato.fabric.api.control.entitlements.provider.SubjectContext;
+import org.pronzato.fabric.api.control.entitlements.core.services.ServiceEntitlements;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-public final class DiscoveryScopeResolver {
+public final class ServiceEntitlementsSimple implements ServiceEntitlements {
+  private static final Logger LOGGER = LoggerFactory.getLogger(ServiceEntitlementsSimple.class);
   private static final String PLATFORM_GROUP = "platform";
 
-  public DiscoveryScope resolve(
-      String primaryGroup,
-      String subject,
-      String delegatedSubject,
-      List<Definition> definitions) {
-    List<Definition> records = definitions == null ? List.of() : definitions;
-    DiscoveryScope base = DiscoveryScope.primaryOnly(primaryGroup, subject, delegatedSubject);
+  private final AtomicReference<Map<String, Set<String>>> membershipIndexRef;
+  private final AtomicReference<Map<String, ServiceEntitlementsSimpleManager.Rules>> entitlementsIndexRef;
+  private final EntitlementProviderSelector providerSelector;
+  private final boolean logDecisions;
 
-    String effectiveSubject = firstNonBlank(normalize(delegatedSubject), normalize(subject));
-    if (effectiveSubject == null) {
-      return base;
-    }
-
-    Set<String> subjectGroups = resolveSubjectGroups(effectiveSubject, records);
-    LinkedHashSet<String> visibleGroups = new LinkedHashSet<>(base.visibleGroups());
-    LinkedHashSet<String> visibleAssetIds = new LinkedHashSet<>(base.visibleAssetIds());
-    LinkedHashMap<String, LinkedHashSet<String>> reasons = mutableReasons(base.visibilityReasons());
-
-    if (isPlatformAdmin(subjectGroups)) {
-      for (String group : groupsFromDefinitions(records)) {
-        addGroupVisibility(visibleGroups, reasons, group, "platform-admin");
-      }
-    }
-
-    for (Definition definition : records) {
-      if (!(definition instanceof DefinitionEntitlement entitlement)) {
-        continue;
-      }
-      if (!enabled(entitlement.envelope() == null ? null : entitlement.envelope().enabled())) {
-        continue;
-      }
-      if (!isEntitlementAllowed(entitlement, effectiveSubject, subjectGroups)) {
-        continue;
-      }
-      String source = entitlementSource(entitlement.envelope());
-      for (String target : entitlementTargets(entitlement)) {
-        String normalizedTarget = normalize(target);
-        if (normalizedTarget == null) {
-          continue;
-        }
-        visibleAssetIds.add(normalizedTarget);
-        String group = groupFromResourceId(normalizedTarget);
-        if (group != null) {
-          addGroupVisibility(visibleGroups, reasons, group, source);
-        }
-      }
-    }
-
-    return base.withGroupVisibility(visibleGroups, visibleAssetIds, immutableReasons(reasons));
+  ServiceEntitlementsSimple(
+      AtomicReference<Map<String, Set<String>>> membershipIndexRef,
+      AtomicReference<Map<String, ServiceEntitlementsSimpleManager.Rules>> entitlementsIndexRef,
+      boolean logDecisions) {
+    this(membershipIndexRef, entitlementsIndexRef, null, logDecisions);
   }
 
-  private static Set<String> resolveSubjectGroups(String effectiveSubject, List<Definition> definitions) {
-    DefinitionPlatform platform = findPlatformModel(definitions);
-    if (platform == null || platform.root() == null) {
-      return Set.of();
-    }
-    Map<String, Set<String>> membership = PlatformModelMembership.buildMembershipIndex(platform);
-    if (membership.isEmpty()) {
-      return Set.of();
-    }
-
-    LinkedHashSet<String> groups = new LinkedHashSet<>();
-    Set<String> candidates = PlatformModelMembership.membershipSubjectCandidates(effectiveSubject);
-    for (String candidate : candidates) {
-      Set<String> candidateGroups = membership.get(candidate);
-      if (candidateGroups != null) {
-        for (String group : candidateGroups) {
-          String normalized = normalizeGroup(group);
-          if (normalized != null) {
-            groups.add(normalized);
-          }
-        }
-      }
-    }
-
-    String directGroup = normalizeGroup(effectiveSubject);
-    if (directGroup != null) {
-      groups.add(directGroup);
-    }
-    return groups.isEmpty() ? Set.of() : Set.copyOf(groups);
+  ServiceEntitlementsSimple(
+      AtomicReference<Map<String, Set<String>>> membershipIndexRef,
+      AtomicReference<Map<String, ServiceEntitlementsSimpleManager.Rules>> entitlementsIndexRef,
+      EntitlementProviderSelector providerSelector,
+      boolean logDecisions) {
+    this.membershipIndexRef = Objects.requireNonNull(membershipIndexRef, "membershipIndexRef");
+    this.entitlementsIndexRef = Objects.requireNonNull(entitlementsIndexRef, "entitlementsIndexRef");
+    this.providerSelector = providerSelector;
+    this.logDecisions = logDecisions;
   }
 
-  private static DefinitionPlatform findPlatformModel(List<Definition> definitions) {
-    for (Definition definition : definitions) {
-      if (!(definition instanceof DefinitionPlatform platform)) {
-        continue;
-      }
-      DefinitionEnvelope envelope = platform.envelope();
-      if (envelope == null) {
-        continue;
-      }
-      if (PLATFORM_GROUP.equalsIgnoreCase(normalize(envelope.group()))
-          && "platform".equalsIgnoreCase(normalize(envelope.name()))) {
-        return platform;
-      }
-    }
-    return null;
-  }
+  @Override
+  public Decision authorize(Identity identity, Request request) {
+    Objects.requireNonNull(identity, "identity");
+    Objects.requireNonNull(request, "request");
+    Objects.requireNonNull(request.action(), "request.action is required");
 
-  private static Set<String> groupsFromDefinitions(List<Definition> definitions) {
-    LinkedHashSet<String> groups = new LinkedHashSet<>();
-    for (Definition definition : definitions) {
-      DefinitionEnvelope envelope = definition == null ? null : definition.envelope();
-      String group = envelope == null ? null : normalize(envelope.group());
-      if (group != null) {
-        groups.add(group);
-      }
-    }
-    return groups.isEmpty() ? Set.of() : Set.copyOf(groups);
-  }
+    String subject = requireIdentitySubject(identity);
+    String resourceId = ServiceEntitlements.requireAssetResourceId(request.serviceResourceId());
 
-  private static boolean isEntitlementAllowed(
-      DefinitionEntitlement entitlement,
-      String effectiveSubject,
-      Set<String> subjectGroups) {
-    boolean allow = false;
-    boolean deny = false;
-
-    if (entitlement.policies() != null) {
-      for (DefinitionEntitlement.PolicyDocument policy : entitlement.policies()) {
-        if (policy == null || !enabled(policy.enabled()) || policy.bindings() == null) {
-          continue;
-        }
-        for (DefinitionEntitlement.PolicyBinding binding : policy.bindings()) {
-          if (binding == null || !enabled(binding.enabled())) {
-            continue;
-          }
-          if (!subjectMatches(binding.subject(), effectiveSubject, subjectGroups)) {
-            continue;
-          }
-          String effect = normalize(binding.effect());
-          if (effect == null) {
-            continue;
-          }
-          if ("DENY".equalsIgnoreCase(effect)) {
-            deny = true;
-          } else if ("ALLOW".equalsIgnoreCase(effect)) {
-            allow = true;
-          }
-        }
-      }
-    }
-
-    if (entitlement.relationships() != null) {
-      for (DefinitionEntitlement.RelationshipTuple relationship : entitlement.relationships()) {
-        if (relationship == null) {
-          continue;
-        }
-        if (!subjectMatches(relationship.subject(), effectiveSubject, subjectGroups)) {
-          continue;
-        }
-        String relation = normalize(relationship.relation());
-        if (relation == null) {
-          continue;
-        }
-        String token = relation.toLowerCase(Locale.ROOT);
-        if (token.contains("deny")) {
-          deny = true;
-          continue;
-        }
-        if (token.contains("allow")
-            || token.contains("read")
-            || token.contains("invoke")
-            || token.contains("write")
-            || token.contains("start")) {
-          allow = true;
-        }
-      }
-    }
-
-    if (deny) {
-      return false;
-    }
-    return allow;
-  }
-
-  private static List<String> entitlementTargets(DefinitionEntitlement entitlement) {
-    LinkedHashSet<String> targets = new LinkedHashSet<>();
-    addTarget(targets, entitlement.scopeId());
-
-    if (entitlement.policies() != null) {
-      for (DefinitionEntitlement.PolicyDocument policy : entitlement.policies()) {
-        if (policy == null || !enabled(policy.enabled())) {
-          continue;
-        }
-        addTarget(targets, policy.resourceId());
-        if (policy.bindings() == null) {
-          continue;
-        }
-        for (DefinitionEntitlement.PolicyBinding binding : policy.bindings()) {
-          if (binding == null || !enabled(binding.enabled()) || binding.obligations() == null) {
-            continue;
-          }
-          List<String> datasetScope = binding.obligations().datasetScope();
-          if (datasetScope == null) {
-            continue;
-          }
-          for (String resourceId : datasetScope) {
-            addTarget(targets, resourceId);
-          }
-        }
-      }
-    }
-
-    if (entitlement.relationships() != null) {
-      for (DefinitionEntitlement.RelationshipTuple tuple : entitlement.relationships()) {
-        if (tuple == null) {
-          continue;
-        }
-        addTarget(targets, tuple.resourceId());
-        addTarget(targets, tuple.resourceSubject());
-      }
-    }
-
-    return targets.isEmpty() ? List.of() : List.copyOf(targets);
-  }
-
-  private static void addTarget(LinkedHashSet<String> targets, String value) {
-    String normalized = normalize(value);
-    if (normalized != null) {
-      targets.add(normalized);
-    }
-  }
-
-  private static String groupFromResourceId(String resourceId) {
-    String normalized = normalize(resourceId);
-    if (normalized == null) {
-      return null;
-    }
+    SubjectContext subjectContext;
     try {
-      CanonicalIds.ParsedId parsed = CanonicalIds.parse(normalized);
-      String group = normalize(parsed.group());
-      if (group != null) {
-        return group;
+      subjectContext = resolveSubjectContext(identity, request, resourceId, subject);
+    } catch (RuntimeException ex) {
+      return new Decision(false, "DENY SUBJECT_PROVIDER_UNAVAILABLE: " + safeReason(ex), null);
+    }
+
+    String resolvedSubject = subjectContext.subjectId();
+    Set<String> subjectCandidates = directSubjectCandidates(resolvedSubject);
+    Set<String> membershipCandidates = membershipSubjectCandidates(resolvedSubject);
+    String operationName = trimToNull(request.operationName());
+    Set<String> subjectGroups = subjectContext.effectiveGroups();
+    boolean platformAdmin = isPlatformAdmin(subjectGroups);
+
+    ServiceEntitlementsSimpleManager.Rules rules = entitlementsIndexRef.get().get(resourceId);
+    if (rules == null) {
+      Decision decision =
+          platformAdmin
+              ? new Decision(true, "ALLOW platform admin default (no entitlements configured)", null)
+              : new Decision(false, "ABSTAIN no entitlements for resourceId", null);
+      logPlatformAdminDefault(resourceId, operationName, resolvedSubject, decision);
+      if (isAbstain(decision)) {
+        logAbstain(
+            resourceId,
+            operationName,
+            resolvedSubject,
+            membershipCandidates,
+            null,
+            null,
+            decision.reason());
       }
-    } catch (RuntimeException ignored) {
-      // fall through to lenient parse for non-canonical config scope ids.
+      return decision;
     }
 
-    int separator = normalized.indexOf(':');
-    if (separator <= 0 || separator >= normalized.length() - 1) {
-      return null;
+    ServiceEntitlementsSimpleManager.ActionSlot slot = actionSlot(request.action());
+    ServiceEntitlementsSimpleManager.RuleSet ruleSet = rules.forAction(slot);
+    MatchResult denyMatch =
+        match(ruleSet == null ? List.of() : ruleSet.denyBindings(), subjectCandidates, subjectGroups, operationName);
+    MatchResult allowMatch =
+        match(ruleSet == null ? List.of() : ruleSet.allowBindings(), subjectCandidates, subjectGroups, operationName);
+
+    Decision decision;
+    if (denyMatch.matched()) {
+      decision = new Decision(false, "DENY matched rules", null);
+    } else if (allowMatch.matched()) {
+      decision = new Decision(true, "ALLOW matched rules", null);
+    } else if (platformAdmin) {
+      decision = new Decision(true, "ALLOW platform admin default", null);
+    } else if (allowMatch.subjectMatched()) {
+      decision = new Decision(false, "ABSTAIN no matching policy (operation mismatch)", null);
+    } else {
+      decision = new Decision(false, "ABSTAIN no matching policy", null);
     }
-    String payload = normalized.substring(separator + 1);
-    String[] parts = payload.split("/");
-    if (parts.length == 0) {
-      return null;
+
+    logPlatformAdminDefault(resourceId, operationName, resolvedSubject, decision);
+    if (isAbstain(decision)) {
+      logAbstain(resourceId, operationName, resolvedSubject, membershipCandidates, rules, ruleSet, decision.reason());
     }
-    String type = normalized.substring(0, separator).toLowerCase(Locale.ROOT);
-    if ("group".equals(type)) {
-      return normalizeGroup(normalized);
+
+    if (logDecisions) {
+      LOGGER.info("[Entitlements][SIMPLE] action={} resourceId={} subject={} allowed={} matched={}", request.action().name(), resourceId, resolvedSubject, decision.allowed(), !isAbstain(decision));
     }
-    if ("external".equals(type)
-        || "storage".equals(type)
-        || "user".equals(type)
-        || "role".equals(type)) {
-      return null;
-    }
-    return normalize(parts[0]);
+    return decision;
   }
 
-  private static void addGroupVisibility(
-      Set<String> visibleGroups,
-      Map<String, LinkedHashSet<String>> reasons,
-      String group,
-      String sourceReason) {
-    String normalizedGroup = normalize(group);
-    if (normalizedGroup == null) {
-      return;
+  private SubjectContext resolveSubjectContext(
+      Identity identity, Request request, String resourceId, String subject) {
+    String effectiveSubject = effectiveSubject(identity, subject);
+    if (providerSelector == null) {
+      Set<String> membershipCandidates = membershipSubjectCandidates(effectiveSubject);
+      Set<String> groups = groupsForCandidates(membershipCandidates);
+      return new SubjectContext(effectiveSubject, groups, groups, Map.of(), false);
     }
-    visibleGroups.add(normalizedGroup);
-    String reason = normalize(sourceReason);
-    if (reason == null) {
-      return;
+
+    EntitlementProviderSelector.Selection selectedProvider =
+        providerSelector.select(EntitlementsScopeType.SERVICE, resourceId);
+
+    Map<String, String> requestAttributes = new java.util.LinkedHashMap<>();
+    requestAttributes.putAll(request.metadata());
+    requestAttributes.putAll(request.bindings());
+    String operation = trimToNull(request.operationName());
+    if (operation != null) {
+      requestAttributes.put("operationName", operation);
     }
-    reasons.computeIfAbsent(normalizedGroup, ignored -> new LinkedHashSet<>()).add(reason);
+    return selectedProvider.provider().resolve(
+        new ResolveRequest(
+            identity.subject(),
+            identity.delegatedSubject(),
+            EntitlementsScopeType.SERVICE.name(),
+            resourceId,
+            requestAttributes));
   }
 
-  private static boolean subjectMatches(String configuredSubject, String subject, Set<String> groups) {
-    String normalizedConfigured = normalize(configuredSubject);
-    if (normalizedConfigured == null) {
+  private void logPlatformAdminDefault(
+      String resourceId, String operationName, String subject, Decision decision) {
+    if (decision == null || !decision.allowed()) {
+      return;
+    }
+    String reason = trimToNull(decision.reason());
+    if (reason == null || !reason.toUpperCase().startsWith("ALLOW PLATFORM ADMIN DEFAULT")) {
+      return;
+    }
+    LOGGER.info("[Entitlements][SIMPLE][PLATFORM_DEFAULT_ALLOW] scopeType={} scopeId={} operation={} subject={} reason={}", ServiceEntitlements.scopeType(), resourceId, operationName, subject, reason);
+  }
+
+  private void logAbstain(
+      String resourceId,
+      String operationName,
+      String subject,
+      Set<String> subjectCandidates,
+      ServiceEntitlementsSimpleManager.Rules rules,
+      ServiceEntitlementsSimpleManager.RuleSet ruleSet,
+      String reason) {
+    int policyCount = rules == null ? 0 : rules.policyCount();
+    String bindingSummary = summarizeBindings(ruleSet == null ? List.of() : ruleSet.bindingSummaries());
+    LOGGER.warn("[Entitlements][SIMPLE][ABSTAIN] scopeType={} scopeId={} operation={} subject={} subjectCandidates={} policyCount={} bindings={} reason={}", ServiceEntitlements.scopeType(), resourceId, operationName, subject, subjectCandidates, policyCount, bindingSummary, reason);
+  }
+
+  private static boolean isAbstain(Decision decision) {
+    if (decision == null || decision.allowed()) {
       return false;
     }
-    if (normalizedConfigured.startsWith("group:")) {
-      String configuredGroup = normalizeGroup(normalizedConfigured);
-      if (configuredGroup == null || groups == null || groups.isEmpty()) {
+    String reason = trimToNull(decision.reason());
+    return reason != null && reason.toUpperCase().startsWith("ABSTAIN");
+  }
+
+  public boolean isMemberOfGroup(String subject, String groupId) {
+    String normalizedSubject = trimToNull(subject);
+    String normalizedGroup = normalizeGroup(groupId);
+    if (normalizedSubject == null || normalizedGroup == null) {
+      return false;
+    }
+    Set<String> groups = groupsForCandidates(membershipSubjectCandidates(normalizedSubject));
+    if (groups.isEmpty()) {
+      return false;
+    }
+    for (String candidate : groups) {
+      if (normalizedGroup.equals(normalizeGroup(candidate))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  public boolean hasRules(String resourceId) {
+    try {
+      String canonical = ServiceEntitlements.requireAssetResourceId(resourceId);
+      return entitlementsIndexRef.get().containsKey(canonical);
+    } catch (RuntimeException ex) {
+      return false;
+    }
+  }
+
+  public Set<String> groupsForSubject(String subject) {
+    String normalizedSubject = trimToNull(subject);
+    if (normalizedSubject == null) {
+      return Set.of();
+    }
+    return Set.copyOf(groupsForCandidates(membershipSubjectCandidates(normalizedSubject)));
+  }
+
+  private static ServiceEntitlementsSimpleManager.ActionSlot actionSlot(Action action) {
+    if (action == Action.START) {
+      return ServiceEntitlementsSimpleManager.ActionSlot.START;
+    }
+    if (action == Action.READ) {
+      return ServiceEntitlementsSimpleManager.ActionSlot.READ;
+    }
+    return ServiceEntitlementsSimpleManager.ActionSlot.INVOKE;
+  }
+
+  private static MatchResult match(
+      List<ServiceEntitlementsSimpleManager.BindingRule> bindings,
+      Set<String> subjects,
+      Set<String> groups,
+      String operationName) {
+    if (bindings == null || bindings.isEmpty()) {
+      return MatchResult.NO_MATCH;
+    }
+    boolean subjectMatched = false;
+    for (ServiceEntitlementsSimpleManager.BindingRule binding : bindings) {
+      if (binding == null || !subjectMatches(binding, subjects, groups)) {
+        continue;
+      }
+      subjectMatched = true;
+      if (operationMatches(binding.methodsAllow(), operationName)) {
+        return MatchResult.MATCHED;
+      }
+    }
+    return subjectMatched ? MatchResult.SUBJECT_ONLY : MatchResult.NO_MATCH;
+  }
+
+  private static boolean subjectMatches(
+      ServiceEntitlementsSimpleManager.BindingRule binding,
+      Set<String> subjects,
+      Set<String> groups) {
+    if (binding.group()) {
+      if (groups == null || groups.isEmpty()) {
+        return false;
+      }
+      String normalizedPolicyGroup = normalizeGroup(binding.subject());
+      if (normalizedPolicyGroup == null) {
         return false;
       }
       for (String group : groups) {
-        if (Objects.equals(configuredGroup, normalizeGroup(group))) {
+        if (normalizedPolicyGroup.equals(normalizeGroup(group))) {
           return true;
         }
       }
       return false;
     }
-    return Objects.equals(normalizedConfigured, normalize(subject));
+    return subjects != null && subjects.contains(binding.subject());
   }
 
-  private static String entitlementSource(DefinitionEnvelope envelope) {
-    String group = envelope == null ? null : normalize(envelope.group());
-    String name = envelope == null ? null : normalize(envelope.name());
-    if (group == null || name == null) {
-      return "entitlement";
+  private static boolean operationMatches(Set<String> methodsAllow, String operationName) {
+    if (methodsAllow == null || methodsAllow.isEmpty()) {
+      return true;
     }
-    return "entitlement:" + group + "/" + name;
+    return operationName != null && methodsAllow.contains(operationName);
   }
 
-  private static boolean enabled(Boolean value) {
-    return value == null || value.booleanValue();
+  private Set<String> groupsForCandidates(Set<String> subjectCandidates) {
+    if (subjectCandidates == null || subjectCandidates.isEmpty()) {
+      return Set.of();
+    }
+    Map<String, Set<String>> membershipIndex = membershipIndexRef.get();
+    if (membershipIndex == null || membershipIndex.isEmpty()) {
+      return Set.of();
+    }
+    LinkedHashSet<String> groups = new LinkedHashSet<>();
+    for (String candidate : subjectCandidates) {
+      Set<String> candidateGroups = membershipIndex.get(candidate);
+      if (candidateGroups != null && !candidateGroups.isEmpty()) {
+        groups.addAll(candidateGroups);
+      }
+    }
+    return groups.isEmpty() ? Set.of() : Set.copyOf(groups);
+  }
+
+  private static Set<String> directSubjectCandidates(String subject) {
+    String normalized = trimToNull(subject);
+    if (normalized == null) {
+      return Set.of();
+    }
+    return Set.of(normalized);
+  }
+
+  private static Set<String> membershipSubjectCandidates(String subject) {
+    return EntitlementSubjectCandidates.membershipSubjectCandidates(subject);
+  }
+
+  private static String normalizeGroup(String value) {
+    String normalized = trimToNull(value);
+    if (normalized == null) {
+      return null;
+    }
+    if (normalized.startsWith("group:") && normalized.length() > "group:".length()) {
+      return normalized.substring("group:".length());
+    }
+    return normalized;
   }
 
   private static boolean isPlatformAdmin(Set<String> groups) {
@@ -342,66 +326,88 @@ public final class DiscoveryScopeResolver {
     return false;
   }
 
-  private static LinkedHashMap<String, LinkedHashSet<String>> mutableReasons(
-      Map<String, List<String>> source) {
-    LinkedHashMap<String, LinkedHashSet<String>> reasons = new LinkedHashMap<>();
-    if (source == null || source.isEmpty()) {
-      return reasons;
+  private static String summarizeBindings(List<ServiceEntitlementsSimpleManager.BindingSummary> bindings) {
+    if (bindings == null || bindings.isEmpty()) {
+      return "[]";
     }
-    for (Map.Entry<String, List<String>> entry : source.entrySet()) {
-      String group = normalize(entry.getKey());
-      if (group == null) {
-        continue;
+    StringBuilder out = new StringBuilder("[");
+    for (int i = 0; i < bindings.size(); i++) {
+      ServiceEntitlementsSimpleManager.BindingSummary binding = bindings.get(i);
+      if (i > 0) {
+        out.append(", ");
       }
-      LinkedHashSet<String> values = new LinkedHashSet<>();
-      List<String> reasonValues = entry.getValue();
-      if (reasonValues != null) {
-        for (String reason : reasonValues) {
-          String normalizedReason = normalize(reason);
-          if (normalizedReason != null) {
-            values.add(normalizedReason);
-          }
-        }
-      }
-      reasons.put(group, values);
+      out.append("{policyId=")
+          .append(nullToDash(binding.policyId()))
+          .append(", name=")
+          .append(nullToDash(binding.policyName()))
+          .append(", ")
+          .append(binding.group() ? "group=" : "subject=")
+          .append(nullToDash(binding.subject()))
+          .append(", methodsAllow=")
+          .append(binding.methodsAllow().isEmpty() ? "[]" : binding.methodsAllow())
+          .append("}");
     }
-    return reasons;
+    out.append(']');
+    return out.toString();
   }
 
-  private static Map<String, List<String>> immutableReasons(Map<String, LinkedHashSet<String>> source) {
-    if (source == null || source.isEmpty()) {
-      return Map.of();
-    }
-    LinkedHashMap<String, List<String>> reasons = new LinkedHashMap<>();
-    for (Map.Entry<String, LinkedHashSet<String>> entry : source.entrySet()) {
-      if (entry.getValue() == null || entry.getValue().isEmpty()) {
-        reasons.put(entry.getKey(), List.of());
-      } else {
-        reasons.put(entry.getKey(), List.copyOf(entry.getValue()));
-      }
-    }
-    return Map.copyOf(reasons);
+  private static String nullToDash(String value) {
+    return value == null ? "-" : value;
   }
 
-  private static String firstNonBlank(String first, String second) {
-    if (first != null) {
-      return first;
-    }
-    return second;
-  }
-
-  private static String normalizeGroup(String value) {
-    String normalized = normalize(value);
-    if (normalized == null) {
+  private static String trimToNull(String value) {
+    if (value == null) {
       return null;
     }
-    if (normalized.startsWith("group:") && normalized.length() > "group:".length()) {
-      return normalize(normalized.substring("group:".length()));
-    }
-    return normalized;
+    String normalized = value.trim();
+    return normalized.isEmpty() ? null : normalized;
   }
 
-  private static String normalize(String value) {
-    return Strings.trimToNull(value);
+  private static String safeReason(RuntimeException error) {
+    if (error == null) {
+      return "unknown";
+    }
+    String message = trimToNull(error.getMessage());
+    return message == null ? error.getClass().getSimpleName() : message;
+  }
+
+  private static String requireIdentitySubject(Identity identity) {
+    String subject = identity.subject();
+    if (subject == null || subject.isBlank()) {
+      throw new IllegalArgumentException("identity.subject is required");
+    }
+    return subject;
+  }
+
+  private static String effectiveSubject(Identity identity, String subject) {
+    if (identity.delegatedSubject() == null) {
+      return subject;
+    }
+    if (identity.delegatedSubject().isBlank()) {
+      throw new IllegalArgumentException("identity.delegatedSubject is blank");
+    }
+    return identity.delegatedSubject();
+  }
+
+  private enum MatchResult {
+    MATCHED(true, true),
+    SUBJECT_ONLY(false, true),
+    NO_MATCH(false, false);
+
+    private final boolean matched;
+    private final boolean subjectMatched;
+
+    MatchResult(boolean matched, boolean subjectMatched) {
+      this.matched = matched;
+      this.subjectMatched = subjectMatched;
+    }
+
+    private boolean matched() {
+      return matched;
+    }
+
+    private boolean subjectMatched() {
+      return subjectMatched;
+    }
   }
 }
