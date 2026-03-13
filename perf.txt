@@ -1,609 +1,548 @@
-package org.pronzato.fabric.api.connectors.amps;
+package org.pronzato.fabric.api.configs.manager;
 
-import com.crankuptheamps.client.Command;
-import com.crankuptheamps.client.CommandId;
-import com.crankuptheamps.client.HAClient;
-import com.crankuptheamps.client.Message;
-import com.crankuptheamps.client.MessageStream;
-import com.crankuptheamps.client.fields.Field;
-import java.util.Arrays;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.AtomicMoveNotSupportedException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
-import java.nio.file.StandardOpenOption;
+import com.fasterxml.jackson.databind.JsonNode;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
-import java.util.function.Consumer;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfigLayer;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
+import org.pronzato.fabric.api.configs.ConfigManager.ConfigSubscription;
+import org.pronzato.fabric.api.configs.ConfigManager.ConfigUpdate;
+import org.pronzato.fabric.api.configs.ConfigManager.ConfigUpdateListener;
+import org.pronzato.fabric.api.configs.audit.ConfigEventSubscribed;
+import org.pronzato.fabric.api.configs.audit.ConfigEventType;
+import org.pronzato.fabric.api.configs.audit.ConfigEventUnsubscribed;
+import org.pronzato.fabric.api.configs.audit.ConfigEventUpdateCallback;
+import org.pronzato.fabric.api.configs.ConfigManager.ConfigLineage;
+import org.pronzato.fabric.api.configs.model.ConfigResolved;
 import org.pronzato.fabric.api.util.Strings;
 
-public final class AmpsConnection implements AutoCloseable {
-  public static final char SOH = '\u0001';
-  public static final int DEFAULT_BATCH_MAX_MESSAGES = 100;
-  public static final int DEFAULT_BATCH_MAX_BYTES = 1_000_000;
-  public static final long DEFAULT_BATCH_FLUSH_MILLIS = 1_000L;
+final class ConfigManagerImplSubscription {
+  private ConfigManagerImplSubscription() {}
 
-  private final HAClient client;
-  private final CloseHandler closeHandler;
-
-  private AmpsConnection(HAClient client, CloseHandler closeHandler) {
-    this.client = Objects.requireNonNull(client, "client");
-    this.closeHandler = closeHandler == null ? CloseHandler.NOOP : closeHandler;
+  static ConfigSubscription subscribe(
+      ConfigManagerImpl manager, String configId, String layerId, ConfigUpdateListener listener) {
+    ConfigManagerImpl.Resolution resolved = manager.resolveId(configId, layerId);
+    return subscribeInternal(manager, resolved.group(), resolved.configId(), resolved.layerId(), listener);
   }
 
-  public static AmpsConnection shared(HAClient client) {
-    return new AmpsConnection(client, CloseHandler.NOOP);
-  }
+  static ConfigSubscription subscribeInternal(
+      ConfigManagerImpl manager,
+      String group,
+      String configId,
+      String layerId,
+      ConfigUpdateListener listener) {
+    manager.ensureOpen();
+    String requiredGroup = ConfigManagerImpl.required(group, "group");
+    String requiredconfigId = ConfigManagerImpl.required(configId, "configId");
+    String requiredLayerId = Strings.trimToNull(layerId);
+    ConfigUpdateListener requiredListener = Objects.requireNonNull(listener, "listener");
+    ConfigManagerImpl.AuditContext auditContext = manager.captureAuditContext();
+    String subscriptionId = "config-sub-" + ConfigManagerImpl.SUBSCRIPTION_ID.incrementAndGet();
 
-  public static AmpsConnection wrap(HAClient client) {
-    return new AmpsConnection(client, CloseHandler.CLOSE_CLIENT);
-  }
+    ConfigManagerImpl.SubscriptionImpl subscription =
+        new ConfigManagerImpl.SubscriptionImpl(
+            manager,
+            subscriptionId,
+            requiredGroup,
+            requiredconfigId,
+            requiredLayerId,
+            requiredListener,
+            auditContext);
 
-  public HAClient client() {
-    return client;
-  }
-
-  public void publish(String topic, String payload) throws Exception {
-    client.publish(topic, payload);
-  }
-
-  public void publish(String topic, String payload, long ttlMillis) throws Exception {
-    client.publish(topic, payload, Math.toIntExact(ttlMillis));
-  }
-
-  public void publish(String topic, Map<String, Object> fields) throws Exception {
-    client.publish(topic, encodeNvfix(fields));
-  }
-
-  public void publish(String topic, Map<String, Object> fields, long ttlMillis) throws Exception {
-    client.publish(topic, encodeNvfix(fields), Math.toIntExact(ttlMillis));
-  }
-
-  public void publish(String topic, byte[] payload) throws Exception {
-    publish(topic, payload, null);
-  }
-
-  public void publish(String topic, String payload, String options) throws Exception {
-    String normalizedTopic = Strings.requireNonBlank(topic, "topic");
-    String normalizedPayload = payload == null ? "" : payload;
-    String normalizedOptions = Strings.trimToNull(options);
-    if (normalizedOptions == null) {
-      client.publish(normalizedTopic, normalizedPayload);
-      return;
-    }
-    Command command = new Command(Message.Command.Publish);
-    command.setTopic(normalizedTopic);
-    command.setOptions(normalizedOptions);
-    command.setData(normalizedPayload);
-    try (MessageStream ignored = client.execute(command)) {
-      // sync-ack publish path
-    }
-  }
-
-  public void publish(String topic, byte[] payload, String options) throws Exception {
-    String normalizedTopic = Strings.requireNonBlank(topic, "topic");
-    byte[] bytes = payload == null ? new byte[0] : payload;
-    String normalizedOptions = Strings.trimToNull(options);
-    if (normalizedOptions == null) {
-      client.publish(
-          normalizedTopic.getBytes(StandardCharsets.UTF_8),
-          0,
-          normalizedTopic.getBytes(StandardCharsets.UTF_8).length,
-          bytes,
-          0,
-          bytes.length);
-      return;
-    }
-    Command command = new Command(Message.Command.Publish);
-    command.setTopic(normalizedTopic);
-    command.setOptions(normalizedOptions);
-    command.setData(bytes, 0, bytes.length);
-    try (MessageStream ignored = client.execute(command)) {
-      // sync-ack publish path
-    }
-  }
-
-  public Subscription sowAndSubscribe(SubscriptionSpec spec, SubscriptionListener listener)
-      throws Exception {
-    return subscribe(spec, listener);
-  }
-
-  public Subscription subscribe(SubscriptionSpec spec, SubscriptionListener listener)
-      throws Exception {
-    Objects.requireNonNull(spec, "spec");
-    int commandType =
-        spec.sowOnly()
-            ? Message.Command.SOW
-            : spec.sow() ? Message.Command.SOWAndSubscribe : Message.Command.Subscribe;
-    String bookmark = spec.sowOnly() ? null : spec.bookmarkStart();
-    return subscribeInternal(
-        commandType, spec.topic(), spec.options(), spec.filter(), bookmark, spec.bookmarkFile(), listener);
-  }
-
-  public Subscription subscribe(SubscriptionSpec spec, Consumer<AmpsMessage> consumer)
-      throws Exception {
-    Objects.requireNonNull(consumer, "consumer");
-    return subscribe(spec, (SubscriptionListener) consumer::accept);
-  }
-
-  public Subscription sowAndSubscribe(
-      String topic, String options, String filter, SubscriptionListener listener) throws Exception {
-    return subscribeInternal(
-        Message.Command.SOWAndSubscribe, topic, options, filter, null, null, listener);
-  }
-
-  public Subscription subscribe(
-      String topic, String options, String filter, SubscriptionListener listener) throws Exception {
-    return subscribeInternal(Message.Command.Subscribe, topic, options, filter, null, null, listener);
-  }
-
-  @Override
-  public void close() {
-    try {
-      closeHandler.close(client);
-    } catch (Exception ignore) {
-    }
-  }
-
-  public static String ensureTrailingNewline(String s) {
-    Objects.requireNonNull(s, "s");
-    return s.endsWith("\n") ? s : s + '\n';
-  }
-
-  private static String encodeNvfix(Map<String, Object> fields) {
-    if (fields == null || fields.isEmpty()) {
-      throw new IllegalArgumentException("fields is required");
-    }
-    StringBuilder builder = new StringBuilder();
-    for (Map.Entry<String, Object> entry : new LinkedHashMap<>(fields).entrySet()) {
-      String key = Strings.trimToNull(entry.getKey());
-      if (key == null) {
-        throw new IllegalArgumentException("nvfix key is required");
-      }
-      if (key.indexOf('=') >= 0) {
-        throw new IllegalArgumentException("nvfix key contains '=': " + key);
-      }
-      if (key.indexOf(SOH) >= 0) {
-        throw new IllegalArgumentException("nvfix key contains SOH: " + key);
-      }
-      Object rawValue = entry.getValue();
-      if (rawValue == null) {
-        continue;
-      }
-      String rendered = String.valueOf(rawValue);
-      if (rendered.indexOf(SOH) >= 0) {
-        throw new IllegalArgumentException("nvfix value contains SOH for key: " + key);
-      }
-      builder.append(key).append('=').append(rendered).append(SOH);
-    }
-    if (builder.isEmpty()) {
-      throw new IllegalArgumentException("fields must contain at least one non-null value");
-    }
-    return builder.toString();
-  }
-
-  private Subscription subscribeInternal(
-      int commandType,
-      String topic,
-      String options,
-      String filter,
-      String bookmarkStart,
-      Path bookmarkFile,
-      SubscriptionListener listener)
-      throws Exception {
-    Objects.requireNonNull(listener, "listener");
-    String normalizedTopic = Strings.requireNonBlank(topic, "topic");
-    Command command = new Command(commandType);
-    command.setTopic(normalizedTopic);
-    String normalizedOptions = Strings.trimToNull(options);
-    if (normalizedOptions != null) {
-      command.setOptions(normalizedOptions);
-    }
-    String normalizedFilter = Strings.trimToNull(filter);
-    if (normalizedFilter != null) {
-      command.setFilter(normalizedFilter);
-    }
-    String normalizedBookmark = Strings.trimToNull(bookmarkStart);
-    if (normalizedBookmark != null) {
-      command.setBookmark(normalizedBookmark);
-    }
-    CommandId commandId =
-        client.executeAsync(
-            command,
-            message -> {
-              if (message == null) {
+    AutoCloseable cacheHandle =
+        manager.configView.onUpsert(
+            DefinitionType.CONFIG_LAYER,
+            (key, definition) -> {
+              if (subscription.closed.get()) {
                 return;
               }
-              listener.onMessage(new AmpsMessage(message));
+              if (!(definition instanceof DefinitionConfigLayer config)) {
+                ConfigManagerImpl.LOGGER.debug(
+                    "[ConfigManager][Ignored] reason=definition-type type={} key={}",
+                    key == null ? null : key.type(),
+                    key);
+                return;
+              }
+              ConfigManagerImpl.ParsedLayerIdentity identity =
+                  manager.parseLayerIdentity(config, key == null ? null : key.group());
+              if (identity == null) {
+                ConfigManagerImpl.LOGGER.debug(
+                    "[ConfigManager][Ignored] reason=identity-parse key={}", key);
+                return;
+              }
+              if (!requiredGroup.equals(identity.group())
+                  || !requiredconfigId.equals(identity.configId())) {
+                ConfigManagerImpl.LOGGER.debug(
+                    "[ConfigManager][Ignored] reason=filter-mismatch key={} configId={} layerId={}",
+                    key,
+                    identity.configId(),
+                    identity.layerId());
+                return;
+              }
+              if (requiredLayerId != null) {
+                if (!layerAffectsTarget(
+                    manager,
+                    requiredGroup,
+                    requiredconfigId,
+                    requiredLayerId,
+                    identity.layerId())) {
+                  ConfigManagerImpl.LOGGER.debug(
+                      "[ConfigManager][Ignored] reason=layer-not-in-chain key={} changedLayerId={} targetLayerId={}",
+                      key,
+                      identity.layerId(),
+                      requiredLayerId);
+                  return;
+                }
+                ConfigManagerImpl.LayerEntry targetLayer =
+                    manager.requireLayer(requiredGroup, requiredconfigId, requiredLayerId);
+                emitResolvedWithReschedule(
+                    manager,
+                    subscription,
+                    targetLayer,
+                    Instant.now(),
+                    ConfigManagerImpl.CALLBACK_REASON_RESOLVED_CHAIN_CHANGE);
+                return;
+              }
+              emitWithReschedule(
+                  manager,
+                  subscription,
+                  config,
+                  identity,
+                  Instant.now(),
+                  ConfigManagerImpl.CALLBACK_REASON_UPSERT);
             });
-    return new Subscription(
-        client, commandId, commandType, normalizedTopic, normalizedOptions, normalizedFilter);
+
+    subscription.cacheHandle = cacheHandle;
+    manager.subscriptions.add(subscription);
+
+    List<ConfigManagerImpl.LayerEntry> initialLayers =
+        manager.sortLayers(manager.findConfigLayersOrEmpty(requiredGroup, requiredconfigId));
+    if (requiredLayerId != null) {
+      initialLayers =
+          initialLayers.stream()
+              .filter(entry -> requiredLayerId.equals(entry.identity().layerId()))
+              .toList();
+    }
+    ConfigManagerImpl.LOGGER.info(
+        "[ConfigManager][Subscribe] group={} configId={} layerId={} initialLayers={}",
+        requiredGroup,
+        requiredconfigId,
+        requiredLayerId,
+        initialLayers.size());
+    Instant subscribedAt = Instant.now();
+    ConfigLineage subscribedLineage =
+        manager.resolveLineage(requiredGroup, requiredconfigId, requiredLayerId, subscribedAt);
+    JsonNode subscribedChangedPayload = null;
+    if (!initialLayers.isEmpty() && (requiredLayerId != null || initialLayers.size() == 1)) {
+      subscribedChangedPayload =
+          manager.deepCopy(manager.resolveDeclaredAt(initialLayers.getFirst().definition(), subscribedAt));
+    }
+    manager.publishAudit(
+        new ConfigEventSubscribed(
+            manager.envelope(
+                ConfigEventType.CONFIG_SUBSCRIBED,
+                requiredGroup,
+                requiredconfigId,
+                requiredLayerId,
+                manager.schemaKey(initialLayers.isEmpty() ? null : initialLayers.getFirst().definition()),
+                auditContext,
+                subscribedAt),
+            subscription.subscriptionId,
+            requiredLayerId,
+            subscribedLineage,
+            subscribedChangedPayload));
+    for (ConfigManagerImpl.LayerEntry layer : initialLayers) {
+      if (requiredLayerId != null) {
+        emitResolvedWithReschedule(
+            manager, subscription, layer, Instant.now(), ConfigManagerImpl.CALLBACK_REASON_INITIAL);
+      } else {
+        emitWithReschedule(
+            manager,
+            subscription,
+            layer.definition(),
+            layer.identity(),
+            Instant.now(),
+            ConfigManagerImpl.CALLBACK_REASON_INITIAL);
+      }
+    }
+    return subscription;
   }
 
-  public static final class Subscription implements AutoCloseable {
-    private final HAClient client;
-    private final CommandId commandId;
-    private final int commandType;
-    private final String topic;
-    private final String options;
-    private volatile String filter;
-    private volatile boolean closed;
+  static void emitWithReschedule(
+      ConfigManagerImpl manager,
+      ConfigManagerImpl.SubscriptionImpl subscription,
+      DefinitionConfigLayer config,
+      ConfigManagerImpl.ParsedLayerIdentity identity,
+      Instant asOfUtc,
+      String callbackReason) {
+    emitIfChanged(manager, subscription, config, identity, asOfUtc, callbackReason);
+    scheduleTransitions(manager, subscription, config, identity);
+  }
 
-    private Subscription(
-        HAClient client,
-        CommandId commandId,
-        int commandType,
-        String topic,
-        String options,
-        String filter) {
-      this.client = client;
-      this.commandId = commandId;
-      this.commandType = commandType;
-      this.topic = topic;
-      this.options = options;
-      this.filter = filter;
+  static void emitResolvedWithReschedule(
+      ConfigManagerImpl manager,
+      ConfigManagerImpl.SubscriptionImpl subscription,
+      ConfigManagerImpl.LayerEntry targetLayer,
+      Instant asOfUtc,
+      String callbackReason) {
+    if (targetLayer == null) {
+      return;
     }
+    emitIfChanged(
+        manager, subscription, targetLayer.definition(), targetLayer.identity(), asOfUtc, callbackReason);
+    scheduleResolvedTransitions(
+        manager, subscription, targetLayer, asOfUtc == null ? Instant.now() : asOfUtc);
+  }
 
-    @Override
-    public void close() {
-      closed = true;
-      if (client == null || commandId == null) {
+  static void emitIfChanged(
+      ConfigManagerImpl manager,
+      ConfigManagerImpl.SubscriptionImpl subscription,
+      DefinitionConfigLayer config,
+      ConfigManagerImpl.ParsedLayerIdentity identity,
+      Instant asOfUtc,
+      String callbackReason) {
+    if (subscription.closed.get()) {
+      return;
+    }
+    try {
+      ConfigManagerImpl.UpdateSnapshot snapshot = manager.toUpdateSnapshotAt(config, identity, asOfUtc);
+      ConfigUpdate update = snapshot.update();
+      String dedupeKey = dedupeKey(update);
+      String last = subscription.lastSeenByLayer.put(identity.layerId(), dedupeKey);
+      if (Objects.equals(last, dedupeKey)) {
         return;
       }
+      dispatch(manager, subscription, snapshot, callbackReason, last, dedupeKey);
+    } catch (Exception ex) {
+      ConfigManagerImpl.LOGGER.warn(
+          "[ConfigManager][EmitIgnored] group={} configId={} layerId={} message={}",
+          identity.group(),
+          identity.configId(),
+          identity.layerId(),
+          ex.getMessage(),
+          ex);
+    }
+  }
+
+  static void scheduleTransitions(
+      ConfigManagerImpl manager,
+      ConfigManagerImpl.SubscriptionImpl subscription,
+      DefinitionConfigLayer config,
+      ConfigManagerImpl.ParsedLayerIdentity identity) {
+    if (subscription.closed.get()) {
+      return;
+    }
+    Instant now = Instant.now();
+    List<Instant> transitions = transitionTimesAfter(config, now);
+    subscription.cancelScheduled(identity.layerId());
+    if (transitions.isEmpty()) {
+      return;
+    }
+    for (Instant transition : transitions) {
+      long delayMillis = Math.max(0L, transition.toEpochMilli() - now.toEpochMilli());
       try {
-        client.unsubscribe(commandId);
-      } catch (Exception ignore) {
+        ScheduledFuture<?> future =
+            manager.scheduleExecutor.schedule(
+                () -> onScheduledTransition(manager, subscription, identity, transition),
+                delayMillis,
+                TimeUnit.MILLISECONDS);
+        subscription.addScheduled(identity.layerId(), future);
+      } catch (RejectedExecutionException ignore) {
+        // Session/client is closing; ignore.
       }
+    }
+  }
+
+  static void scheduleResolvedTransitions(
+      ConfigManagerImpl manager,
+      ConfigManagerImpl.SubscriptionImpl subscription,
+      ConfigManagerImpl.LayerEntry targetLayer,
+      Instant now) {
+    if (subscription.closed.get() || targetLayer == null) {
+      return;
+    }
+    ConfigManagerImpl.ParsedLayerIdentity identity = targetLayer.identity();
+    List<Instant> transitions = transitionTimesAfterResolvedChain(manager, targetLayer, now);
+    subscription.cancelScheduled(identity.layerId());
+    if (transitions.isEmpty()) {
+      return;
+    }
+    for (Instant transition : transitions) {
+      long delayMillis = Math.max(0L, transition.toEpochMilli() - now.toEpochMilli());
       try {
-        client.removeMessageHandler(commandId);
-      } catch (Exception ignore) {
-      }
-    }
-
-    public void replaceFilter(String nextFilter) throws Exception {
-      if (client == null || commandId == null) {
-        throw new IllegalStateException("Subscription handle is invalid");
-      }
-      if (closed) {
-        throw new IllegalStateException("Subscription is closed");
-      }
-      if (!isReplaceSupported(commandType)) {
-        throw new IllegalStateException(
-            "Subscription replacement is unsupported for command type=" + commandType);
-      }
-      Command command = new Command(commandType);
-      command.setTopic(topic);
-      String replaceOptions = withReplaceOption(options);
-      if (replaceOptions != null) {
-        command.setOptions(replaceOptions);
-      }
-      String normalizedFilter = Strings.trimToNull(nextFilter);
-      if (normalizedFilter != null) {
-        command.setFilter(normalizedFilter);
-      }
-      command.setSubId(commandId);
-      client.executeAsync(command, null);
-      filter = normalizedFilter;
-    }
-
-    private static boolean isReplaceSupported(int commandType) {
-      return commandType == Message.Command.Subscribe
-          || commandType == Message.Command.SOWAndSubscribe
-          || commandType == Message.Command.DeltaSubscribe
-          || commandType == Message.Command.SOWAndDeltaSubscribe;
-    }
-
-    private static String withReplaceOption(String options) {
-      LinkedHashSet<String> normalized = new LinkedHashSet<>();
-      String source = Strings.trimToNull(options);
-      if (source != null) {
-        for (String token : source.split(",")) {
-          String trimmed = Strings.trimToNull(token);
-          if (trimmed != null) {
-            normalized.add(trimmed);
-          }
-        }
-      }
-      boolean hasReplace = false;
-      for (String token : normalized) {
-        if ("replace".equalsIgnoreCase(token)) {
-          hasReplace = true;
-          break;
-        }
-      }
-      if (!hasReplace) {
-        normalized.add("replace");
-      }
-      if (normalized.isEmpty()) {
-        return null;
-      }
-      return String.join(",", normalized);
-    }
-  }
-
-  @FunctionalInterface
-  public interface SubscriptionListener {
-    void onMessage(AmpsMessage message);
-  }
-
-  public record SubscriptionSpec(
-      boolean sow,
-      boolean sowOnly,
-      String topic,
-      String options,
-      String filter,
-      String bookmarkStart,
-      Path bookmarkFile
-  ) {
-    public SubscriptionSpec(boolean sow, String topic, String options, String filter) {
-      this(sow, false, topic, options, filter, null, null);
-    }
-
-    public SubscriptionSpec(boolean sow, boolean sowOnly, String topic, String options, String filter) {
-      this(sow, sowOnly, topic, options, filter, null, null);
-    }
-
-    public SubscriptionSpec {
-      if (sowOnly) {
-        sow = false;
-      }
-      topic = Strings.requireNonBlank(topic, "topic");
-      options = Strings.trimToNull(options);
-      filter = Strings.trimToNull(filter);
-      bookmarkStart = Strings.trimToNull(bookmarkStart);
-    }
-
-    public static Builder builder() {
-      return new Builder();
-    }
-
-    public static final class Builder {
-      private boolean sow;
-      private boolean sowOnly;
-      private String topic;
-      private String options;
-      private String filter;
-      private String bookmarkStart;
-      private Path bookmarkFile;
-
-      private Builder() {}
-
-      public Builder withSowSubscribe(boolean value) {
-        sow = value;
-        if (value) {
-          sowOnly = false;
-        }
-        return this;
-      }
-
-      public Builder withSow(boolean value) {
-        sowOnly = value;
-        if (value) {
-          sow = false;
-        }
-        return this;
-      }
-
-      public Builder withSow() {
-        return withSow(true);
-      }
-
-      public Builder withSow(Boolean value) {
-        return withSow(Boolean.TRUE.equals(value));
-      }
-
-      public Builder withSowSubscribe(Boolean value) {
-        sow = Boolean.TRUE.equals(value);
-        if (Boolean.TRUE.equals(value)) {
-          sowOnly = false;
-        }
-        return this;
-      }
-
-      public Builder withTopic(String value) {
-        topic = value;
-        return this;
-      }
-
-      public Builder withOptions(String value) {
-        options = value;
-        return this;
-      }
-
-      public Builder withFilter(String value) {
-        filter = value;
-        return this;
-      }
-
-      public Builder withBookmarkStart(String value) {
-        bookmarkStart = value;
-        return this;
-      }
-
-      public Builder withBookmarkFile(Path value) {
-        bookmarkFile = value;
-        return this;
-      }
-
-      public Builder withBookmarkFile(String value) {
-        String normalized = Strings.trimToNull(value);
-        bookmarkFile = normalized == null ? null : Path.of(normalized);
-        return this;
-      }
-
-      public SubscriptionSpec build() {
-        return new SubscriptionSpec(
-            sow,
-            sowOnly,
-            topic,
-            options,
-            filter,
-            bookmarkStart,
-            bookmarkFile);
+        ScheduledFuture<?> future =
+            manager.scheduleExecutor.schedule(
+                () -> onScheduledTransition(manager, subscription, identity, transition),
+                delayMillis,
+                TimeUnit.MILLISECONDS);
+        subscription.addScheduled(identity.layerId(), future);
+      } catch (RejectedExecutionException ignore) {
+        // Session/client is closing; ignore.
       }
     }
   }
 
-  public enum BatchMode {
-    STREAM,
-    BATCH
-  }
-
-  public record BatchSpec(
-      BatchMode mode,
-      int batchMaxMessages,
-      int batchMaxBytes,
-      long batchFlushMillis
-  ) {
-    public BatchSpec {
-      mode = mode == null ? BatchMode.STREAM : mode;
-      batchMaxMessages =
-          batchMaxMessages <= 0 ? DEFAULT_BATCH_MAX_MESSAGES : batchMaxMessages;
-      batchMaxBytes = batchMaxBytes <= 0 ? DEFAULT_BATCH_MAX_BYTES : batchMaxBytes;
-      batchFlushMillis =
-          batchFlushMillis <= 0L ? DEFAULT_BATCH_FLUSH_MILLIS : batchFlushMillis;
+  static void onScheduledTransition(
+      ConfigManagerImpl manager,
+      ConfigManagerImpl.SubscriptionImpl subscription,
+      ConfigManagerImpl.ParsedLayerIdentity identity,
+      Instant transitionUtc) {
+    if (subscription.closed.get() || manager.closed.get()) {
+      return;
     }
-
-    public static BatchSpec defaults() {
-      return new BatchSpec(
-          BatchMode.STREAM,
-          DEFAULT_BATCH_MAX_MESSAGES,
-          DEFAULT_BATCH_MAX_BYTES,
-          DEFAULT_BATCH_FLUSH_MILLIS);
+    try {
+      ConfigManagerImpl.LayerEntry layer =
+          manager.requireLayer(identity.group(), identity.configId(), identity.layerId());
+      emitIfChanged(
+          manager,
+          subscription,
+          layer.definition(),
+          layer.identity(),
+          transitionUtc,
+          ConfigManagerImpl.CALLBACK_REASON_SCHEDULED);
+    } catch (IllegalArgumentException ignored) {
+      // Config/layer disappeared between scheduling and execution; ignore.
+    } finally {
+      subscription.pruneScheduled(identity.layerId());
     }
   }
 
-  public static final class AmpsMessage {
-    private final Message raw;
-
-    private AmpsMessage(Message raw) {
-      this.raw = Objects.requireNonNull(raw, "raw");
+  static void dispatch(
+      ConfigManagerImpl manager,
+      ConfigManagerImpl.SubscriptionImpl subscription,
+      ConfigManagerImpl.UpdateSnapshot snapshot,
+      String callbackReason,
+      String previousHash,
+      String newHash) {
+    ConfigUpdate update = snapshot.update();
+    if (subscription.closed.get() || manager.closed.get()) {
+      return;
     }
-
-    public String topic() {
-      return raw.getTopic();
+    try {
+      manager.callbackExecutor.execute(
+          () -> {
+            if (subscription.closed.get() || manager.closed.get()) {
+              return;
+            }
+            try {
+              manager.publishAudit(
+                  new ConfigEventUpdateCallback(
+                      manager.envelope(
+                          ConfigEventType.CONFIG_UPDATE_CALLBACK,
+                          update.group(),
+                          update.configName(),
+                          update.layerId(),
+                          update.schemaKey(),
+                          subscription.auditContext,
+                          Instant.now()),
+                      subscription.subscriptionId,
+                      callbackReason,
+                      previousHash,
+                      newHash,
+                      update.configId(),
+                      update.effectiveConfigId(),
+                      update.updatedTimeUtc(),
+                      snapshot.lineage(),
+                      snapshot.changedPayload()));
+              subscription.callbackCount.incrementAndGet();
+              subscription.listener.onUpdate(update);
+            } catch (Exception ex) {
+              ConfigManagerImpl.LOGGER.warn(
+                  "[ConfigManager][CallbackFailed] group={} configId={} layerId={} message={}",
+                  update.group(),
+                  update.configName(),
+                  update.layerId(),
+                  ex.getMessage(),
+                  ex);
+            }
+          });
+    } catch (RejectedExecutionException ignore) {
+      // Session/client is closing; ignore.
     }
+  }
 
-    public String data() {
-      return raw.getData();
+  static boolean layerAffectsTarget(
+      ConfigManagerImpl manager,
+      String group,
+      String configId,
+      String targetLayerId,
+      String changedLayerId) {
+    if (targetLayerId == null || changedLayerId == null) {
+      return false;
     }
-
-    public byte[] dataBytes() {
-      Field data = raw.getDataRaw();
-      if (data == null || data.isNull() || data.buffer == null || data.length <= 0) {
-        String fallback = raw.getData();
-        return fallback == null ? null : fallback.getBytes(StandardCharsets.UTF_8);
+    if (targetLayerId.equals(changedLayerId)) {
+      return true;
+    }
+    try {
+      if (manager.resolver == null) {
+        return false;
       }
-      return Arrays.copyOfRange(data.buffer, data.position, data.position + data.length);
-    }
-
-    public String bookmark() {
-      return raw.getBookmark();
-    }
-
-    public String options() {
-      return raw.getOptions();
-    }
-
-    public Message raw() {
-      return raw;
+      ConfigResolved resolved = manager.resolver.resolve(group, configId, targetLayerId, Instant.now());
+      ConfigLineage lineage = resolved == null ? null : resolved.lineage();
+      List<String> resolvedLayers = lineage == null ? List.of() : lineage.resolvedLayers();
+      return resolvedLayers.contains(changedLayerId);
+    } catch (RuntimeException ex) {
+      ConfigManagerImpl.LOGGER.debug(
+          "[ConfigManager][ChainIgnored] group={} configId={} targetLayerId={} changedLayerId={} message={}",
+          group,
+          configId,
+          targetLayerId,
+          changedLayerId,
+          ex.getMessage());
+      return false;
     }
   }
 
-  @FunctionalInterface
-  private interface CloseHandler {
-    CloseHandler NOOP = client -> {};
-
-    CloseHandler CLOSE_CLIENT =
-        client -> {
-          try {
-            client.disconnect();
-          } catch (Exception ignore) {
-          }
-          client.close();
-        };
-
-    void close(HAClient client) throws Exception;
-  }
-
-  public static final class BookmarkStoreLocal {
-    private BookmarkStoreLocal() {}
-
-    public static Path defaultBookmarkPath(String group, String subscriptionName) {
-      String normalizedGroup = Strings.requireNonBlank(group, "group");
-      String normalizedSubscription = Strings.requireNonBlank(subscriptionName, "subscriptionName");
-      return Path.of("data", "lite", "bookmarks", normalizedGroup, normalizedSubscription + ".bookmark");
+  static List<Instant> transitionTimesAfterResolvedChain(
+      ConfigManagerImpl manager, ConfigManagerImpl.LayerEntry targetLayer, Instant now) {
+    if (targetLayer == null) {
+      return List.of();
     }
-
-    public static String subscriptionKey(String ingestName, String connectionName, String topic) {
-      String normalizedIngest = sanitizeToken(Strings.requireNonBlank(ingestName, "ingestName"));
-      String normalizedConnection =
-          sanitizeToken(Strings.requireNonBlank(connectionName, "connectionName"));
-      String normalizedTopic = sanitizeToken(Strings.requireNonBlank(topic, "topic"));
-      return normalizedIngest + "__" + normalizedConnection + "__" + normalizedTopic;
+    if (manager.resolver == null) {
+      return transitionTimesAfter(targetLayer.definition(), now);
     }
-
-    public static Optional<String> load(Path path) {
-      Objects.requireNonNull(path, "path");
-      try {
-        if (!Files.exists(path)) {
-          return Optional.empty();
-        }
-        String value = Strings.trimToNull(Files.readString(path, StandardCharsets.UTF_8));
-        return value == null ? Optional.empty() : Optional.of(value);
-      } catch (Exception ex) {
-        throw new IllegalStateException("Failed to load bookmark file: " + path, ex);
+    ConfigResolved resolved =
+        manager.resolver.resolve(
+            targetLayer.identity().group(),
+            targetLayer.identity().configId(),
+            targetLayer.identity().layerId(),
+            now);
+    List<String> resolvedLayers =
+        resolved == null || resolved.lineage() == null || resolved.lineage().resolvedLayers() == null
+            ? List.of()
+            : resolved.lineage().resolvedLayers();
+    if (resolvedLayers.isEmpty()) {
+      return List.of();
+    }
+    Map<String, ConfigManagerImpl.LayerEntry> byLayerId = new LinkedHashMap<>();
+    for (ConfigManagerImpl.LayerEntry entry :
+        manager.findConfigLayers(targetLayer.identity().group(), targetLayer.identity().configId())) {
+      byLayerId.put(entry.identity().layerId(), entry);
+    }
+    List<Instant> times = new ArrayList<>();
+    for (String layerId : resolvedLayers) {
+      ConfigManagerImpl.LayerEntry entry = byLayerId.get(layerId);
+      if (entry == null) {
+        continue;
+      }
+      times.addAll(transitionTimesAfter(entry.definition(), now));
+    }
+    if (times.isEmpty()) {
+      return List.of();
+    }
+    times.sort(Instant::compareTo);
+    List<Instant> distinct = new ArrayList<>(times.size());
+    Instant last = null;
+    for (Instant time : times) {
+      if (!Objects.equals(last, time)) {
+        distinct.add(time);
+        last = time;
       }
     }
+    return List.copyOf(distinct);
+  }
 
-    public static void saveAtomic(Path path, String bookmark) {
-      Objects.requireNonNull(path, "path");
-      String normalizedBookmark = Strings.requireNonBlank(bookmark, "bookmark");
-      try {
-        Path parent = path.getParent();
-        if (parent != null) {
-          Files.createDirectories(parent);
-        }
-        Path temp =
-            path.resolveSibling(path.getFileName().toString() + ".tmp." + Thread.currentThread().getId());
-        Files.writeString(
-            temp,
-            normalizedBookmark,
-            StandardCharsets.UTF_8,
-            StandardOpenOption.CREATE,
-            StandardOpenOption.TRUNCATE_EXISTING,
-            StandardOpenOption.WRITE);
+  static List<Instant> transitionTimesAfter(DefinitionConfigLayer definition, Instant now) {
+    DefinitionConfigLayer payload =
+        definition == null  ? null : definition;
+    List<DefinitionConfigLayer.Effective> effectiveEntries = payload == null ? null : payload.effective();
+    if (effectiveEntries == null || effectiveEntries.isEmpty()) {
+      return List.of();
+    }
+    List<Instant> times = new ArrayList<>();
+    for (DefinitionConfigLayer.Effective entry : effectiveEntries) {
+      if (entry == null) {
+        continue;
+      }
+      String effectiveTimeUtc = Strings.trimToNull(entry.effectiveTimeUtc());
+      if (effectiveTimeUtc != null) {
         try {
-          Files.move(
-              temp,
-              path,
-              StandardCopyOption.REPLACE_EXISTING,
-              StandardCopyOption.ATOMIC_MOVE);
-        } catch (AtomicMoveNotSupportedException ex) {
-          Files.move(temp, path, StandardCopyOption.REPLACE_EXISTING);
+          Instant effectiveAt = Instant.parse(effectiveTimeUtc);
+          if (effectiveAt.isAfter(now)) {
+            times.add(effectiveAt);
+          }
+        } catch (Exception ex) {
+          ConfigManagerImpl.LOGGER.debug(
+              "[ConfigManager][ScheduleIgnored] reason=invalid-effectiveTimeUtc value={}",
+              effectiveTimeUtc);
         }
-      } catch (Exception ex) {
-        throw new IllegalStateException("Failed to persist bookmark file: " + path, ex);
+      }
+      String expiresAtUtc = Strings.trimToNull(entry.expiresAtUtc());
+      if (expiresAtUtc != null) {
+        try {
+          Instant expiresAt = Instant.parse(expiresAtUtc);
+          if (expiresAt.isAfter(now)) {
+            times.add(expiresAt);
+          }
+        } catch (Exception ex) {
+          ConfigManagerImpl.LOGGER.debug(
+              "[ConfigManager][ScheduleIgnored] reason=invalid-expiresAtUtc value={}",
+              expiresAtUtc);
+        }
       }
     }
+    if (times.isEmpty()) {
+      return List.of();
+    }
+    times.sort(Instant::compareTo);
+    List<Instant> distinct = new ArrayList<>(times.size());
+    Instant last = null;
+    for (Instant time : times) {
+      if (!Objects.equals(last, time)) {
+        distinct.add(time);
+        last = time;
+      }
+    }
+    return List.copyOf(distinct);
+  }
 
-    private static String sanitizeToken(String value) {
-      StringBuilder normalized = new StringBuilder(value.length());
-      for (int index = 0; index < value.length(); index++) {
-        char current = value.charAt(index);
-        if (Character.isLetterOrDigit(current) || current == '-' || current == '_' || current == '.') {
-          normalized.append(current);
-          continue;
-        }
-        normalized.append('_');
-      }
-      return normalized.toString();
+  static String dedupeKey(ConfigUpdate update) {
+    JsonNode declared = update.declared();
+    return declared == null ? "" : ConfigManagerImplAudit.hashJson(ConfigManagerImpl.HASH_MAPPER, declared);
+  }
+
+  static void closeSubscription(ConfigManagerImpl.SubscriptionImpl subscription) {
+    if (!subscription.closed.compareAndSet(false, true)) {
+      return;
     }
+    ConfigManagerImpl manager = subscription.manager;
+    manager.subscriptions.remove(subscription);
+    AutoCloseable handle = subscription.cacheHandle;
+    subscription.cacheHandle = null;
+    if (handle != null) {
+      try {
+        handle.close();
+      } catch (Exception ignore) {
+      }
+    }
+    for (String layer : subscription.scheduledByLayer.keySet()) {
+      subscription.cancelScheduled(layer);
+    }
+    manager.publishAudit(
+        new ConfigEventUnsubscribed(
+            manager.envelope(
+                ConfigEventType.CONFIG_UNSUBSCRIBED,
+                subscription.group,
+                subscription.configId,
+                subscription.layerId,
+                null,
+                subscription.auditContext,
+                Instant.now()),
+            subscription.subscriptionId));
+    ConfigManagerImpl.LOGGER.info(
+        "[ConfigManager][Unsubscribe] subscriptionId={} group={} configId={} layerId={} callbacks={}",
+        subscription.subscriptionId,
+        subscription.group,
+        subscription.configId,
+        subscription.layerId,
+        subscription.callbackCount.get());
   }
 }
+
