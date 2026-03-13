@@ -1,1 +1,680 @@
-null
+package org.pronzato.fabric.api.util;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.util.Objects;
+
+public final class Bytes {
+  private static final int DEFAULT_DIRECT_OUTPUT_CAPACITY = 8 * 1024;
+  private static final int MAX_DIRECT_OUTPUT_CAPACITY = Integer.MAX_VALUE - 8;
+
+  private Bytes() {}
+
+  public static ByteBuffer toDirectBuffer(byte[] bytes) {
+    Objects.requireNonNull(bytes, "bytes");
+    ByteBuffer direct = ByteBuffer.allocateDirect(bytes.length);
+    direct.put(bytes);
+    direct.flip();
+    assert direct.isDirect();
+    assert direct.position() == 0;
+    assert direct.limit() == bytes.length;
+    return direct;
+  }
+
+  public static ByteBuffer toDirectBuffer(ByteBuffer source) {
+    Objects.requireNonNull(source, "source");
+    ByteBuffer copy = source.asReadOnlyBuffer();
+    int expectedLimit = copy.remaining();
+    ByteBuffer direct = ByteBuffer.allocateDirect(copy.remaining());
+    direct.put(copy);
+    direct.flip();
+    assert direct.isDirect();
+    assert direct.position() == 0;
+    assert direct.limit() == expectedLimit;
+    return direct;
+  }
+
+  public static byte[] toByteArray(ByteBuffer buffer) {
+    Objects.requireNonNull(buffer, "buffer");
+    ByteBuffer copy = buffer.asReadOnlyBuffer();
+    byte[] bytes = new byte[copy.remaining()];
+    copy.get(bytes);
+    return bytes;
+  }
+
+  public static InputStream asInputStream(ByteBuffer buffer) {
+    Objects.requireNonNull(buffer, "buffer");
+    return new ByteBufferInputStream(buffer.asReadOnlyBuffer());
+  }
+
+  public static DirectBufferOutputStream directOutputStream() {
+    return new DirectBufferOutputStream(DEFAULT_DIRECT_OUTPUT_CAPACITY);
+  }
+
+  public static DirectBufferOutputStream directOutputStream(int initialCapacity) {
+    return new DirectBufferOutputStream(initialCapacity);
+  }
+
+  public static final class DirectBufferOutputStream extends OutputStream {
+    private ByteBuffer buffer;
+
+    private DirectBufferOutputStream(int initialCapacity) {
+      if (initialCapacity <= 0) {
+        throw new IllegalArgumentException("initialCapacity must be > 0");
+      }
+      this.buffer = ByteBuffer.allocateDirect(initialCapacity);
+    }
+
+    @Override
+    public void write(int value) throws IOException {
+      ensureRemaining(1);
+      buffer.put((byte) value);
+    }
+
+    @Override
+    public void write(byte[] bytes, int offset, int length) throws IOException {
+      Objects.requireNonNull(bytes, "bytes");
+      if (offset < 0 || length < 0 || length > bytes.length - offset) {
+        throw new IndexOutOfBoundsException(
+            "offset=" + offset + ", length=" + length + ", arrayLength=" + bytes.length);
+      }
+      if (length == 0) {
+        return;
+      }
+      ensureRemaining(length);
+      buffer.put(bytes, offset, length);
+    }
+
+    public ByteBuffer toDirectByteBuffer() {
+      int expectedSize = buffer.position();
+      ByteBuffer view = buffer.asReadOnlyBuffer();
+      view.flip();
+      assert view.isDirect();
+      assert view.position() == 0;
+      assert view.limit() == expectedSize;
+      return view;
+    }
+
+    public int size() {
+      return buffer.position();
+    }
+
+    private void ensureRemaining(int additionalBytes) throws IOException {
+      if (additionalBytes <= buffer.remaining()) {
+        return;
+      }
+      int required;
+      try {
+        required = Math.addExact(buffer.position(), additionalBytes);
+      } catch (ArithmeticException ex) {
+        throw new IOException("Direct IPC buffer size overflow", ex);
+      }
+      int expanded = buffer.capacity();
+      while (expanded < required) {
+        if (expanded >= MAX_DIRECT_OUTPUT_CAPACITY) {
+          throw new IOException("Direct IPC buffer exceeded max capacity");
+        }
+        expanded = Math.min(MAX_DIRECT_OUTPUT_CAPACITY, Math.max(expanded << 1, required));
+      }
+      ByteBuffer next = ByteBuffer.allocateDirect(expanded);
+      buffer.flip();
+      next.put(buffer);
+      buffer = next;
+    }
+  }
+
+  private static final class ByteBufferInputStream extends InputStream {
+    private final ByteBuffer buffer;
+
+    private ByteBufferInputStream(ByteBuffer buffer) {
+      this.buffer = Objects.requireNonNull(buffer, "buffer");
+    }
+
+    @Override
+    public int read() {
+      if (!buffer.hasRemaining()) {
+        return -1;
+      }
+      return buffer.get() & 0xFF;
+    }
+
+    @Override
+    public int read(byte[] b, int off, int len) {
+      Objects.requireNonNull(b, "b");
+      if (off < 0 || len < 0 || len > b.length - off) {
+        throw new IndexOutOfBoundsException(
+            "off=" + off + ", len=" + len + ", arrayLength=" + b.length);
+      }
+      if (len == 0) {
+        return 0;
+      }
+      if (!buffer.hasRemaining()) {
+        return -1;
+      }
+      int read = Math.min(len, buffer.remaining());
+      buffer.get(b, off, read);
+      return read;
+    }
+
+    @Override
+    public long skip(long n) {
+      if (n <= 0) {
+        return 0L;
+      }
+      int skipped = (int) Math.min(n, buffer.remaining());
+      buffer.position(buffer.position() + skipped);
+      return skipped;
+    }
+
+    @Override
+    public int available() {
+      return buffer.remaining();
+    }
+  }
+}
+
+
+
+
+package org.pronzato.fabric.api.util;
+
+public final class CloseSupport {
+  private CloseSupport() {}
+
+  public static void closeQuietly(AutoCloseable closeable) {
+    if (closeable == null) {
+      return;
+    }
+    try {
+      closeable.close();
+    } catch (Exception ignore) {
+    }
+  }
+}
+
+
+
+
+
+package org.pronzato.fabric.api.util;
+
+import java.time.Instant;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
+
+public final class DefinitionModelMapperSupport {
+  public static final String DEFAULT_LIFECYCLE_STATUS = "ACTIVE";
+  public static final String DEFAULT_ACTOR = "fabric-lite";
+
+  private DefinitionModelMapperSupport() {}
+
+  public static String requireNonBlank(String value, String fieldName) {
+    return Strings.requireNonBlank(value, fieldName);
+  }
+
+  public static String normalizeLifecycleStatus(String lifecycleStatus) {
+    return Strings.firstNonBlank(lifecycleStatus, DEFAULT_LIFECYCLE_STATUS);
+  }
+
+  public static String normalizeActor(String actor) {
+    return Strings.firstNonBlank(actor, DEFAULT_ACTOR);
+  }
+
+  public static String buildDefinitionId(String kind, String group, String name) {
+    return requireNonBlank(kind, "kind")
+        + ":"
+        + requireNonBlank(group, "group")
+        + "/"
+        + requireNonBlank(name, "name");
+  }
+
+  public static String buildScopedName(
+      String namespace, String name, String namespaceFieldName, String nameFieldName) {
+    return requireNonBlank(namespace, namespaceFieldName)
+        + "/"
+        + requireNonBlank(name, nameFieldName);
+  }
+
+  public static DefinitionEnvelope envelopeNow(
+      String group,
+      DefinitionType type,
+      String name,
+      String uuid,
+      boolean enabled,
+      String lifecycleStatus,
+      String actor) {
+    return envelopeAt(
+        group,
+        type,
+        name,
+        uuid,
+        enabled,
+        lifecycleStatus,
+        actor,
+        Instant.now().toString());
+  }
+
+  public static DefinitionEnvelope envelopeAt(
+      String group,
+      DefinitionType type,
+      String name,
+      String uuid,
+      boolean enabled,
+      String lifecycleStatus,
+      String actor,
+      String timestampIso) {
+    String now = requireNonBlank(timestampIso, "timestampIso");
+    String resolvedActor = normalizeActor(actor);
+    return new DefinitionEnvelope(
+        requireNonBlank(group, "group"),
+        type,
+        requireNonBlank(name, "name"),
+        requireNonBlank(uuid, "uuid"),
+        enabled,
+        normalizeLifecycleStatus(lifecycleStatus),
+        now,
+        resolvedActor,
+        now,
+        resolvedActor);
+  }
+}
+
+
+
+package org.pronzato.fabric.api.util;
+
+public final class Exceptions {
+
+  private Exceptions() {}
+
+  public static Throwable rootCause(Throwable error) {
+    Throwable cursor = error;
+    while (cursor != null && cursor.getCause() != null && cursor.getCause() != cursor) {
+      cursor = cursor.getCause();
+    }
+    return cursor;
+  }
+
+  public static boolean hasCause(Throwable error, Class<? extends Throwable> type) {
+    if (type == null) {
+      return false;
+    }
+    Throwable cursor = error;
+    while (cursor != null) {
+      if (type.isInstance(cursor)) {
+        return true;
+      }
+      Throwable next = cursor.getCause();
+      if (next == cursor) {
+        break;
+      }
+      cursor = next;
+    }
+    return false;
+  }
+
+  public static String rootMessageNullable(Throwable error) {
+    Throwable root = rootCause(error);
+    return root == null ? null : Strings.trimToNull(root.getMessage());
+  }
+
+  public static String rootMessage(Throwable error) {
+    Throwable root = rootCause(error);
+    if (root == null) {
+      return "unknown error";
+    }
+    String message = Strings.trimToNull(root.getMessage());
+    return message == null ? root.getClass().getSimpleName() : message;
+  }
+
+  public static String normalizeMessage(Throwable error) {
+    if (error == null) {
+      return "unknown failure";
+    }
+    String message = error.getMessage();
+    if (message == null || message.isBlank()) {
+      return error.getClass().getSimpleName();
+    }
+    return message;
+  }
+}
+
+
+
+package org.pronzato.fabric.api.util;
+
+public final class IdentityParsingSupport {
+  private IdentityParsingSupport() {}
+
+  public static String requireGroup(String group) {
+    return requireGroup(group, "session.group");
+  }
+
+  public static String requireGroup(String group, String fieldName) {
+    return Strings.requireNonBlank(group, fieldName);
+  }
+
+  public static String requireNamespace(String namespace, String fieldName) {
+    return Strings.requireNonBlank(namespace, fieldName);
+  }
+
+  public static String requireName(String name, String fieldName) {
+    return Strings.requireNonBlank(name, fieldName);
+  }
+
+  public static <T> T requireNonNullRuntime(T value, String message) {
+    if (value == null) {
+      throw new IllegalStateException(message);
+    }
+    return value;
+  }
+
+  public static ScopedName parseScopedName(
+      String scopedName, String namespaceFieldName, String nameFieldName) {
+    String normalized = Strings.requireNonBlank(scopedName, "scopedName");
+    int slash = normalized.indexOf('/');
+    if (slash < 0) {
+      return new ScopedName(null, requireName(normalized, nameFieldName));
+    }
+    String namespace = requireNamespace(normalized.substring(0, slash), namespaceFieldName);
+    String name = requireName(normalized.substring(slash + 1), nameFieldName);
+    return new ScopedName(namespace, name);
+  }
+
+  public record ScopedName(String namespace, String name) {}
+}
+
+
+
+package org.pronzato.fabric.api.util;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+public final class Io {
+
+  private Io() {}
+
+  public static Path writeTempFile(String prefix, String suffix, byte[] data) throws IOException {
+    if (data == null) {
+      throw new IllegalArgumentException("data is required");
+    }
+    Path temp = Files.createTempFile(prefix, suffix);
+    Files.write(temp, data, StandardOpenOption.TRUNCATE_EXISTING);
+    temp.toFile().deleteOnExit();
+    return temp.toAbsolutePath().normalize();
+  }
+
+  public static byte[] readClasspathBytes(String resourcePath, Class<?> anchor) throws IOException {
+    if (anchor == null) {
+      throw new IllegalArgumentException("anchor is required");
+    }
+    String normalized = normalizeResourcePath(resourcePath);
+    ClassLoader tccl = Thread.currentThread().getContextClassLoader();
+    InputStream in = tccl == null ? null : tccl.getResourceAsStream(normalized);
+    if (in == null) {
+      ClassLoader anchorLoader = anchor.getClassLoader();
+      in = anchorLoader == null ? ClassLoader.getSystemResourceAsStream(normalized) : anchorLoader.getResourceAsStream(normalized);
+    }
+    if (in == null) {
+      throw new IllegalArgumentException("Classpath resource not found: " + resourcePath);
+    }
+    try (InputStream stream = in) {
+      return stream.readAllBytes();
+    }
+  }
+
+  public static void deleteIfExists(Path path) {
+    if (path == null) {
+      return;
+    }
+    try {
+      Files.deleteIfExists(path);
+    } catch (IOException ignore) {
+    }
+  }
+
+  private static String normalizeResourcePath(String resourcePath) {
+    String path = Strings.trimToNull(resourcePath);
+    if (path == null) {
+      throw new IllegalArgumentException("resourcePath is required");
+    }
+    return path.startsWith("/") ? path.substring(1) : path;
+  }
+}
+
+package org.pronzato.fabric.api.util;
+
+/** Shared namespace utilities for normalization. */
+public final class Namespaces {
+
+  public static final String DEFAULT_NAMESPACE = "default";
+
+  private Namespaces() {}
+
+  public static String resolveNamespace(String namespace) {
+    return Strings.requireNonBlank(namespace, "namespace");
+  }
+
+  public static String normalizeNamespace(String namespace) {
+    return Strings.trimToNull(namespace);
+  }
+}
+
+
+
+package org.pronzato.fabric.api.util;
+
+import java.util.Collection;
+import java.util.Map;
+
+public final class Strings {
+
+  private Strings() {
+    // utility
+  }
+
+  /**
+   * Returns {@code true} when the value is {@code null} or contains only whitespace.
+   */
+  public static boolean isBlank(String value) {
+    return value == null || value.isBlank();
+  }
+
+  /**
+   * Returns {@code true} when the value is not {@code null} and has non-whitespace content.
+   */
+  public static boolean isNotBlank(String value) {
+    return !isBlank(value);
+  }
+
+  /**
+   * Returns {@code true} when the value is {@code null} or empty (no trim).
+   */
+  public static boolean isEmpty(String value) {
+    return value == null || value.isEmpty();
+  }
+
+  /**
+   * Returns {@code true} when the value is not {@code null} and not empty (no trim).
+   */
+  public static boolean isNotEmpty(String value) {
+    return !isEmpty(value);
+  }
+
+  /**
+   * Returns {@code true} when the collection is {@code null} or empty.
+   */
+  public static boolean isEmpty(Collection<?> value) {
+    return value == null || value.isEmpty();
+  }
+
+  /**
+   * Returns {@code true} when the collection is not {@code null} and not empty.
+   */
+  public static boolean isNotEmpty(Collection<?> value) {
+    return value != null && !value.isEmpty();
+  }
+
+  /**
+   * Returns {@code true} when the map is {@code null} or empty.
+   */
+  public static boolean isEmpty(Map<?, ?> value) {
+    return value == null || value.isEmpty();
+  }
+
+  /**
+   * Returns {@code true} when the map is not {@code null} and not empty.
+   */
+  public static boolean isNotEmpty(Map<?, ?> value) {
+    return value != null && !value.isEmpty();
+  }
+
+  /**
+   * Returns {@code true} when the array is {@code null} or empty.
+   */
+  public static boolean isEmpty(Object[] value) {
+    return value == null || value.length == 0;
+  }
+
+  /**
+   * Returns {@code true} when the array is not {@code null} and not empty.
+   */
+  public static boolean isNotEmpty(Object[] value) {
+    return value != null && value.length > 0;
+  }
+
+  /**
+   * Trims the value, returning {@code null} when the input is {@code null} or blank after trim.
+   */
+  public static String trimToNull(String value) {
+    if (value == null) {
+      return null;
+    }
+    String trimmed = value.trim();
+    return trimmed.isEmpty() ? null : trimmed;
+  }
+
+  /**
+   * Trims the value, returning an empty string when the input is {@code null}.
+   */
+  public static String trimToEmpty(String value) {
+    return value == null ? "" : value.trim();
+  }
+
+  /**
+   * Returns an empty string when the input is {@code null}.
+   */
+  public static String nullToEmpty(String value) {
+    return value == null ? "" : value;
+  }
+
+  /**
+   * Returns {@code null} when the input is an empty string; leaves whitespace unchanged.
+   */
+  public static String emptyToNull(String value) {
+    if (value == null) {
+      return null;
+    }
+    return value.isEmpty() ? null : value;
+  }
+
+  /**
+   * Returns {@code null} when the input is {@code null} or blank; leaves non-blank values unchanged.
+   */
+  public static String blankToNull(String value) {
+    return isBlank(value) ? null : value;
+  }
+
+  /**
+   * Returns a normalized string with trimmed edges and single spaces between tokens.
+   * Returns {@code null} when the input is {@code null}.
+   */
+  public static String normalizeSpace(String value) {
+    if (value == null) {
+      return null;
+    }
+    return value.trim().replaceAll("\\s+", " ");
+  }
+
+  /**
+   * Returns the trimmed value or throws {@link IllegalArgumentException} when blank.
+   */
+  public static String requireNonBlank(String value, String name) {
+    if (isBlank(value)) {
+      String label = name == null ? "value" : name;
+      throw new IllegalArgumentException(label + " is required");
+    }
+    return value.trim();
+  }
+
+  /**
+   * Returns the value or throws {@link IllegalArgumentException} when null or empty.
+   */
+  public static String requireNonEmpty(String value, String name) {
+    if (isEmpty(value)) {
+      String label = name == null ? "value" : name;
+      throw new IllegalArgumentException(label + " is required");
+    }
+    return value;
+  }
+
+  /**
+   * Null-safe equality check.
+   */
+  public static boolean equals(String left, String right) {
+    if (left == null) {
+      return right == null;
+    }
+    return left.equals(right);
+  }
+
+  /**
+   * Null-safe case-insensitive equality check.
+   */
+  public static boolean equalsIgnoreCase(String left, String right) {
+    if (left == null) {
+      return right == null;
+    }
+    return right != null && left.equalsIgnoreCase(right);
+  }
+
+  /**
+   * Returns the first non-blank value (after trimming) or {@code null} if none.
+   */
+  public static String firstNonBlank(String... values) {
+    if (values == null) {
+      return null;
+    }
+    for (String value : values) {
+      String trimmed = trimToNull(value);
+      if (trimmed != null) {
+        return trimmed;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Returns the first non-null value or {@code null} if none.
+   */
+  public static String firstNonNull(String... values) {
+    if (values == null) {
+      return null;
+    }
+    for (String value : values) {
+      if (value != null) {
+        return value;
+      }
+    }
+    return null;
+  }
+}
+
+
+
