@@ -1,652 +1,674 @@
-package org.pronzato.fabric.api.data.catalog;
+package org.pronzato.fabric.api.control.entitlements.simple.services;
 
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import org.pronzato.fabric.api.data.dataset.DatasetId;
+import java.util.concurrent.atomic.AtomicReference;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryListener;
+import org.pronzato.fabric.api.control.discovery.definitions.Definition;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEntitlement;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionPlatform;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
+import org.pronzato.fabric.api.control.entitlements.core.services.ServiceEntitlements;
+import org.pronzato.fabric.api.control.entitlements.provider.DefaultEntitlementProviderRegistry;
+import org.pronzato.fabric.api.control.entitlements.provider.EntitlementProviderRegistry;
+import org.pronzato.fabric.api.control.entitlements.provider.EntitlementProviderSelector;
+import org.pronzato.fabric.api.control.entitlements.provider.EntitlementSubjectProvider;
+import org.pronzato.fabric.api.control.entitlements.provider.EntitlementSubjectProviderPlatform;
 import org.pronzato.fabric.api.util.Strings;
 
-public final class DatasetNameResolver {
-  private static final Comparator<DatasetId> DATASET_ID_ORDER =
-      Comparator.comparing(DatasetId::toString, String.CASE_INSENSITIVE_ORDER)
-          .thenComparing(DatasetId::toString);
-  private static final Set<String> TABLE_CLAUSE_KEYWORDS =
-      Set.of("from", "join", "update", "into");
-  private static final Set<String> STOP_KEYWORDS =
-      Set.of(
-          "where",
-          "group",
-          "order",
-          "having",
-          "qualify",
-          "window",
-          "union",
-          "except",
-          "intersect",
-          "limit",
-          "offset",
-          "fetch",
-          "on",
-          "using",
-          "set",
-          "values",
-          "returning");
+public final class ServiceEntitlementsSimpleManager implements AutoCloseable {
+  private static final String PLATFORM_GROUP = "platform";
+  private static final String PLATFORM_NAME = "platform";
 
+  private final DiscoveryCache DiscoveryCache;
   private final String sessionGroup;
-  private final String defaultNamespace;
-  private final CatalogSnapshot snapshot;
+  private final EntitlementSubjectProvider provider;
+  private final DiscoveryListener listener;
+  private final ServiceEntitlementsSimple serviceEntitlements;
+  private final AtomicReference<Map<String, Set<String>>> membershipIndexRef =
+      new AtomicReference<>(Map.of());
+  private final AtomicReference<Map<String, Rules>> entitlementsIndexRef =
+      new AtomicReference<>(Map.of());
+  private final AtomicReference<String> platformModelVersionKeyRef = new AtomicReference<>("");
+  private final AtomicReference<String> entitlementsVersionKeyRef = new AtomicReference<>("");
+  private final Object rebuildLock = new Object();
 
-  public DatasetNameResolver(String sessionGroup, String defaultNamespace, CatalogSnapshot snapshot) {
-    this.sessionGroup = Strings.requireNonBlank(sessionGroup, "sessionGroup");
-    this.defaultNamespace = Strings.requireNonBlank(defaultNamespace, "defaultNamespace");
-    this.snapshot = Objects.requireNonNull(snapshot, "snapshot");
+  public ServiceEntitlementsSimpleManager(DiscoveryCache DiscoveryCache, String sessionGroup, boolean logDecisions) {
+    this(
+        DiscoveryCache,
+        sessionGroup,
+        logDecisions,
+        new DefaultEntitlementProviderRegistry(DiscoveryCache));
   }
 
-  public DatasetId resolveTableToken(String token) {
-    String normalizedToken = normalizeToken(token);
-    if (normalizedToken.indexOf('.') >= 0) {
-      DatasetId qualified = snapshot.qualifiedNameMap().get(normalizedToken.toLowerCase(Locale.ROOT));
-      if (qualified == null) {
-        throw unknownTableToken(token);
-      }
-      return qualified;
-    }
-
-    List<DatasetId> candidates = snapshot.unqualifiedNameMap().get(normalizedToken.toLowerCase(Locale.ROOT));
-    if (candidates == null || candidates.isEmpty()) {
-      throw unknownTableToken(token);
-    }
-    if (candidates.size() == 1) {
-      return candidates.get(0);
-    }
-    DatasetId preferred = preferDefaultNamespaceCandidate(candidates);
-    if (preferred != null) {
-      return preferred;
-    }
-    List<String> ids = new ArrayList<>(candidates.size());
-    List<DatasetId> sorted = new ArrayList<>(candidates);
-    sorted.sort(DATASET_ID_ORDER);
-    for (DatasetId candidate : sorted) {
-      ids.add(candidate.toString());
-    }
-    throw new IllegalArgumentException(
-        "Ambiguous table token '"
-            + token
-            + "' resolves to multiple datasets: ["
-            + String.join(",", ids)
-            + "]. Use namespace.foo or fully qualify group.namespace.foo");
+  public ServiceEntitlementsSimpleManager(
+      DiscoveryCache DiscoveryCache,
+      String sessionGroup,
+      boolean logDecisions,
+      EntitlementSubjectProvider provider) {
+    this(
+        DiscoveryCache,
+        sessionGroup,
+        logDecisions,
+        new DefaultEntitlementProviderRegistry(provider));
   }
 
-  public List<DatasetId> resolveAllTableTokensInSql(String sql) {
-    return resolveAllTableTokensInSql(sql, false);
+  public ServiceEntitlementsSimpleManager(
+      DiscoveryCache DiscoveryCache,
+      String sessionGroup,
+      boolean logDecisions,
+      EntitlementProviderRegistry providerRegistry) {
+    this(
+        DiscoveryCache,
+        sessionGroup,
+        logDecisions,
+        providerRegistry,
+        new EntitlementProviderSelector(DiscoveryCache, providerRegistry));
   }
 
-  public List<DatasetId> resolveAllTableTokensInSql(String sql, boolean strict) {
-    List<DatasetToken> tokens = scanTableTokensInSql(sql, strict);
-    LinkedHashSet<DatasetId> resolved = new LinkedHashSet<>();
-    for (DatasetToken token : tokens) {
-      resolved.add(resolveTableToken(token.normalizedToken()));
-    }
-    return List.copyOf(resolved);
-  }
-
-  private DatasetId preferDefaultNamespaceCandidate(List<DatasetId> candidates) {
-    if (candidates == null || candidates.isEmpty()) {
-      return null;
-    }
-    for (DatasetId candidate : candidates) {
-      if (candidate == null) {
-        continue;
-      }
-      if (!sessionGroup.equals(candidate.group())) {
-        continue;
-      }
-      if (defaultNamespace.equals(candidate.namespace())) {
-        return candidate;
-      }
-    }
-    return null;
-  }
-
-  List<DatasetToken> scanTableTokensInSql(String sql) {
-    return scanTableTokensInSql(sql, false);
-  }
-
-  List<DatasetToken> scanTableTokensInSql(String sql, boolean strict) {
-    String query = Strings.requireNonBlank(sql, "sql");
-    List<SqlToken> tokens = tokenize(query);
-    Set<String> cteNames = collectLeadingCteNames(tokens);
-    List<DatasetToken> resolved = new ArrayList<>();
-    for (int index = 0; index < tokens.size(); index++) {
-      SqlToken token = tokens.get(index);
-      if (!token.word()) {
-        continue;
-      }
-      String keyword = token.normalizedLower();
-      if (!TABLE_CLAUSE_KEYWORDS.contains(keyword)) {
-        continue;
-      }
-      switch (keyword) {
-        case "from" -> index = scanFromClause(query, tokens, cteNames, strict, index + 1, resolved) - 1;
-        case "join", "update", "into" -> {
-          int next = scanSingleTableReference(query, tokens, cteNames, keyword, strict, index + 1, resolved);
-          index = Math.max(index, next - 1);
-        }
-        default -> {
-          // no-op
-        }
-      }
-    }
-    return List.copyOf(resolved);
-  }
-
-  private int scanFromClause(
-      String sql,
-      List<SqlToken> tokens,
-      Set<String> cteNames,
-      boolean strict,
-      int start,
-      List<DatasetToken> resolved) {
-    int index = start;
-    while (index < tokens.size()) {
-      SqlToken token = tokens.get(index);
-      if (isStopKeyword(token)) {
-        return index;
-      }
-      if (token.symbol("(")) {
-        if (strict) {
-          throw unsupportedSql("from", token.start(), "derived table reference", null);
-        }
-        return index;
-      }
-      int next = addTableReference(sql, tokens, cteNames, "from", strict, index, resolved);
-      if (next < 0) {
-        return index + 1;
-      }
-      index = next;
-      if (index < tokens.size() && tokens.get(index).symbol(",")) {
-        index++;
-        continue;
-      }
-      return index;
-    }
-    return index;
-  }
-
-  private int scanSingleTableReference(
-      String sql,
-      List<SqlToken> tokens,
-      Set<String> cteNames,
-      String keyword,
-      boolean strict,
-      int start,
-      List<DatasetToken> resolved) {
-    return Math.max(start, addTableReference(sql, tokens, cteNames, keyword, strict, start, resolved));
-  }
-
-  private int addTableReference(
-      String sql,
-      List<SqlToken> tokens,
-      Set<String> cteNames,
-      String keyword,
-      boolean strict,
-      int start,
-      List<DatasetToken> resolved) {
-    if (start >= tokens.size()) {
-      if (strict) {
-        throw unsupportedSql(keyword, sql.length(), "unable to parse table reference", null);
-      }
-      return -1;
-    }
-    SqlToken token = tokens.get(start);
-    if (token.symbol("(")) {
-      if (strict) {
-        throw unsupportedSql(keyword, token.start(), "derived table reference", null);
-      }
-      return -1;
-    }
-    ParsedIdentifier parsed = parseIdentifier(sql, tokens, start, strict);
-    if (parsed == null) {
-      if (strict) {
-        throw unsupportedSql(keyword, token.start(), "unable to parse table reference", null);
-      }
-      return -1;
-    }
-    if (parsed.nextIndex() < tokens.size() && tokens.get(parsed.nextIndex()).symbol("(")) {
-      if (strict) {
-        throw unsupportedSql(null, parsed.startOffset(), "table function reference", parsed.rawToken());
-      }
-      return -1;
-    }
-    AliasReference alias = parseAlias(sql, tokens, parsed.nextIndex(), strict);
-    int referenceEnd = alias == null ? parsed.endOffset() : alias.endOffset();
-    int nextIndex = alias == null ? parsed.nextIndex() : alias.nextIndex();
-    String normalizedLower = parsed.normalizedToken().toLowerCase(Locale.ROOT);
-    if (cteNames.contains(normalizedLower)) {
-      return nextIndex;
-    }
-    resolved.add(
-        new DatasetToken(
-            parsed.rawToken(),
-            parsed.normalizedToken(),
-            parsed.startOffset(),
-            referenceEnd,
-            alias == null ? null : alias.aliasToken(),
-            alias != null && alias.usesAsKeyword()));
-    return nextIndex;
-  }
-
-  private static boolean isStopKeyword(SqlToken token) {
-    return token != null && token.word() && STOP_KEYWORDS.contains(token.normalizedLower());
-  }
-
-  private static AliasReference parseAlias(String sql, List<SqlToken> tokens, int start) {
-    return parseAlias(sql, tokens, start, false);
-  }
-
-  private static AliasReference parseAlias(String sql, List<SqlToken> tokens, int start, boolean strict) {
-    if (start >= tokens.size()) {
-      return null;
-    }
-    SqlToken token = tokens.get(start);
-    if (token.word() && "as".equals(token.normalizedLower())) {
-      int aliasIndex = start + 1;
-      if (aliasIndex >= tokens.size()) {
-        return null;
-      }
-      SqlToken aliasToken = tokens.get(aliasIndex);
-      if (!isAliasToken(aliasToken)) {
-        return null;
-      }
-      return new AliasReference(
-          sql.substring(aliasToken.start(), aliasToken.end()), true, aliasToken.end(), aliasIndex + 1);
-    }
-    if (!isAliasToken(token)) {
-      return null;
-    }
-    return new AliasReference(sql.substring(token.start(), token.end()), false, token.end(), start + 1);
-  }
-
-  private static boolean isAliasToken(SqlToken token) {
-    if (token == null || (!token.word() && !token.quotedIdentifier())) {
-      return false;
-    }
-    String lower = token.normalizedLower();
-    if (isReservedWord(lower) || "join".equals(lower)) {
-      return false;
-    }
-    return true;
-  }
-
-  private static Set<String> collectLeadingCteNames(List<SqlToken> tokens) {
-    if (tokens.isEmpty()) {
-      return Set.of();
-    }
-    int index = 0;
-    SqlToken first = tokens.get(index);
-    if (!first.word() || !"with".equals(first.normalizedLower())) {
-      return Set.of();
-    }
-    index++;
-    if (index < tokens.size()
-        && tokens.get(index).word()
-        && "recursive".equals(tokens.get(index).normalizedLower())) {
-      index++;
-    }
-
-    LinkedHashSet<String> names = new LinkedHashSet<>();
-    while (index < tokens.size()) {
-      SqlToken cteName = tokens.get(index);
-      if (!cteName.word() && !cteName.quotedIdentifier()) {
-        break;
-      }
-      if (isReservedWord(cteName.normalizedLower())) {
-        break;
-      }
-      names.add(cteName.identifierValue().toLowerCase(Locale.ROOT));
-      index++;
-
-      if (index < tokens.size() && tokens.get(index).symbol("(")) {
-        int next = skipBalancedParentheses(tokens, index);
-        if (next < 0) {
-          break;
-        }
-        index = next;
-      }
-      if (index >= tokens.size() || !tokens.get(index).word() || !"as".equals(tokens.get(index).normalizedLower())) {
-        break;
-      }
-      index++;
-      if (index >= tokens.size() || !tokens.get(index).symbol("(")) {
-        break;
-      }
-      int next = skipBalancedParentheses(tokens, index);
-      if (next < 0) {
-        break;
-      }
-      index = next;
-
-      if (index < tokens.size() && tokens.get(index).symbol(",")) {
-        index++;
-        continue;
-      }
-      break;
-    }
-    return names.isEmpty() ? Set.of() : Set.copyOf(names);
-  }
-
-  private static int skipBalancedParentheses(List<SqlToken> tokens, int openIndex) {
-    if (openIndex >= tokens.size() || !tokens.get(openIndex).symbol("(")) {
-      return -1;
-    }
-    int depth = 0;
-    for (int index = openIndex; index < tokens.size(); index++) {
-      SqlToken token = tokens.get(index);
-      if (token.symbol("(")) {
-        depth++;
-        continue;
-      }
-      if (token.symbol(")")) {
-        depth--;
-        if (depth == 0) {
-          return index + 1;
-        }
-      }
-    }
-    return -1;
-  }
-
-  private static ParsedIdentifier parseIdentifier(String sql, List<SqlToken> tokens, int start) {
-    return parseIdentifier(sql, tokens, start, false);
-  }
-
-  private static ParsedIdentifier parseIdentifier(
-      String sql, List<SqlToken> tokens, int start, boolean strict) {
-    if (start >= tokens.size()) {
-      return null;
-    }
-    SqlToken first = tokens.get(start);
-    if (!first.word() && !first.quotedIdentifier()) {
-      return null;
-    }
-    if (isReservedWord(first.normalizedLower())) {
-      return null;
-    }
-    String firstPart = first.identifierValue();
-    if (firstPart == null) {
-      return null;
-    }
-    int end = first.end();
-    int next = start + 1;
-    String normalized = firstPart;
-    if (next + 1 < tokens.size() && tokens.get(next).symbol(".")) {
-      SqlToken second = tokens.get(next + 1);
-      if (!second.word() && !second.quotedIdentifier()) {
-        return null;
-      }
-      if (isReservedWord(second.normalizedLower())) {
-        return null;
-      }
-      String secondPart = second.identifierValue();
-      if (secondPart == null) {
-        return null;
-      }
-      normalized = firstPart + "." + secondPart;
-      end = second.end();
-      next = next + 2;
-      if (next + 1 < tokens.size() && tokens.get(next).symbol(".")) {
-        SqlToken third = tokens.get(next + 1);
-        if (!third.word() && !third.quotedIdentifier()) {
-          return null;
-        }
-        if (isReservedWord(third.normalizedLower())) {
-          return null;
-        }
-        String thirdPart = third.identifierValue();
-        if (thirdPart == null) {
-          return null;
-        }
-        normalized = normalized + "." + thirdPart;
-        end = third.end();
-        next = next + 2;
-        if (next + 1 < tokens.size() && tokens.get(next).symbol(".")) {
-          if (strict) {
-            int rawEnd = tokens.get(next).end();
-            if (next + 1 < tokens.size()) {
-              SqlToken extra = tokens.get(next + 1);
-              if (extra.word() || extra.quotedIdentifier()) {
-                rawEnd = extra.end();
-              }
-            }
-            String rawToken = sql.substring(first.start(), rawEnd);
-            throw unsupportedSql(null, first.start(), "identifier with more than 3 parts", rawToken);
+  public ServiceEntitlementsSimpleManager(
+      DiscoveryCache DiscoveryCache,
+      String sessionGroup,
+      boolean logDecisions,
+      EntitlementProviderRegistry providerRegistry,
+      EntitlementProviderSelector providerSelector) {
+    this.DiscoveryCache = Objects.requireNonNull(DiscoveryCache, "DiscoveryCache");
+    this.sessionGroup = sessionGroup;
+    Objects.requireNonNull(providerRegistry, "providerRegistry");
+    Objects.requireNonNull(providerSelector, "providerSelector");
+    this.provider = Objects.requireNonNull(providerRegistry.defaultProvider(), "providerRegistry.defaultProvider");
+    this.serviceEntitlements =
+        new ServiceEntitlementsSimple(
+            membershipIndexRef, entitlementsIndexRef, providerSelector, logDecisions);
+    this.listener =
+        new DiscoveryListener() {
+          @Override
+          public void onUpsert(Definition definition) {
+            handleUpsert(definition);
           }
-          return null;
-        }
-      }
-    }
-    String raw = sql.substring(first.start(), end);
-    return new ParsedIdentifier(raw, normalized, first.start(), end, next);
-  }
 
-  private IllegalArgumentException unknownTableToken(String token) {
-    return new IllegalArgumentException(
-        "Unknown table token '"
-            + token
-            + "' (searched group="
-            + sessionGroup
-            + " defaultNamespace="
-            + defaultNamespace
-            + ")");
-  }
-
-  private static String normalizeToken(String token) {
-    String raw = Strings.requireNonBlank(token, "token");
-    ParsedIdentifier parsed = parseIdentifier(raw, tokenize(raw), 0);
-    if (parsed == null) {
-      return raw;
-    }
-    return parsed.normalizedToken();
-  }
-
-  private static boolean isReservedWord(String tokenLower) {
-    if (tokenLower == null) {
-      return true;
-    }
-    if (TABLE_CLAUSE_KEYWORDS.contains(tokenLower) || STOP_KEYWORDS.contains(tokenLower)) {
-      return true;
-    }
-    return switch (tokenLower) {
-      case "select",
-          "with",
-          "left",
-          "right",
-          "full",
-          "inner",
-          "outer",
-          "cross",
-          "lateral",
-          "as",
-          "and",
-          "or",
-          "not" -> true;
-      default -> false;
-    };
-  }
-
-  private static IllegalArgumentException unsupportedSql(
-      String keyword, int offset, String reason, String tokenOrNull) {
-    StringBuilder message =
-        new StringBuilder("Unsupported SQL for entitled queries: ").append(reason);
-    if (tokenOrNull != null) {
-      message.append(" '").append(tokenOrNull).append("'");
-    }
-    if (keyword != null) {
-      message.append(" after ").append(keyword.toUpperCase(Locale.ROOT));
-    }
-    message.append(" at offset=").append(Math.max(offset, 0));
-    return new IllegalArgumentException(message.toString());
-  }
-
-  private static List<SqlToken> tokenize(String sql) {
-    List<SqlToken> tokens = new ArrayList<>();
-    int index = 0;
-    while (index < sql.length()) {
-      char ch = sql.charAt(index);
-      if (Character.isWhitespace(ch)) {
-        index++;
-        continue;
-      }
-      if (ch == '-' && index + 1 < sql.length() && sql.charAt(index + 1) == '-') {
-        index += 2;
-        while (index < sql.length() && sql.charAt(index) != '\n') {
-          index++;
-        }
-        continue;
-      }
-      if (ch == '/' && index + 1 < sql.length() && sql.charAt(index + 1) == '*') {
-        index += 2;
-        while (index + 1 < sql.length()) {
-          if (sql.charAt(index) == '*' && sql.charAt(index + 1) == '/') {
-            index += 2;
-            break;
+          @Override
+          public void onDelete(DefinitionEnvelope envelope) {
+            handleDelete(envelope);
           }
-          index++;
+        };
+
+    this.DiscoveryCache.addListener(listener);
+    try {
+      rebuildMembershipIndex(true);
+      rebuildEntitlementsIndex(true);
+    } catch (RuntimeException ex) {
+      this.DiscoveryCache.removeListener(listener);
+      throw ex;
+    }
+  }
+
+  public ServiceEntitlementsSimple serviceEntitlements() {
+    return serviceEntitlements;
+  }
+
+  @Override
+  public void close() {
+    DiscoveryCache.removeListener(listener);
+  }
+
+  private void handleUpsert(Definition definition) {
+    if (definition instanceof DefinitionPlatform platformModel
+        && isPlatformModel(platformModel.envelope())) {
+      rebuildMembershipIndex(false);
+      return;
+    }
+    if (definition instanceof DefinitionEntitlement entitlement && isInScope(entitlement.envelope())) {
+      rebuildEntitlementsIndex(false);
+    }
+  }
+
+  private void handleDelete(DefinitionEnvelope envelope) {
+    if (envelope == null || envelope.type() == null) {
+      return;
+    }
+    if (envelope.type() == DefinitionType.PLATFORM && isPlatformModel(envelope)) {
+      rebuildMembershipIndex(false);
+      return;
+    }
+    if (envelope.type() == DefinitionType.ENTITLEMENT && isInScope(envelope)) {
+      rebuildEntitlementsIndex(false);
+    }
+  }
+
+  private void rebuildMembershipIndex(boolean required) {
+    synchronized (rebuildLock) {
+      String nextVersionKey = provider.versionKey();
+      if ("MISSING".equals(nextVersionKey)) {
+        if (required) {
+          throw new IllegalStateException(
+              "Missing required platform model " + PLATFORM_GROUP + "/" + PLATFORM_NAME);
         }
+        membershipIndexRef.set(Map.of());
+        platformModelVersionKeyRef.set(nextVersionKey);
+        return;
+      }
+      if (nextVersionKey.equals(platformModelVersionKeyRef.get())) {
+        return;
+      }
+      membershipIndexRef.set(membershipIndexFromProvider(required));
+      platformModelVersionKeyRef.set(nextVersionKey);
+    }
+  }
+
+  private Map<String, Set<String>> membershipIndexFromProvider(boolean required) {
+    if (provider instanceof EntitlementSubjectProviderPlatform platformProvider) {
+      return platformProvider.membershipIndex();
+    }
+    return Map.of();
+  }
+
+  private void rebuildEntitlementsIndex(boolean required) {
+    synchronized (rebuildLock) {
+      List<DefinitionEntitlement> assetEntitlements = collectAssetEntitlements();
+      if (assetEntitlements.isEmpty()) {
+        entitlementsIndexRef.set(Map.of());
+        entitlementsVersionKeyRef.set("MISSING");
+        return;
+      }
+
+      String nextVersionKey = entitlementsVersionKey(assetEntitlements);
+      if (nextVersionKey.equals(entitlementsVersionKeyRef.get())) {
+        return;
+      }
+
+      entitlementsIndexRef.set(compileRulesIndex(assetEntitlements));
+      entitlementsVersionKeyRef.set(nextVersionKey);
+    }
+  }
+
+  private List<DefinitionEntitlement> collectAssetEntitlements() {
+    List<DefinitionEntitlement> all = DiscoveryCache.list(DefinitionEntitlement.class);
+    List<DefinitionEntitlement> assetEntitlements = new ArrayList<>();
+    for (DefinitionEntitlement entitlement : all) {
+      if (entitlement == null || !enabled(entitlement.envelope() == null ? null : entitlement.envelope().enabled())) {
         continue;
       }
-      if (ch == '\'') {
-        index++;
-        while (index < sql.length()) {
-          if (sql.charAt(index) == '\'') {
-            if (index + 1 < sql.length() && sql.charAt(index + 1) == '\'') {
-              index += 2;
-              continue;
-            }
-            index++;
-            break;
-          }
-          index++;
-        }
+      if (!isInScope(entitlement.envelope())) {
         continue;
       }
-      if (ch == '"' || ch == '`' || ch == '[') {
-        int start = index;
-        ParsedQuotedIdentifier quoted = parseQuotedIdentifier(sql, index);
-        if (quoted == null) {
-          index++;
+      if (canonicalAssetScopeId(entitlement.scopeId()) == null) {
+        continue;
+      }
+      assetEntitlements.add(entitlement);
+    }
+    return List.copyOf(assetEntitlements);
+  }
+
+  static Map<String, Rules> compileRulesIndex(List<DefinitionEntitlement> definitions) {
+    Map<String, MutableRules> mutable = new LinkedHashMap<>();
+    for (DefinitionEntitlement entitlement : definitions) {
+      String scopeId = canonicalAssetScopeId(entitlement.scopeId());
+      if (scopeId == null) {
+        continue;
+      }
+      MutableRules target =
+          mutable.computeIfAbsent(scopeId, ignored -> new MutableRules());
+      appendPolicyRules(target, entitlement.policies());
+      appendRelationshipRules(target, entitlement.relationships(), scopeId);
+    }
+
+    Map<String, Rules> built = new LinkedHashMap<>();
+    for (Map.Entry<String, MutableRules> entry : mutable.entrySet()) {
+      built.put(entry.getKey(), entry.getValue().freeze());
+    }
+    return Map.copyOf(built);
+  }
+
+  private static void appendPolicyRules(
+      MutableRules rules, List<DefinitionEntitlement.PolicyDocument> policies) {
+    if (rules == null || policies == null) {
+      return;
+    }
+    for (DefinitionEntitlement.PolicyDocument policy : policies) {
+      if (policy == null || !enabled(policy.enabled()) || policy.bindings() == null) {
+        continue;
+      }
+      String policyId = normalize(policy.policyId());
+      String policyName = normalize(policy.name());
+      rules.addPolicy(policyId, policyName);
+      for (DefinitionEntitlement.PolicyBinding binding : policy.bindings()) {
+        if (binding == null || !enabled(binding.enabled())) {
           continue;
         }
-        index = quoted.end();
-        tokens.add(
-            new SqlToken(
-                sql.substring(start, quoted.end()),
-                quoted.identifier(),
-                quoted.identifier().toLowerCase(Locale.ROOT),
-                start,
-                quoted.end(),
-                false,
-                true));
-        continue;
-      }
-      if (isIdentifierStart(ch)) {
-        int start = index;
-        index++;
-        while (index < sql.length() && isIdentifierPart(sql.charAt(index))) {
-          index++;
-        }
-        String text = sql.substring(start, index);
-        tokens.add(new SqlToken(text, text, text.toLowerCase(Locale.ROOT), start, index, true, false));
-        continue;
-      }
-      tokens.add(
-          new SqlToken(
-              String.valueOf(ch),
-              String.valueOf(ch),
-              String.valueOf(ch).toLowerCase(Locale.ROOT),
-              index,
-              index + 1,
-              false,
-              false));
-      index++;
-    }
-    return List.copyOf(tokens);
-  }
-
-  private static ParsedQuotedIdentifier parseQuotedIdentifier(String sql, int start) {
-    if (start >= sql.length()) {
-      return null;
-    }
-    char open = sql.charAt(start);
-    char close = open == '[' ? ']' : open;
-    int index = start + 1;
-    StringBuilder value = new StringBuilder();
-    while (index < sql.length()) {
-      char current = sql.charAt(index);
-      if (current == close) {
-        if (open != '['
-            && index + 1 < sql.length()
-            && sql.charAt(index + 1) == close
-            && close != '`') {
-          value.append(close);
-          index += 2;
+        List<ActionSlot> slots = actionSlots(binding.action());
+        if (slots.isEmpty()) {
           continue;
         }
-        return new ParsedQuotedIdentifier(value.toString(), index + 1);
+        SubjectSlot subjectSlot = subjectSlot(binding.subject());
+        if (subjectSlot == null) {
+          continue;
+        }
+        Set<String> methodsAllow = methodsAllow(binding.obligations());
+        BindingSummary summary =
+            new BindingSummary(policyId, policyName, subjectSlot.id(), subjectSlot.group(), methodsAllow);
+        rules.addBindingSummary(slots, summary);
+        String effect = binding.effect();
+        if ("DENY".equalsIgnoreCase(effect)) {
+          for (ActionSlot slot : slots) {
+            rules.addDeny(slot, subjectSlot, methodsAllow);
+          }
+          continue;
+        }
+        if ("ALLOW".equalsIgnoreCase(effect)) {
+          for (ActionSlot slot : slots) {
+            rules.addAllow(slot, subjectSlot, methodsAllow);
+          }
+        }
       }
-      value.append(current);
-      index++;
     }
-    return null;
   }
 
-  private static boolean isIdentifierStart(char ch) {
-    return Character.isLetter(ch) || ch == '_' || ch == '$';
-  }
-
-  private static boolean isIdentifierPart(char ch) {
-    return Character.isLetterOrDigit(ch) || ch == '_' || ch == '$';
-  }
-
-  private record ParsedQuotedIdentifier(String identifier, int end) {}
-
-  private record ParsedIdentifier(
-      String rawToken,
-      String normalizedToken,
-      int startOffset,
-      int endOffset,
-      int nextIndex) {}
-
-  private record AliasReference(
-      String aliasToken,
-      boolean usesAsKeyword,
-      int endOffset,
-      int nextIndex) {}
-
-  private record SqlToken(
-      String text,
-      String normalized,
-      String normalizedLower,
-      int start,
-      int end,
-      boolean word,
-      boolean quotedIdentifier) {
-    private boolean symbol(String candidate) {
-      return !word && !quotedIdentifier && Objects.equals(text, candidate);
+  private static void appendRelationshipRules(
+      MutableRules rules,
+      List<DefinitionEntitlement.RelationshipTuple> relationships,
+      String resourceId) {
+    if (rules == null || relationships == null || resourceId == null) {
+      return;
     }
+    for (DefinitionEntitlement.RelationshipTuple tuple : relationships) {
+      if (tuple == null) {
+        continue;
+      }
+      String tupleResourceId = canonicalAssetScopeId(tuple.resourceId());
+      String tupleResourceSubject = canonicalAssetScopeId(tuple.resourceSubject());
+      if (!Objects.equals(resourceId, tupleResourceId) && !Objects.equals(resourceId, tupleResourceSubject)) {
+        continue;
+      }
+      SubjectSlot subjectSlot = subjectSlot(tuple.subject());
+      if (subjectSlot == null) {
+        continue;
+      }
+      String relation = tuple.relation();
+      if (relation == null) {
+        continue;
+      }
+      if ("DENY".equalsIgnoreCase(relation) || "service.deny".equalsIgnoreCase(relation)) {
+        rules.addDeny(ActionSlot.START, subjectSlot, Set.of());
+        rules.addDeny(ActionSlot.INVOKE, subjectSlot, Set.of());
+        continue;
+      }
+      if ("ALLOW".equalsIgnoreCase(relation) || "service.allow".equalsIgnoreCase(relation)) {
+        rules.addAllow(ActionSlot.START, subjectSlot, Set.of());
+        rules.addAllow(ActionSlot.INVOKE, subjectSlot, Set.of());
+        continue;
+      }
+      for (ActionSlot slot : actionSlots(relation)) {
+        rules.addAllow(slot, subjectSlot, Set.of());
+      }
+    }
+  }
 
-    private String identifierValue() {
-      if (word) {
-        return normalized;
+  static List<ActionSlot> actionSlots(String action) {
+    if (action == null) {
+      return List.of();
+    }
+    if ("*".equals(action)) {
+      return List.of(ActionSlot.START, ActionSlot.INVOKE, ActionSlot.READ);
+    }
+    if ("service.start".equalsIgnoreCase(action) || "START".equalsIgnoreCase(action)) {
+      return List.of(ActionSlot.START);
+    }
+    if ("service.invoke".equalsIgnoreCase(action)
+        || "INVOKE".equalsIgnoreCase(action)
+        || "WRITE".equalsIgnoreCase(action)) {
+      return List.of(ActionSlot.INVOKE);
+    }
+    if ("service.read".equalsIgnoreCase(action) || "READ".equalsIgnoreCase(action)) {
+      return List.of(ActionSlot.READ);
+    }
+    return List.of();
+  }
+
+  private static SubjectSlot subjectSlot(String subject) {
+    String normalized = normalize(subject);
+    if (normalized == null) {
+      return null;
+    }
+    if (normalized.startsWith("group:")) {
+      return new SubjectSlot(normalized, true);
+    }
+    return new SubjectSlot(normalized, false);
+  }
+
+  private static Set<String> methodsAllow(DefinitionEntitlement.ObligationSet obligations) {
+    if (obligations == null || obligations.methodsAllow() == null || obligations.methodsAllow().isEmpty()) {
+      return Set.of();
+    }
+    LinkedHashSet<String> normalized = new LinkedHashSet<>();
+    for (String method : obligations.methodsAllow()) {
+      String value = normalize(method);
+      if (value != null) {
+        normalized.add(value);
       }
-      if (quotedIdentifier) {
-        return normalized;
-      }
+    }
+    return normalized.isEmpty() ? Set.of() : Set.copyOf(normalized);
+  }
+
+  private static String normalize(String value) {
+    return Strings.trimToNull(value);
+  }
+
+  private static boolean isPlatformModel(DefinitionEnvelope envelope) {
+    if (envelope == null) {
+      return false;
+    }
+    return Objects.equals(PLATFORM_GROUP, envelope.group()) && Objects.equals(PLATFORM_NAME, envelope.name());
+  }
+
+  private boolean isInScope(DefinitionEnvelope envelope) {
+    return envelope != null && normalize(envelope.group()) != null;
+  }
+
+  private static String canonicalAssetScopeId(String scopeId) {
+    if (scopeId == null) {
+      return null;
+    }
+    try {
+      return ServiceEntitlements.requireAssetResourceId(scopeId);
+    } catch (RuntimeException ex) {
       return null;
     }
   }
+
+  private static String entitlementsVersionKey(List<DefinitionEntitlement> definitions) {
+    if (definitions == null || definitions.isEmpty()) {
+      return "EMPTY";
+    }
+    List<String> keys = new ArrayList<>(definitions.size());
+    for (DefinitionEntitlement definition : definitions) {
+      if (definition == null) {
+        continue;
+      }
+      DefinitionEnvelope envelope = definition.envelope();
+      String group = envelope == null ? null : envelope.group();
+      String name = envelope == null ? null : envelope.name();
+      String uuid = envelope == null ? null : envelope.uuid();
+      String updated = envelope == null ? null : envelope.updatedTimeUtc();
+      keys.add(
+          String.valueOf(group)
+              + "/"
+              + String.valueOf(name)
+              + "|"
+              + String.valueOf(uuid)
+              + "|"
+              + String.valueOf(updated)
+              + "|"
+              + definition.hashCode());
+    }
+    keys.sort(Comparator.naturalOrder());
+    return String.join(";", keys);
+  }
+
+  private static boolean enabled(Boolean value) {
+    return value == null || value.booleanValue();
+  }
+
+  enum ActionSlot {
+    START,
+    INVOKE,
+    READ
+  }
+
+  static final class Rules {
+    private final RuleSet start;
+    private final RuleSet invoke;
+    private final RuleSet read;
+    private final int policyCount;
+
+    private Rules(RuleSet start, RuleSet invoke, RuleSet read, int policyCount) {
+      this.start = start;
+      this.invoke = invoke;
+      this.read = read;
+      this.policyCount = policyCount;
+    }
+
+    RuleSet forAction(ActionSlot actionSlot) {
+      return switch (actionSlot) {
+        case START -> start;
+        case INVOKE -> invoke;
+        case READ -> read;
+      };
+    }
+
+    int policyCount() {
+      return policyCount;
+    }
+  }
+
+  static final class RuleSet {
+    private final Set<String> allowSubjects;
+    private final Set<String> allowGroups;
+    private final Set<String> denySubjects;
+    private final Set<String> denyGroups;
+    private final List<BindingRule> allowBindings;
+    private final List<BindingRule> denyBindings;
+    private final List<BindingSummary> bindingSummaries;
+
+    private RuleSet(
+        Set<String> allowSubjects,
+        Set<String> allowGroups,
+        Set<String> denySubjects,
+        Set<String> denyGroups,
+        List<BindingRule> allowBindings,
+        List<BindingRule> denyBindings,
+        List<BindingSummary> bindingSummaries) {
+      this.allowSubjects = allowSubjects;
+      this.allowGroups = allowGroups;
+      this.denySubjects = denySubjects;
+      this.denyGroups = denyGroups;
+      this.allowBindings = allowBindings;
+      this.denyBindings = denyBindings;
+      this.bindingSummaries = bindingSummaries;
+    }
+
+    Set<String> allowSubjects() {
+      return allowSubjects;
+    }
+
+    Set<String> allowGroups() {
+      return allowGroups;
+    }
+
+    Set<String> denySubjects() {
+      return denySubjects;
+    }
+
+    Set<String> denyGroups() {
+      return denyGroups;
+    }
+
+    List<BindingRule> allowBindings() {
+      return allowBindings;
+    }
+
+    List<BindingRule> denyBindings() {
+      return denyBindings;
+    }
+
+    List<BindingSummary> bindingSummaries() {
+      return bindingSummaries;
+    }
+  }
+
+  private static final class MutableRules {
+    private final MutableRuleSet start = new MutableRuleSet();
+    private final MutableRuleSet invoke = new MutableRuleSet();
+    private final MutableRuleSet read = new MutableRuleSet();
+    private final Set<String> policies = new LinkedHashSet<>();
+
+    private void addAllow(ActionSlot actionSlot, SubjectSlot subject, Set<String> methodsAllow) {
+      target(actionSlot).addAllow(subject, methodsAllow);
+    }
+
+    private void addDeny(ActionSlot actionSlot, SubjectSlot subject, Set<String> methodsAllow) {
+      target(actionSlot).addDeny(subject, methodsAllow);
+    }
+
+    private void addPolicy(String policyId, String policyName) {
+      policies.add((policyId == null ? "-" : policyId) + "|" + (policyName == null ? "-" : policyName));
+    }
+
+    private void addBindingSummary(List<ActionSlot> actionSlots, BindingSummary summary) {
+      if (actionSlots == null || actionSlots.isEmpty() || summary == null) {
+        return;
+      }
+      for (ActionSlot actionSlot : actionSlots) {
+        target(actionSlot).addBindingSummary(summary);
+      }
+    }
+
+    private MutableRuleSet target(ActionSlot actionSlot) {
+      return switch (actionSlot) {
+        case START -> start;
+        case INVOKE -> invoke;
+        case READ -> read;
+      };
+    }
+
+    private Rules freeze() {
+      return new Rules(start.freeze(), invoke.freeze(), read.freeze(), policies.size());
+    }
+  }
+
+  private static final class MutableRuleSet {
+    private final Set<String> allowSubjects = new LinkedHashSet<>();
+    private final Set<String> allowGroups = new LinkedHashSet<>();
+    private final Set<String> denySubjects = new LinkedHashSet<>();
+    private final Set<String> denyGroups = new LinkedHashSet<>();
+    private final List<BindingRule> allowBindings = new ArrayList<>();
+    private final List<BindingRule> denyBindings = new ArrayList<>();
+    private final List<BindingSummary> bindingSummaries = new ArrayList<>();
+
+    private void addAllow(SubjectSlot subject, Set<String> methodsAllow) {
+      allowBindings.add(new BindingRule(subject.id(), subject.group(), methodsAllow));
+      if (subject.group()) {
+        allowGroups.add(subject.id());
+      } else {
+        allowSubjects.add(subject.id());
+      }
+    }
+
+    private void addDeny(SubjectSlot subject, Set<String> methodsAllow) {
+      denyBindings.add(new BindingRule(subject.id(), subject.group(), methodsAllow));
+      if (subject.group()) {
+        denyGroups.add(subject.id());
+      } else {
+        denySubjects.add(subject.id());
+      }
+    }
+
+    private void addBindingSummary(BindingSummary summary) {
+      bindingSummaries.add(summary);
+    }
+
+    private RuleSet freeze() {
+      return new RuleSet(
+          immutable(allowSubjects),
+          immutable(allowGroups),
+          immutable(denySubjects),
+          immutable(denyGroups),
+          immutableList(allowBindings),
+          immutableList(denyBindings),
+          immutableList(bindingSummaries));
+    }
+  }
+
+  private static Set<String> immutable(Collection<String> values) {
+    if (values == null || values.isEmpty()) {
+      return Set.of();
+    }
+    return Collections.unmodifiableSet(new LinkedHashSet<>(values));
+  }
+
+  private static <T> List<T> immutableList(Collection<T> values) {
+    if (values == null || values.isEmpty()) {
+      return List.of();
+    }
+    return Collections.unmodifiableList(new ArrayList<>(values));
+  }
+
+  static final class BindingRule {
+    private final String subject;
+    private final boolean group;
+    private final Set<String> methodsAllow;
+
+    private BindingRule(String subject, boolean group, Set<String> methodsAllow) {
+      this.subject = subject;
+      this.group = group;
+      this.methodsAllow = methodsAllow == null || methodsAllow.isEmpty() ? Set.of() : Set.copyOf(methodsAllow);
+    }
+
+    String subject() {
+      return subject;
+    }
+
+    boolean group() {
+      return group;
+    }
+
+    Set<String> methodsAllow() {
+      return methodsAllow;
+    }
+  }
+
+  static final class BindingSummary {
+    private final String policyId;
+    private final String policyName;
+    private final String subject;
+    private final boolean group;
+    private final Set<String> methodsAllow;
+
+    private BindingSummary(
+        String policyId, String policyName, String subject, boolean group, Set<String> methodsAllow) {
+      this.policyId = policyId;
+      this.policyName = policyName;
+      this.subject = subject;
+      this.group = group;
+      this.methodsAllow = methodsAllow == null || methodsAllow.isEmpty() ? Set.of() : Set.copyOf(methodsAllow);
+    }
+
+    String policyId() {
+      return policyId;
+    }
+
+    String policyName() {
+      return policyName;
+    }
+
+    String subject() {
+      return subject;
+    }
+
+    boolean group() {
+      return group;
+    }
+
+    Set<String> methodsAllow() {
+      return methodsAllow;
+    }
+  }
+
+  private record SubjectSlot(String id, boolean group) {}
 }
+
+
+
+
+
+
