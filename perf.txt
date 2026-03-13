@@ -1,1058 +1,972 @@
-package org.pronzato.fabric.api.services.manager;
+package org.pronzato.fabric.api.data.catalog;
 
-import io.grpc.BindableService;
-import io.grpc.ClientCall;
-import io.grpc.Channel;
-import io.grpc.ClientInterceptor;
-import io.grpc.ForwardingClientCall;
-import io.grpc.ManagedChannel;
-import io.grpc.Metadata;
-import io.grpc.ServerCall;
-import io.grpc.ServerCallHandler;
-import io.grpc.ServerInterceptor;
-import io.grpc.Status;
-import io.opentelemetry.api.common.Attributes;
-import org.apache.arrow.flight.FlightProducer;
-import org.apache.arrow.flight.FlightServerMiddleware;
-import java.io.File;
-import java.lang.reflect.Method;
-import java.lang.reflect.Modifier;
-import java.nio.file.Path;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
-import java.util.UUID;
+import java.util.function.Consumer;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngest;
 import org.pronzato.fabric.api.control.discovery.definitions.DefinitionSchema;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionService;
-import org.pronzato.fabric.api.control.status.service.ServiceHbCache;
-import org.pronzato.fabric.api.control.status.service.ServiceStatusPublisher;
-import org.pronzato.fabric.api.data.TabularManager;
-import org.pronzato.fabric.api.data.checkpoints.CheckpointStore;
-import org.pronzato.fabric.api.data.checkpoints.CheckpointStores;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
 import org.pronzato.fabric.api.data.dataset.DatasetId;
-import org.pronzato.fabric.api.control.entitlements.core.services.ServiceEntitlements;
-import org.pronzato.fabric.api.control.security.headers.FabricRequestHeaders;
-import org.pronzato.fabric.api.control.security.identity.CallerAppIdentity;
-import org.pronzato.fabric.api.control.security.identity.RequestIdentity;
-import org.pronzato.fabric.api.control.security.identity.RequestIdentityResolver;
-import org.pronzato.fabric.api.services.ServiceClient;
-import org.pronzato.fabric.api.services.ServiceHandle;
-import org.pronzato.fabric.api.services.ServiceManager;
-import org.pronzato.fabric.api.services.ServiceRunOptions;
-import org.pronzato.fabric.api.services.flight.FlightSqlServiceProducer;
-import org.pronzato.fabric.api.services.flight.FlightSqlServiceRuntime;
-import org.pronzato.fabric.api.services.flight.ingest.FlightIngestProducer;
-import org.pronzato.fabric.api.services.flight.ingest.FlightIngestServiceRuntime;
-import org.pronzato.fabric.api.services.grpc.GrpcServiceRuntime;
-import org.pronzato.fabric.api.services.common.routing.ServiceRoutingMode;
-import org.pronzato.fabric.api.control.session.SessionImpl;
-import org.pronzato.fabric.api.telemetry.manager.FabricOtelAttributes;
-import org.pronzato.fabric.api.telemetry.manager.FabricGrpcOtelInterceptors;
-import org.pronzato.fabric.api.telemetry.manager.FabricOtelEnablement;
-import org.pronzato.fabric.api.telemetry.OtelManager;
-import org.pronzato.fabric.api.telemetry.manager.FabricOtelSupport;
+import org.pronzato.fabric.api.data.duckdb.DuckdbSession;
+import org.pronzato.fabric.api.data.ingest.model.IngestModelMapper;
+import org.pronzato.fabric.api.data.manager.RowManagerImpl;
+import org.pronzato.fabric.api.data.views.ViewGraphPlanner;
+import org.pronzato.fabric.api.control.entitlements.core.data.DataColumnMaskPlanner;
+import org.pronzato.fabric.api.control.entitlements.core.data.DataEntitlements;
+import org.pronzato.fabric.api.control.entitlements.core.data.DataRowFilterPlanner;
+import org.pronzato.fabric.api.schemas.SchemaModel;
+import org.pronzato.fabric.api.schemas.manager.SchemaModelMapper;
+import org.pronzato.fabric.api.util.Exceptions;
 import org.pronzato.fabric.api.util.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class ServiceManagerImpl implements ServiceManager {
+public final class DuckdbCatalogImpl implements DuckdbCatalog {
+  private static final Logger LOGGER = LoggerFactory.getLogger(DuckdbCatalogImpl.class);
+  private static final String PLATFORM_GROUP = "platform";
+  private static final String DEFAULT_NAMESPACE = "default";
+  private static final String DEFAULT_PARQUET_GLOB = "**/*.parquet";
+  private static final Comparator<DatasetId> DATASET_ID_ORDER =
+      Comparator.comparing(DatasetId::toString, String.CASE_INSENSITIVE_ORDER)
+          .thenComparing(DatasetId::toString);
+  private static final Comparator<MetadataTable> METADATA_TABLE_ORDER =
+      Comparator.comparing(MetadataTable::namespace, String.CASE_INSENSITIVE_ORDER)
+          .thenComparing(MetadataTable::namespace)
+          .thenComparing(MetadataTable::name, String.CASE_INSENSITIVE_ORDER)
+          .thenComparing(MetadataTable::name)
+          .thenComparing(MetadataTable::tableType, String.CASE_INSENSITIVE_ORDER)
+          .thenComparing(MetadataTable::tableType);
 
-  private static final Logger LOGGER = LoggerFactory.getLogger(ServiceManagerImpl.class);
-  private static final String[] STUB_FACTORIES = {"newBlockingStub", "newFutureStub", "newStub"};
-  static final long DEFAULT_HEARTBEAT_SECONDS = 10L;
-  static final int DEFAULT_TTL_SECONDS = 30;
+  private final Object lock = new Object();
+  private final DiscoveryCache DiscoveryCache;
+  private final RowManagerImpl rowManager;
+  private final String sessionGroup;
+  private final String defaultNamespace;
+  private final ViewGraphPlanner viewGraphPlanner = new ViewGraphPlanner();
+  private final IngestModelMapper ingestModelMapper = new IngestModelMapper();
+  private final LinkedHashSet<DatasetId> explicitInstalls = new LinkedHashSet<>();
+  private final DuckdbDatasetProviderRegistry datasetProviderRegistry;
+  private volatile CatalogSnapshot snapshot;
 
-  private final SessionImpl session;
-  private final ServiceEntitlements entitlements;
-  private final CheckpointStore checkpointStore;
-  private final Map<String, LocalServiceHandle> runningServices = new ConcurrentHashMap<>();
-
-  public ServiceManagerImpl(SessionImpl session) {
-    this(
-        session,
-        CheckpointStores.failFast(
-            "ServiceManager checkpoint store is not configured. Configure session with withCheckpointPath(...)"));
+  public DuckdbCatalogImpl(DiscoveryCache DiscoveryCache, RowManagerImpl rowManager, String sessionGroup) {
+    this(DiscoveryCache, rowManager, sessionGroup, DEFAULT_NAMESPACE);
   }
 
-  public ServiceManagerImpl(SessionImpl session, CheckpointStore checkpointStore) {
-    this.session = Objects.requireNonNull(session, "session");
-    this.entitlements = session.serviceEntitlements();
-    this.checkpointStore = Objects.requireNonNull(checkpointStore, "checkpointStore");
-  }
-
-  SessionImpl session() {
-    return session;
-  }
-
-  ServiceEntitlements entitlements() {
-    return entitlements;
-  }
-
-  CheckpointStore checkpointStore() {
-    return checkpointStore;
-  }
-
-  Logger logger() {
-    return LOGGER;
-  }
-
-  long resolvedServiceHeartbeatSeconds() {
-    long configured = session.serviceHeartbeatCadenceSeconds();
-    return configured > 0L ? configured : DEFAULT_HEARTBEAT_SECONDS;
-  }
-
-  long resolvedServiceStatusSeconds() {
-    long configured = session.serviceStatusCadenceSeconds();
-    return configured > 0L ? configured : 30L;
-  }
-
-  int resolvedServiceHeartbeatTtlSeconds() {
-    long heartbeatSeconds = resolvedServiceHeartbeatSeconds();
-    long minTtl = heartbeatSeconds * 3L;
-    long resolved = Math.max(DEFAULT_TTL_SECONDS, minTtl);
-    return (int) Math.min(Integer.MAX_VALUE, resolved);
+  public DuckdbCatalogImpl(
+      DiscoveryCache DiscoveryCache, RowManagerImpl rowManager, String sessionGroup, String defaultNamespace) {
+    this.DiscoveryCache = Objects.requireNonNull(DiscoveryCache, "DiscoveryCache");
+    this.rowManager = Objects.requireNonNull(rowManager, "rowManager");
+    this.sessionGroup = Strings.requireNonBlank(sessionGroup, "sessionGroup");
+    this.defaultNamespace = Strings.requireNonBlank(defaultNamespace, "defaultNamespace");
+    this.datasetProviderRegistry = DuckdbDatasetProviderRegistry.defaults();
+    this.snapshot = CatalogSnapshot.empty(this.sessionGroup);
   }
 
   @Override
-  public ServiceClient client(String name, ServiceRunOptions options) throws Exception {
-    DefinitionService service = requireDefinition(name);
-    if (isArrowFlightIngestService(service)) {
-      throw unsupported("Arrow Flight ingest client");
+  public void installAll() {
+    CatalogSnapshot updated;
+    synchronized (lock) {
+      updated = rebuildSnapshotLocked();
+      snapshot = updated;
     }
-    if (isArrowFlightSqlService(service)) {
-      throw unsupported("Arrow Flight SQL client");
-    }
-    requireGrpc(service, name);
-    requireGrpcRoutingMode(service, "client");
-    ManagedChannel channel = createGrpcChannel(service, options);
-    String group = resolveGroup(service);
-    return new LocalServiceClient(name, group, channel);
+    rowManager.withDuckdbSession((Consumer<DuckdbSession>) session -> installSnapshotIntoSession(session, updated));
   }
 
   @Override
-  public ServiceHandle start(String name, ServiceRunOptions options, Object implementation)
-      throws Exception {
-    DefinitionService service = requireDefinition(name);
-    RunningService running;
-    if (isArrowFlightIngestService(service)) {
-      running = startArrowFlightIngestServerInternal(service, options, implementation);
-    } else if (isArrowFlightSqlService(service)) {
-      running = startArrowFlightSqlServerInternal(service, options, implementation);
-    } else {
-      requireGrpc(service, name);
-      requireGrpcRoutingMode(service, "server");
-      BindableService bindableService = toBindableService(name, implementation);
-      running = startGrpcServer(service, bindableService, options);
+  public void install(String datasetId) {
+    DatasetId parsed = DatasetId.parse(Strings.requireNonBlank(datasetId, "datasetId"));
+    DefinitionDataset definition = fetchDefinition(parsed);
+    synchronized (lock) {
+      explicitInstalls.add(parsed);
+      if (isActive(definition)) {
+        snapshot = upsertLocked(snapshot, toEntry(definition), true);
+      }
     }
-    LocalServiceHandle handle = new LocalServiceHandle(running);
-    String serviceKey = runningServiceKey(normalizeServiceName(name), running.instanceId());
-    LocalServiceHandle previous = runningServices.put(serviceKey, handle);
-    if (previous != null) {
-      previous.close();
-      throw new IllegalStateException(
-          "Service already started: " + name + " instance=" + running.instanceId());
-    }
-    return handle;
+    rowManager.withDuckdbSession(
+        (Consumer<DuckdbSession>) session -> installSnapshotIntoSession(session, snapshot));
   }
 
   @Override
-  public void stop(String name) throws Exception {
-    String normalized = normalizeServiceName(name);
-    if (normalized == null) {
+  public void onDatasetUpsert(DefinitionDataset definition) {
+    if (definition == null) {
       return;
     }
-    List<String> keysToRemove = new ArrayList<>();
-    for (String key : runningServices.keySet()) {
-      if (isServiceKeyForName(key, normalized)) {
-        keysToRemove.add(key);
-      }
+    DatasetId datasetId = tryDatasetId(definition);
+    if (datasetId == null) {
+      return;
     }
-    for (String key : keysToRemove) {
-      LocalServiceHandle handle = runningServices.remove(key);
-      if (handle != null) {
-        handle.close();
+    boolean explicit = false;
+    synchronized (lock) {
+      if (!sessionGroup.equals(datasetId.group()) && !explicitInstalls.contains(datasetId)) {
+        return;
       }
+      explicit = explicitInstalls.contains(datasetId);
+      if (!isActive(definition)) {
+        snapshot = removeLocked(snapshot, datasetId, false);
+        return;
+      }
+      snapshot = upsertLocked(snapshot, toEntry(definition), explicit);
     }
+    rowManager.withDuckdbSession((Consumer<DuckdbSession>) session -> installDataset(session, toEntry(definition)));
   }
 
   @Override
-  public void stopAll() {
-    List<LocalServiceHandle> snapshot = new ArrayList<>(runningServices.values());
-    runningServices.clear();
-    for (LocalServiceHandle handle : snapshot) {
-      handle.close();
+  public void onDatasetDelete(String group, String namespace, String name) {
+    String resolvedGroup = Strings.requireNonBlank(group, "group");
+    String resolvedNamespace = Strings.requireNonBlank(namespace, "namespace");
+    String resolvedName = Strings.requireNonBlank(name, "name");
+    DatasetId datasetId = DatasetId.of(resolvedGroup, resolvedNamespace, resolvedName);
+    if (!sessionGroup.equals(datasetId.group())) {
+      synchronized (lock) {
+        if (!explicitInstalls.remove(datasetId)) {
+          return;
+        }
+      }
+    }
+
+    CatalogEntry removed;
+    synchronized (lock) {
+      removed = snapshot.entriesById().get(datasetId);
+      snapshot = removeLocked(snapshot, datasetId, true);
+    }
+    String viewName =
+        removed == null
+            ? duckdbViewName(resolvedGroup, resolvedNamespace, resolvedName)
+            : removed.physicalViewName();
+    rowManager.withDuckdbSession(
+        (Consumer<DuckdbSession>) session -> dropView(session, datasetId, viewName));
+  }
+
+  @Override
+  public QueryPlan planSql(String sql, Integer limit) {
+    String rawSql = Strings.requireNonBlank(sql, "sql");
+    CatalogSnapshot current = snapshot;
+    DatasetNameResolver resolver =
+        new DatasetNameResolver(sessionGroup, defaultNamespace, current);
+    List<DatasetId> directDatasets = resolver.resolveAllTableTokensInSql(rawSql);
+    String rewrittenSql = rewriteSqlForQuery(rawSql, resolver, current);
+    List<DatasetId> expanded = expandDependencies(directDatasets, current);
+    return new QueryPlan(applyLimit(rewrittenSql, limit), expanded);
+  }
+
+  @Override
+  public QueryPlan planSqlPublic(String sql, Integer limit) {
+    String rawSql = Strings.requireNonBlank(sql, "sql");
+    CatalogSnapshot current = snapshot;
+    DatasetNameResolver resolver =
+        new DatasetNameResolver(sessionGroup, defaultNamespace, current);
+    List<DatasetId> directDatasets = resolver.resolveAllTableTokensInSql(rawSql);
+    String rewrittenSql = rewriteSql(rawSql, resolver, current);
+    List<DatasetId> expanded = expandDependencies(directDatasets, current);
+    return new QueryPlan(applyLimit(rewrittenSql, limit), expanded);
+  }
+
+  @Override
+  public void prepareSession(DuckdbSession session) {
+    Objects.requireNonNull(session, "session");
+    installSnapshotIntoSession(session, snapshot);
+  }
+
+  @Override
+  public void close() {
+    synchronized (lock) {
+      explicitInstalls.clear();
+      snapshot = CatalogSnapshot.empty(sessionGroup);
     }
   }
 
-  public AutoCloseable startGrpcServer(DefinitionService def, BindableService svc) throws Exception {
-    return ServiceManagerImplBootstrap.startGrpcServer(
-        this, def, svc, ServiceRunOptions.defaults());
-  }
-
-  public ManagedChannel createGrpcChannel(DefinitionService def) throws Exception {
-    return ServiceManagerImplBootstrap.createGrpcChannel(
-        this, def, ServiceRunOptions.defaults());
-  }
-
-  public AutoCloseable startArrowFlightServer(Object... ignored) {
-    throw unsupported("Arrow Flight server");
-  }
-
-  public Object createArrowFlightClient(Object... ignored) {
-    throw unsupported("Arrow Flight client");
-  }
-
-  public AutoCloseable startArrowFlightSqlServer(Object... ignored) {
-    throw unsupported("Arrow Flight SQL server");
-  }
-
-  public Object createArrowFlightSqlClient(Object... ignored) {
-    throw unsupported("Arrow Flight SQL client");
-  }
-
-  public AutoCloseable startAmpsService(Object... ignored) {
-    throw unsupported("AMPS service");
-  }
-
-  public Object createAmpsClient(Object... ignored) {
-    throw unsupported("AMPS client");
-  }
-
-  private RunningGrpcServer startGrpcServer(
-      DefinitionService def, BindableService svc, ServiceRunOptions options) throws Exception {
-    return ServiceManagerImplBootstrap.startGrpcServer(this, def, svc, options);
-  }
-
-  private RunningArrowFlightSqlServer startArrowFlightSqlServerInternal(
-      DefinitionService def, ServiceRunOptions options, Object implementation) throws Exception {
-    return ServiceManagerImplBootstrap.startArrowFlightSqlServerInternal(
-        this, def, options, implementation);
-  }
-
-  private RunningArrowFlightIngestServer startArrowFlightIngestServerInternal(
-      DefinitionService def, ServiceRunOptions options, Object implementation) throws Exception {
-    return ServiceManagerImplBootstrap.startArrowFlightIngestServerInternal(
-        this, def, options, implementation);
-  }
-
-  private ManagedChannel createGrpcChannel(DefinitionService def, ServiceRunOptions options)
-      throws Exception {
-    return ServiceManagerImplBootstrap.createGrpcChannel(this, def, options);
-  }
-
-  private ServiceHbCache createRoutingStatusCache(String group, String serviceName, String serviceId)
-      throws Exception {
-    return ServiceManagerImplBootstrap.createRoutingStatusCache(
-        this, group, serviceName, serviceId);
-  }
-
-  DefinitionService requireDefinition(String name) {
-    return ServiceManagerImplRegistry.requireDefinition(this, name);
-  }
-
-  DefinitionService.Grpc requireGrpc(DefinitionService service, String serviceName) {
-    return ServiceManagerImplRegistry.requireGrpc(service, serviceName);
-  }
-
-  DefinitionService.Arrow requireArrowFlightSql(DefinitionService service, String serviceName) {
-    return ServiceManagerImplRegistry.requireArrowFlightSql(service, serviceName);
-  }
-
-  DefinitionService.Arrow requireArrowFlightIngest(DefinitionService service, String serviceName) {
-    return ServiceManagerImplRegistry.requireArrowFlightIngest(service, serviceName);
-  }
-
-  static boolean isArrowFlightSqlService(DefinitionService service) {
-    return ServiceManagerImplRegistry.isArrowFlightSqlService(service);
-  }
-
-  static boolean isArrowFlightIngestService(DefinitionService service) {
-    return ServiceManagerImplRegistry.isArrowFlightIngestService(service);
-  }
-
-  static BindableService toBindableService(String serviceName, Object implementation) {
-    return ServiceManagerImplRegistry.toBindableService(serviceName, implementation);
-  }
-
-  FlightSqlServiceProducer toFlightSqlProducer(
-      Object implementation,
-      String serviceResourceId,
-      String advertiseHost,
-      java.util.function.IntSupplier portSupplier,
-      boolean tlsEnabled,
-      ServiceRunOptions options) {
-    return ServiceManagerImplBootstrap.toFlightSqlProducer(
-        this, implementation, serviceResourceId, advertiseHost, portSupplier, tlsEnabled, options);
-  }
-
-  TabularManager resolveFlightSqlTabularManager(
-      String serviceResourceId, List<String> datasetAllowlist) {
-    return ServiceManagerImplBootstrap.resolveFlightSqlTabularManager(
-        this, serviceResourceId, datasetAllowlist);
-  }
-
-  static List<String> normalizeDatasetAllowlist(List<String> datasetIds) {
-    return ServiceManagerImplBootstrap.normalizeDatasetAllowlist(datasetIds);
-  }
-
-  static Set<DatasetId> parseDatasetAllowlist(List<String> datasetIds) {
-    return ServiceManagerImplBootstrap.parseDatasetAllowlist(datasetIds);
-  }
-
-  FlightIngestProducer toFlightIngestProducer(Object implementation, String serviceResourceId) {
-    return ServiceManagerImplBootstrap.toFlightIngestProducer(this, implementation, serviceResourceId);
-  }
-
-  List<ServerInterceptor> buildServerInterceptors(
-      DefinitionService def,
-      String serviceId,
-      DefinitionService.Grpc grpc,
-      ServiceRunOptions options) {
-    List<ServerInterceptor> interceptors = new ArrayList<>();
-    OtelManager otelManager = sessionOtelManager();
-    if (otelManager.enabled() && FabricOtelEnablement.isGrpcServerTracingEnabled(def)) {
-      interceptors.add(
-          FabricGrpcOtelInterceptors.server(
-              otelManager, resolveGroup(def), currentAppName(), resolveServiceName(def)));
+  public List<MetadataTable> metadataTables() {
+    CatalogSnapshot current = snapshot;
+    if (current.orderedEntries().isEmpty()) {
+      return List.of();
     }
-    DefinitionService.IdentityMode identityMode = resolveGrpcIdentityMode(grpc);
-    interceptors.add(
-        new ServerInterceptor() {
-          @Override
-          public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
-              ServerCall<ReqT, RespT> call,
-              Metadata headers,
-              ServerCallHandler<ReqT, RespT> next) {
-            String operationName =
-                call.getMethodDescriptor() == null
-                    ? null
-                    : call.getMethodDescriptor().getFullMethodName();
-            Map<String, String> headerSnapshot = snapshotGrpcHeaders(headers);
-            RequestIdentity identity;
-            try {
-              String principal = resolveGrpcAuthenticatedPrincipal(identityMode, headers);
-              if (principal == null && identityMode == DefinitionService.IdentityMode.APP) {
-                call.close(
-                    Status.UNAUTHENTICATED.withDescription(
-                        "Missing caller app headers for grpc.identityMode=APP"),
-                    new Metadata());
-                return new ServerCall.Listener<>() {};
-              }
-              FabricRequestHeaders requestHeaders = FabricRequestHeaders.fromGrpc(headers, principal);
-              identity =
-                  RequestIdentityResolver.resolve(
-                      requestHeaders, session.discoveryCache(), resolveRuntimeEnvironment());
-            } catch (FabricRequestHeaders.ParseException ex) {
-              call.close(Status.UNAUTHENTICATED.withDescription(ex.getMessage()), new Metadata());
-              return new ServerCall.Listener<>() {};
-            } catch (RequestIdentityResolver.ResolutionException ex) {
-              call.close(statusFor(ex).withDescription(ex.getMessage()), new Metadata());
-              return new ServerCall.Listener<>() {};
-            }
-            LOGGER.info("[Request] transport=GRPC serviceId={} operation={} requestId={} caller={} user={} delegatedUser={} headers={}", serviceId, Strings.firstNonBlank(operationName, "<unknown>"), identity.requestId(), safeCaller(identity.callerAppSubject()), identity.effectiveUserSubject(), Strings.firstNonBlank(identity.delegatedUserSubject(), "<none>"), headerSnapshot);
-
-            String subject = identity.effectiveUserSubject();
-            if (Strings.isNotBlank(subject)) {
-              FabricOtelSupport.setCurrentSpanAttributes(
-                  Attributes.builder()
-                      .put(FabricOtelAttributes.FABRIC_SUBJECT, subject)
-                      .build());
-            }
-            ServiceEntitlements.Decision decision =
-                authorizeInvoke(subject, serviceId, operationName);
-            if (decision == null || !decision.allowed()) {
-              String reason = decisionReason(decision);
-              LOGGER.warn("[ServiceManager][gRPC][server-deny] serviceId={} operation={} subject={} reason={}", serviceId, operationName, subject, reason);
-              call.close(Status.PERMISSION_DENIED.withDescription(reason), new Metadata());
-              return new ServerCall.Listener<>() {};
-            }
-            ServerCall.Listener<ReqT> delegate =
-                RequestIdentityResolver.callAsRequestIdentity(
-                    identity, () -> next.startCall(call, headers));
-            return scopedServerListener(delegate, identity);
-          }
-        });
-    interceptors.addAll(extractServerInterceptors(options));
-    return interceptors;
-  }
-
-  List<ClientInterceptor> buildClientInterceptors(
-      DefinitionService def, String serviceId, ServiceRunOptions options) {
-    List<ClientInterceptor> interceptors = new ArrayList<>();
-    OtelManager otelManager = sessionOtelManager();
-    if (otelManager.enabled() && FabricOtelEnablement.isGrpcClientTracingEnabled(def)) {
-      interceptors.add(
-          FabricGrpcOtelInterceptors.client(
-              otelManager, resolveGroup(def), currentAppName(), resolveServiceName(def)));
-    }
-    String appSubject = sessionAppSubject();
-    String userSubject = sessionKerberosPrincipal();
-    String primarySubject = Strings.firstNonBlank(appSubject, userSubject);
-    CallerAppIdentity callerApp = currentCallerApp();
-    FabricRequestHeaders.RequestMetadata staticMetadata = currentRequestMetadataTemplate();
-    interceptors.add(
-        new ClientInterceptor() {
-          @Override
-          public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
-              io.grpc.MethodDescriptor<ReqT, RespT> method,
-              io.grpc.CallOptions callOptions,
-              io.grpc.Channel next) {
-            String operationName = method == null ? null : method.getFullMethodName();
-            String normalizedOperation = Strings.firstNonBlank(operationName, "<unknown>");
-            ServiceEntitlements.Decision primaryDecision =
-                authorizeInvoke(primarySubject, serviceId, operationName);
-            ServiceEntitlements.Decision decision = primaryDecision;
-            if (shouldFallbackToUserSubject(primaryDecision, primarySubject, appSubject, userSubject)) {
-              ServiceEntitlements.Decision fallbackDecision =
-                  authorizeInvoke(userSubject, serviceId, operationName);
-              decision = fallbackDecision;
-              LOGGER.info("[ServiceManager][gRPC][client-auth] serviceId={} operation={} primarySubject={} primaryAllowed={} primaryReason={} fallbackSubject={} fallbackAllowed={} fallbackReason={} finalSubject={} finalAllowed={} finalReason={}", serviceId, normalizedOperation, primarySubject, decisionAllowed(primaryDecision), decisionReason(primaryDecision), userSubject, decisionAllowed(fallbackDecision), decisionReason(fallbackDecision), userSubject, decisionAllowed(decision), decisionReason(decision));
-            } else if (decision == null || !decision.allowed()) {
-              LOGGER.warn("[ServiceManager][gRPC][client-auth] serviceId={} operation={} subject={} allowed={} reason={}", serviceId, normalizedOperation, primarySubject, decisionAllowed(decision), decisionReason(decision));
-            }
-            if (decision == null || !decision.allowed()) {
-              throw new IllegalArgumentException(decisionReason(decision));
-            }
-            ClientCall<ReqT, RespT> delegate = next.newCall(method, callOptions);
-            return new ForwardingClientCall.SimpleForwardingClientCall<>(delegate) {
-              @Override
-              public void start(Listener<RespT> responseListener, Metadata headers) {
-                Metadata metadata = headers == null ? new Metadata() : headers;
-                FabricRequestHeaders requestHeaders =
-                    FabricRequestHeaders.outbound(
-                        callerApp,
-                        null,
-                        new FabricRequestHeaders.RequestMetadata(
-                            Strings.firstNonBlank(
-                                staticMetadata.requestId(), FabricRequestHeaders.generateRequestId()),
-                            Strings.firstNonBlank(
-                                staticMetadata.traceId(), UUID.randomUUID().toString()),
-                            staticMetadata.env(),
-                            staticMetadata.region(),
-                            staticMetadata.site()));
-                requestHeaders.applyToGrpcMetadata(metadata);
-                super.start(responseListener, metadata);
-              }
-            };
-          }
-        });
-    interceptors.addAll(extractClientInterceptors(options));
-    return interceptors;
-  }
-
-  static List<ServerInterceptor> extractServerInterceptors(ServiceRunOptions options) {
-    return ServiceManagerImplInterceptors.extractServerInterceptors(options);
-  }
-
-  @SuppressWarnings("unchecked")
-  static Map<
-          FlightServerMiddleware.Key<?>,
-          FlightServerMiddleware.Factory<? extends FlightServerMiddleware>>
-      mergeFlightMiddlewares(
-          ServiceRunOptions options,
-          Map<
-                  FlightServerMiddleware.Key<?>,
-                  FlightServerMiddleware.Factory<? extends FlightServerMiddleware>>
-              defaults) {
-    LinkedHashMap<
-            FlightServerMiddleware.Key<?>,
-            FlightServerMiddleware.Factory<? extends FlightServerMiddleware>>
-        merged = new LinkedHashMap<>();
-    if (defaults != null && !defaults.isEmpty()) {
-      merged.putAll(defaults);
-    }
-    if (options == null || Strings.isEmpty(options.interceptors())) {
-      return Map.copyOf(merged);
-    }
-    for (Object candidate : options.interceptors()) {
-      if (candidate == null) {
+    List<MetadataTable> tables = new ArrayList<>();
+    for (CatalogEntry entry : current.orderedEntries()) {
+      if (entry == null) {
         continue;
       }
-      if (candidate instanceof Map.Entry<?, ?> entry) {
-        Object key = entry.getKey();
-        Object value = entry.getValue();
-        if (key instanceof FlightServerMiddleware.Key<?> middlewareKey
-            && value instanceof FlightServerMiddleware.Factory<?> middlewareFactory) {
-          merged.put(
-              middlewareKey,
-              (FlightServerMiddleware.Factory<? extends FlightServerMiddleware>) middlewareFactory);
-          continue;
+      for (String tableType : metadataTableTypes(entry)) {
+        tables.add(new MetadataTable(entry.datasetId(), entry.namespace(), entry.name(), tableType));
+      }
+    }
+    tables.sort(METADATA_TABLE_ORDER);
+    return List.copyOf(tables);
+  }
+
+  public Optional<SchemaModel> metadataSchemaModel(DatasetId datasetId) {
+    Objects.requireNonNull(datasetId, "datasetId");
+    CatalogEntry entry = snapshot.entriesById().get(datasetId);
+    if (entry == null) {
+      return Optional.empty();
+    }
+    SchemaModel schemaModel = resolveSchemaForMasking(entry);
+    if (schemaModel == null) {
+      return Optional.empty();
+    }
+    return Optional.of(schemaModel);
+  }
+
+  public record MetadataTable(
+      DatasetId datasetId,
+      String namespace,
+      String name,
+      String tableType) {}
+
+  private CatalogSnapshot rebuildSnapshotLocked() {
+    LinkedHashMap<DatasetId, CatalogEntry> byId = new LinkedHashMap<>();
+    for (DefinitionDataset definition : DiscoveryCache.list(DefinitionDataset.class, sessionGroup)) {
+      if (!isActive(definition)) {
+        continue;
+      }
+      CatalogEntry entry = toEntry(definition);
+      byId.put(entry.datasetId(), entry);
+    }
+    for (DatasetId datasetId : explicitInstalls) {
+      DefinitionDataset definition = fetchDefinition(datasetId);
+      if (!isActive(definition)) {
+        continue;
+      }
+      CatalogEntry entry = toEntry(definition);
+      byId.put(entry.datasetId(), entry);
+    }
+    return buildSnapshotById(byId.values());
+  }
+
+  private CatalogSnapshot upsertLocked(
+      CatalogSnapshot current, CatalogEntry entry, boolean includeExplicitGroup) {
+    LinkedHashMap<DatasetId, CatalogEntry> byId = new LinkedHashMap<>(current.entriesById());
+    if (!sessionGroup.equals(entry.datasetId().group()) && !includeExplicitGroup) {
+      return current;
+    }
+    byId.put(entry.datasetId(), entry);
+    CatalogSnapshot updated = buildSnapshotById(byId.values());
+    LOGGER.debug("[Catalog] update datasetId={} type={} viewName={}", entry.datasetId(), typeToken(entry.definition()), entry.physicalViewName());
+    return updated;
+  }
+
+  private CatalogSnapshot removeLocked(CatalogSnapshot current, DatasetId datasetId, boolean logDrop) {
+    LinkedHashMap<DatasetId, CatalogEntry> byId = new LinkedHashMap<>(current.entriesById());
+    CatalogEntry removed = byId.remove(datasetId);
+    CatalogSnapshot updated = buildSnapshotById(byId.values());
+    if (removed != null && logDrop) {
+      LOGGER.debug("[Catalog] drop datasetId={} viewName={}", removed.datasetId(), removed.physicalViewName());
+    }
+    return updated;
+  }
+
+  private CatalogSnapshot buildSnapshotById(Collection<CatalogEntry> entries) {
+    List<CatalogEntry> ordered = new ArrayList<>(entries);
+    ordered.sort(
+        Comparator.comparing((CatalogEntry entry) -> entry.datasetId().toString(), String.CASE_INSENSITIVE_ORDER)
+            .thenComparing(entry -> entry.datasetId().toString()));
+    Map<DatasetId, CatalogEntry> byId = new LinkedHashMap<>();
+    for (CatalogEntry entry : ordered) {
+      byId.put(entry.datasetId(), entry);
+    }
+    Map<String, DatasetId> preliminaryQualified = new HashMap<>();
+    Map<String, List<DatasetId>> preliminaryUnqualified = new HashMap<>();
+    for (CatalogEntry entry : ordered) {
+      String namespaceQualified = qualifiedNameKey(entry.namespace(), entry.name());
+      putQualifiedPreferSessionGroup(preliminaryQualified, namespaceQualified, entry.datasetId());
+      preliminaryQualified.put(
+          qualifiedNameKey(entry.datasetId().group(), entry.namespace(), entry.name()),
+          entry.datasetId());
+      if (sessionGroup.equals(entry.datasetId().group())) {
+        String unqualifiedKey = entry.name().toLowerCase(Locale.ROOT);
+        preliminaryUnqualified
+            .computeIfAbsent(unqualifiedKey, ignored -> new ArrayList<>())
+            .add(entry.datasetId());
+      }
+    }
+    Map<String, List<DatasetId>> preliminaryUnqualifiedImmutable = new HashMap<>();
+    for (Map.Entry<String, List<DatasetId>> entry : preliminaryUnqualified.entrySet()) {
+      List<DatasetId> values = new ArrayList<>(entry.getValue());
+      values.sort(DATASET_ID_ORDER);
+      preliminaryUnqualifiedImmutable.put(entry.getKey(), List.copyOf(values));
+    }
+    CatalogSnapshot preliminary =
+        new CatalogSnapshot(
+            sessionGroup,
+            List.copyOf(ordered),
+            Map.copyOf(byId),
+            Map.copyOf(preliminaryQualified),
+            Map.copyOf(preliminaryUnqualifiedImmutable));
+
+    List<CatalogEntry> withDependencies = new ArrayList<>(ordered.size());
+    DatasetNameResolver resolver = new DatasetNameResolver(sessionGroup, defaultNamespace, preliminary);
+    for (CatalogEntry entry : ordered) {
+      if (!entry.logicalView()) {
+        withDependencies.add(entry);
+        continue;
+      }
+      List<DatasetId> dependencies = resolveViewDependencies(entry, resolver);
+      withDependencies.add(
+          new CatalogEntry(
+              entry.datasetId(),
+              entry.definition(),
+              entry.namespace(),
+              entry.name(),
+              entry.physicalViewName(),
+              dependencies,
+              true));
+    }
+
+    Map<DatasetId, CatalogEntry> finalById = new LinkedHashMap<>();
+    Map<String, DatasetId> qualified = new HashMap<>();
+    Map<String, List<DatasetId>> unqualified = new HashMap<>();
+    for (CatalogEntry entry : withDependencies) {
+      finalById.put(entry.datasetId(), entry);
+      String namespaceQualified = qualifiedNameKey(entry.namespace(), entry.name());
+      putQualifiedPreferSessionGroup(qualified, namespaceQualified, entry.datasetId());
+      qualified.put(
+          qualifiedNameKey(entry.datasetId().group(), entry.namespace(), entry.name()),
+          entry.datasetId());
+      if (sessionGroup.equals(entry.datasetId().group())) {
+        String unqualifiedKey = entry.name().toLowerCase(Locale.ROOT);
+        unqualified.computeIfAbsent(unqualifiedKey, ignored -> new ArrayList<>()).add(entry.datasetId());
+      }
+    }
+    Map<String, List<DatasetId>> immutableUnqualified = new HashMap<>();
+    for (Map.Entry<String, List<DatasetId>> entry : unqualified.entrySet()) {
+      List<DatasetId> values = new ArrayList<>(entry.getValue());
+      values.sort(DATASET_ID_ORDER);
+      immutableUnqualified.put(entry.getKey(), List.copyOf(values));
+    }
+    return new CatalogSnapshot(
+        sessionGroup,
+        List.copyOf(withDependencies),
+        Map.copyOf(finalById),
+        Map.copyOf(qualified),
+        Map.copyOf(immutableUnqualified));
+  }
+
+  private List<DatasetId> resolveViewDependencies(CatalogEntry entry, DatasetNameResolver resolver) {
+    DefinitionDataset.View view = entry.definition().view();
+    if (view == null) {
+      return List.of();
+    }
+    LinkedHashSet<DatasetId> dependencies = new LinkedHashSet<>();
+    List<String> configured = view.dependencies();
+    if (configured != null && !configured.isEmpty()) {
+      for (String dependency : configured) {
+        DatasetId parsed = tryParseDependencyToken(dependency, resolver);
+        if (parsed != null && !parsed.equals(entry.datasetId())) {
+          dependencies.add(parsed);
         }
       }
-      throw new IllegalArgumentException(
-          "Unsupported Arrow Flight middleware registration type: "
-              + candidate.getClass().getName()
-              + " (expected Map.Entry<FlightServerMiddleware.Key, FlightServerMiddleware.Factory>)");
+    } else {
+      String querySql = Strings.trimToNull(view.querySql());
+      if (querySql != null) {
+        try {
+          for (DatasetId dependency : resolver.resolveAllTableTokensInSql(querySql)) {
+            if (!dependency.equals(entry.datasetId())) {
+              dependencies.add(dependency);
+            }
+          }
+        } catch (IllegalArgumentException ignore) {
+          // Keep catalog rebuild deterministic even when configured view dependencies are temporarily missing.
+        }
+      }
     }
-    return Map.copyOf(merged);
+    return List.copyOf(dependencies);
   }
 
-  void authorizeStart(String serviceId, String subject) {
-    ServiceManagerImplBootstrap.authorizeStart(this, serviceId, subject);
-  }
-
-  void authorizeStart(
-      String serviceId, String subject, ServiceEntitlements.Transport transport) {
-    ServiceManagerImplBootstrap.authorizeStart(this, serviceId, subject, transport);
-  }
-
-  ServiceEntitlements.Decision authorizeInvoke(
-      String subject, String serviceId, String operationName) {
-    return entitlements.authorize(
-        new ServiceEntitlements.Identity(subject, null),
-        new ServiceEntitlements.Request(
-            ServiceEntitlements.Transport.GRPC,
-            ServiceEntitlements.Action.INVOKE,
-            serviceId,
-            operationName,
-            null,
-            null,
-            Map.of(),
-            Map.of()));
-  }
-
-  static boolean shouldFallbackToUserSubject(
-      ServiceEntitlements.Decision decision,
-      String primarySubject,
-      String appSubject,
-      String userSubject) {
-    return ServiceManagerImplInterceptors.shouldFallbackToUserSubject(
-        decision, primarySubject, appSubject, userSubject);
-  }
-
-  static String decisionReason(ServiceEntitlements.Decision decision) {
-    return ServiceManagerImplInterceptors.decisionReason(decision);
-  }
-
-  static boolean decisionAllowed(ServiceEntitlements.Decision decision) {
-    return ServiceManagerImplInterceptors.decisionAllowed(decision);
-  }
-
-  static String safeCaller(String callerAppSubject) {
-    return ServiceManagerImplInterceptors.safeCaller(callerAppSubject);
-  }
-
-  static Map<String, String> snapshotGrpcHeaders(Metadata headers) {
-    return ServiceManagerImplInterceptors.snapshotGrpcHeaders(headers);
-  }
-
-  static String startOperationName(ServiceEntitlements.Transport transport) {
-    return ServiceManagerImplInterceptors.startOperationName(transport);
-  }
-
-  String resolveServerStartSubject(DefinitionService.Grpc grpc) {
-    return ServiceManagerImplBootstrap.resolveServerStartSubject(this, grpc);
-  }
-
-  String resolveServerStartSubject(DefinitionService.Arrow arrow) {
-    return ServiceManagerImplBootstrap.resolveServerStartSubject(this, arrow);
-  }
-
-  static String resolveGrpcAuthenticatedPrincipal(
-      DefinitionService.IdentityMode identityMode, Metadata headers) {
-    return ServiceManagerImplInterceptors.resolveGrpcAuthenticatedPrincipal(identityMode, headers);
-  }
-
-  static DefinitionService.IdentityMode resolveGrpcIdentityMode(
-      DefinitionService.Grpc grpc) {
-    return ServiceManagerImplInterceptors.resolveGrpcIdentityMode(grpc);
-  }
-
-  static Status statusFor(RequestIdentityResolver.ResolutionException ex) {
-    return ServiceManagerImplInterceptors.statusFor(ex);
-  }
-
-  static <ReqT> ServerCall.Listener<ReqT> scopedServerListener(
-      ServerCall.Listener<ReqT> delegate, RequestIdentity identity) {
-    return ServiceManagerImplInterceptors.scopedServerListener(delegate, identity);
-  }
-
-  CallerAppIdentity currentCallerApp() {
-    String group = session.context() == null ? null : session.context().getGroup();
-    String name = session.context() == null ? null : session.context().getAppName();
-    String instance = session.context() == null ? null : session.context().getInstance();
-    return new CallerAppIdentity(group, name, instance);
-  }
-
-  String currentAppName() {
-    return session.context() == null ? null : session.context().getAppName();
-  }
-
-  FlightProducer maybeInstrumentArrowServerProducer(
-      DefinitionService service,
-      FlightProducer producer,
-      String transport,
-      boolean transportEnabled) {
-    return ServiceManagerImplBootstrap.maybeInstrumentArrowServerProducer(
-        this, service, producer, transport, transportEnabled);
-  }
-
-  OtelManager sessionOtelManager() {
-    return ServiceManagerImplBootstrap.sessionOtelManager(this);
-  }
-
-  FabricRequestHeaders.RequestMetadata currentRequestMetadataTemplate() {
-    return new FabricRequestHeaders.RequestMetadata(
-        null,
-        null,
-        session.context() == null ? null : session.context().getEnv(),
-        session.context() == null ? null : session.context().getRegion(),
-        session.context() == null ? null : session.context().getSite());
-  }
-
-  String resolveRuntimeEnvironment() {
-    return ServiceManagerImplBootstrap.resolveRuntimeEnvironment(this);
-  }
-
-  String sessionAppSubject() {
-    String group = session.context() == null ? null : Strings.trimToNull(session.context().getGroup());
-    String app = session.context() == null ? null : Strings.trimToNull(session.context().getAppName());
-    if (group == null || app == null) {
+  private DatasetId tryParseDependencyToken(String dependency, DatasetNameResolver resolver) {
+    String token = Strings.trimToNull(dependency);
+    if (token == null) {
       return null;
     }
-    return "app:" + group + "/" + app;
-  }
-
-  static List<ClientInterceptor> extractClientInterceptors(ServiceRunOptions options) {
-    return ServiceManagerImplInterceptors.extractClientInterceptors(options);
-  }
-
-  int resolveBindPort(DefinitionService.Grpc grpc, ServiceRunOptions options) {
-    return ServiceManagerImplRegistry.resolveBindPort(grpc, options);
-  }
-
-  int resolveBindPort(DefinitionService.Arrow arrow, ServiceRunOptions options) {
-    return ServiceManagerImplRegistry.resolveBindPort(arrow, options);
-  }
-
-  String resolveBindHost(DefinitionService.Grpc grpc, ServiceRunOptions options) {
-    return ServiceManagerImplRegistry.resolveBindHost(grpc, options);
-  }
-
-  String resolveBindHost(DefinitionService.Arrow arrow, ServiceRunOptions options) {
-    return ServiceManagerImplRegistry.resolveBindHost(arrow, options);
-  }
-
-  String resolveAdvertiseHost(DefinitionService.Grpc grpc, ServiceRunOptions options) {
-    return ServiceManagerImplRegistry.resolveAdvertiseHost(this, grpc, options);
-  }
-
-  String resolveAdvertiseHost(DefinitionService.Arrow arrow, ServiceRunOptions options) {
-    return ServiceManagerImplRegistry.resolveAdvertiseHost(this, arrow, options);
-  }
-
-  int resolveAdvertisePort(
-      DefinitionService.Grpc grpc, ServiceRunOptions options, int bindPort) {
-    return ServiceManagerImplRegistry.resolveAdvertisePort(grpc, options, bindPort);
-  }
-
-  int resolveAdvertisePort(
-      DefinitionService.Arrow arrow, ServiceRunOptions options, int bindPort) {
-    return ServiceManagerImplRegistry.resolveAdvertisePort(arrow, options, bindPort);
-  }
-
-  static boolean tlsEnabled(DefinitionService.Grpc grpc) {
-    return ServiceManagerImplRegistry.tlsEnabled(grpc);
-  }
-
-  static boolean tlsEnabled(DefinitionService.Arrow arrow) {
-    return ServiceManagerImplRegistry.tlsEnabled(arrow);
-  }
-
-  static boolean kerberosEnabled(DefinitionService.Grpc grpc) {
-    return ServiceManagerImplRegistry.kerberosEnabled(grpc);
-  }
-
-  static boolean kerberosEnabled(DefinitionService.Arrow arrow) {
-    return ServiceManagerImplRegistry.kerberosEnabled(arrow);
-  }
-
-  String sessionKerberosPrincipal() {
-    return ServiceManagerImplRegistry.sessionKerberosPrincipal(this);
-  }
-
-  File sessionKerberosKeytab() {
-    return ServiceManagerImplRegistry.sessionKerberosKeytab(this);
-  }
-
-  static File toFile(Path path) {
-    return ServiceManagerImplRegistry.toFile(path);
-  }
-
-  static <T> T firstNonNull(T first, T second) {
-    return ServiceManagerImplRegistry.firstNonNull(first, second);
-  }
-
-  static <T> T firstNonNull(T first, T second, T third) {
-    return ServiceManagerImplRegistry.firstNonNull(first, second, third);
-  }
-
-  static String firstNonBlank(String... values) {
-    return ServiceManagerImplRegistry.firstNonBlank(values);
-  }
-
-  ServiceRoutingMode requireGrpcRoutingMode(DefinitionService service, String usage) {
-    return ServiceManagerImplRegistry.requireGrpcRoutingMode(service, usage);
-  }
-
-  ServiceRoutingMode requireArrowRoutingMode(DefinitionService service, String usage) {
-    return ServiceManagerImplRegistry.requireArrowRoutingMode(service, usage);
-  }
-
-  ServiceStatusPublisher createGrpcStatusPublisher(
-      String serviceName,
-      String instanceId,
-      String advertiseHost,
-      int advertisePort,
-      String bindHost,
-      int bindPort,
-      DefinitionService.Grpc grpc,
-      boolean tlsEnabled,
-      ServiceRunOptions options) {
-    return ServiceManagerImplBootstrap.createGrpcStatusPublisher(
-        this,
-        serviceName,
-        instanceId,
-        advertiseHost,
-        advertisePort,
-        bindHost,
-        bindPort,
-        grpc,
-        tlsEnabled,
-        options);
-  }
-
-  ServiceStatusPublisher createArrowStatusPublisher(
-      String serviceName,
-      String instanceId,
-      String advertiseHost,
-      int advertisePort,
-      String bindHost,
-      int bindPort,
-      DefinitionService.Arrow arrow,
-      boolean tlsEnabled,
-      ServiceRunOptions options) {
-    return ServiceManagerImplBootstrap.createArrowStatusPublisher(
-        this,
-        serviceName,
-        instanceId,
-        advertiseHost,
-        advertisePort,
-        bindHost,
-        bindPort,
-        arrow,
-        tlsEnabled,
-        options);
-  }
-
-  String resolveInstanceId(
-      ServiceRunOptions options, String advertiseHost, int advertisePort) {
-    return ServiceManagerImplBootstrap.resolveInstanceId(options, advertiseHost, advertisePort);
-  }
-
-  String resolveGroupName() {
-    return ServiceManagerImplRegistry.resolveGroupName(this);
-  }
-
-  static String requireValue(String value, String label) {
-    return ServiceManagerImplRegistry.requireValue(value, label);
-  }
-
-  static String runningServiceKey(String serviceName, String instanceId) {
-    return ServiceManagerImplRegistry.runningServiceKey(serviceName, instanceId);
-  }
-
-  static boolean isServiceKeyForName(String key, String serviceName) {
-    return ServiceManagerImplRegistry.isServiceKeyForName(key, serviceName);
-  }
-
-  static String serviceId(DefinitionService service) {
-    return ServiceManagerImplRegistry.serviceId(service);
-  }
-
-  static String resolveServiceName(DefinitionService service) {
-    return ServiceManagerImplRegistry.resolveServiceName(service);
-  }
-
-  String resolveGroup(DefinitionService service) {
-    return ServiceManagerImplRegistry.resolveGroup(this, service);
-  }
-
-  static String normalizeServiceName(String name) {
-    return ServiceManagerImplRegistry.normalizeServiceName(name);
-  }
-
-  static UnsupportedOperationException unsupported(String operation) {
-    return ServiceManagerImplRegistry.unsupported(operation);
-  }
-
-  Optional<DefinitionSchema> resolveSchema(DefinitionService service) {
-    return ServiceManagerImplRegistry.resolveSchema(this, service);
-  }
-
-  interface RunningService extends AutoCloseable {
-    String instanceId();
-
-    int port();
-
-    void blockUntilShutdown() throws InterruptedException;
-  }
-
-  static final class RunningGrpcServer implements RunningService {
-    private final String serviceId;
-    private final String instanceId;
-    private final GrpcServiceRuntime runtime;
-    private final ServiceStatusPublisher publisher;
-
-    RunningGrpcServer(
-        String serviceId, String instanceId, GrpcServiceRuntime runtime, ServiceStatusPublisher publisher) {
-      this.serviceId = serviceId;
-      this.instanceId = instanceId;
-      this.runtime = Objects.requireNonNull(runtime, "runtime");
-      this.publisher = Objects.requireNonNull(publisher, "publisher");
-    }
-
-    @Override
-    public String instanceId() {
-      return instanceId;
-    }
-
-    @Override
-    public int port() {
-      return runtime.port();
-    }
-
-    @Override
-    public void blockUntilShutdown() throws InterruptedException {
-      runtime.blockUntilShutdown();
-    }
-
-    @Override
-    public void close() {
-      try {
-        publisher.close();
-      } catch (Exception ex) {
-        LOGGER.warn("[ServiceManager][gRPC][publisher-close] serviceId={} instance={} error={}",
-            serviceId, instanceId, ex.toString());
+    try {
+      if (token.regionMatches(true, 0, "dataset:", 0, "dataset:".length())) {
+        return DatasetId.parse(token);
       }
-      runtime.close();
-    }
-  }
-
-  static final class RunningArrowFlightSqlServer implements RunningService {
-    private final String serviceId;
-    private final String instanceId;
-    private final FlightSqlServiceRuntime runtime;
-    private final ServiceStatusPublisher publisher;
-
-    RunningArrowFlightSqlServer(
-        String serviceId,
-        String instanceId,
-        FlightSqlServiceRuntime runtime,
-        ServiceStatusPublisher publisher) {
-      this.serviceId = serviceId;
-      this.instanceId = instanceId;
-      this.runtime = Objects.requireNonNull(runtime, "runtime");
-      this.publisher = Objects.requireNonNull(publisher, "publisher");
-    }
-
-    @Override
-    public String instanceId() {
-      return instanceId;
-    }
-
-    @Override
-    public int port() {
-      return runtime.port();
-    }
-
-    @Override
-    public void blockUntilShutdown() throws InterruptedException {
-      runtime.blockUntilShutdown();
-    }
-
-    @Override
-    public void close() {
-      try {
-        publisher.close();
-      } catch (Exception ex) {
-        LOGGER.warn("[ServiceManager][FlightSQL][publisher-close] serviceId={} instance={} error={}", serviceId, instanceId, ex.toString());
+      if (token.indexOf('/') >= 0) {
+        String[] parts = token.split("/", 2);
+        if (parts.length != 2) {
+          return null;
+        }
+        return DatasetId.of(sessionGroup, parts[0], parts[1]);
       }
-      runtime.close();
+      return resolver.resolveTableToken(token);
+    } catch (IllegalArgumentException ex) {
+      return null;
     }
   }
 
-  static final class RunningArrowFlightIngestServer implements RunningService {
-    private final String serviceId;
-    private final String instanceId;
-    private final FlightIngestServiceRuntime runtime;
-    private final ServiceStatusPublisher publisher;
-
-    RunningArrowFlightIngestServer(
-        String serviceId,
-        String instanceId,
-        FlightIngestServiceRuntime runtime,
-        ServiceStatusPublisher publisher) {
-      this.serviceId = serviceId;
-      this.instanceId = instanceId;
-      this.runtime = Objects.requireNonNull(runtime, "runtime");
-      this.publisher = Objects.requireNonNull(publisher, "publisher");
-    }
-
-    @Override
-    public String instanceId() {
-      return instanceId;
-    }
-
-    @Override
-    public int port() {
-      return runtime.port();
-    }
-
-    @Override
-    public void blockUntilShutdown() throws InterruptedException {
-      runtime.blockUntilShutdown();
-    }
-
-    @Override
-    public void close() {
-      try {
-        publisher.close();
-      } catch (Exception ex) {
-        LOGGER.warn("[ServiceManager][FlightIngest][publisher-close] serviceId={} instance={} error={}", serviceId, instanceId, ex.toString());
-      }
-      runtime.close();
-    }
-  }
-
-  static final class LocalServiceHandle implements ServiceHandle {
-    private final RunningService running;
-
-    LocalServiceHandle(RunningService running) {
-      this.running = Objects.requireNonNull(running, "running");
-    }
-
-    @Override
-    public int port() {
-      return running.port();
-    }
-
-    @Override
-    public void blockUntilShutdown() throws InterruptedException {
-      running.blockUntilShutdown();
-    }
-
-    @Override
-    public void close() {
-      try {
-        running.close();
-      } catch (Exception ex) {
-        throw new IllegalStateException("Failed to close service handle", ex);
+  private void installSnapshotIntoSession(DuckdbSession session, CatalogSnapshot current) {
+    for (CatalogEntry entry : current.orderedEntries()) {
+      if (!entry.logicalView()) {
+        installDataset(session, entry);
       }
     }
+    installLogicalViews(session, current);
   }
 
-  private static final class LocalServiceClient implements ServiceClient {
-    private final String serviceName;
-    private final String group;
-    private final ManagedChannel channel;
-
-    private LocalServiceClient(String serviceName, String group, ManagedChannel channel) {
-      this.serviceName = serviceName;
-      this.group = group;
-      this.channel = Objects.requireNonNull(channel, "channel");
-    }
-
-    @Override
-    public String serviceName() {
-      return serviceName;
-    }
-
-    @Override
-    public String group() {
-      return group;
-    }
-
-    @Override
-    public <T> T as(Class<T> type) {
-      Objects.requireNonNull(type, "type");
-      if (type.isAssignableFrom(channel.getClass())) {
-        return type.cast(channel);
+  private void installLogicalViews(DuckdbSession session, CatalogSnapshot current) {
+    Map<String, List<String>> graph = new LinkedHashMap<>();
+    for (CatalogEntry entry : current.orderedEntries()) {
+      if (!entry.logicalView()) {
+        continue;
       }
-      if (type == ManagedChannel.class || type == Channel.class) {
-        return type.cast(channel);
-      }
-      Class<?> owner = type.getEnclosingClass();
-      if (owner != null) {
-        for (String factory : STUB_FACTORIES) {
-          T stub = invokeFactory(owner, factory, channel, type);
-          if (stub != null) {
-            return stub;
-          }
+      List<String> dependencies = new ArrayList<>();
+      for (DatasetId dependency : entry.dependencies()) {
+        CatalogEntry dependencyEntry = current.entriesById().get(dependency);
+        if (dependencyEntry != null && dependencyEntry.logicalView()) {
+          dependencies.add(dependency.toString());
         }
       }
-      for (String factory : STUB_FACTORIES) {
-        T stub = invokeFactory(type, factory, channel, type);
-        if (stub != null) {
-          return stub;
-        }
-      }
-      throw new IllegalArgumentException("Unsupported gRPC stub type: " + type.getName());
+      dependencies.sort(String.CASE_INSENSITIVE_ORDER);
+      graph.put(entry.datasetId().toString(), List.copyOf(dependencies));
     }
 
-    @Override
-    public void close() {
-      channel.shutdown();
-      try {
-        if (!channel.awaitTermination(2, TimeUnit.SECONDS)) {
-          channel.shutdownNow();
-          channel.awaitTermination(1, TimeUnit.SECONDS);
-        }
-      } catch (InterruptedException ex) {
-        Thread.currentThread().interrupt();
-        channel.shutdownNow();
-      }
+    LinkedHashSet<String> ordered = new LinkedHashSet<>();
+    List<String> roots = new ArrayList<>(graph.keySet());
+    roots.sort(String.CASE_INSENSITIVE_ORDER);
+    for (String root : roots) {
+      ordered.addAll(viewGraphPlanner.plan(root, graph));
     }
 
-    private static <T> T invokeFactory(
-        Class<?> factoryOwner, String methodName, Channel channel, Class<T> expectedType) {
-      Method method;
+    DatasetNameResolver resolver = new DatasetNameResolver(sessionGroup, defaultNamespace, current);
+    for (String datasetId : ordered) {
+      CatalogEntry entry = current.entriesById().get(DatasetId.parse(datasetId));
+      if (entry == null) {
+        continue;
+      }
+      String querySql = Strings.requireNonBlank(entry.definition().view().querySql(), "view.querySql");
+      String rewritten;
       try {
-        method = factoryOwner.getMethod(methodName, Channel.class);
-      } catch (NoSuchMethodException ex) {
-        return null;
+        rewritten = rewriteSql(querySql, resolver, current);
+      } catch (IllegalArgumentException ex) {
+        dropView(session, entry.datasetId(), entry.physicalViewName());
+        LOGGER.debug("[Catalog] install-skipped datasetId={} type={} viewName={} reason=unresolved-view-dependency message={}", entry.datasetId(), typeToken(entry.definition()), entry.physicalViewName(), ex.getMessage());
+        continue;
       }
-      if (!Modifier.isStatic(method.getModifiers())) {
-        return null;
+      String sql =
+          "create or replace view "
+              + quoteIdentifier(entry.physicalViewName())
+              + " as "
+              + stripTrailingSemicolon(rewritten);
+      exec(session, sql);
+      LOGGER.debug("[Catalog] install datasetId={} type={} viewName={}", entry.datasetId(), typeToken(entry.definition()), entry.physicalViewName());
+    }
+  }
+
+  private void installDataset(DuckdbSession session, CatalogEntry entry) {
+    try (DuckdbPreparedDataset prepared = prepareDatasetForCatalog(session, entry)) {
+      if (!prepared.installed()) {
+        return;
       }
-      if (!expectedType.isAssignableFrom(method.getReturnType())) {
-        return null;
+      LOGGER.debug("[Catalog] install datasetId={} type={} viewName={}", entry.datasetId(), typeToken(entry.definition()), entry.physicalViewName());
+    } catch (IllegalStateException ex) {
+      if (isMissingParquetFilesError(ex)) {
+        LOGGER.debug("[Catalog] install-skipped datasetId={} type={} viewName={} reason=no-matching-parquet-files", entry.datasetId(), typeToken(entry.definition()), entry.physicalViewName());
+        return;
+      }
+      if (isS3CredentialUnavailableError(ex)) {
+        LOGGER.warn("[Catalog] install-skipped datasetId={} type={} viewName={} reason=s3-credentials-unavailable message={}", entry.datasetId(), typeToken(entry.definition()), entry.physicalViewName(), Exceptions.rootMessageNullable(ex));
+        return;
+      }
+      if (isMissingDuckdbRelationError(ex) && isDuckdbActive(entry.definition().binding() == null ? null : entry.definition().binding().duckdb())) {
+        LOGGER.debug("[Catalog] install-skipped datasetId={} type={} viewName={} reason=missing-duckdb-active-relation", entry.datasetId(), typeToken(entry.definition()), entry.physicalViewName());
+        return;
+      }
+      throw ex;
+    } catch (Exception ex) {
+      throw new IllegalStateException(
+          "Failed to prepare dataset install for " + entry.datasetId() + ": " + ex.getMessage(),
+          ex);
+    }
+  }
+
+  private DuckdbPreparedDataset prepareDatasetForCatalog(
+      DuckdbSession session, CatalogEntry entry) {
+    DefinitionDataset definition = entry.definition();
+    DefinitionDataset.View view = definition.view();
+    String viewName = quoteIdentifier(entry.physicalViewName());
+
+    if (view != null) {
+      DefinitionDataset.Target target = view.target();
+      String targetParquetPath = target == null ? null : Strings.trimToNull(target.parquetPath());
+      if (targetParquetPath != null) {
+        String parquetExpression = parquetFromPath(targetParquetPath, null, false);
+        exec(
+            session,
+            "create or replace view " + viewName + " as select * from " + parquetExpression);
+        return DuckdbPreparedDataset.installed(entry.datasetId(), entry.physicalViewName(), null);
+      }
+      String targetTable = target == null ? null : Strings.trimToNull(target.duckdbTableName());
+      if (targetTable != null) {
+        exec(
+            session,
+            "create or replace view " + viewName + " as select * from " + targetTable);
+        return DuckdbPreparedDataset.installed(entry.datasetId(), entry.physicalViewName(), null);
+      }
+      if (entry.logicalView()) {
+        return DuckdbPreparedDataset.noOp(entry.datasetId(), entry.physicalViewName());
+      }
+    }
+    DuckdbDatasetPrepareRequest request =
+        new DuckdbDatasetPrepareRequest(
+            entry.datasetId(),
+            definition,
+            entry.physicalViewName(),
+            session,
+            DiscoveryCache,
+            rowManager,
+            DuckdbDatasetPrepareMode.CATALOG);
+    return datasetProviderRegistry.prepare(request);
+  }
+
+  private static String rewriteSql(String sql, DatasetNameResolver resolver, CatalogSnapshot snapshot) {
+    List<DatasetToken> tokens = resolver.scanTableTokensInSql(sql);
+    if (tokens.isEmpty()) {
+      return stripTrailingSemicolon(sql);
+    }
+    StringBuilder rewritten = new StringBuilder(sql.length() + (tokens.size() * 16));
+    int cursor = 0;
+    for (DatasetToken token : tokens) {
+      DatasetId datasetId = resolver.resolveTableToken(token.normalizedToken());
+      CatalogEntry entry = snapshot.entriesById().get(datasetId);
+      if (entry == null) {
+        throw new IllegalArgumentException("Unknown table token '" + token.token() + "'");
+      }
+      rewritten.append(sql, cursor, token.start());
+      rewritten.append(withAlias(quoteIdentifier(entry.physicalViewName()), token));
+      cursor = token.end();
+    }
+    rewritten.append(sql, cursor, sql.length());
+    return stripTrailingSemicolon(rewritten.toString());
+  }
+
+  private String rewriteSqlForQuery(String sql, DatasetNameResolver resolver, CatalogSnapshot snapshot) {
+    List<DatasetToken> tokens = resolver.scanTableTokensInSql(sql, true);
+    if (tokens.isEmpty()) {
+      return stripTrailingSemicolon(sql);
+    }
+    DataEntitlements entitlements = rowManager.dataEntitlementsForSqlPlanning();
+    DataEntitlements.Identity identity = rowManager.effectiveIdentityForSqlPlanning();
+    Map<DatasetId, DataRowFilterPlanner.RowFilterPlan> rowPlansByDataset = new HashMap<>();
+    Map<DatasetId, DataColumnMaskPlanner.ColumnMaskPlan> maskPlansByDataset = new HashMap<>();
+    StringBuilder rewritten = new StringBuilder(sql.length() + (tokens.size() * 32));
+    int cursor = 0;
+    for (DatasetToken token : tokens) {
+      DatasetId datasetId = resolver.resolveTableToken(token.normalizedToken());
+      CatalogEntry entry = snapshot.entriesById().get(datasetId);
+      if (entry == null) {
+        throw new IllegalArgumentException("Unknown table token '" + token.token() + "'");
+      }
+      DataRowFilterPlanner.RowFilterPlan rowPlan =
+          rowPlansByDataset.computeIfAbsent(
+              datasetId,
+              ignored -> DataRowFilterPlanner.planRead(entitlements, identity, datasetId.toString()));
+      if (!rowPlan.allowed()) {
+        throw new IllegalStateException(firstDenyReason(rowPlan.reasons(), "row filter", datasetId));
+      }
+
+      DataColumnMaskPlanner.ColumnMaskPlan maskPlan =
+          maskPlansByDataset.computeIfAbsent(
+              datasetId,
+              ignored ->
+                  DataColumnMaskPlanner.planRead(
+                      entitlements,
+                      identity,
+                      datasetId.toString(),
+                      resolveSchemaForMasking(entry)));
+      if (!maskPlan.allowed()) {
+        throw new IllegalStateException(firstDenyReason(maskPlan.reasons(), "column mask", datasetId));
+      }
+
+      String replacement = quoteIdentifier(entry.physicalViewName());
+      String predicate = Strings.trimToNull(rowPlan.predicateSql());
+      if (predicate != null) {
+        replacement = "(select * from " + replacement + " where " + predicate + ")";
+      }
+      String projection = Strings.trimToNull(maskPlan.projectionSql());
+      if (projection != null) {
+        replacement = "(select " + projection + " from " + replacement + ")";
+      }
+      rewritten.append(sql, cursor, token.start());
+      rewritten.append(withAlias(replacement, token));
+      cursor = token.end();
+    }
+    rewritten.append(sql, cursor, sql.length());
+    return stripTrailingSemicolon(rewritten.toString());
+  }
+
+  private static String withAlias(String replacement, DatasetToken token) {
+    String alias = Strings.trimToNull(token.alias());
+    if (alias == null) {
+      return replacement;
+    }
+    if (token.aliasUsesAsKeyword()) {
+      return replacement + " as " + alias;
+    }
+    return replacement + " " + alias;
+  }
+
+  private static String firstDenyReason(
+      List<String> reasons, String policyType, DatasetId datasetId) {
+    if (reasons == null || reasons.isEmpty()) {
+      return "DENIED: no " + policyType + " decision for dataset " + datasetId;
+    }
+    String reason = Strings.trimToNull(reasons.get(0));
+    if (reason == null) {
+      return "DENIED: no " + policyType + " decision for dataset " + datasetId;
+    }
+    return reason;
+  }
+
+  private SchemaModel resolveSchemaForMasking(CatalogEntry entry) {
+    String schemaName = resolveSchemaName(entry);
+    if (schemaName == null) {
+      return null;
+    }
+    Optional<DefinitionSchema> definition = resolveSchemaDefinition(entry.datasetId().group(), schemaName);
+    return definition.map(SchemaModelMapper::fromDefinition).orElse(null);
+  }
+
+  private Optional<DefinitionSchema> resolveSchemaDefinition(String datasetGroup, String schemaName) {
+    List<String> groups = new ArrayList<>();
+    addDistinct(groups, datasetGroup);
+    addDistinct(groups, sessionGroup);
+    addDistinct(groups, PLATFORM_GROUP);
+    for (String group : groups) {
+      Optional<DefinitionSchema> schema = DiscoveryCache.get(DefinitionSchema.class, group, schemaName);
+      if (schema.isPresent() && isTabularSchema(schema.get())) {
+        return schema;
+      }
+    }
+    return Optional.empty();
+  }
+
+  private String resolveSchemaName(CatalogEntry entry) {
+    DefinitionDataset definition = entry == null ? null : entry.definition();
+    DefinitionDataset.View view = definition == null ? null : definition.view();
+    String viewSchemaName = view == null ? null : Strings.trimToNull(view.schemaName());
+    if (viewSchemaName != null) {
+      return viewSchemaName;
+    }
+    String ingestSchemaName = resolveSchemaNameFromIngest(entry.datasetId());
+    if (ingestSchemaName != null) {
+      return ingestSchemaName;
+    }
+    String deterministic =
+        ingestModelMapper.deterministicSchemaName(
+            entry.datasetId().group(), entry.datasetId().namespace(), entry.datasetId().name());
+    return resolveSchemaDefinition(entry.datasetId().group(), deterministic).isPresent()
+        ? deterministic
+        : null;
+  }
+
+  private String resolveSchemaNameFromIngest(DatasetId datasetId) {
+    List<String> schemaNames = new ArrayList<>();
+    List<DefinitionIngest> ingests = DiscoveryCache.list(DefinitionIngest.class, datasetId.group());
+    for (DefinitionIngest ingest : ingests) {
+      if (ingest == null) {
+        continue;
+      }
+      String ingestDatasetId = Strings.trimToNull(ingest.datasetId());
+      String outputSchemaId = Strings.trimToNull(ingest.outputSchemaId());
+      if (ingestDatasetId == null || outputSchemaId == null) {
+        continue;
       }
       try {
-        Object value = method.invoke(null, channel);
-        return expectedType.cast(value);
-      } catch (Exception ex) {
-        throw new IllegalArgumentException(
-            "Unable to create gRPC stub via "
-                + factoryOwner.getName()
-                + "."
-                + methodName
-                + "(Channel)",
-            ex);
+        if (DatasetId.parse(ingestDatasetId).equals(datasetId)) {
+          schemaNames.add(outputSchemaId);
+        }
+      } catch (RuntimeException ignore) {
+        // skip invalid ingest references for deterministic planning
+      }
+    }
+    if (schemaNames.isEmpty()) {
+      return null;
+    }
+    schemaNames.sort(String.CASE_INSENSITIVE_ORDER.thenComparing(Comparator.naturalOrder()));
+    return schemaNames.get(0);
+  }
+
+  private static boolean isTabularSchema(DefinitionSchema schema) {
+    DefinitionSchema.SchemaType schemaType = schema == null ? null : schema.schemaType();
+    return schemaType == null || schemaType == DefinitionSchema.SchemaType.TABULAR;
+  }
+
+  private static void addDistinct(List<String> values, String value) {
+    String normalized = Strings.trimToNull(value);
+    if (normalized != null && !values.contains(normalized)) {
+      values.add(normalized);
+    }
+  }
+
+  private List<DatasetId> expandDependencies(List<DatasetId> directDatasets, CatalogSnapshot current) {
+    LinkedHashSet<DatasetId> visited = new LinkedHashSet<>();
+    List<DatasetId> roots = new ArrayList<>(directDatasets);
+    roots.sort(DATASET_ID_ORDER);
+    for (DatasetId root : roots) {
+      collectDependencies(root, current, visited, new LinkedHashSet<>());
+    }
+    return List.copyOf(visited);
+  }
+
+  private static void collectDependencies(
+      DatasetId datasetId,
+      CatalogSnapshot current,
+      LinkedHashSet<DatasetId> visited,
+      LinkedHashSet<DatasetId> visiting) {
+    if (visited.contains(datasetId)) {
+      return;
+    }
+    if (!visiting.add(datasetId)) {
+      return;
+    }
+    CatalogEntry entry = current.entriesById().get(datasetId);
+    if (entry != null) {
+      List<DatasetId> dependencies = new ArrayList<>(entry.dependencies());
+      dependencies.sort(DATASET_ID_ORDER);
+      for (DatasetId dependency : dependencies) {
+        collectDependencies(dependency, current, visited, visiting);
+      }
+    }
+    visiting.remove(datasetId);
+    visited.add(datasetId);
+  }
+
+  private CatalogEntry toEntry(DefinitionDataset definition) {
+    DatasetId datasetId = requireDatasetId(definition);
+    String namespace = datasetId.namespace();
+    String name = datasetId.name();
+    String viewName = duckdbViewName(datasetId.group(), namespace, name);
+    boolean logicalView = isLogicalView(definition);
+    return new CatalogEntry(
+        datasetId,
+        definition,
+        namespace,
+        name,
+        viewName,
+        List.of(),
+        logicalView);
+  }
+
+  private static boolean isLogicalView(DefinitionDataset definition) {
+    if (definition == null || definition.view() == null) {
+      return false;
+    }
+    DefinitionDataset.Target target = definition.view().target();
+    if (target == null) {
+      return true;
+    }
+    return Strings.trimToNull(target.duckdbTableName()) == null
+        && Strings.trimToNull(target.parquetPath()) == null;
+  }
+
+  private DefinitionDataset fetchDefinition(DatasetId datasetId) {
+    String name = datasetId.namespace() + "/" + datasetId.name();
+    Optional<DefinitionDataset> definition =
+        DiscoveryCache.get(DefinitionDataset.class, datasetId.group(), name);
+    return definition.orElseThrow(
+        () -> new IllegalArgumentException("Dataset definition not found for install: " + datasetId));
+  }
+
+  private static DatasetId tryDatasetId(DefinitionDataset definition) {
+    try {
+      return requireDatasetId(definition);
+    } catch (RuntimeException ex) {
+      return null;
+    }
+  }
+
+  private static DatasetId requireDatasetId(DefinitionDataset definition) {
+    Objects.requireNonNull(definition, "definition");
+    DefinitionEnvelope envelope = Objects.requireNonNull(definition.envelope(), "definition.envelope");
+    String group = Strings.requireNonBlank(envelope.group(), "definition.envelope.group");
+    String namespace = Strings.requireNonBlank(definition.namespace(), "definition.namespace");
+    String baseName = datasetBaseName(definition);
+    return DatasetId.of(group, namespace, baseName);
+  }
+
+  private static String datasetBaseName(DefinitionDataset definition) {
+    DefinitionEnvelope envelope = Objects.requireNonNull(definition.envelope(), "definition.envelope");
+    String namespace = Strings.requireNonBlank(definition.namespace(), "definition.namespace");
+    String envelopeName = Strings.requireNonBlank(envelope.name(), "definition.envelope.name");
+    String prefix = namespace + "/";
+    if (!envelopeName.startsWith(prefix)) {
+      throw new IllegalStateException(
+          "Dataset definition invalid envelope.name. Expected namespace/baseName with namespace='"
+              + namespace
+              + "' and envelope.name='"
+              + envelopeName
+              + "'");
+    }
+    String base = envelopeName.substring(prefix.length());
+    if (base.isBlank() || base.indexOf('/') >= 0) {
+      throw new IllegalStateException(
+          "Dataset definition invalid envelope.name. Expected namespace/baseName with namespace='"
+              + namespace
+              + "' and envelope.name='"
+              + envelopeName
+              + "'");
+    }
+    return base;
+  }
+
+  private static boolean isActive(DefinitionDataset definition) {
+    if (definition == null || definition.envelope() == null) {
+      return false;
+    }
+    DefinitionEnvelope envelope = definition.envelope();
+    if (Boolean.FALSE.equals(envelope.enabled())) {
+      return false;
+    }
+    String status = Strings.trimToNull(envelope.lifecycleStatus());
+    return status == null || "ACTIVE".equalsIgnoreCase(status);
+  }
+
+  private static String applyLimit(String sql, Integer limit) {
+    if (limit == null) {
+      return sql;
+    }
+    if (limit <= 0) {
+      throw new IllegalArgumentException("limit must be > 0");
+    }
+    return "select * from (" + sql + ") as __fabric_sql limit " + limit;
+  }
+
+  private static void exec(DuckdbSession session, String sql) {
+    if (sql == null || sql.isBlank()) {
+      return;
+    }
+    String[] statements = sql.split(";\\s*\\n|;\\s*$|;\\s*");
+    for (String statementSql : statements) {
+      String trimmed = Strings.trimToNull(statementSql);
+      if (trimmed == null) {
+        continue;
+      }
+      try (Statement statement = session.createStatement()) {
+        statement.execute(trimmed);
+      } catch (SQLException ex) {
+        throw new IllegalStateException("DuckDB SQL failed: " + ex.getMessage(), ex);
       }
     }
   }
 
+  private static void dropView(DuckdbSession session, DatasetId datasetId, String viewName) {
+    String sql = "drop view if exists " + quoteIdentifier(viewName);
+    exec(session, sql);
+    LOGGER.debug("[Catalog] drop datasetId={} viewName={}", datasetId, viewName);
+  }
+
+  private static String duckdbViewName(String group, String namespace, String name) {
+    return DuckdbCatalogImplRelation.duckdbViewName(group, namespace, name);
+  }
+
+  private static String sanitizeIdentifier(String value) {
+    return DuckdbCatalogImplRelation.sanitizeIdentifier(value);
+  }
+
+  private static String quoteIdentifier(String identifier) {
+    return DuckdbCatalogImplRelation.quoteIdentifier(identifier);
+  }
+
+  private static String stripTrailingSemicolon(String sql) {
+    return DuckdbCatalogImplRelation.stripTrailingSemicolon(sql);
+  }
+
+  private static String typeToken(DefinitionDataset definition) {
+    return DuckdbCatalogImplRelation.typeToken(definition);
+  }
+
+  private static boolean isDuckdbActive(DefinitionDataset.DuckdbBinding binding) {
+    return DuckdbCatalogImplRelation.isDuckdbActive(binding);
+  }
+
+  private static String resolveDuckDbActiveDatabasePath(DefinitionDataset.DuckdbBinding binding) {
+    return DuckdbCatalogImplRelation.resolveDuckDbActiveDatabasePath(binding);
+  }
+
+  private static String parquetFromPath(String uri, String glob, boolean hivePartitioning) {
+    return DuckdbCatalogImplRelation.parquetFromPath(uri, glob, DEFAULT_PARQUET_GLOB, hivePartitioning);
+  }
+
+  private static String normalizePathForDuckdb(String value) {
+    return DuckdbCatalogImplRelation.normalizePathForDuckdb(value);
+  }
+
+  private static boolean isS3Uri(String value) {
+    return DuckdbCatalogImplRelation.isS3Uri(value);
+  }
+
+  private static String trimTrailingSlash(String value) {
+    return DuckdbCatalogImplRelation.trimTrailingSlash(value);
+  }
+
+  private static String escapeSqlLiteral(String value) {
+    return DuckdbCatalogImplRelation.escapeSqlLiteral(value);
+  }
+
+  private static boolean isMissingParquetFilesError(IllegalStateException ex) {
+    return DuckdbCatalogImplRelation.isMissingParquetFilesError(ex);
+  }
+
+  private static boolean isMissingDuckdbRelationError(IllegalStateException ex) {
+    return DuckdbCatalogImplRelation.isMissingDuckdbRelationError(ex);
+  }
+
+  private static boolean isS3CredentialUnavailableError(IllegalStateException ex) {
+    return DuckdbCatalogImplRelation.isS3CredentialUnavailableError(ex);
+  }
+
+  private static String qualifiedNameKey(String namespace, String name) {
+    return DuckdbCatalogImplRelation.qualifiedNameKey(namespace, name);
+  }
+
+  private static String qualifiedNameKey(String group, String namespace, String name) {
+    return DuckdbCatalogImplRelation.qualifiedNameKey(group, namespace, name);
+  }
+
+  private void putQualifiedPreferSessionGroup(
+      Map<String, DatasetId> qualified, String key, DatasetId candidate) {
+    DatasetId existing = qualified.get(key);
+    if (existing == null) {
+      qualified.put(key, candidate);
+      return;
+    }
+    boolean existingSession = sessionGroup.equals(existing.group());
+    boolean candidateSession = sessionGroup.equals(candidate.group());
+    if (!existingSession && candidateSession) {
+      qualified.put(key, candidate);
+    }
+  }
+
+  private static List<String> metadataTableTypes(CatalogEntry entry) {
+    if (entry == null) {
+      return List.of("TABLE");
+    }
+    if (entry.logicalView()) {
+      return List.of("VIEW");
+    }
+    DefinitionDataset definition = entry.definition();
+    DefinitionDataset.Binding binding = definition == null ? null : definition.binding();
+    DefinitionDataset.DuckdbBinding duckdb = binding == null ? null : binding.duckdb();
+    if (isDuckdbActive(duckdb)) {
+      return List.of("TABLE", "STREAM");
+    }
+    return List.of("TABLE");
+  }
 }
-
-
-
 
 
 
