@@ -1,1 +1,287 @@
-null
+mkdir -p 'vault/git/dev/core/app'
+mkdir -p 'vault/git/dev/desk1/app'
+mkdir -p 'vault/git/dev/desk2/app'
+mkdir -p 'vault/git/dev/lab/app'
+mkdir -p 'vault/git/dev/lab/config'
+mkdir -p 'vault/git/dev/lab/config_layer'
+mkdir -p 'vault/git/dev/lab/connection'
+mkdir -p 'vault/git/dev/lab/dataset'
+mkdir -p 'vault/git/dev/lab/entitlement'
+mkdir -p 'vault/git/dev/lab/ingest'
+mkdir -p 'vault/git/dev/lab/ingest_source'
+mkdir -p 'vault/git/dev/lab/schema'
+mkdir -p 'vault/git/dev/lab/service'
+mkdir -p 'vault/git/dev/platform/app'
+mkdir -p 'vault/git/dev/platform/connection'
+mkdir -p 'vault/git/dev/platform/control'
+mkdir -p 'vault/git/dev/platform/dataset'
+mkdir -p 'vault/git/dev/platform/entitlement'
+mkdir -p 'vault/git/dev/platform/environment'
+mkdir -p 'vault/git/dev/platform/ingest'
+mkdir -p 'vault/git/dev/platform/ingest_source'
+mkdir -p 'vault/git/dev/platform/krb5'
+mkdir -p 'vault/git/dev/platform/platform'
+mkdir -p 'vault/git/dev/platform/schema'
+mkdir -p 'vault/git/dev/platform/secret'
+mkdir -p 'vault/git/dev/platform/secrets_kdf'
+mkdir -p 'vault/git/dev/platform/service'
+
+# Recreate JSON files
+touch 'vault/git/dev/core/app/client.json'
+touch 'vault/git/dev/desk1/app/starter.json'
+touch 'vault/git/dev/desk2/app/starter.json'
+touch 'vault/git/dev/lab/app/client.json'
+touch 'vault/git/dev/lab/app/config.json'
+touch 'vault/git/dev/lab/app/data.json'
+touch 'vault/git/dev/lab/app/python.json'
+touch 'vault/git/dev/lab/app/query.json'
+touch 'vault/git/dev/lab/app/server.json'
+touch 'vault/git/dev/lab/config/vwap.json'
+touch 'vault/git/dev/lab/config_layer/config__vwap__algo001.json'
+touch 'vault/git/dev/lab/config_layer/config__vwap__base.json'
+touch 'vault/git/dev/lab/config_layer/config__vwap__twap.json'
+touch 'vault/git/dev/lab/config_layer/config__vwap__twap1.json'
+touch 'vault/git/dev/lab/config_layer/config__vwap__twap1_1.json'
+touch 'vault/git/dev/lab/config_layer/config__vwap__twap2.json'
+touch 'vault/git/dev/lab/config_layer/config__vwap__twap2_1.json'
+touch 'vault/git/dev/lab/config_layer/config__vwap__twap2_2.json'
+touch 'vault/git/dev/lab/config_layer/config__vwap__twap3.json'
+touch 'vault/git/dev/lab/config_layer/config__vwap__twap3_1.json'
+touch 'vault/git/dev/lab/config_layer/config__vwap__twap4.json'
+touch 'vault/git/dev/lab/config_layer/config__vwap__twap4_1.json'
+touch 'vault/git/dev/lab/config_layer/config__vwap__twap5.json'
+touch 'vault/git/dev/lab/config_layer/config__vwap__twap5_1.json'
+touch 'vault/git/dev/lab/config_layer/config__vwap__twap5_2.json'
+touch 'vault/git/dev/lab/config_layer/config__vwap__twap6.json'
+touch 'vault/git/dev/lab/connection/amps-fabric-json.json'
+touch 'vault/git/dev/lab/connection/s3-fabric.json'
+touch 'vault/git/dev/lab/dataset/default_counterparties.json'
+touch 'vault/git/dev/lab/dataset/default_orders.json'
+touch 'vault/git/dev/lab/dataset/default_positions.json'
+touch 'vault/git/dev/lab/dataset/default_s3_orders.json'
+touch 'vault/git/dev/lab/entitlement/namespaces_default.json'
+touch 'vault/git/dev/lab/entitlement/services_arrow.json'
+touch 'vault/git/dev/lab/entitlement/services_arrow-openshift.json'
+touch 'vault/git/dev/lab/entitlement/services_arrow-secure.json'
+touch 'vault/git/dev/lab/entitlement/services_config.json'
+touch 'vault/git/dev/lab/entitlement/services_data.json'
+touch 'vault/git/dev/lab/entitlement/services_data-openshift.json'
+touch 'vault/git/dev/lab/entitlement/services_data-secure.json'
+touch 'vault/git/dev/lab/entitlement/services_echo.json'
+touch 'vault/git/dev/lab/entitlement/services_echo-openshift.json'
+touch 'vault/git/dev/lab/entitlement/services_echo-secure.json'
+touch 'vault/git/dev/lab/entitlement/services_ingest.json'
+touch 'vault/git/dev/lab/entitlement/services_query.json'
+touch 'vault/git/dev/lab/ingest/counterparties.json'
+touch 'vault/git/dev/lab/ingest/orders.json'
+touch 'vault/git/dev/lab/ingest/positions.json'
+touch 'vault/git/dev/lab/ingest/s3_orders.json'
+touch 'vault/git/dev/lab/ingest_source/counterparties.json'
+touch 'vault/git/dev/lab/ingest_source/orders.json'
+touch 'vault/git/dev/lab/ingest_source/positions.json'
+touch 'vault/git/dev/lab/ingest_source/s3_orders.json'
+touch 'vault/git/dev/lab/schema/config_vwap.json'
+touch 'vault/git/dev/lab/schema/ingest_default_counterparties.json'
+touch 'vault/git/dev/lab/schema/ingest_default_orders.json'
+touch 'vault/git/dev/lab/schema/ingest_default_positions.json'
+touch 'vault/git/dev/lab/schema/ingest_default_s3_orders.json'
+touch 'vault/git/dev/lab/schema/service-echo-openshift-transport.json'
+touch 'vault/git/dev/lab/schema/service-echo-secure-transport.json'
+touch 'vault/git/dev/lab/schema/service-echo-transport.json'
+touch 'vault/git/dev/lab/service/arrow.json'
+touch 'vault/git/dev/lab/service/arrow-openshift.json'
+touch 'vault/git/dev/lab/service/arrow-secure.json'
+touch 'vault/git/dev/lab/service/config.json'
+touch 'vault/git/dev/lab/service/data.json'
+touch 'vault/git/dev/lab/service/data-openshift.json'
+touch 'vault/git/dev/lab/service/data-secure.json'
+touch 'vault/git/dev/lab/service/echo.json'
+touch 'vault/git/dev/lab/service/echo-openshift.json'
+touch 'vault/git/dev/lab/service/echo-secure.json'
+touch 'vault/git/dev/lab/service/ingest.json'
+touch 'vault/git/dev/lab/service/query.json'
+touch 'vault/git/dev/platform/app/archive-configs.json'
+touch 'vault/git/dev/platform/app/archive-discovery.json'
+touch 'vault/git/dev/platform/app/archive-entitlements.json'
+touch 'vault/git/dev/platform/app/archive-status.json'
+touch 'vault/git/dev/platform/app/controller.json'
+touch 'vault/git/dev/platform/app/data.json'
+touch 'vault/git/dev/platform/app/studio.json'
+touch 'vault/git/dev/platform/connection/amps-fabric-discovery.json'
+touch 'vault/git/dev/platform/connection/amps-fabric-json.json'
+touch 'vault/git/dev/platform/connection/amps-fabric-nvfix.json'
+touch 'vault/git/dev/platform/connection/bitbucket-fabric.json'
+touch 'vault/git/dev/platform/connection/http-healthcheck-studio.json'
+touch 'vault/git/dev/platform/connection/http-secure.json'
+touch 'vault/git/dev/platform/connection/mongodb-local.json'
+touch 'vault/git/dev/platform/connection/s3-fabric.json'
+touch 'vault/git/dev/platform/connection/s3-storage.json'
+touch 'vault/git/dev/platform/connection/splunk-fabric.json'
+touch 'vault/git/dev/platform/control/controller.json'
+touch 'vault/git/dev/platform/dataset/default_config_generated.json'
+touch 'vault/git/dev/platform/dataset/default_config_resolved.json'
+touch 'vault/git/dev/platform/dataset/default_config_resolved_snapshot.json'
+touch 'vault/git/dev/platform/dataset/default_config_subscribed.json'
+touch 'vault/git/dev/platform/dataset/default_config_unsubscribed.json'
+touch 'vault/git/dev/platform/dataset/default_config_update_callback.json'
+touch 'vault/git/dev/platform/dataset/default_discovery.json'
+touch 'vault/git/dev/platform/dataset/default_entitlements.json'
+touch 'vault/git/dev/platform/dataset/default_marketdata.json'
+touch 'vault/git/dev/platform/dataset/default_status_app.json'
+touch 'vault/git/dev/platform/dataset/default_status_service.json'
+touch 'vault/git/dev/platform/entitlement/namespaces_default.json'
+touch 'vault/git/dev/platform/entitlement/services_data.json'
+touch 'vault/git/dev/platform/environment/environment.json'
+touch 'vault/git/dev/platform/ingest/config_generated.json'
+touch 'vault/git/dev/platform/ingest/config_resolved.json'
+touch 'vault/git/dev/platform/ingest/config_resolved_snapshot.json'
+touch 'vault/git/dev/platform/ingest/config_subscribed.json'
+touch 'vault/git/dev/platform/ingest/config_unsubscribed.json'
+touch 'vault/git/dev/platform/ingest/config_update_callback.json'
+touch 'vault/git/dev/platform/ingest/discovery.json'
+touch 'vault/git/dev/platform/ingest/entitlements.json'
+touch 'vault/git/dev/platform/ingest/marketdata.json'
+touch 'vault/git/dev/platform/ingest/status_app.json'
+touch 'vault/git/dev/platform/ingest/status_service.json'
+touch 'vault/git/dev/platform/ingest_source/config_generated.json'
+touch 'vault/git/dev/platform/ingest_source/config_resolved.json'
+touch 'vault/git/dev/platform/ingest_source/config_resolved_snapshot.json'
+touch 'vault/git/dev/platform/ingest_source/config_subscribed.json'
+touch 'vault/git/dev/platform/ingest_source/config_unsubscribed.json'
+touch 'vault/git/dev/platform/ingest_source/config_update_callback.json'
+touch 'vault/git/dev/platform/ingest_source/discovery.json'
+touch 'vault/git/dev/platform/ingest_source/entitlements.json'
+touch 'vault/git/dev/platform/ingest_source/marketdata.json'
+touch 'vault/git/dev/platform/ingest_source/status_app.json'
+touch 'vault/git/dev/platform/ingest_source/status_service.json'
+touch 'vault/git/dev/platform/krb5/krb5-data-lakes.json'
+touch 'vault/git/dev/platform/platform/platform.json'
+touch 'vault/git/dev/platform/schema/ingest_default_config_generated.json'
+touch 'vault/git/dev/platform/schema/ingest_default_config_resolved.json'
+touch 'vault/git/dev/platform/schema/ingest_default_config_resolved_snapshot.json'
+touch 'vault/git/dev/platform/schema/ingest_default_config_subscribed.json'
+touch 'vault/git/dev/platform/schema/ingest_default_config_unsubscribed.json'
+touch 'vault/git/dev/platform/schema/ingest_default_config_update_callback.json'
+touch 'vault/git/dev/platform/schema/ingest_default_discovery.json'
+touch 'vault/git/dev/platform/schema/ingest_default_entitlements.json'
+touch 'vault/git/dev/platform/schema/ingest_default_marketdata.json'
+touch 'vault/git/dev/platform/schema/ingest_default_status_app.json'
+touch 'vault/git/dev/platform/schema/ingest_default_status_service.json'
+touch 'vault/git/dev/platform/secret/s3-fabric___.json'
+touch 'vault/git/dev/platform/secrets_kdf/secrets-kdf.json'
+touch 'vault/git/dev/platform/service/data.json'
+
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public final class GenerateVwapConfigCopies {
+    private static final Path DEFAULT_SEED_PATH = Paths.get(
+            "vault", "git", "dev", "lab", "config_layer", "config__vwap__algo001.json");
+
+    private static final Pattern PARENT_ID_PATTERN = Pattern.compile("\"parentId\"\\s*:\\s*\"([^\"]+)\"");
+
+    private GenerateVwapConfigCopies() {
+    }
+
+    public static void main(String[] args) throws IOException {
+        if (args.length != 1) {
+            System.err.println("Usage: java GenerateVwapConfigCopies <N>");
+            System.err.println("Example: java GenerateVwapConfigCopies 99");
+            System.exit(1);
+        }
+
+        int n;
+        try {
+            n = Integer.parseInt(args[0]);
+        } catch (NumberFormatException ex) {
+            System.err.println("N must be an integer.");
+            System.exit(1);
+            return;
+        }
+
+        if (n < 1) {
+            System.err.println("N must be >= 1.");
+            System.exit(1);
+        }
+
+        if (!Files.exists(DEFAULT_SEED_PATH)) {
+            System.err.println("Seed file not found: " + DEFAULT_SEED_PATH.toAbsolutePath());
+            System.exit(1);
+        }
+
+        String seedJson = Files.readString(DEFAULT_SEED_PATH, StandardCharsets.UTF_8);
+        String parentId = extractParentId(seedJson);
+
+        Path configLayerDir = DEFAULT_SEED_PATH.getParent();
+        int created = 0;
+
+        for (int i = 2; i <= n + 1; i++) {
+            String suffix = String.format("%03d", i);
+            String algoId = "config:lab/vwap/algo" + suffix;
+            String fileName = "config__vwap__algo" + suffix + ".json";
+            String envelopeName = "config__vwap__algo" + suffix;
+            String shortName = "L" + suffix;
+            String displayName = "VWAP - Algo " + suffix;
+            String uuid = UUID.randomUUID().toString();
+
+            String json = seedJson;
+            json = replaceJsonStringValue(json, "resourceId", algoId);
+            json = replaceJsonStringValue(json, "parentId", parentId);
+            json = replaceJsonStringValue(json, "shortName", shortName);
+            json = replaceJsonStringValue(json, "displayName", displayName);
+            json = replaceJsonStringValue(json, "configId", algoId);
+            json = replaceJsonStringValue(json, "effectiveConfigId", algoId);
+            json = replaceJsonStringValue(json, "name", envelopeName);
+            json = replaceJsonStringValue(json, "uuid", uuid);
+
+            Path out = configLayerDir.resolve(fileName);
+            Files.writeString(
+                    out,
+                    ensureTrailingNewline(json),
+                    StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.TRUNCATE_EXISTING,
+                    StandardOpenOption.WRITE);
+            created++;
+        }
+
+        System.out.println("Seed file: " + DEFAULT_SEED_PATH.toAbsolutePath());
+        System.out.println("ParentId used for all generated files: " + parentId);
+        System.out.println("Created/updated files: " + created + " (algo002..algo" + String.format("%03d", n + 1) + ")");
+    }
+
+    private static String extractParentId(String json) {
+        Matcher m = PARENT_ID_PATTERN.matcher(json);
+        if (!m.find()) {
+            throw new IllegalStateException("Could not find parentId in seed JSON.");
+        }
+        return m.group(1);
+    }
+
+    private static String replaceJsonStringValue(String json, String key, String value) {
+        Pattern p = Pattern.compile("(\\\"" + Pattern.quote(key) + "\\\"\\s*:\\s*\\\")[^\\\"]*(\\\")");
+        Matcher m = p.matcher(json);
+        if (!m.find()) {
+            throw new IllegalStateException("Could not find key in seed JSON: " + key);
+        }
+        String replacement = m.group(1) + Matcher.quoteReplacement(value) + m.group(2);
+        return m.replaceFirst(replacement);
+    }
+
+    private static String ensureTrailingNewline(String json) {
+        if (json.endsWith("\n")) {
+            return json;
+        }
+        return json + "\n";
+    }
+}
+
+
