@@ -1,1 +1,4231 @@
-null
+
+===== FILE: fabric-lite/src/main/java/org/pronzato/fabric/api/control/discovery/DiscoveryManager.java =====
+
+
+package org.pronzato.fabric.api.control.discovery;
+
+import java.time.Duration;
+import org.pronzato.fabric.api.util.CloseSupport;
+import java.util.Objects;
+import java.util.function.Supplier;
+import org.pronzato.fabric.api.control.ControlConnection;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryTopics;
+import org.pronzato.fabric.api.control.discovery.scope.DiscoveryScope;
+import org.pronzato.fabric.api.control.discovery.scope.DiscoveryScopeDiff;
+import org.pronzato.fabric.api.control.discovery.scope.DiscoveryScopeResolver;
+import org.pronzato.fabric.api.control.discovery.scope.DiscoveryVisibilityManager;
+import org.pronzato.fabric.api.control.status.app.AppStatusCache;
+import org.pronzato.fabric.api.control.status.data.DataStatusCache;
+import org.pronzato.fabric.api.control.status.service.ServiceStatusCache;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public final class DiscoveryManager implements AutoCloseable {
+  private static final Logger LOGGER = LoggerFactory.getLogger(DiscoveryManager.class);
+  private static final String STATUS_SUBSCRIPTION_FILTER =
+      "(/type='STATUS_APP' OR /type='STATUS_SERVICE' OR /type='STATUS_DATA')";
+  private static final long DEFAULT_STATUS_CADENCE_SECONDS = 30L;
+  private final Object lifecycleLock = new Object();
+  private final ControlConnection controlConnection;
+  private final DiscoveryCache preloadedDiscoveryCache;
+  private final String sessionGroup;
+  private final boolean configCacheAdmin;
+  private final boolean verbose;
+  private final Supplier<String> subjectSupplier;
+  private final Supplier<String> delegatedSubjectSupplier;
+  private final long serviceStatusCadenceSeconds;
+  private final long dataStatusCadenceSeconds;
+
+  private volatile DiscoveryCache discoveryCache;
+  private volatile AppStatusCache appStatusCache;
+  private volatile ServiceStatusCache serviceStatusCache;
+  private volatile DataStatusCache dataStatusCache;
+  private volatile DiscoveryVisibilityManager discoveryVisibilityManager;
+  private volatile DiscoveryScope discoveryScope;
+  private volatile DiscoveryScopeDiff discoveryScopeDiff;
+  private volatile ControlConnection.Subscription statusSubscription;
+
+  public DiscoveryManager(
+      ControlConnection controlConnection,
+      String sessionGroup,
+      boolean configCacheAdmin,
+      boolean verbose,
+      Supplier<String> subjectSupplier,
+      Supplier<String> delegatedSubjectSupplier) {
+    this(
+        controlConnection,
+        sessionGroup,
+        configCacheAdmin,
+        verbose,
+        subjectSupplier,
+        delegatedSubjectSupplier,
+        DEFAULT_STATUS_CADENCE_SECONDS,
+        DEFAULT_STATUS_CADENCE_SECONDS);
+  }
+
+  public DiscoveryManager(
+      ControlConnection controlConnection,
+      String sessionGroup,
+      boolean configCacheAdmin,
+      boolean verbose,
+      Supplier<String> subjectSupplier,
+      Supplier<String> delegatedSubjectSupplier,
+      long serviceStatusCadenceSeconds,
+      long dataStatusCadenceSeconds) {
+    this(
+        Objects.requireNonNull(controlConnection, "controlConnection"),
+        null,
+        sessionGroup,
+        configCacheAdmin,
+        verbose,
+        subjectSupplier,
+        delegatedSubjectSupplier,
+        serviceStatusCadenceSeconds,
+        dataStatusCadenceSeconds);
+  }
+
+  public static DiscoveryManager recoveredSnapshot(
+      DiscoveryCache recoveredDiscoveryCache,
+      String sessionGroup,
+      Supplier<String> subjectSupplier,
+      Supplier<String> delegatedSubjectSupplier) {
+    return new DiscoveryManager(
+        null,
+        Objects.requireNonNull(recoveredDiscoveryCache, "recoveredDiscoveryCache"),
+        sessionGroup,
+        true,
+        false,
+        subjectSupplier,
+        delegatedSubjectSupplier,
+        DEFAULT_STATUS_CADENCE_SECONDS,
+        DEFAULT_STATUS_CADENCE_SECONDS);
+  }
+
+  private DiscoveryManager(
+      ControlConnection controlConnection,
+      DiscoveryCache preloadedDiscoveryCache,
+      String sessionGroup,
+      boolean configCacheAdmin,
+      boolean verbose,
+      Supplier<String> subjectSupplier,
+      Supplier<String> delegatedSubjectSupplier,
+      long serviceStatusCadenceSeconds,
+      long dataStatusCadenceSeconds) {
+    this.controlConnection = controlConnection;
+    this.preloadedDiscoveryCache = preloadedDiscoveryCache;
+    this.sessionGroup = sessionGroup;
+    this.configCacheAdmin = configCacheAdmin;
+    this.verbose = verbose;
+    this.subjectSupplier = Objects.requireNonNull(subjectSupplier, "subjectSupplier");
+    this.delegatedSubjectSupplier =
+        delegatedSubjectSupplier == null ? () -> null : delegatedSubjectSupplier;
+    this.serviceStatusCadenceSeconds =
+        serviceStatusCadenceSeconds > 0L
+            ? serviceStatusCadenceSeconds
+            : DEFAULT_STATUS_CADENCE_SECONDS;
+    this.dataStatusCadenceSeconds =
+        dataStatusCadenceSeconds > 0L ? dataStatusCadenceSeconds : DEFAULT_STATUS_CADENCE_SECONDS;
+  }
+
+  public void start() {
+    synchronized (lifecycleLock) {
+      if (discoveryCache != null) {
+        return;
+      }
+      long managerStartNanos = System.nanoTime();
+      long phaseStartNanos = System.nanoTime();
+      DiscoveryCache createdCache =
+          preloadedDiscoveryCache == null
+              ? createDiscoveryCache(controlConnection)
+              : startPreloadedDiscoveryCache(preloadedDiscoveryCache);
+      discoveryCache = createdCache;
+      LOGGER.info(
+          "[Session][StartupTiming] phase=discovery-manager.discovery-cache elapsedMs={} recovered={} offline={}",
+          elapsedMillis(phaseStartNanos),
+          createdCache.recovered(),
+          createdCache.offlineMode());
+
+      phaseStartNanos = System.nanoTime();
+      DiscoveryVisibilityManager visibilityManager =
+          new DiscoveryVisibilityManager(
+              createdCache,
+              new DiscoveryScopeResolver(),
+              () -> sessionGroup,
+              subjectSupplier,
+              delegatedSubjectSupplier);
+      visibilityManager.start();
+      discoveryVisibilityManager = visibilityManager;
+      discoveryScope = visibilityManager.currentScope();
+      discoveryScopeDiff = visibilityManager.lastDiff();
+      LOGGER.info(
+          "[Session][StartupTiming] phase=discovery-manager.visibility elapsedMs={}",
+          elapsedMillis(phaseStartNanos));
+
+      phaseStartNanos = System.nanoTime();
+      appStatusCache = controlConnection == null ? null : createSharedAppStatusCache(controlConnection);
+      LOGGER.info(
+          "[Session][StartupTiming] phase=discovery-manager.app-status-cache elapsedMs={} enabled={}",
+          elapsedMillis(phaseStartNanos),
+          appStatusCache != null);
+      phaseStartNanos = System.nanoTime();
+      serviceStatusCache =
+          controlConnection == null ? null : createSharedServiceStatusCache(controlConnection);
+      LOGGER.info(
+          "[Session][StartupTiming] phase=discovery-manager.service-status-cache elapsedMs={} enabled={}",
+          elapsedMillis(phaseStartNanos),
+          serviceStatusCache != null);
+      phaseStartNanos = System.nanoTime();
+      dataStatusCache = controlConnection == null ? null : createSharedDataStatusCache(controlConnection);
+      if (controlConnection != null) {
+        statusSubscription =
+            createSharedStatusSubscription(
+                controlConnection, appStatusCache, serviceStatusCache, dataStatusCache);
+      }
+      LOGGER.info(
+          "[Session][StartupTiming] phase=discovery-manager.data-status-cache elapsedMs={} enabled={}",
+          elapsedMillis(phaseStartNanos),
+          dataStatusCache != null);
+      LOGGER.info(
+          "[Session][StartupTiming] phase=discovery-manager.complete elapsedMs={}",
+          elapsedMillis(managerStartNanos));
+    }
+  }
+
+  public DiscoveryCache discoveryCache() {
+    return discoveryCache;
+  }
+
+  public AppStatusCache appStatusCache() {
+    return appStatusCache;
+  }
+
+  public ServiceStatusCache serviceStatusCache() {
+    return serviceStatusCache;
+  }
+
+  public DataStatusCache dataStatusCache() {
+    return dataStatusCache;
+  }
+
+  public DiscoveryScope currentScope() {
+    DiscoveryVisibilityManager manager = discoveryVisibilityManager;
+    return manager == null ? discoveryScope : manager.currentScope();
+  }
+
+  public DiscoveryScopeDiff lastScopeDiff() {
+    DiscoveryVisibilityManager manager = discoveryVisibilityManager;
+    return manager == null ? discoveryScopeDiff : manager.lastDiff();
+  }
+
+  @Override
+  public void close() {
+    synchronized (lifecycleLock) {
+      CloseSupport.closeQuietly(discoveryVisibilityManager);
+      discoveryVisibilityManager = null;
+      discoveryScope = null;
+      discoveryScopeDiff = null;
+      CloseSupport.closeQuietly(statusSubscription);
+      statusSubscription = null;
+      CloseSupport.closeQuietly(appStatusCache);
+      appStatusCache = null;
+      CloseSupport.closeQuietly(serviceStatusCache);
+      serviceStatusCache = null;
+      CloseSupport.closeQuietly(dataStatusCache);
+      dataStatusCache = null;
+      CloseSupport.closeQuietly(discoveryCache);
+      discoveryCache = null;
+    }
+  }
+
+  private DiscoveryCache createDiscoveryCache(ControlConnection connection) {
+    DiscoveryCache created = new DiscoveryCache(connection, sessionGroup, configCacheAdmin, verbose);
+    try {
+      created.start();
+      return created;
+    } catch (Exception ex) {
+      CloseSupport.closeQuietly(created);
+      throw new IllegalStateException("Failed to initialize DiscoveryCache", ex);
+    }
+  }
+
+  private static DiscoveryCache startPreloadedDiscoveryCache(DiscoveryCache preloaded) {
+    try {
+      preloaded.start();
+      return preloaded;
+    } catch (Exception ex) {
+      CloseSupport.closeQuietly(preloaded);
+      throw new IllegalStateException("Failed to initialize recovered DiscoveryCache", ex);
+    }
+  }
+
+  private AppStatusCache createSharedAppStatusCache(ControlConnection connection) {
+    AppStatusCache created = new AppStatusCache(connection);
+    try {
+      created.startShared();
+      return created;
+    } catch (Exception ex) {
+      CloseSupport.closeQuietly(created);
+      throw new IllegalStateException("Failed to initialize AppStatusCache", ex);
+    }
+  }
+
+  private ServiceStatusCache createSharedServiceStatusCache(ControlConnection connection) {
+    ServiceStatusCache created = new ServiceStatusCache(connection, serviceStatusCadenceSeconds);
+    try {
+      created.startShared();
+      return created;
+    } catch (Exception ex) {
+      CloseSupport.closeQuietly(created);
+      throw new IllegalStateException("Failed to initialize ServiceStatusCache", ex);
+    }
+  }
+
+  private DataStatusCache createSharedDataStatusCache(ControlConnection connection) {
+    DataStatusCache created = new DataStatusCache(connection, dataStatusCadenceSeconds);
+    try {
+      created.startShared();
+      return created;
+    } catch (Exception ex) {
+      CloseSupport.closeQuietly(created);
+      throw new IllegalStateException("Failed to initialize DataStatusCache", ex);
+    }
+  }
+
+  private ControlConnection.Subscription createSharedStatusSubscription(
+      ControlConnection connection,
+      AppStatusCache appCache,
+      ServiceStatusCache serviceCache,
+      DataStatusCache dataCache) {
+    Objects.requireNonNull(connection, "connection");
+    Objects.requireNonNull(appCache, "appCache");
+    Objects.requireNonNull(serviceCache, "serviceCache");
+    Objects.requireNonNull(dataCache, "dataCache");
+    ControlConnection.Subscription subscription = null;
+    boolean success = false;
+    try {
+      subscription =
+          connection.sowAndSubscribe(
+              DiscoveryTopics.STATUS,
+              "oof",
+              STATUS_SUBSCRIPTION_FILTER,
+              message -> {
+                com.crankuptheamps.client.Message raw = message.raw();
+                appCache.onStatusMessage(raw);
+                serviceCache.onStatusMessage(raw);
+                dataCache.onStatusMessage(raw);
+              });
+      Duration recoveryTimeout = Duration.ofSeconds(30);
+      appCache.awaitRecovery(recoveryTimeout);
+      serviceCache.awaitRecovery(recoveryTimeout);
+      dataCache.awaitRecovery(recoveryTimeout);
+      success = true;
+      return subscription;
+    } catch (Exception ex) {
+      throw new IllegalStateException("Failed to initialize shared status subscription", ex);
+    } finally {
+      if (!success) {
+        CloseSupport.closeQuietly(subscription);
+        CloseSupport.closeQuietly(appCache);
+        CloseSupport.closeQuietly(serviceCache);
+        CloseSupport.closeQuietly(dataCache);
+      }
+    }
+  }
+
+  private static long elapsedMillis(long startNanos) {
+    return Math.max(0L, (System.nanoTime() - startNanos) / 1_000_000L);
+  }
+
+}
+
+
+
+
+===== FILE: fabric-lite/src/main/java/org/pronzato/fabric/api/control/discovery/definitions/DefinitionEnvironment.java =====
+
+
+package org.pronzato.fabric.api.control.discovery.definitions;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import java.util.List;
+
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public record DefinitionEnvironment(
+    @JsonProperty("envelope") DefinitionEnvelope envelope,
+    Integer version,
+    List<Environment> environments,
+    Entitlements entitlements,
+    Configs configs,
+    Otel otel,
+    Cadence cadence,
+    String configId,
+    String effectiveConfigId
+) implements Definition {
+
+  @JsonInclude(JsonInclude.Include.NON_NULL)
+  public record Entitlements(
+      String implementation,
+      Events events,
+      String defaultProviderId,
+      List<ProviderRegistration> providers
+  ) {
+    public Entitlements(String implementation, Events events) {
+      this(implementation, events, null, List.of());
+    }
+
+    public Entitlements {
+      providers = providers == null || providers.isEmpty() ? List.of() : List.copyOf(providers);
+    }
+
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record ProviderRegistration(
+        String id,
+        String type,
+        Boolean enabled,
+        java.util.Map<String, Object> config) {
+
+      public ProviderRegistration {
+        config = config == null || config.isEmpty() ? java.util.Map.of() : java.util.Map.copyOf(config);
+      }
+    }
+  }
+
+  @JsonInclude(JsonInclude.Include.NON_NULL)
+  public record Configs(
+      String implementation,
+      Events events
+  ) {}
+
+  @JsonInclude(JsonInclude.Include.NON_NULL)
+  public record Events(
+      Boolean enabled,
+      String transport,
+      EventsAmps amps
+  ) {}
+
+  @JsonInclude(JsonInclude.Include.NON_NULL)
+  public record EventsAmps(
+      String connection,
+      String topic,
+      Integer maxRetries,
+      Long initialBackoffMillis,
+      Long maxBackoffMillis,
+      Double backoffMultiplier
+  ) {}
+
+  @JsonInclude(JsonInclude.Include.NON_NULL)
+  public record Otel(
+      Boolean enabled,
+      String serviceNamespace,
+      String deploymentEnvironment,
+      String otlpEndpoint,
+      Boolean tracesEnabled,
+      Boolean metricsEnabled
+  ) {}
+
+  @JsonInclude(JsonInclude.Include.NON_NULL)
+  public record Cadence(
+      Integer appStatusSeconds,
+      Integer serviceHeartbeatSeconds,
+      Integer serviceStatusSeconds,
+      Integer dataStatusSeconds
+  ) {}
+
+  @JsonInclude(JsonInclude.Include.NON_NULL)
+  public record Environment(
+      String environment,
+      List<EnvironmentRegion> regions
+  ) {}
+
+  @JsonInclude(JsonInclude.Include.NON_NULL)
+  public record EnvironmentRegion(
+      String region,
+      List<EnvironmentSite> sites
+  ) {}
+
+  @JsonInclude(JsonInclude.Include.NON_NULL)
+  public record EnvironmentSite(
+      String site,
+      List<EnvironmentAmps> amps
+  ) {}
+
+  @JsonInclude(JsonInclude.Include.NON_NULL)
+  public record EnvironmentAmps(
+      String name,
+      List<String> endpoints
+  ) {}
+
+}
+
+
+
+
+
+
+===== FILE: fabric-lite/src/main/java/org/pronzato/fabric/api/control/session/SessionImpl.java =====
+
+
+package org.pronzato.fabric.api.control.session;
+
+import org.pronzato.fabric.api.access.AccessManager;
+import org.pronzato.fabric.api.access.manager.AccessManagerImpl;
+import org.pronzato.fabric.api.util.CloseSupport;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
+import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
+import org.pronzato.fabric.api.Fabric;
+import org.pronzato.fabric.api.catalog.CatalogManager;
+import org.pronzato.fabric.api.connections.manager.ConnectionManagerImpl;
+import org.pronzato.fabric.api.connections.ConnectionManager;
+import org.pronzato.fabric.api.connectors.amps.AmpsConfig;
+import org.pronzato.fabric.api.control.ControlConnection;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryTopics;
+import org.pronzato.fabric.api.control.discovery.DeleteManager;
+import org.pronzato.fabric.api.control.discovery.DiscoveryManager;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionApp;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvironment;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
+import org.pronzato.fabric.api.data.checkpoints.CheckpointStore;
+import org.pronzato.fabric.api.data.checkpoints.CheckpointStores;
+import org.pronzato.fabric.api.data.DataManagers;
+import org.pronzato.fabric.api.data.DataOptions;
+import org.pronzato.fabric.api.data.manager.DataPlanesImpl;
+import org.pronzato.fabric.api.control.entitlements.core.data.DataEntitlements;
+import org.pronzato.fabric.api.control.entitlements.manager.EntitlementsManagerImpl;
+import org.pronzato.fabric.api.schemas.SchemaManager;
+import org.pronzato.fabric.api.control.status.app.AppStatusCache;
+import org.pronzato.fabric.api.control.status.app.AppStatusPublisher;
+import org.pronzato.fabric.api.control.status.data.DataStatusCache;
+import org.pronzato.fabric.api.control.status.service.ServiceStatusCache;
+import org.pronzato.fabric.api.control.entitlements.core.services.ServiceEntitlements;
+import org.pronzato.fabric.api.configs.ConfigManager;
+import org.pronzato.fabric.api.configs.manager.ConfigManagerImpl;
+import org.pronzato.fabric.api.configs.workflow.ConfigAdminService;
+import org.pronzato.fabric.api.recovery.RecoveryManager;
+import org.pronzato.fabric.api.recovery.manager.DiscoveryCacheRecoveryResult;
+import org.pronzato.fabric.api.recovery.manager.DiscoveryCacheSnapshotManifest;
+import org.pronzato.fabric.api.recovery.manager.DiscoveryCacheSnapshotService;
+import org.pronzato.fabric.api.recovery.manager.RecoveryManagerImpl;
+import org.pronzato.fabric.api.control.security.SecurityManager;
+import org.pronzato.fabric.api.control.security.manager.SecurityManagerImpl;
+import org.pronzato.fabric.api.services.ServiceManager;
+import org.pronzato.fabric.api.services.common.ServiceInstanceResolver;
+import org.pronzato.fabric.api.control.security.secrets.SessionSecrets;
+import org.pronzato.fabric.api.streams.StreamManager;
+import org.pronzato.fabric.api.streams.manager.StreamManagerImpl;
+import org.pronzato.fabric.api.telemetry.manager.FabricOtelEnablement;
+import org.pronzato.fabric.api.telemetry.OtelManager;
+import org.pronzato.fabric.api.telemetry.manager.OtelManagerImpl;
+import org.pronzato.fabric.api.telemetry.manager.OtelManagerNoop;
+import org.pronzato.fabric.api.util.Strings;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public final class SessionImpl implements Fabric.Session {
+  private static final Logger LOGGER = LoggerFactory.getLogger(SessionImpl.class);
+  private static final String UNKNOWN = "UNKNOWN";
+  private static final String DEFAULT_KERBEROS_REALM = "FABRIC.TEST.REALM";
+  private static final int DEFAULT_DUPLICATE_INSTANCE_CHECK_ATTEMPTS = 6;
+  private static final long DEFAULT_DUPLICATE_INSTANCE_CHECK_DELAY_MILLIS = 3_000L;
+  private static final Duration DEFAULT_DUPLICATE_HEARTBEAT_GRACE = Duration.ofSeconds(12);
+  private static final long DEFAULT_APP_STATUS_CADENCE_SECONDS = 30L;
+  private static final long DEFAULT_SERVICE_HEARTBEAT_CADENCE_SECONDS = 10L;
+  private static final long DEFAULT_SERVICE_STATUS_CADENCE_SECONDS = 30L;
+  private static final long DEFAULT_DATA_STATUS_CADENCE_SECONDS = 30L;
+  private static final int STATUS_SCHEDULER_THREADS = 2;
+  private static final AtomicInteger STATUS_SCHEDULER_THREAD_ID = new AtomicInteger(0);
+
+  private final SessionConfig cfg;
+  private final String sessionId = UUID.randomUUID().toString();
+  private final Object lifecycleLock = new Object();
+  private final AtomicBoolean started = new AtomicBoolean(false);
+  private final AtomicBoolean closed = new AtomicBoolean(false);
+  private final AtomicBoolean shutdownHookRegistered = new AtomicBoolean(false);
+  private final Thread shutdownHook;
+  private final ConnectionManagerImpl connectionManager;
+  private final SecurityManager securityManager;
+
+  private volatile String group;
+  private volatile String appName;
+  private volatile String instance;
+  private volatile String env = UNKNOWN;
+  private volatile String region = UNKNOWN;
+  private volatile String site = UNKNOWN;
+  private volatile boolean configCacheAdmin;
+  private volatile List<String> normalizedDiscoveryUrls = List.of();
+  private volatile List<String> discoveryUris = List.of();
+  private volatile ControlConnection controlPlaneConnection;
+  private volatile String runtimePlacementHost;
+  private volatile DiscoveryManager discoveryManager;
+  private volatile DeleteManager deleteManager;
+  private volatile DefinitionEnvironment environmentDefinition;
+  private volatile DefinitionApp appDefinition;
+  private volatile AppStatusPublisher statusPublisher;
+  private volatile SessionVmArgs kerberosPropertyScope;
+  private volatile SessionContext sessionContext;
+  private volatile ScheduledExecutorService statusScheduler;
+  private volatile Path checkpointPath;
+  private volatile CheckpointStore checkpointStore;
+  private volatile DiscoveryCacheRecoveryResult discoveryRecoveryStatus =
+      DiscoveryCacheRecoveryResult.notStarted();
+  private final DiscoveryCacheSnapshotService discoverySnapshotService =
+      new DiscoveryCacheSnapshotService();
+  private final RecoveryManager recoveryManager;
+
+  private volatile ServiceManager serviceManager;
+  private final AccessManagerImpl accessManager;
+  private volatile DataManagers dataPlanes;
+  private volatile ConfigManagerImpl configsCore;
+  private volatile SchemaManager schemaRegistryManager;
+  private volatile StreamManagerImpl streamManager;
+  private volatile CatalogManager assetCatalogService;
+  private volatile ServiceEntitlements serviceEntitlements;
+  private volatile DataEntitlements dataEntitlements;
+  private volatile EntitlementsManagerImpl entitlementsManager;
+  private volatile OtelManager otelManager;
+  private final boolean serviceEntitlementsLogDecisions;
+  private final boolean grpcRoutingLogSelections;
+  private final String statusUserTag;
+
+  public SessionImpl(SessionConfig config) {
+    this.cfg = Objects.requireNonNull(config, "config");
+    this.group = Strings.trimToNull(config.group());
+    this.appName = Strings.trimToNull(config.appName());
+    this.instance = SessionBootstrap.resolveInstanceName(config.instance());
+    this.normalizedDiscoveryUrls = SessionBootstrap.normalizeDiscoveryUrls(config.discoveryUrls());
+    this.shutdownHook = new Thread(this::closeQuietlyFromShutdownHook, "fabric-session-" + sessionId);
+    this.serviceEntitlementsLogDecisions = config.entitlementsDecisionLogging();
+    this.grpcRoutingLogSelections = config.grpcRoutingLogSelections();
+    this.statusUserTag = config.statusUserTag();
+    this.connectionManager =
+        new ConnectionManagerImpl(
+            this::discoveryCache, () -> group, () -> sessionContext, cfg, this::decryptS3Credential);
+    this.securityManager =
+        new SecurityManagerImpl(this::discoveryCache, () -> group, connectionManager::evictS3Connection);
+    this.accessManager =
+        new AccessManagerImpl(
+            this, () -> entitlementsManager, this::discoveryCache, this::serviceStatusCache);
+    this.recoveryManager =
+        new RecoveryManagerImpl(
+            this::dumpConfiguredRecoverySnapshot, this::currentDiscoveryRecoveryStatus);
+    refreshSessionViews();
+  }
+
+
+  @Override
+  public SessionContext context() {
+    return sessionContext;
+  }
+
+  @Override
+  public ServiceManager services() {
+    return serviceManager;
+  }
+
+  @Override
+  public AccessManager access() {
+    return accessManager;
+  }
+
+  public ServiceEntitlements serviceEntitlements() {
+    return serviceEntitlements;
+  }
+
+  @Override
+  public DataManagers data() {
+    return dataPlanes;
+  }
+
+  @Override
+  public ConfigManager configs() {
+    return configsCore;
+  }
+
+  @Override
+  public SchemaManager schemas() {
+    return schemaRegistryManager;
+  }
+
+  @Override
+  public StreamManager streams() {
+    return streamManager;
+  }
+
+  public DeleteManager deletes() {
+    return deleteManager;
+  }
+
+  @Override
+  public ConnectionManager connections() {
+    return connectionManager;
+  }
+
+  @Override
+  public CatalogManager catalog() {
+    return assetCatalogService;
+  }
+
+  @Override
+  public SecurityManager security() {
+    return securityManager;
+  }
+
+  public boolean grpcRoutingLogSelections() {
+    return grpcRoutingLogSelections;
+  }
+
+  public String statusUserTag() {
+    return statusUserTag;
+  }
+
+  Path checkpointPath() {
+    return checkpointPath;
+  }
+
+  Path configuredCheckpointPath() {
+    return cfg.checkpointPath();
+  }
+
+  public DefinitionApp appDefinition() {
+    return appDefinition;
+  }
+
+  @Override
+  public OtelManager telemetry() {
+    return otelManager;
+  }
+  
+  @Override
+  public void start() throws Exception {
+    synchronized (lifecycleLock) {
+      if (closed.get()) {
+        throw new IllegalStateException("Session is closed");
+      }
+      if (started.get()) {
+        return;
+      }
+
+      long startupStartNanos = System.nanoTime();
+      LOGGER.info(
+          "[Session][StartupTiming] phase=start group={} app={} instance={} recoveryEnabled={}",
+          cfg.group(),
+          cfg.appName(),
+          cfg.instance(),
+          cfg.discoveryCacheRecoveryEnabled());
+
+      long phaseStartNanos = System.nanoTime();
+      SessionBootstrap.BootstrapResult result = bootstrapWithRecoveryFallback();
+      LOGGER.info(
+          "[Session][StartupTiming] phase=bootstrap elapsedMs={} mode={}",
+          elapsedMillis(phaseStartNanos),
+          discoveryRecoveryStatus.recoveryUsed() ? "recovered" : "live");
+
+      phaseStartNanos = System.nanoTime();
+      this.kerberosPropertyScope = result.kerberosPropertyScope();
+      this.group = result.group();
+      this.appName = result.appName();
+      this.instance = result.instance();
+      this.normalizedDiscoveryUrls = result.discoveryUrls();
+      this.env = result.environment();
+      this.region = result.region();
+      this.site = result.site();
+      this.configCacheAdmin = result.configCacheAdmin();
+      this.discoveryUris = result.discoveryUris();
+      this.controlPlaneConnection = result.controlPlaneConnection();
+      this.runtimePlacementHost = resolveHostname();
+      this.environmentDefinition = result.environmentDefinition();
+      this.appDefinition = result.appDefinition();
+      this.otelManager = createOtelManager(result.environmentDefinition(), result.appDefinition());
+      LOGGER.info(
+          "[Session][StartupTiming] phase=bootstrap-assign elapsedMs={}",
+          elapsedMillis(phaseStartNanos));
+
+      phaseStartNanos = System.nanoTime();
+      Path configuredCheckpointPath = cfg.checkpointPath();
+      if (configuredCheckpointPath != null) {
+        Path resolvedCheckpointPath = configuredCheckpointPath.toAbsolutePath().normalize();
+        this.checkpointPath = resolvedCheckpointPath;
+        this.checkpointStore = CheckpointStores.local(resolvedCheckpointPath);
+        LOGGER.info("[Checkpoint] usingConfiguredPath path={}", resolvedCheckpointPath);
+      } else {
+        this.checkpointPath = null;
+        this.checkpointStore =
+            CheckpointStores.noOp(
+                "checkpointPath not configured for session "
+                    + Strings.firstNonBlank(group, "<group>")
+                    + "/"
+                    + Strings.firstNonBlank(appName, "<app>"));
+        LOGGER.info("[Checkpoint] disabled (no checkpointPath configured)");
+      }
+      LOGGER.info(
+          "[Session][StartupTiming] phase=checkpoint elapsedMs={}",
+          elapsedMillis(phaseStartNanos));
+
+      phaseStartNanos = System.nanoTime();
+      SessionImplManagers.StartedManagers startedManagers =
+          SessionImplManagers.initialize(
+              this,
+              cfg,
+              result,
+              sessionId,
+              checkpointStore,
+              connectionManager,
+              serviceEntitlementsLogDecisions,
+              LOGGER);
+      DiscoveryCache cache = startedManagers.discoveryCache();
+      LOGGER.info(
+          "[Session][StartupTiming] phase=managers.initialize elapsedMs={}",
+          elapsedMillis(phaseStartNanos));
+
+      phaseStartNanos = System.nanoTime();
+      this.discoveryManager = startedManagers.discoveryManager();
+      this.deleteManager = startedManagers.deleteManager();
+      this.entitlementsManager = startedManagers.entitlementsManager();
+      this.serviceEntitlements = startedManagers.serviceEntitlements();
+      this.dataEntitlements = startedManagers.dataEntitlements();
+      this.serviceManager = startedManagers.serviceManager();
+      this.schemaRegistryManager = startedManagers.schemaRegistryManager();
+      this.streamManager = startedManagers.streamManager();
+      this.dataPlanes = startedManagers.dataPlanes();
+      this.assetCatalogService = startedManagers.assetCatalogService();
+      this.configsCore = startedManagers.configsCore();
+      LOGGER.info(
+          "[Session][StartupTiming] phase=managers.publish elapsedMs={}",
+          elapsedMillis(phaseStartNanos));
+
+      phaseStartNanos = System.nanoTime();
+      registerShutdownHook();
+      this.started.set(true);
+      refreshSessionViews();
+      LOGGER.info(
+          "[Session][StartupTiming] phase=session-mark-started elapsedMs={}",
+          elapsedMillis(phaseStartNanos));
+
+      phaseStartNanos = System.nanoTime();
+      SessionImplLifecycle.runDuplicateInstanceCheck(
+          LOGGER,
+          controlPlaneConnection,
+          appDefinition,
+          cfg,
+          group,
+          appName,
+          instance,
+          DEFAULT_DUPLICATE_HEARTBEAT_GRACE,
+          DEFAULT_DUPLICATE_INSTANCE_CHECK_ATTEMPTS,
+          DEFAULT_DUPLICATE_INSTANCE_CHECK_DELAY_MILLIS);
+      LOGGER.info(
+          "[Session][StartupTiming] phase=duplicate-instance-check elapsedMs={}",
+          elapsedMillis(phaseStartNanos));
+
+      phaseStartNanos = System.nanoTime();
+      startStatusPublisher();
+      LOGGER.info(
+          "[Session][StartupTiming] phase=status-publisher-start elapsedMs={}",
+          elapsedMillis(phaseStartNanos));
+
+      phaseStartNanos = System.nanoTime();
+      refreshSessionViews();
+      LOGGER.info(
+          "[Session][StartupTiming] phase=session-refresh-final elapsedMs={}",
+          elapsedMillis(phaseStartNanos));
+
+      if (discoveryRecoveryStatus.recoveryUsed()) {
+        LOGGER.info(
+            "[Session][DiscoveryRecovery] startup=recovered sessionId={} app={}/{} instance={} snapshotPath={} definitions={}",
+            sessionId,
+            group,
+            appName,
+            instance,
+            discoveryRecoveryStatus.snapshotPath(),
+            discoveryRecoveryStatus.definitionCount());
+      } else {
+        LOGGER.info(
+            "[Session][DiscoveryRecovery] startup=live sessionId={} app={}/{} instance={} endpoints={} definitions={}",
+            sessionId,
+            group,
+            appName,
+            instance,
+            discoveryUris,
+            cache == null ? 0 : cache.size());
+      }
+      LOGGER.info(
+          "[Session][StartupTiming] phase=complete sessionId={} totalElapsedMs={} mode={}",
+          sessionId,
+          elapsedMillis(startupStartNanos),
+          discoveryRecoveryStatus.recoveryUsed() ? "recovered" : "live");
+      LOGGER.debug("L0 bootstrap complete sessionId={} app={}/{} instance={} env={} region={} site={} endpoints={} configCount={}", sessionId, group, appName, instance, env, region, site, discoveryUris, cache == null ? 0 : cache.size());
+    }
+  }
+
+  @Override
+  public boolean started() {
+    return started.get();
+  }
+
+  @Override
+  public RecoveryManager recovery() {
+    return recoveryManager;
+  }
+
+  @Override
+  public void stop() {
+    synchronized (lifecycleLock) {
+      if (!started.get()
+          && controlPlaneConnection == null
+          && discoveryManager == null
+          && statusScheduler == null
+          && configsCore == null
+          && dataPlanes == null) {
+        return;
+      }
+      SessionImplShutdown.stopManagedServices(serviceManager, LOGGER);
+      serviceManager = null;
+      CloseSupport.closeQuietly(dataPlanes instanceof AutoCloseable closeable ? closeable : null);
+      dataPlanes = null;
+      CloseSupport.closeQuietly(streamManager);
+      streamManager = null;
+      assetCatalogService = null;
+      CloseSupport.closeQuietly(configsCore);
+      configsCore = null;
+      CloseSupport.closeQuietly(connectionManager);
+      schemaRegistryManager = null;
+      CloseSupport.closeQuietly(statusPublisher);
+      statusPublisher = null;
+      CloseSupport.closeQuietly(entitlementsManager);
+      entitlementsManager = null;
+      CloseSupport.closeQuietly(accessManager);
+      serviceEntitlements = null;
+      dataEntitlements = null;
+      CloseSupport.closeQuietly(deleteManager);
+      deleteManager = null;
+      CloseSupport.closeQuietly(otelManager);
+      otelManager = null;
+      CloseSupport.closeQuietly(discoveryManager);
+      discoveryManager = null;
+      SessionImplShutdown.closeControlConnection(controlPlaneConnection);
+      controlPlaneConnection = null;
+      runtimePlacementHost = null;
+      environmentDefinition = null;
+      appDefinition = null;
+      configCacheAdmin = false;
+      discoveryUris = List.of();
+      discoveryRecoveryStatus = DiscoveryCacheRecoveryResult.notStarted();
+      started.set(false);
+      closeStatusScheduler();
+      refreshSessionViews();
+    }
+  }
+
+  @Override
+  public void close() {
+    synchronized (lifecycleLock) {
+      if (!closed.compareAndSet(false, true)) {
+        return;
+      }
+      unregisterShutdownHook();
+      stop();
+      CloseSupport.closeQuietly(kerberosPropertyScope);
+      kerberosPropertyScope = null;
+    }
+  }
+
+  public InternalAccess internal() {
+    if (cfg.type() != SessionType.PLATFORM) {
+      throw new IllegalStateException("internal access denied");
+    }
+    return new InternalAccess();
+  }
+
+  public DiscoveryCache discoveryCache() {
+    synchronized (lifecycleLock) {
+      DiscoveryManager manager = discoveryManager;
+      return manager == null ? null : manager.discoveryCache();
+    }
+  }
+
+  public AppStatusCache appStatusCache() {
+    synchronized (lifecycleLock) {
+      DiscoveryManager manager = discoveryManager;
+      return manager == null ? null : manager.appStatusCache();
+    }
+  }
+
+  public ServiceStatusCache serviceStatusCache() {
+    synchronized (lifecycleLock) {
+      DiscoveryManager manager = discoveryManager;
+      return manager == null ? null : manager.serviceStatusCache();
+    }
+  }
+
+  public DataStatusCache dataStatusCache() {
+    synchronized (lifecycleLock) {
+      DiscoveryManager manager = discoveryManager;
+      return manager == null ? null : manager.dataStatusCache();
+    }
+  }
+
+  public DefinitionEnvironment environmentDefinition() {
+    return environmentDefinition;
+  }
+
+  public long serviceHeartbeatCadenceSeconds() {
+    DefinitionEnvironment.Cadence configuredCadence =
+        environmentDefinition == null ? null : environmentDefinition.cadence();
+    Integer configured =
+        configuredCadence == null ? null : configuredCadence.serviceHeartbeatSeconds();
+    return resolveCadenceSeconds(configured, DEFAULT_SERVICE_HEARTBEAT_CADENCE_SECONDS);
+  }
+
+  public long serviceStatusCadenceSeconds() {
+    DefinitionEnvironment.Cadence configuredCadence =
+        environmentDefinition == null ? null : environmentDefinition.cadence();
+    Integer configured = configuredCadence == null ? null : configuredCadence.serviceStatusSeconds();
+    return resolveCadenceSeconds(configured, DEFAULT_SERVICE_STATUS_CADENCE_SECONDS);
+  }
+
+  public long dataStatusCadenceSeconds() {
+    DefinitionEnvironment.Cadence configuredCadence =
+        environmentDefinition == null ? null : environmentDefinition.cadence();
+    Integer configured = configuredCadence == null ? null : configuredCadence.dataStatusSeconds();
+    return resolveCadenceSeconds(configured, DEFAULT_DATA_STATUS_CADENCE_SECONDS);
+  }
+
+  public String kerberosPrincipal() {
+    return cfg.kerberosPrincipal();
+  }
+
+  public Path kerberosKeytab() {
+    return cfg.kerberosKeytab();
+  }
+
+  public Path trustCert() {
+    return cfg.trustCert();
+  }
+
+  public long appStatusCadenceSeconds() {
+    DefinitionEnvironment.Cadence configuredCadence =
+        environmentDefinition == null ? null : environmentDefinition.cadence();
+    Integer configured = configuredCadence == null ? null : configuredCadence.appStatusSeconds();
+    return resolveCadenceSeconds(configured, DEFAULT_APP_STATUS_CADENCE_SECONDS);
+  }
+
+  public Path serviceTlsCertChain() {
+    return cfg.serviceTlsCertChain();
+  }
+
+  public Path serviceTlsPrivateKey() {
+    return cfg.serviceTlsPrivateKey();
+  }
+
+  public ControlConnection controlPlaneConnection() {
+    return controlPlaneConnection;
+  }
+
+  public ScheduledExecutorService statusScheduler() {
+    synchronized (lifecycleLock) {
+      if (statusScheduler == null || statusScheduler.isShutdown()) {
+        statusScheduler =
+            Executors.newScheduledThreadPool(
+                STATUS_SCHEDULER_THREADS,
+                runnable -> {
+                  Thread thread =
+                      new Thread(
+                          runnable,
+                          "fabric-status-" + STATUS_SCHEDULER_THREAD_ID.incrementAndGet());
+                  thread.setDaemon(true);
+                  return thread;
+                });
+      }
+      return statusScheduler;
+    }
+  }
+
+  public String runtimePlacementHost() {
+    String configured = Strings.trimToNull(runtimePlacementHost);
+    return configured == null ? resolveHostname() : configured;
+  }
+
+  public final class InternalAccess {
+    public ControlConnection controlPlaneConnection() {
+      return controlPlaneConnection;
+    }
+
+    public DiscoveryCache discoveryCache() {
+      return SessionImpl.this.discoveryCache();
+    }
+
+    public AppStatusCache statusCache() {
+      return SessionImpl.this.appStatusCache();
+    }
+
+    public AppStatusCache appStatusCache() {
+      return SessionImpl.this.appStatusCache();
+    }
+
+    public ServiceStatusCache serviceStatusCache() {
+      return SessionImpl.this.serviceStatusCache();
+    }
+
+    public DataStatusCache dataStatusCache() {
+      return SessionImpl.this.dataStatusCache();
+    }
+
+    public ConfigAdminService configAdminService() {
+      ConfigAdminService service = configsCore;
+      if (service == null) {
+        throw new IllegalStateException("Config manager is not available");
+      }
+      return service;
+    }
+  }
+
+  String decryptS3Credential(String alias, String encryptedValue) {
+    SessionSecrets secrets = cfg.sessionSecrets();
+    if (secrets == null) {
+      throw new IllegalStateException(
+          "S3 credentials are encrypted but no KEK was provided (alias="
+              + Strings.firstNonBlank(alias, SessionSecrets.DEFAULT_KEK_ALIAS)
+              + ")");
+    }
+    return secrets.decrypt(alias, encryptedValue);
+  }
+
+  public ServiceInstanceResolver serviceInstanceResolver() {
+    DataManagers manager = dataPlanes;
+    if (manager instanceof DataPlanesImpl impl) {
+      ServiceInstanceResolver resolver = impl.serviceInstanceResolverIfInitialized();
+      if (resolver != null) {
+        return resolver;
+      }
+    }
+    throw new IllegalStateException("ServiceInstanceResolver is not initialized");
+  }
+
+  public ServiceInstanceResolver serviceInstanceResolverIfInitialized() {
+    DataManagers manager = dataPlanes;
+    if (manager instanceof DataPlanesImpl impl) {
+      return impl.serviceInstanceResolverIfInitialized();
+    }
+    return null;
+  }
+
+  private void dumpConfiguredRecoverySnapshot() {
+    Path configuredPath = cfg.discoveryCacheRecoveryPath();
+    if (configuredPath == null) {
+      throw new IllegalStateException(
+          "Discovery cache recovery path is not configured; set withRecoveryPath(...)");
+    }
+    dumpRecoverySnapshot(configuredPath);
+  }
+
+  private void dumpRecoverySnapshot(Path path) {
+    DiscoveryCache cache = discoveryCache();
+    if (cache == null) {
+      throw new IllegalStateException("DiscoveryCache is not initialized");
+    }
+    DiscoveryCacheSnapshotManifest manifest =
+        discoverySnapshotService.dump(
+            cache,
+            Objects.requireNonNull(path, "path"),
+            new DiscoveryCacheSnapshotService.SnapshotMetadata(sessionId, group, appName, instance));
+    LOGGER.info(
+        "[Session][DiscoveryRecovery][Dump] path={} createdTimeUtc={} definitions={}",
+        path.toAbsolutePath().normalize(),
+        manifest.createdTimeUtc(),
+        manifest.definitionCount());
+  }
+
+  private DiscoveryCacheRecoveryResult currentDiscoveryRecoveryStatus() {
+    return discoveryRecoveryStatus;
+  }
+
+  private SessionBootstrap.BootstrapResult bootstrapWithRecoveryFallback() throws Exception {
+    LOGGER.info(
+        "[Session][DiscoveryRecovery] config enabled={} path={} ttl={}",
+        cfg.discoveryCacheRecoveryEnabled(),
+        cfg.discoveryCacheRecoveryPath(),
+        cfg.discoveryCacheRecoveryTtl());
+    LOGGER.info(
+        "[Session][DiscoveryRecovery] live-bootstrap-start app={}/{} instance={} discoveryUrls={}",
+        cfg.group(),
+        cfg.appName(),
+        cfg.instance(),
+        cfg.discoveryUrls());
+    try {
+      SessionBootstrap.BootstrapResult liveResult =
+          SessionBootstrap.bootstrap(cfg, sessionId, kerberosPropertyScope);
+      discoveryRecoveryStatus =
+          DiscoveryCacheRecoveryResult.live(
+              cfg.discoveryCacheRecoveryEnabled(), "live DiscoveryCache bootstrap succeeded");
+      LOGGER.info(
+          "[Session][DiscoveryRecovery] live-bootstrap-succeeded app={}/{} instance={}",
+          cfg.group(),
+          cfg.appName(),
+          cfg.instance());
+      return liveResult;
+    } catch (Exception liveFailure) {
+      LOGGER.warn(
+          "[Session][DiscoveryRecovery] live-bootstrap-failed app={}/{} instance={} message={}",
+          cfg.group(),
+          cfg.appName(),
+          cfg.instance(),
+          Strings.firstNonBlank(liveFailure.getMessage(), liveFailure.getClass().getSimpleName()));
+      return recoverBootstrapOrThrow(liveFailure);
+    }
+  }
+
+  private SessionBootstrap.BootstrapResult recoverBootstrapOrThrow(Exception liveFailure)
+      throws Exception {
+    if (!cfg.discoveryCacheRecoveryEnabled()) {
+      LOGGER.info("[Session][DiscoveryRecovery] recovery-disabled; startup will fail if live bootstrap fails");
+      discoveryRecoveryStatus =
+          DiscoveryCacheRecoveryResult.failed(
+              false,
+              null,
+              null,
+              null,
+              null,
+              "Recovery disabled and live bootstrap failed");
+      throw liveFailure;
+    }
+
+    Path snapshotPath = cfg.discoveryCacheRecoveryPath();
+    Duration snapshotTtl = cfg.discoveryCacheRecoveryTtl();
+    if (snapshotPath == null) {
+      discoveryRecoveryStatus =
+          DiscoveryCacheRecoveryResult.failed(
+              true,
+              null,
+              null,
+              null,
+              snapshotTtl,
+              "Recovery enabled but snapshot path is not configured");
+      IllegalStateException error =
+          new IllegalStateException(
+              "DiscoveryCache recovery is enabled but no snapshot path is configured");
+      error.addSuppressed(liveFailure);
+      throw error;
+    }
+
+    LOGGER.info(
+        "[Session][DiscoveryRecovery] recovery-attempt-enabled=true path={} ttl={}",
+        snapshotPath.toAbsolutePath().normalize(),
+        snapshotTtl);
+    DiscoveryCache probeCache = null;
+    DiscoveryCache runtimeCache = null;
+    boolean published = false;
+    try {
+      DiscoveryCacheSnapshotService.LoadedSnapshot loaded =
+          discoverySnapshotService.load(snapshotPath, snapshotTtl);
+      String sessionGroup = Strings.trimToNull(cfg.group());
+      probeCache =
+          DiscoveryCache.recoveredSnapshotCache(
+              sessionGroup, true, cfg.verbose(), loaded.definitions());
+      SessionBootstrap.BootstrapResult recoveredResult =
+          SessionBootstrap.bootstrapFromRecoveredSnapshot(
+              cfg, sessionId, kerberosPropertyScope, probeCache);
+      runtimeCache = probeCache;
+      if (!recoveredResult.configCacheAdmin()) {
+        runtimeCache =
+            DiscoveryCache.recoveredSnapshotCache(
+                recoveredResult.group(), false, cfg.verbose(), loaded.definitions());
+        probeCache.close();
+        probeCache = null;
+      }
+      publishDiscoveryManager(
+          DiscoveryManager.recoveredSnapshot(
+              runtimeCache, recoveredResult.group(), this::defaultCatalogSubject, () -> null));
+      published = true;
+      discoveryRecoveryStatus =
+          DiscoveryCacheRecoveryResult.recovered(
+              loaded.snapshotPath(),
+              loaded.createdTimeUtc(),
+              loaded.age(),
+              loaded.ttl(),
+              loaded.manifest().definitionCount(),
+              "Recovered DiscoveryCache from disk snapshot");
+      LOGGER.info(
+          "[Session][DiscoveryRecovery] recovery-accepted path={} createdTimeUtc={} age={} ttl={} definitions={}",
+          loaded.snapshotPath(),
+          loaded.createdTimeUtc(),
+          loaded.age(),
+          loaded.ttl(),
+          loaded.manifest().definitionCount());
+      return recoveredResult;
+    } catch (Exception recoveryFailure) {
+      CloseSupport.closeQuietly(probeCache);
+      if (!published) {
+        CloseSupport.closeQuietly(runtimeCache);
+      }
+      discoveryRecoveryStatus =
+          DiscoveryCacheRecoveryResult.failed(
+              true,
+              snapshotPath,
+              null,
+              null,
+              snapshotTtl,
+              Strings.firstNonBlank(
+                  recoveryFailure.getMessage(), recoveryFailure.getClass().getSimpleName()));
+      LOGGER.error(
+          "[Session][DiscoveryRecovery] recovery-rejected path={} ttl={} reason={}",
+          snapshotPath.toAbsolutePath().normalize(),
+          snapshotTtl,
+          Strings.firstNonBlank(
+              recoveryFailure.getMessage(), recoveryFailure.getClass().getSimpleName()));
+      IllegalStateException startupFailure =
+          new IllegalStateException(
+              "Live bootstrap failed and DiscoveryCache recovery failed: "
+                  + Strings.firstNonBlank(
+                      recoveryFailure.getMessage(),
+                      recoveryFailure.getClass().getSimpleName()),
+              recoveryFailure);
+      startupFailure.addSuppressed(liveFailure);
+      throw startupFailure;
+    }
+  }
+
+  OtelManager createOtelManager(
+      DefinitionEnvironment environment, DefinitionApp app) {
+    if (!FabricOtelEnablement.isEnvironmentOtelEnabled(environment)
+        || !FabricOtelEnablement.isAppOtelEnabled(app)) {
+      return OtelManagerNoop.instance();
+    }
+    String defaultServiceName =
+        Strings.firstNonBlank(
+            app == null || app.envelope() == null ? null : app.envelope().name(),
+            appName,
+            "fabric-lite");
+    return OtelManagerImpl.create(environment, app, defaultServiceName);
+  }
+
+  private void refreshSessionViews() {
+    DiscoveryCache cache = discoveryCache();
+    SessionContext context =
+        new SessionContext(
+            cfg.type(),
+            group,
+            appName,
+            instance,
+            env,
+            region,
+            site,
+            sessionId,
+            normalizedDiscoveryUrls,
+            discoveryUris,
+            configCacheAdmin,
+            cache != null && cache.recovered(),
+            cache == null ? 0 : cache.size(),
+            statusPublisher == null ? 0 : statusPublisher.publishIntervalSeconds(),
+            statusPublisher == null ? null : statusPublisher.intervalSource(),
+            statusPublisher != null && statusPublisher.started(),
+            statusPublisher == null ? null : statusPublisher.lastPublishedPayload(),
+            statusPublisher == null ? 0L : statusPublisher.lastPublishedEpochMs(),
+            statusPublisher == null ? 0L : statusPublisher.publishCount());
+    this.sessionContext = context;
+  }
+
+  private void startStatusPublisher() {
+    DiscoveryCache cache = discoveryCache();
+    if (controlPlaneConnection == null || cache == null) {
+      return;
+    }
+    long appStatusCadenceSeconds = appStatusCadenceSeconds();
+    String cadenceSource = appStatusCadenceSource();
+    AppStatusPublisher publisher =
+        new AppStatusPublisher(
+            controlPlaneConnection,
+            sessionContext,
+            appDefinition,
+            statusUserTag,
+            otelManager.enabled(),
+            toIntSeconds(appStatusCadenceSeconds),
+            cadenceSource,
+            statusScheduler(),
+            (publishEpochMs, status, payload) -> {
+              synchronized (lifecycleLock) {
+                if (!started.get() || statusPublisher == null) {
+                  return;
+                }
+                refreshSessionViews();
+              }
+            });
+    statusPublisher = publisher;
+    publisher.start();
+  }
+
+  private String appStatusCadenceSource() {
+    DefinitionEnvironment.Cadence configuredCadence =
+        environmentDefinition == null ? null : environmentDefinition.cadence();
+    Integer configured = configuredCadence == null ? null : configuredCadence.appStatusSeconds();
+    if (configured != null && configured > 0) {
+      return "environment.cadence.appStatusSeconds";
+    }
+    return "default";
+  }
+
+  private static int toIntSeconds(long value) {
+    long normalized = Math.max(1L, value);
+    return (int) Math.min(Integer.MAX_VALUE, normalized);
+  }
+
+  public record SessionConfig(
+      String group,
+      String appName,
+      List<String> discoveryUrls,
+      String instance,
+      String kerberosUsername,
+      String kerberosPrincipal,
+      Path kerberosKeytab,
+      Path trustCert,
+      Path serviceTlsCertChain,
+      Path serviceTlsPrivateKey,
+      SessionType type,
+      boolean verbose,
+      Integer duplicateInstanceCheckAttempts,
+      Duration duplicateInstanceCheckDelay,
+      DataOptions dataOptions,
+      boolean entitlementsDecisionLogging,
+      boolean grpcRoutingLogSelections,
+      String statusUserTag,
+      Path checkpointPath,
+      boolean discoveryCacheRecoveryEnabled,
+      Path discoveryCacheRecoveryPath,
+      Duration discoveryCacheRecoveryTtl,
+      SessionSecrets sessionSecrets) {
+    public SessionConfig(
+        String group,
+        String appName,
+        List<String> discoveryUrls,
+        String instance,
+        String kerberosUsername,
+        String kerberosPrincipal,
+        Path kerberosKeytab,
+        Path trustCert,
+        Path serviceTlsCertChain,
+        Path serviceTlsPrivateKey,
+        SessionType type,
+        boolean verbose,
+        Integer duplicateInstanceCheckAttempts,
+        Duration duplicateInstanceCheckDelay,
+        DataOptions dataOptions,
+        boolean entitlementsDecisionLogging,
+        boolean grpcRoutingLogSelections,
+        String statusUserTag,
+        Path checkpointPath,
+        boolean discoveryCacheRecoveryEnabled,
+        Path discoveryCacheRecoveryPath,
+        Duration discoveryCacheRecoveryTtl) {
+      this(
+          group,
+          appName,
+          discoveryUrls,
+          instance,
+          kerberosUsername,
+          kerberosPrincipal,
+          kerberosKeytab,
+          trustCert,
+          serviceTlsCertChain,
+          serviceTlsPrivateKey,
+          type,
+          verbose,
+          duplicateInstanceCheckAttempts,
+          duplicateInstanceCheckDelay,
+          dataOptions,
+          entitlementsDecisionLogging,
+          grpcRoutingLogSelections,
+          statusUserTag,
+          checkpointPath,
+          discoveryCacheRecoveryEnabled,
+          discoveryCacheRecoveryPath,
+          discoveryCacheRecoveryTtl,
+          SessionSecrets.empty());
+    }
+
+    public SessionConfig {
+      discoveryUrls = discoveryUrls == null ? Collections.emptyList() : List.copyOf(discoveryUrls);
+      type = type == null ? SessionType.CLIENT : type;
+      duplicateInstanceCheckAttempts =
+          duplicateInstanceCheckAttempts != null && duplicateInstanceCheckAttempts > 0
+              ? duplicateInstanceCheckAttempts
+              : null;
+      duplicateInstanceCheckDelay =
+          duplicateInstanceCheckDelay != null
+                  && !duplicateInstanceCheckDelay.isNegative()
+                  && !duplicateInstanceCheckDelay.isZero()
+              ? duplicateInstanceCheckDelay
+              : null;
+      dataOptions = dataOptions == null ? DataOptions.builder().build() : dataOptions;
+      statusUserTag = Strings.trimToNull(statusUserTag);
+      checkpointPath = checkpointPath == null ? null : checkpointPath.normalize();
+      discoveryCacheRecoveryPath =
+          discoveryCacheRecoveryPath == null ? null : discoveryCacheRecoveryPath.normalize();
+      discoveryCacheRecoveryTtl =
+          discoveryCacheRecoveryTtl == null || discoveryCacheRecoveryTtl.isNegative()
+              ? null
+              : discoveryCacheRecoveryTtl;
+      trustCert = trustCert == null ? null : trustCert.normalize();
+      serviceTlsCertChain =
+          serviceTlsCertChain == null ? null : serviceTlsCertChain.normalize();
+      serviceTlsPrivateKey =
+          serviceTlsPrivateKey == null ? null : serviceTlsPrivateKey.normalize();
+      sessionSecrets = sessionSecrets == null ? SessionSecrets.empty() : sessionSecrets;
+    }
+  }
+
+  void deleteDefinition(DefinitionType type, String definitionGroup, String definitionName) {
+    DiscoveryCache cache = discoveryCache();
+    if (cache == null) {
+      throw new IllegalStateException("DiscoveryCache is not initialized");
+    }
+    cache.delete(type, definitionGroup, definitionName);
+  }
+
+  void publishDiscoveryManager(DiscoveryManager manager) {
+    this.discoveryManager = manager;
+  }
+
+  DiscoveryManager publishedDiscoveryManager() {
+    return discoveryManager;
+  }
+
+  void publishDeleteManager(DeleteManager manager) {
+    this.deleteManager = manager;
+  }
+
+  void publishSchemaRegistryManager(SchemaManager manager) {
+    this.schemaRegistryManager = manager;
+  }
+
+  void publishServiceEntitlements(ServiceEntitlements entitlements) {
+    this.serviceEntitlements = entitlements;
+  }
+
+  void publishDataEntitlements(DataEntitlements entitlements) {
+    this.dataEntitlements = entitlements;
+  }
+
+
+
+  public static final class Builder {
+    private String group;
+    private String appName;
+    private List<String> discoveryUrls = List.of();
+    private String instance;
+    private String kerberosUsername;
+    private String kerberosPrincipal;
+    private Path kerberosKeytab;
+    private Path trustCert;
+    private Path serviceTlsCertChain;
+    private Path serviceTlsPrivateKey;
+    private SessionType type = SessionType.CLIENT;
+    private boolean verbose;
+    private Integer duplicateInstanceCheckAttempts;
+    private Duration duplicateInstanceCheckDelay;
+    private DataOptions dataOptions = DataOptions.builder().build();
+    private boolean entitlementsDecisionLogging;
+    private boolean grpcRoutingLogSelections;
+    private String statusUserTag;
+    private Path checkpointPath;
+    private boolean discoveryCacheRecoveryEnabled;
+    private Path discoveryCacheRecoveryPath;
+    private Duration discoveryCacheRecoveryTtl;
+    private final SessionSecrets.Builder sessionSecrets = SessionSecrets.builder();
+
+    public Builder withGroup(String value) {
+      group = Strings.trimToNull(value);
+      return this;
+    }
+
+    public Builder withName(String value) {
+      appName = Strings.trimToNull(value);
+      return this;
+    }
+
+    public Builder withDiscoveryUrls(String value) {
+      discoveryUrls = AmpsConfig.parseDiscoveryUrls(value == null ? List.of() : List.of(value));
+      return this;
+    }
+
+    public Builder withDiscoveryUrls(String... values) {
+      discoveryUrls =
+          AmpsConfig.parseDiscoveryUrls(values == null ? List.of() : Arrays.asList(values));
+      return this;
+    }
+
+    public Builder withDiscoveryUrls(List<String> values) {
+      discoveryUrls = AmpsConfig.parseDiscoveryUrls(values);
+      return this;
+    }
+
+    public Builder withInstance(String value) {
+      instance = Strings.trimToNull(value);
+      return this;
+    }
+
+    public Builder withKerberosUsername(String value) {
+      if (Strings.isBlank(value)) {
+        throw new IllegalArgumentException("Kerberos username is required");
+      }
+      kerberosUsername = value.trim();
+      return this;
+    }
+
+    public Builder withKerberosPrincipal(String value) {
+      kerberosPrincipal = Strings.trimToNull(value);
+      return this;
+    }
+
+    public Builder withKerberosKeytab(Path value) {
+      kerberosKeytab = value;
+      return this;
+    }
+
+    public Builder withTlsTrustCert(Path value) {
+      trustCert = value;
+      return this;
+    }
+
+    public Builder withTlsCertChain(Path value) {
+      serviceTlsCertChain = value;
+      return this;
+    }
+
+    public Builder withTlsPrivateKey(Path value) {
+      serviceTlsPrivateKey = value;
+      return this;
+    }
+
+    public Builder withType(SessionType value) {
+      type = value == null ? SessionType.CLIENT : value;
+      return this;
+    }
+
+    public Builder withVerbose(boolean value) {
+      verbose = value;
+      return this;
+    }
+
+    public Builder withDiscoveryVerbose(boolean value) {
+      verbose = value;
+      return this;
+    }
+
+    public Builder withVerbos(boolean value) {
+      return withVerbose(value);
+    }
+
+    public Builder withDuplicateInstanceCheckAttempts(int value) {
+      if (value <= 0) {
+        throw new IllegalArgumentException("duplicate instance check attempts must be > 0");
+      }
+      duplicateInstanceCheckAttempts = value;
+      return this;
+    }
+
+    public Builder withDuplicateInstanceCheckDelay(Duration value) {
+      if (value == null || value.isNegative() || value.isZero()) {
+        throw new IllegalArgumentException("duplicate instance check delay must be > 0");
+      }
+      duplicateInstanceCheckDelay = value;
+      return this;
+    }
+
+    public Builder withDataOptions(DataOptions options) {
+      dataOptions = options == null ? DataOptions.builder().build() : options;
+      return this;
+    }
+
+    public Builder withEntitlementsDecisionLogging(boolean value) {
+      entitlementsDecisionLogging = value;
+      return this;
+    }
+
+    public Builder withGrpcRoutingLogging(boolean value) {
+      grpcRoutingLogSelections = value;
+      return this;
+    }
+
+    public Builder withStatusUserTag(String value) {
+      statusUserTag = Strings.trimToNull(value);
+      return this;
+    }
+
+    public Builder withCheckpointPath(Path value) {
+      checkpointPath = Objects.requireNonNull(value, "checkpointPath");
+      return this;
+    }
+
+    public Builder withRecoveryEnabled(boolean enabled) {
+      discoveryCacheRecoveryEnabled = enabled;
+      return this;
+    }
+
+    public Builder withRecoveryPath(Path path) {
+      discoveryCacheRecoveryPath = Objects.requireNonNull(path, "path");
+      return this;
+    }
+
+    public Builder withRecoveryTtl(Duration ttl) {
+      if (ttl != null && ttl.isNegative()) {
+        throw new IllegalArgumentException("discovery cache recovery TTL must be >= 0");
+      }
+      discoveryCacheRecoveryTtl = ttl;
+      return this;
+    }
+
+    public Builder withSecrets(Consumer<SessionSecrets.Builder> customizer) {
+      Objects.requireNonNull(customizer, "customizer");
+      customizer.accept(sessionSecrets);
+      return this;
+    }
+
+    public Builder withKekFile(String alias, Path kekFile) {
+      sessionSecrets.withClientKekFile(alias, kekFile);
+      return this;
+    }
+
+    public Builder withKekFile(Path kekFile) {
+      sessionSecrets.withClientKekFile(kekFile);
+      return this;
+    }
+
+    public Fabric.Session build() {
+      String principal = Strings.trimToNull(kerberosPrincipal);
+      if (principal == null && Strings.isNotBlank(kerberosUsername)) {
+        principal = kerberosUsername.trim() + "@" + DEFAULT_KERBEROS_REALM;
+      }
+      return new SessionImpl(
+          new SessionConfig(
+              group,
+              appName,
+              discoveryUrls,
+              instance,
+              Strings.trimToNull(kerberosUsername),
+              principal,
+              kerberosKeytab,
+              trustCert,
+              serviceTlsCertChain,
+              serviceTlsPrivateKey,
+              type == null ? SessionType.CLIENT : type,
+              verbose,
+              duplicateInstanceCheckAttempts,
+              duplicateInstanceCheckDelay,
+              dataOptions,
+              entitlementsDecisionLogging,
+              grpcRoutingLogSelections,
+              statusUserTag,
+              checkpointPath,
+              discoveryCacheRecoveryEnabled,
+              discoveryCacheRecoveryPath,
+              discoveryCacheRecoveryTtl,
+              sessionSecrets.build()));
+    }
+  }
+
+  private void closeStatusScheduler() {
+    ScheduledExecutorService scheduler = statusScheduler;
+    statusScheduler = null;
+    SessionImplShutdown.closeStatusScheduler(scheduler);
+  }
+
+  private static String resolveHostname() {
+    try {
+      return InetAddress.getLocalHost().getHostName();
+    } catch (UnknownHostException ex) {
+      return "localhost";
+    }
+  }
+
+  private void registerShutdownHook() {
+    SessionImplShutdown.registerShutdownHook(shutdownHookRegistered, shutdownHook);
+  }
+
+  private void unregisterShutdownHook() {
+    SessionImplShutdown.unregisterShutdownHook(shutdownHookRegistered, shutdownHook);
+  }
+
+  private void closeQuietlyFromShutdownHook() {
+    SessionImplShutdown.closeQuietlyFromShutdownHook(this::close);
+  }
+
+  String defaultCatalogSubject() {
+    String resolvedGroup = Strings.trimToNull(group);
+    String resolvedApp = Strings.trimToNull(appName);
+    if (resolvedGroup == null || resolvedApp == null) {
+      return "app:catalog/system";
+    }
+    return "app:" + resolvedGroup + "/" + resolvedApp;
+  }
+
+  private static long elapsedMillis(long startNanos) {
+    return Math.max(0L, (System.nanoTime() - startNanos) / 1_000_000L);
+  }
+
+  private static long resolveCadenceSeconds(Integer configuredSeconds, long defaultSeconds) {
+    if (configuredSeconds != null && configuredSeconds > 0) {
+      return configuredSeconds.longValue();
+    }
+    return defaultSeconds;
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+===== FILE: fabric-lite/src/main/java/org/pronzato/fabric/api/control/session/SessionImplManagers.java =====
+
+
+package org.pronzato.fabric.api.control.session;
+
+import java.util.List;
+import org.pronzato.fabric.api.catalog.CatalogManager;
+import org.pronzato.fabric.api.catalog.manager.CatalogServiceImpl;
+import org.pronzato.fabric.api.connections.manager.ConnectionManagerImpl;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
+import org.pronzato.fabric.api.control.discovery.DeleteManager;
+import org.pronzato.fabric.api.control.discovery.DiscoveryManager;
+import org.pronzato.fabric.api.data.DataManagers;
+import org.pronzato.fabric.api.data.DataOptions;
+import org.pronzato.fabric.api.data.checkpoints.CheckpointStore;
+import org.pronzato.fabric.api.data.manager.DataPlanesImpl;
+import org.pronzato.fabric.api.control.entitlements.core.data.DataEntitlements;
+import org.pronzato.fabric.api.control.entitlements.core.services.ServiceEntitlements;
+import org.pronzato.fabric.api.control.entitlements.manager.EntitlementsManagerImpl;
+import org.pronzato.fabric.api.schemas.SchemaManager;
+import org.pronzato.fabric.api.schemas.manager.SchemaManagerImpl;
+import org.pronzato.fabric.api.configs.manager.ConfigManagerImpl;
+import org.pronzato.fabric.api.services.ServiceManager;
+import org.pronzato.fabric.api.services.manager.ServiceManagerImpl;
+import org.pronzato.fabric.api.streams.manager.StreamManagerImpl;
+import org.pronzato.fabric.api.util.Strings;
+import org.slf4j.Logger;
+
+final class SessionImplManagers {
+  private SessionImplManagers() {}
+
+  static StartedManagers initialize(
+      SessionImpl session,
+      SessionImpl.SessionConfig cfg,
+      SessionBootstrap.BootstrapResult result,
+      String sessionId,
+      CheckpointStore checkpointStore,
+      ConnectionManagerImpl connectionManager,
+      boolean serviceEntitlementsLogDecisions,
+      Logger logger) {
+    long initializeStartNanos = System.nanoTime();
+    long phaseStartNanos = System.nanoTime();
+    DiscoveryManager resolvedDiscoveryManager = session.publishedDiscoveryManager();
+    if (resolvedDiscoveryManager == null) {
+      resolvedDiscoveryManager =
+          new DiscoveryManager(
+              result.controlPlaneConnection(),
+              result.group(),
+              result.configCacheAdmin(),
+              cfg.verbose(),
+              session::defaultCatalogSubject,
+              cfg::statusUserTag,
+              session.serviceStatusCadenceSeconds(),
+              session.dataStatusCadenceSeconds());
+      resolvedDiscoveryManager.start();
+    }
+    DiscoveryManager discoveryManager = resolvedDiscoveryManager;
+    DiscoveryCache cache = discoveryManager.discoveryCache();
+    if (cache == null) {
+      throw new IllegalStateException("DiscoveryCache is not initialized");
+    }
+    logger.info(
+        "[Session][StartupTiming] phase=managers.discovery elapsedMs={} recovered={} offline={}",
+        elapsedMillis(phaseStartNanos),
+        cache.recovered(),
+        cache.offlineMode());
+    // Preserve pre-extraction startup ordering: publish discovery manager before data plane init.
+    session.publishDiscoveryManager(discoveryManager);
+
+    phaseStartNanos = System.nanoTime();
+    DeleteManager deleteManager =
+        new DeleteManager(
+            () -> {
+              DiscoveryCache active = discoveryManager.discoveryCache();
+              return active == null ? List.of() : active.allDefinitions();
+            },
+            session::deleteDefinition);
+    session.publishDeleteManager(deleteManager);
+    logger.info(
+        "[Session][StartupTiming] phase=managers.delete-manager elapsedMs={}",
+        elapsedMillis(phaseStartNanos));
+
+    phaseStartNanos = System.nanoTime();
+    EntitlementsManagerImpl entitlementsManager =
+        new EntitlementsManagerImpl(
+            cache,
+            result.controlPlaneConnection(),
+            sessionId,
+            result.group(),
+            result.appName(),
+            result.instance(),
+            result.environment(),
+            result.region(),
+            result.site(),
+            serviceEntitlementsLogDecisions);
+    ServiceEntitlements serviceEntitlements = entitlementsManager.serviceEntitlements();
+    DataEntitlements dataEntitlements = entitlementsManager.dataEntitlements();
+    session.publishServiceEntitlements(serviceEntitlements);
+    session.publishDataEntitlements(dataEntitlements);
+    EntitlementsManagerImpl.RuntimeInfo entitlementsRuntime = entitlementsManager.runtimeInfo();
+    logger.info(
+        "[Session][Entitlements] implementation={} eventsEnabled={} eventsTransport={} eventsConnection={} eventsTopic={}",
+        entitlementsRuntime.implementation(),
+        entitlementsRuntime.eventsEnabled(),
+        entitlementsRuntime.eventsTransport(),
+        entitlementsRuntime.eventsConnection(),
+        entitlementsRuntime.eventsTopic());
+    logger.info(
+        "[Session][StartupTiming] phase=managers.entitlements elapsedMs={}",
+        elapsedMillis(phaseStartNanos));
+
+    phaseStartNanos = System.nanoTime();
+    ServiceManager serviceManager = new ServiceManagerImpl(session, checkpointStore);
+    DataOptions dataOptions = cfg.dataOptions() == null ? DataOptions.builder().build() : cfg.dataOptions();
+    if (result.controlPlaneConnection() == null && dataOptions.service().enabled()) {
+      logger.warn(
+          "[Session][DiscoveryRecovery] data service plane disabled in recovered mode (control-plane unavailable)");
+      dataOptions =
+          DataOptions.builder()
+              .withDirect(dataOptions.direct())
+              .withService(dataOptions.service())
+              .withServiceEnabled(false)
+              .build();
+    }
+    logger.debug(
+        "[DataManager] directEnabled={} serviceEnabled={} queryService={} ingestService={}",
+        dataOptions.direct().enabled(),
+        dataOptions.service().enabled(),
+        Strings.trimToNull(dataOptions.service().queryService()),
+        Strings.trimToNull(dataOptions.service().ingestService()));
+    logger.info(
+        "[Session][StartupTiming] phase=managers.service-manager elapsedMs={}",
+        elapsedMillis(phaseStartNanos));
+
+    phaseStartNanos = System.nanoTime();
+    SchemaManager schemaRegistryManager =
+        new SchemaManagerImpl(
+            () -> discoveryManager.discoveryCache(),
+            result::group,
+            () -> connectionManager,
+            () -> deleteManager);
+    session.publishSchemaRegistryManager(schemaRegistryManager);
+    StreamManagerImpl streamManager =
+        new StreamManagerImpl(
+            () -> discoveryManager.discoveryCache(),
+            result::group,
+            () -> schemaRegistryManager,
+            () -> connectionManager,
+            () -> deleteManager,
+            session);
+    logger.info(
+        "[Session][StartupTiming] phase=managers.schema-stream elapsedMs={}",
+        elapsedMillis(phaseStartNanos));
+
+    phaseStartNanos = System.nanoTime();
+    DataManagers dataPlanes =
+        new DataPlanesImpl(
+            dataOptions,
+            cache,
+            result.group(),
+            result.appName(),
+            cfg.kerberosUsername(),
+            cfg.kerberosPrincipal(),
+            cfg.kerberosKeytab(),
+            cfg.trustCert(),
+            result.controlPlaneConnection(),
+            session::statusScheduler,
+            connectionManager,
+            dataEntitlements,
+            session,
+            checkpointStore);
+    logger.info(
+        "[Session][StartupTiming] phase=managers.data-planes elapsedMs={}",
+        elapsedMillis(phaseStartNanos));
+
+    phaseStartNanos = System.nanoTime();
+    CatalogManager assetCatalogService =
+        new CatalogServiceImpl(
+            cache,
+            serviceEntitlements,
+            dataEntitlements,
+            session.defaultCatalogSubject(),
+            null,
+            Strings.firstNonBlank(result.environment(), "dev"));
+    logger.info(
+        "[Session][StartupTiming] phase=managers.catalog elapsedMs={}",
+        elapsedMillis(phaseStartNanos));
+
+    phaseStartNanos = System.nanoTime();
+    ConfigManagerImpl configsCore =
+        new ConfigManagerImpl(
+            cache,
+            result.group(),
+            result.appName(),
+            result.instance(),
+            sessionId,
+            result.controlPlaneConnection(),
+            result.environmentDefinition());
+    logger.info(
+        "[Session][StartupTiming] phase=managers.configs elapsedMs={}",
+        elapsedMillis(phaseStartNanos));
+    logger.info(
+        "[Session][StartupTiming] phase=managers.complete elapsedMs={}",
+        elapsedMillis(initializeStartNanos));
+
+    return new StartedManagers(
+        cache,
+        discoveryManager,
+        deleteManager,
+        entitlementsManager,
+        serviceEntitlements,
+        dataEntitlements,
+        serviceManager,
+        schemaRegistryManager,
+        streamManager,
+        dataPlanes,
+        assetCatalogService,
+        configsCore);
+  }
+
+  record StartedManagers(
+      DiscoveryCache discoveryCache,
+      DiscoveryManager discoveryManager,
+      DeleteManager deleteManager,
+      EntitlementsManagerImpl entitlementsManager,
+      ServiceEntitlements serviceEntitlements,
+      DataEntitlements dataEntitlements,
+      ServiceManager serviceManager,
+      SchemaManager schemaRegistryManager,
+      StreamManagerImpl streamManager,
+      DataManagers dataPlanes,
+      CatalogManager assetCatalogService,
+      ConfigManagerImpl configsCore) {}
+
+  private static long elapsedMillis(long startNanos) {
+    return Math.max(0L, (System.nanoTime() - startNanos) / 1_000_000L);
+  }
+}
+
+
+
+
+
+
+
+===== FILE: fabric-lite/src/main/java/org/pronzato/fabric/api/control/status/app/AppStatusPublisher.java =====
+
+
+package org.pronzato.fabric.api.control.status.app;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.net.InetAddress;
+import java.time.Clock;
+import java.time.Duration;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import org.pronzato.fabric.api.control.ControlConnection;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryTopics;
+import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionApp;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStatusApp;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
+import org.pronzato.fabric.api.control.session.SessionContext;
+import org.pronzato.fabric.api.util.Strings;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public final class AppStatusPublisher implements AutoCloseable {
+  private static final Logger LOG = LoggerFactory.getLogger(AppStatusPublisher.class);
+  private static final int MAX_ATTEMPTS = 3;
+  private static final String DEFAULT_VERSION = "DEV";
+  private static final int DEFAULT_HEARTBEAT_SECONDS = 30;
+
+  private final ControlConnection control;
+  private final SessionContext context;
+  private final DefinitionApp appDefinition;
+  private final TickListener tickListener;
+  private final long heartbeatIntervalMs;
+  private final int heartbeatIntervalSeconds;
+  private final int heartbeatTimeoutSeconds;
+  private final String intervalSource;
+  private final String configuredUserTag;
+  private final Boolean otelEnabled;
+  private final Clock clock;
+  private final AppMetricsCollector metricsCollector;
+  private final ObjectMapper mapper = DiscoveryCodec.mapper();
+  private final ScheduledExecutorService executor;
+  private final boolean ownsExecutor;
+  private final AtomicBoolean running = new AtomicBoolean(false);
+  private final AtomicLong publishCount = new AtomicLong(0L);
+
+  private volatile DefinitionStatusApp current;
+  private volatile String lastPayload;
+  private volatile long lastPublishedEpochMs;
+  private volatile ScheduledFuture<?> heartbeatTask;
+
+  public AppStatusPublisher(
+      ControlConnection control, SessionContext context, DefinitionApp appDefinition) {
+    this(control, context, appDefinition, null, null, null);
+  }
+
+  public AppStatusPublisher(
+      ControlConnection control,
+      SessionContext context,
+      DefinitionApp appDefinition,
+      TickListener tickListener) {
+    this(control, context, appDefinition, null, null, tickListener);
+  }
+
+  public AppStatusPublisher(
+      ControlConnection control,
+      SessionContext context,
+      DefinitionApp appDefinition,
+      ScheduledExecutorService scheduler,
+      TickListener tickListener) {
+    this(control, context, appDefinition, null, scheduler, tickListener);
+  }
+
+  public AppStatusPublisher(
+      ControlConnection control,
+      SessionContext context,
+      DefinitionApp appDefinition,
+      String configuredUserTag,
+      ScheduledExecutorService scheduler,
+      TickListener tickListener) {
+    this(control, context, appDefinition, configuredUserTag, null, scheduler, tickListener);
+  }
+
+  public AppStatusPublisher(
+      ControlConnection control,
+      SessionContext context,
+      DefinitionApp appDefinition,
+      String configuredUserTag,
+      Boolean otelEnabled,
+      ScheduledExecutorService scheduler,
+      TickListener tickListener) {
+    this(
+        control,
+        context,
+        appDefinition,
+        configuredUserTag,
+        otelEnabled,
+        null,
+        null,
+        scheduler,
+        tickListener);
+  }
+
+  public AppStatusPublisher(
+      ControlConnection control,
+      SessionContext context,
+      DefinitionApp appDefinition,
+      String configuredUserTag,
+      Boolean otelEnabled,
+      Integer cadenceIntervalSeconds,
+      String cadenceIntervalSource,
+      ScheduledExecutorService scheduler,
+      TickListener tickListener) {
+    this.control = Objects.requireNonNull(control, "control");
+    this.context = Objects.requireNonNull(context, "context");
+    this.appDefinition = appDefinition;
+    this.tickListener = tickListener;
+    this.configuredUserTag = Strings.trimToNull(configuredUserTag);
+    this.otelEnabled = otelEnabled;
+    this.clock = Clock.systemUTC();
+    this.metricsCollector = new AppMetricsCollector();
+    this.heartbeatIntervalSeconds =
+        resolveHeartbeatIntervalSeconds(appDefinition, cadenceIntervalSeconds);
+    this.heartbeatIntervalMs = Duration.ofSeconds(heartbeatIntervalSeconds).toMillis();
+    this.heartbeatTimeoutSeconds = (int) Math.max(heartbeatIntervalSeconds * 3L, 60L);
+    this.intervalSource =
+        resolveIntervalSource(appDefinition, cadenceIntervalSeconds, cadenceIntervalSource);
+    if (scheduler == null) {
+      this.executor =
+          Executors.newSingleThreadScheduledExecutor(
+              runnable -> {
+                Thread thread = new Thread(runnable, "fabric-app-heartbeat");
+                thread.setDaemon(true);
+                return thread;
+              });
+      this.ownsExecutor = true;
+    } else {
+      this.executor = scheduler;
+      this.ownsExecutor = false;
+    }
+  }
+
+  public void start() {
+    if (!running.compareAndSet(false, true)) {
+      return;
+    }
+    LOG.info(
+        "[AppStatusPublisher] start group={} name={} instance={} intervalSeconds={} timeoutSeconds={} source={}",
+        Strings.firstNonBlank(context.getGroup(), ""),
+        Strings.firstNonBlank(context.getAppName(), ""),
+        Strings.firstNonBlank(context.getInstance(), ""),
+        heartbeatIntervalSeconds,
+        heartbeatTimeoutSeconds,
+        intervalSource);
+    DefinitionStatusApp started = buildInitialStatus();
+    publish(started, "startup-started");
+    publish(transitionToRunning(started, clock.millis()), "startup-running");
+    heartbeatTask =
+        executor.scheduleAtFixedRate(
+        this::publishHeartbeatSafe, heartbeatIntervalMs, heartbeatIntervalMs, TimeUnit.MILLISECONDS);
+  }
+
+  public boolean started() {
+    return running.get();
+  }
+
+  public int publishIntervalSeconds() {
+    return heartbeatIntervalSeconds;
+  }
+
+  public String intervalSource() {
+    return intervalSource;
+  }
+
+  public String lastPublishedPayload() {
+    return lastPayload;
+  }
+
+  public long lastPublishedEpochMs() {
+    return lastPublishedEpochMs;
+  }
+
+  public long publishCount() {
+    return publishCount.get();
+  }
+
+  @Override
+  public void close() {
+    if (!running.getAndSet(false)) {
+      return;
+    }
+    ScheduledFuture<?> task = heartbeatTask;
+    heartbeatTask = null;
+    if (task != null) {
+      task.cancel(true);
+    }
+    publishStoppedSafe();
+    if (ownsExecutor) {
+      executor.shutdownNow();
+    }
+  }
+
+  public void stop() {
+    close();
+  }
+
+  private void publish(DefinitionStatusApp status, String reason) {
+    Objects.requireNonNull(status, "status");
+    DefinitionStatusApp normalized = normalizeStatus(status);
+    String group = Strings.trimToNull(normalized.group());
+    if (group == null) {
+      throw new IllegalStateException("STATUS_GROUP_MISSING: group is required");
+    }
+    current = normalized;
+    int attempt = 0;
+    while (attempt < MAX_ATTEMPTS) {
+      try {
+        publishOnce(normalized, reason);
+        return;
+      } catch (Exception ex) {
+        attempt++;
+        if (attempt >= MAX_ATTEMPTS) {
+          LOG.warn(
+              "[AppStatusPublisher] failed to publish status for {}/{}/{} after {} attempts: {}",
+              normalized.group(),
+              normalized.name(),
+              normalized.instance(),
+              attempt,
+              ex.toString());
+        } else {
+          try {
+            Thread.sleep(50L * attempt);
+          } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return;
+          }
+        }
+      }
+    }
+  }
+
+  private void publishHeartbeatSafe() {
+    if (!running.get()) {
+      return;
+    }
+    try {
+      DefinitionStatusApp baseline = current;
+      if (baseline == null) {
+        return;
+      }
+      long now = clock.millis();
+      DefinitionStatusApp heartbeat = withLastHeartbeatEpochMs(baseline, now);
+      publish(heartbeat, "heartbeat");
+    } catch (Exception ex) {
+      LOG.warn("[AppStatusPublisher] heartbeat publish failed", ex);
+    }
+  }
+
+  private void publishOnce(DefinitionStatusApp status, String reason) throws Exception {
+    if (status == null) {
+      return;
+    }
+    String payload = mapper.writeValueAsString(status);
+    control.amps().publish(DiscoveryTopics.STATUS, payload);
+
+    long publishedAt =
+        status.lastHeartbeatEpochMs() == null
+            ? clock.millis()
+            : Math.max(0L, status.lastHeartbeatEpochMs());
+    this.lastPayload = payload;
+    this.lastPublishedEpochMs = publishedAt;
+    long count = this.publishCount.incrementAndGet();
+    LOG.info(
+        "[AppStatusPublisher] published reason={} topic={} group={} name={} instance={} state={} heartbeatEpochMs={} count={}",
+        Strings.firstNonBlank(reason, "unknown"),
+        DiscoveryTopics.STATUS,
+        Strings.firstNonBlank(status.group(), ""),
+        Strings.firstNonBlank(status.name(), ""),
+        Strings.firstNonBlank(status.instance(), ""),
+        status.state() == null ? "UNKNOWN" : status.state().name(),
+        publishedAt,
+        count);
+    if (tickListener != null) {
+      try {
+        tickListener.onPublished(publishedAt, status, payload);
+      } catch (Exception ignore) {
+      }
+    }
+  }
+
+  private DefinitionStatusApp buildInitialStatus() {
+    long now = clock.millis();
+    String group = requireField(context.getGroup(), "group");
+    String name = requireField(context.getAppName(), "name");
+    String instance = requireField(context.getInstance(), "instance");
+    String env = Strings.trimToNull(context.getEnv());
+    String appType = Strings.trimToNull(appDefinition == null ? null : appDefinition.appType());
+
+    Map<String, String> tags = buildTags(group, name, instance, appType, context, configuredUserTag);
+    String buildVersion = Strings.trimToNull(tags.get("buildVersion"));
+    String configVersion = Strings.trimToNull(tags.get("configVersion"));
+    String codeVersion = Strings.trimToNull(tags.get("codeVersion"));
+    String codeCommitId = Strings.trimToNull(tags.get("codeCommitId"));
+    String resolvedVersion = firstNonBlank(buildVersion, codeVersion, configVersion);
+    AppRuntimeType runtimeType = mapRuntimeType(appType);
+
+    DefinitionEnvelope envelope =
+        new DefinitionEnvelope(
+            group, DefinitionType.STATUS_APP, name, null, null, null, null, null, null, null);
+    return new DefinitionStatusApp(
+        envelope,
+        group,
+        DefinitionType.STATUS_APP,
+        name,
+        instance,
+        Strings.trimToNull(context.getSessionId()),
+        buildSessionKey(group, name, instance, context.getEnv(), context.getRegion(), context.getSite()),
+        runtimeType,
+        resolveHostname(),
+        resolvedVersion,
+        env,
+        appType,
+        DefinitionStatusApp.State.STARTED,
+        now,
+        now,
+        now,
+        now,
+        null,
+        1L,
+        buildVersion,
+        configVersion,
+        codeVersion,
+        codeCommitId,
+        null,
+        null,
+        heartbeatIntervalSeconds,
+        heartbeatTimeoutSeconds,
+        otelEnabled,
+        tags,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null);
+  }
+
+  private DefinitionStatusApp transitionToRunning(DefinitionStatusApp baseline, long now) {
+    if (baseline == null) {
+      return null;
+    }
+    long normalizedNow = Math.max(0L, now);
+    Long startedAt = baseline.startedAtEpochMs() == null ? normalizedNow : baseline.startedAtEpochMs();
+    Long lastStart = baseline.lastStartEpochMs() == null ? normalizedNow : baseline.lastStartEpochMs();
+    return new DefinitionStatusApp(
+        baseline.envelope(),
+        baseline.group(),
+        baseline.type(),
+        baseline.name(),
+        baseline.instance(),
+        baseline.sessionId(),
+        baseline.sessionKey(),
+        baseline.runtimeType(),
+        baseline.host(),
+        baseline.version(),
+        baseline.env(),
+        baseline.appType(),
+        DefinitionStatusApp.State.RUNNING,
+        startedAt,
+        normalizedNow,
+        normalizedNow,
+        lastStart,
+        baseline.lastStopEpochMs(),
+        baseline.runCount(),
+        baseline.buildVersion(),
+        baseline.configVersion(),
+        baseline.codeVersion(),
+        baseline.codeCommitId(),
+        baseline.lastExitCode(),
+        baseline.lastErrorMessage(),
+        baseline.heartbeatIntervalSeconds(),
+        baseline.heartbeatTimeoutSeconds(),
+        baseline.otel(),
+        baseline.tags(),
+        baseline.message(),
+        baseline.deployEnabled(),
+        baseline.deployStatus(),
+        baseline.deployAtEpochMs(),
+        baseline.deployMessage(),
+        baseline.deploySuccess(),
+        baseline.metrics());
+  }
+
+  private DefinitionStatusApp transitionToStopped(DefinitionStatusApp baseline, long now) {
+    if (baseline == null) {
+      return null;
+    }
+    long normalizedNow = Math.max(0L, now);
+    return new DefinitionStatusApp(
+        baseline.envelope(),
+        baseline.group(),
+        baseline.type(),
+        baseline.name(),
+        baseline.instance(),
+        baseline.sessionId(),
+        baseline.sessionKey(),
+        baseline.runtimeType(),
+        baseline.host(),
+        baseline.version(),
+        baseline.env(),
+        baseline.appType(),
+        DefinitionStatusApp.State.STOPPED,
+        baseline.startedAtEpochMs(),
+        normalizedNow,
+        normalizedNow,
+        baseline.lastStartEpochMs(),
+        normalizedNow,
+        baseline.runCount(),
+        baseline.buildVersion(),
+        baseline.configVersion(),
+        baseline.codeVersion(),
+        baseline.codeCommitId(),
+        baseline.lastExitCode(),
+        baseline.lastErrorMessage(),
+        baseline.heartbeatIntervalSeconds(),
+        baseline.heartbeatTimeoutSeconds(),
+        baseline.otel(),
+        baseline.tags(),
+        "graceful shutdown",
+        baseline.deployEnabled(),
+        baseline.deployStatus(),
+        baseline.deployAtEpochMs(),
+        baseline.deployMessage(),
+        baseline.deploySuccess(),
+        baseline.metrics());
+  }
+
+  private void publishStoppedSafe() {
+    try {
+      DefinitionStatusApp baseline = current;
+      if (baseline == null) {
+        return;
+      }
+      publish(transitionToStopped(baseline, clock.millis()), "shutdown");
+    } catch (Exception ex) {
+      LOG.warn("[AppStatusPublisher] stop publish failed", ex);
+    }
+  }
+
+  private DefinitionStatusApp normalizeStatus(DefinitionStatusApp status) {
+    if (status == null) {
+      return null;
+    }
+    long now = clock.millis();
+    String group = Strings.trimToNull(status.group());
+    String name = Strings.trimToNull(status.name());
+    String instance = Strings.trimToNull(status.instance());
+    if (group == null || name == null || instance == null) {
+      return null;
+    }
+    AppRuntimeType runtimeType = status.runtimeType() == null ? AppRuntimeType.UNKNOWN : status.runtimeType();
+    String host = Strings.firstNonBlank(status.host(), resolveHostname());
+    String version = resolveVersion(status.version());
+    Long startedAtEpochMs =
+        status.startedAtEpochMs() == null || status.startedAtEpochMs() <= 0L
+            ? now
+            : status.startedAtEpochMs();
+    Long lastHeartbeatEpochMs =
+        status.lastHeartbeatEpochMs() == null || status.lastHeartbeatEpochMs() <= 0L
+            ? now
+            : status.lastHeartbeatEpochMs();
+    Integer intervalSeconds =
+        status.heartbeatIntervalSeconds() == null
+            ? heartbeatIntervalSeconds
+            : status.heartbeatIntervalSeconds();
+    Integer timeoutSeconds =
+        status.heartbeatTimeoutSeconds() == null
+            ? heartbeatTimeoutSeconds
+            : status.heartbeatTimeoutSeconds();
+    Map<String, String> tags = status.tags() == null || status.tags().isEmpty() ? Map.of() : Map.copyOf(status.tags());
+    AppMetrics metrics = status.metrics();
+    if (metricsCollector != null) {
+      try {
+        AppMetrics collected = metricsCollector.collect();
+        if (collected != null) {
+          metrics = collected;
+        }
+      } catch (Exception ignore) {
+      }
+    }
+    DefinitionEnvelope envelope = status.envelope();
+    if (envelope == null) {
+      envelope =
+          new DefinitionEnvelope(
+              group, DefinitionType.STATUS_APP, name, null, null, null, null, null, null, null);
+    }
+    DefinitionStatusApp.State state =
+        status.state() == null || status.state() == DefinitionStatusApp.State.UNKNOWN
+            ? DefinitionStatusApp.State.RUNNING
+            : status.state();
+    return new DefinitionStatusApp(
+        envelope,
+        group,
+        DefinitionType.STATUS_APP,
+        name,
+        instance,
+        Strings.trimToNull(status.sessionId()),
+        Strings.trimToNull(status.sessionKey()),
+        runtimeType,
+        host,
+        version,
+        Strings.trimToNull(status.env()),
+        Strings.trimToNull(status.appType()),
+        state,
+        startedAtEpochMs,
+        lastHeartbeatEpochMs,
+        status.lastStateChangeEpochMs(),
+        status.lastStartEpochMs(),
+        status.lastStopEpochMs(),
+        status.runCount(),
+        Strings.trimToNull(status.buildVersion()),
+        Strings.trimToNull(status.configVersion()),
+        Strings.trimToNull(status.codeVersion()),
+        Strings.trimToNull(status.codeCommitId()),
+        status.lastExitCode(),
+        Strings.trimToNull(status.lastErrorMessage()),
+        intervalSeconds,
+        timeoutSeconds,
+        status.otel(),
+        tags,
+        Strings.trimToNull(status.message()),
+        status.deployEnabled(),
+        Strings.trimToNull(status.deployStatus()),
+        status.deployAtEpochMs(),
+        Strings.trimToNull(status.deployMessage()),
+        status.deploySuccess(),
+        metrics);
+  }
+
+  private static DefinitionStatusApp withLastHeartbeatEpochMs(DefinitionStatusApp status, long lastHeartbeatEpochMs) {
+    if (status == null) {
+      return null;
+    }
+    long heartbeat = Math.max(0L, lastHeartbeatEpochMs);
+    return new DefinitionStatusApp(
+        status.envelope(),
+        status.group(),
+        status.type(),
+        status.name(),
+        status.instance(),
+        status.sessionId(),
+        status.sessionKey(),
+        status.runtimeType(),
+        status.host(),
+        status.version(),
+        status.env(),
+        status.appType(),
+        status.state(),
+        status.startedAtEpochMs(),
+        heartbeat,
+        status.lastStateChangeEpochMs(),
+        status.lastStartEpochMs(),
+        status.lastStopEpochMs(),
+        status.runCount(),
+        status.buildVersion(),
+        status.configVersion(),
+        status.codeVersion(),
+        status.codeCommitId(),
+        status.lastExitCode(),
+        status.lastErrorMessage(),
+        status.heartbeatIntervalSeconds(),
+        status.heartbeatTimeoutSeconds(),
+        status.otel(),
+        status.tags(),
+        status.message(),
+        status.deployEnabled(),
+        status.deployStatus(),
+        status.deployAtEpochMs(),
+        status.deployMessage(),
+        status.deploySuccess(),
+        status.metrics());
+  }
+
+  private static int resolveHeartbeatIntervalSeconds(
+      DefinitionApp appDefinition, Integer cadenceIntervalSeconds) {
+    if (cadenceIntervalSeconds != null && cadenceIntervalSeconds > 0) {
+      return cadenceIntervalSeconds;
+    }
+    Integer configured = null;
+    if (appDefinition != null
+        && appDefinition.runtimeControls() != null
+        && appDefinition.runtimeControls().status() != null) {
+      configured = appDefinition.runtimeControls().status().publishIntervalSeconds();
+    }
+    if (configured != null && configured > 0) {
+      return configured;
+    }
+    return DEFAULT_HEARTBEAT_SECONDS;
+  }
+
+  private static String resolveIntervalSource(
+      DefinitionApp appDefinition, Integer cadenceIntervalSeconds, String cadenceIntervalSource) {
+    if (cadenceIntervalSeconds != null && cadenceIntervalSeconds > 0) {
+      String configuredSource = Strings.trimToNull(cadenceIntervalSource);
+      return configuredSource == null ? "environment.cadence.appStatusSeconds" : configuredSource;
+    }
+    Integer configured = null;
+    if (appDefinition != null
+        && appDefinition.runtimeControls() != null
+        && appDefinition.runtimeControls().status() != null) {
+      configured = appDefinition.runtimeControls().status().publishIntervalSeconds();
+    }
+    if (configured != null && configured > 0) {
+      return "runtimeControls.status.publishIntervalSeconds";
+    }
+    return "default";
+  }
+
+  private String resolveVersion(String provided) {
+    String trimmed = Strings.trimToNull(provided);
+    if (trimmed != null) {
+      return trimmed;
+    }
+    String manifestVersion = manifestVersion();
+    if (manifestVersion != null) {
+      return manifestVersion;
+    }
+    return DEFAULT_VERSION;
+  }
+
+  private static String manifestVersion() {
+    Package pkg = AppStatusPublisher.class.getPackage();
+    if (pkg == null) {
+      return null;
+    }
+    String impl = Strings.trimToNull(pkg.getImplementationVersion());
+    if (impl != null) {
+      return impl;
+    }
+    return Strings.trimToNull(pkg.getSpecificationVersion());
+  }
+
+  private static String resolveHostname() {
+    try {
+      return InetAddress.getLocalHost().getHostName();
+    } catch (Exception ex) {
+      return "localhost";
+    }
+  }
+
+  private static Map<String, String> buildTags(
+      String group,
+      String app,
+      String instance,
+      String appType,
+      SessionContext context,
+      String configuredUserTag) {
+    Map<String, String> tags = new LinkedHashMap<>();
+    putIfPresent(tags, "group", group);
+    putIfPresent(tags, "app", app);
+    putIfPresent(tags, "instance", instance);
+    putIfPresent(tags, "env", context == null ? null : context.getEnv());
+    putIfPresent(tags, "region", context == null ? null : context.getRegion());
+    putIfPresent(tags, "site", context == null ? null : context.getSite());
+    putIfPresent(tags, "appType", appType);
+    putIfPresent(tags, "pid", Long.toString(ProcessHandle.current().pid()));
+    putIfPresent(tags, "user", firstNonBlank(configuredUserTag, resolveRuntimeUser()));
+    return tags.isEmpty() ? Map.of() : Map.copyOf(tags);
+  }
+
+  private static String resolveRuntimeUser() {
+    try {
+      return ProcessHandle.current().info().user().orElse(null);
+    } catch (Exception ex) {
+      return null;
+    }
+  }
+
+  private static void putIfPresent(Map<String, String> tags, String key, String value) {
+    if (tags == null || key == null) {
+      return;
+    }
+    String normalized = Strings.trimToNull(value);
+    if (normalized != null) {
+      tags.put(key, normalized);
+    }
+  }
+
+  private static String buildSessionKey(
+      String group, String appName, String instance, String environment, String region, String site) {
+    String resolvedGroup = Strings.trimToNull(group);
+    String resolvedApp = Strings.trimToNull(appName);
+    if (resolvedGroup == null || resolvedApp == null) {
+      return null;
+    }
+    String resolvedInstance = Strings.trimToNull(instance);
+    if (resolvedInstance == null) {
+      resolvedInstance = "unknown";
+    }
+    StringBuilder builder =
+        new StringBuilder("app:")
+            .append(resolvedGroup)
+            .append('/')
+            .append(resolvedApp)
+            .append('|')
+            .append(resolvedInstance);
+    appendPlacement(builder, "env", environment);
+    appendPlacement(builder, "region", region);
+    appendPlacement(builder, "site", site);
+    return builder.toString();
+  }
+
+  private static void appendPlacement(StringBuilder builder, String label, String value) {
+    String normalized = Strings.trimToNull(value);
+    if (normalized == null || "UNKNOWN".equalsIgnoreCase(normalized)) {
+      return;
+    }
+    builder.append('|').append(label).append('=').append(normalized);
+  }
+
+  private static AppRuntimeType mapRuntimeType(String appType) {
+    String normalized = Strings.trimToNull(appType);
+    if (normalized == null) {
+      return AppRuntimeType.UNKNOWN;
+    }
+    String upper = normalized.toUpperCase();
+    if (upper.contains("JAVA")) {
+      return AppRuntimeType.JAVA;
+    }
+    if (upper.contains("PYTHON")) {
+      return AppRuntimeType.PYTHON;
+    }
+    if (upper.contains("SCRIPT") || upper.contains("SHELL")) {
+      return AppRuntimeType.SCRIPT;
+    }
+    return AppRuntimeType.UNKNOWN;
+  }
+
+  private static String requireField(String value, String fieldName) {
+    String normalized = Strings.trimToNull(value);
+    if (normalized == null) {
+      throw new IllegalStateException("status publish " + fieldName + " is required");
+    }
+    return normalized;
+  }
+
+  private static String firstNonBlank(String... values) {
+    if (values == null) {
+      return null;
+    }
+    for (String value : values) {
+      String normalized = Strings.trimToNull(value);
+      if (normalized != null) {
+        return normalized;
+      }
+    }
+    return null;
+  }
+
+  @FunctionalInterface
+  public interface TickListener {
+    void onPublished(long publishEpochMs, DefinitionStatusApp status, String payload);
+  }
+}
+
+
+
+
+
+
+
+
+
+
+===== FILE: fabric-lite/src/main/java/org/pronzato/fabric/api/control/status/data/DataStatusCache.java =====
+
+
+package org.pronzato.fabric.api.control.status.data;
+
+import com.crankuptheamps.client.Command;
+import com.crankuptheamps.client.Message;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.pronzato.fabric.api.control.ControlConnection;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryTopics;
+import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
+import org.pronzato.fabric.api.control.discovery.definitions.Definition;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStatusData;
+import org.pronzato.fabric.api.util.Strings;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public final class DataStatusCache implements AutoCloseable {
+  private static final Logger LOGGER = LoggerFactory.getLogger(DataStatusCache.class);
+  private static final String TOPIC_STATUS = DiscoveryTopics.STATUS;
+  private static final String FILTER_STATUS_DATA = "/type='STATUS_DATA'";
+  private static final long DEFAULT_STATUS_CADENCE_SECONDS = 30L;
+  private static final Duration DEFAULT_STALE_AFTER =
+      resolveStaleAfter(DEFAULT_STATUS_CADENCE_SECONDS);
+  private static final String UNKNOWN = "-";
+
+  private final ControlConnection control;
+  private final Clock clock;
+  private final Duration staleAfter;
+  private final ConcurrentHashMap<Key, StatusSnapshot> statuses = new ConcurrentHashMap<>();
+  private final AtomicBoolean started = new AtomicBoolean(false);
+  private final AtomicBoolean recovered = new AtomicBoolean(false);
+  private final CountDownLatch recoveryLatch = new CountDownLatch(1);
+  private volatile ControlConnection.Subscription subscription;
+
+  public DataStatusCache(ControlConnection control) {
+    this(control, Clock.systemUTC(), DEFAULT_STATUS_CADENCE_SECONDS);
+  }
+
+  public DataStatusCache(ControlConnection control, long statusCadenceSeconds) {
+    this(control, Clock.systemUTC(), statusCadenceSeconds);
+  }
+
+  DataStatusCache(ControlConnection control, Clock clock, long statusCadenceSeconds) {
+    this.control = Objects.requireNonNull(control, "control");
+    this.clock = Objects.requireNonNull(clock, "clock");
+    this.staleAfter = resolveStaleAfter(statusCadenceSeconds);
+  }
+
+  public void start() throws Exception {
+    if (!started.compareAndSet(false, true)) {
+      awaitRecovery(Duration.ofSeconds(30));
+      return;
+    }
+    Command command = new Command(Message.Command.SOWAndSubscribe);
+    command.setTopic(TOPIC_STATUS);
+    command.setOptions("oof");
+    command.setFilter(FILTER_STATUS_DATA);
+    subscription =
+        control
+            .sowAndSubscribe(
+                command.getTopic(),
+                command.getOptions(),
+                command.getFilter(),
+                message -> handleMessage(message.raw()));
+    awaitRecovery(Duration.ofSeconds(30));
+    LOGGER.debug(
+        "Data status cache ready topics={} enabledTypes={} instanceCount={}",
+        List.of(TOPIC_STATUS),
+        List.of("STATUS_DATA"),
+        statuses.size());
+  }
+
+  public void startShared() {
+    if (!started.compareAndSet(false, true)) {
+      awaitRecovery(Duration.ofSeconds(30));
+    }
+  }
+
+  public boolean recovered() {
+    return recovered.get();
+  }
+
+  public int size() {
+    return statuses.size();
+  }
+
+  public List<DataStatusRow> snapshot() {
+    long nowMs = clock.millis();
+    return statuses.entrySet().stream()
+        .map(entry -> toRow(entry.getKey(), entry.getValue(), nowMs))
+        .sorted(
+            Comparator.comparing(
+                    (DataStatusRow row) ->
+                        Strings.trimToEmpty(row.group()), String.CASE_INSENSITIVE_ORDER)
+                .thenComparing(
+                    row -> Strings.trimToEmpty(row.name()), String.CASE_INSENSITIVE_ORDER)
+                .thenComparing(
+                    row -> Strings.trimToEmpty(row.instanceName()), String.CASE_INSENSITIVE_ORDER))
+        .toList();
+  }
+
+  public void stop() {
+    ControlConnection.Subscription id = subscription;
+    if (id != null) {
+      try {
+        id.close();
+      } catch (Exception ignore) {
+      }
+      subscription = null;
+    }
+    statuses.clear();
+  }
+
+  @Override
+  public void close() {
+    stop();
+  }
+
+  private DataStatusRow toRow(Key key, StatusSnapshot snapshot, long nowMs) {
+    DefinitionStatusData status = snapshot.status();
+    Long heartbeatMs = positive(status.lastHeartbeatEpochMs());
+    Instant lastHeartbeatUtc = heartbeatMs == null ? null : Instant.ofEpochMilli(heartbeatMs);
+    Instant lastSeenUtc = snapshot.receivedTimeUtc();
+    String state = deriveState(status.state(), heartbeatMs, snapshot.receivedTimeUtc(), nowMs);
+    String producerType =
+        status.producerType() == null ? "UNKNOWN" : status.producerType().name();
+    return new DataStatusRow(
+        key.group(),
+        key.name(),
+        key.instanceName(),
+        producerType,
+        state,
+        defaultText(status.producerId()),
+        defaultText(status.datasetId()),
+        defaultText(status.host()),
+        defaultText(status.message()),
+        lastHeartbeatUtc,
+        lastSeenUtc);
+  }
+
+  private String deriveState(
+      DefinitionStatusData.State rawState, Long heartbeatMs, Instant lastSeenUtc, long nowMs) {
+    if (isOfflineState(rawState)) {
+      return "OFFLINE";
+    }
+    if (isErrorState(rawState)) {
+      return "ERROR";
+    }
+    if (isStale(heartbeatMs, lastSeenUtc, nowMs)) {
+      return "STALE";
+    }
+    if (isOnlineState(rawState)) {
+      return "ONLINE";
+    }
+    return "UNKNOWN";
+  }
+
+  private boolean isStale(Long heartbeatMs, Instant lastSeenUtc, long nowMs) {
+    long referenceMs = heartbeatMs == null ? 0L : heartbeatMs;
+    if (referenceMs <= 0L && lastSeenUtc != null) {
+      referenceMs = lastSeenUtc.toEpochMilli();
+    }
+    if (referenceMs <= 0L) {
+      return true;
+    }
+    return nowMs - referenceMs > staleAfter.toMillis();
+  }
+
+  private boolean isOnlineState(DefinitionStatusData.State state) {
+    return switch (state == null ? DefinitionStatusData.State.UNKNOWN : state) {
+      case ONLINE -> true;
+      default -> false;
+    };
+  }
+
+  private boolean isOfflineState(DefinitionStatusData.State state) {
+    return switch (state == null ? DefinitionStatusData.State.UNKNOWN : state) {
+      case OFFLINE -> true;
+      default -> false;
+    };
+  }
+
+  private boolean isErrorState(DefinitionStatusData.State state) {
+    return switch (state == null ? DefinitionStatusData.State.UNKNOWN : state) {
+      case ERROR -> true;
+      default -> false;
+    };
+  }
+
+  public void awaitRecovery(Duration timeout) {
+    long millis = timeout == null ? 30000L : Math.max(1L, timeout.toMillis());
+    try {
+      boolean done = recoveryLatch.await(millis, TimeUnit.MILLISECONDS);
+      if (!done) {
+        throw new IllegalStateException(
+            "DataStatusCache initial recovery did not complete (GroupEnd not observed)");
+      }
+    } catch (InterruptedException ex) {
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException("Interrupted while waiting for DataStatusCache recovery", ex);
+    }
+  }
+
+  private void handleMessage(Message message) {
+    if (message == null) {
+      return;
+    }
+    int command = message.getCommand();
+    if (command == Message.Command.GroupEnd) {
+      recovered.set(true);
+      recoveryLatch.countDown();
+      return;
+    }
+    if (command != Message.Command.SOW
+        && command != Message.Command.Publish
+        && command != Message.Command.OOF
+        && command != Message.Command.SOWDelete) {
+      return;
+    }
+    String payload = message.getData();
+    if (Strings.isBlank(payload)) {
+      return;
+    }
+    try {
+      Definition definition = DiscoveryCodec.decode(payload);
+      if (!(definition instanceof DefinitionStatusData status)) {
+        return;
+      }
+      Key key = key(status.group(), status.name(), status.instance());
+      if (key == null) {
+        return;
+      }
+      if (command == Message.Command.OOF || command == Message.Command.SOWDelete) {
+        statuses.remove(key);
+        return;
+      }
+      statuses.put(key, new StatusSnapshot(status, Instant.now(clock)));
+    } catch (Exception ex) {
+      LOGGER.debug("Data status decode failed payload={} reason={}", payload, ex.toString());
+    }
+  }
+
+  public void onStatusMessage(Message message) {
+    handleMessage(message);
+  }
+
+  private static Key key(String group, String name, String instanceName) {
+    String normalizedGroup = Strings.trimToNull(group);
+    String normalizedName = Strings.trimToNull(name);
+    String normalizedInstance = Strings.trimToNull(instanceName);
+    if (normalizedGroup == null || normalizedName == null || normalizedInstance == null) {
+      return null;
+    }
+    return new Key(normalizedGroup, normalizedName, normalizedInstance);
+  }
+
+  private static Long positive(Long value) {
+    return value == null || value <= 0L ? null : value;
+  }
+
+  private static String defaultText(String value) {
+    String normalized = Strings.trimToNull(value);
+    return normalized == null ? UNKNOWN : normalized;
+  }
+
+  private static Duration resolveStaleAfter(long statusCadenceSeconds) {
+    long cadence = statusCadenceSeconds <= 0L ? DEFAULT_STATUS_CADENCE_SECONDS : statusCadenceSeconds;
+    long staleSeconds = Math.max(60L, cadence * 2L);
+    return Duration.ofSeconds(staleSeconds);
+  }
+
+  private record Key(String group, String name, String instanceName) {}
+
+  private record StatusSnapshot(DefinitionStatusData status, Instant receivedTimeUtc) {}
+}
+
+
+
+
+===== FILE: fabric-lite/src/main/java/org/pronzato/fabric/api/control/status/data/DataStatusPublisher.java =====
+
+
+package org.pronzato.fabric.api.control.status.data;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import java.io.Closeable;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import org.pronzato.fabric.api.control.ControlConnection;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryTopics;
+import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStatusData;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
+import org.pronzato.fabric.api.util.Strings;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public final class DataStatusPublisher implements Closeable {
+  private static final Logger LOGGER = LoggerFactory.getLogger(DataStatusPublisher.class);
+  private static final boolean STATUS_DEBUG = false;
+  private static final long DEFAULT_INTERVAL_SECONDS = 30L;
+
+  private final ObjectMapper om =
+      DiscoveryCodec.mapper().copy().configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
+  private final ControlConnection control;
+  private final ScheduledExecutorService ses;
+  private final boolean ownsScheduler;
+  private final long intervalSec;
+  private final String group;
+  private final String name;
+  private final String instance;
+  private final DefinitionStatusData.ProducerType producerType;
+  private final String producerId;
+  private final String datasetId;
+  private final String host;
+  private final String appName;
+  private final String appInstance;
+  private final String appGroup;
+  private final long startEpochMs;
+  private final Map<String, String> tags;
+
+  private volatile String message;
+  private volatile DefinitionStatusData.State state = DefinitionStatusData.State.ONLINE;
+  private volatile boolean open = true;
+  private volatile ScheduledFuture<?> heartbeatTask;
+
+  public DataStatusPublisher(
+      ControlConnection control,
+      String group,
+      String name,
+      String instance,
+      DefinitionStatusData.ProducerType producerType,
+      String producerId,
+      String datasetId,
+      String host,
+      String appName,
+      String appInstance,
+      String appGroup,
+      Map<String, String> tags,
+      long heartbeatSeconds,
+      ScheduledExecutorService scheduler) {
+    this.control = Objects.requireNonNull(control, "control");
+    this.group = Strings.requireNonBlank(group, "group");
+    this.name = Strings.requireNonBlank(name, "name");
+    this.instance = Strings.requireNonBlank(instance, "instance");
+    this.producerType =
+        producerType == null ? DefinitionStatusData.ProducerType.UNKNOWN : producerType;
+    this.producerId = Strings.trimToNull(producerId);
+    this.datasetId = Strings.trimToNull(datasetId);
+    this.host = Strings.trimToNull(host);
+    this.appName = Strings.trimToNull(appName);
+    this.appInstance = Strings.trimToNull(appInstance);
+    this.appGroup = Strings.trimToNull(appGroup);
+    this.startEpochMs = System.currentTimeMillis();
+    this.tags = new ConcurrentHashMap<>(sanitizeTags(tags));
+    this.intervalSec = heartbeatSeconds <= 0 ? DEFAULT_INTERVAL_SECONDS : heartbeatSeconds;
+    if (scheduler == null) {
+      this.ses = Executors.newSingleThreadScheduledExecutor();
+      this.ownsScheduler = true;
+    } else {
+      this.ses = scheduler;
+      this.ownsScheduler = false;
+    }
+  }
+
+  public void start() {
+    publishSafe(state, message);
+    heartbeatTask =
+        ses.scheduleAtFixedRate(
+            () -> publishSafe(state, message), intervalSec, intervalSec, TimeUnit.SECONDS);
+  }
+
+  public void publishOnline(String detail) {
+    publishState(DefinitionStatusData.State.ONLINE, detail);
+  }
+
+  public void publishError(String detail) {
+    publishState(DefinitionStatusData.State.ERROR, detail);
+  }
+
+  public void publishState(DefinitionStatusData.State state, String detail) {
+    this.state = normalizeState(state);
+    this.message = Strings.trimToNull(detail);
+    publishSafe(this.state, this.message);
+  }
+
+  public void putTag(String key, String value) {
+    String normalizedKey = Strings.trimToNull(key);
+    if (normalizedKey == null) {
+      return;
+    }
+    String normalizedValue = Strings.trimToNull(value);
+    if (normalizedValue == null) {
+      tags.remove(normalizedKey);
+      return;
+    }
+    tags.put(normalizedKey, normalizedValue);
+  }
+
+  @Override
+  public void close() {
+    if (!open) {
+      return;
+    }
+    open = false;
+    publishSafe(DefinitionStatusData.State.OFFLINE, "stopped");
+    ScheduledFuture<?> task = heartbeatTask;
+    heartbeatTask = null;
+    if (task != null) {
+      task.cancel(true);
+    }
+    if (ownsScheduler) {
+      ses.shutdownNow();
+    }
+  }
+
+  private void publishSafe(DefinitionStatusData.State state, String detail) {
+    try {
+      publish(buildStatus(state, detail));
+    } catch (Exception ex) {
+      LOGGER.debug(
+          "Data status publish failed group={} name={} instance={} reason={}",
+          group,
+          name,
+          instance,
+          ex.toString());
+    }
+  }
+
+  private void publish(DefinitionStatusData status) throws Exception {
+    if (status == null) {
+      return;
+    }
+    String payload = om.writeValueAsString(status);
+    if (STATUS_DEBUG) {
+      LOGGER.debug("[DataStatus] publish topic={} payload={}", DiscoveryTopics.STATUS, payload);
+    }
+    control.amps().publish(DiscoveryTopics.STATUS, payload);
+  }
+
+  private DefinitionStatusData buildStatus(DefinitionStatusData.State state, String detail) {
+    DefinitionEnvelope envelope =
+        new DefinitionEnvelope(
+            group, DefinitionType.STATUS_DATA, name, null, null, null, null, null, null, null);
+    long now = System.currentTimeMillis();
+    return new DefinitionStatusData(
+        envelope,
+        group,
+        DefinitionType.STATUS_DATA,
+        name,
+        instance,
+        producerType,
+        normalizeState(state),
+        producerId,
+        datasetId,
+        startEpochMs > 0L ? startEpochMs : null,
+        now,
+        Strings.trimToNull(detail),
+        host,
+        appName,
+        appInstance,
+        appGroup,
+        tags.isEmpty() ? Map.of() : Map.copyOf(tags));
+  }
+
+  private static Map<String, String> sanitizeTags(Map<String, String> tags) {
+    if (Strings.isEmpty(tags)) {
+      return Map.of();
+    }
+    Map<String, String> normalized = new ConcurrentHashMap<>();
+    for (Map.Entry<String, String> entry : tags.entrySet()) {
+      if (entry == null) {
+        continue;
+      }
+      String key = Strings.trimToNull(entry.getKey());
+      String value = Strings.trimToNull(entry.getValue());
+      if (key != null && value != null) {
+        normalized.put(key, value);
+      }
+    }
+    return normalized.isEmpty() ? Map.of() : Map.copyOf(normalized);
+  }
+
+  private static DefinitionStatusData.State normalizeState(DefinitionStatusData.State state) {
+    if (state == null || state == DefinitionStatusData.State.UNKNOWN) {
+      return DefinitionStatusData.State.ONLINE;
+    }
+    return state;
+  }
+}
+
+
+
+
+===== FILE: fabric-lite/src/main/java/org/pronzato/fabric/api/control/status/service/ServiceStatusCache.java =====
+
+
+package org.pronzato.fabric.api.control.status.service;
+
+import com.crankuptheamps.client.Command;
+import com.crankuptheamps.client.Message;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.pronzato.fabric.api.control.ControlConnection;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryTopics;
+import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
+import org.pronzato.fabric.api.control.discovery.definitions.Definition;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStatusService;
+import org.pronzato.fabric.api.util.Strings;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public final class ServiceStatusCache implements AutoCloseable {
+  private static final Logger LOGGER = LoggerFactory.getLogger(ServiceStatusCache.class);
+  private static final String TOPIC_STATUS = DiscoveryTopics.STATUS;
+  private static final String FILTER_STATUS_SERVICE = "/type='STATUS_SERVICE'";
+  private static final long DEFAULT_STATUS_CADENCE_SECONDS = 30L;
+  private static final Duration DEFAULT_STALE_AFTER =
+      resolveStaleAfter(DEFAULT_STATUS_CADENCE_SECONDS);
+  private static final String UNKNOWN = "-";
+
+  private final ControlConnection control;
+  private final Clock clock;
+  private final Duration staleAfter;
+  private final ConcurrentHashMap<Key, StatusSnapshot> statuses = new ConcurrentHashMap<>();
+  private final AtomicBoolean started = new AtomicBoolean(false);
+  private final AtomicBoolean recovered = new AtomicBoolean(false);
+  private final CountDownLatch recoveryLatch = new CountDownLatch(1);
+  private volatile ControlConnection.Subscription subscription;
+
+  public ServiceStatusCache(ControlConnection control) {
+    this(control, Clock.systemUTC(), DEFAULT_STATUS_CADENCE_SECONDS);
+  }
+
+  public ServiceStatusCache(ControlConnection control, long statusCadenceSeconds) {
+    this(control, Clock.systemUTC(), statusCadenceSeconds);
+  }
+
+  ServiceStatusCache(ControlConnection control, Clock clock, long statusCadenceSeconds) {
+    this.control = Objects.requireNonNull(control, "control");
+    this.clock = Objects.requireNonNull(clock, "clock");
+    this.staleAfter = resolveStaleAfter(statusCadenceSeconds);
+  }
+
+  public void start() throws Exception {
+    if (!started.compareAndSet(false, true)) {
+      awaitRecovery(Duration.ofSeconds(30));
+      return;
+    }
+    Command command = new Command(Message.Command.SOWAndSubscribe);
+    command.setTopic(TOPIC_STATUS);
+    command.setOptions("oof");
+    command.setFilter(FILTER_STATUS_SERVICE);
+    subscription =
+        control
+            .sowAndSubscribe(
+                command.getTopic(),
+                command.getOptions(),
+                command.getFilter(),
+                message -> handleMessage(message.raw()));
+    awaitRecovery(Duration.ofSeconds(30));
+    LOGGER.debug("Service status cache ready topics={} enabledTypes={} instanceCount={}", List.of(TOPIC_STATUS), List.of("STATUS_SERVICE"), statuses.size());
+  }
+
+  public void startShared() {
+    if (!started.compareAndSet(false, true)) {
+      awaitRecovery(Duration.ofSeconds(30));
+    }
+  }
+
+  public boolean recovered() {
+    return recovered.get();
+  }
+
+  public int size() {
+    return statuses.size();
+  }
+
+  public List<ServiceStatusRow> snapshot() {
+    long nowMs = clock.millis();
+    return statuses.entrySet().stream()
+        .map(entry -> toRow(entry.getKey(), entry.getValue(), nowMs))
+        .sorted(
+            Comparator.comparing(
+                    (ServiceStatusRow row) ->
+                        Strings.trimToEmpty(row.group()), String.CASE_INSENSITIVE_ORDER)
+                .thenComparing(
+                    row -> Strings.trimToEmpty(row.name()), String.CASE_INSENSITIVE_ORDER)
+                .thenComparing(
+                    row -> Strings.trimToEmpty(row.instanceName()), String.CASE_INSENSITIVE_ORDER))
+        .toList();
+  }
+
+  public List<DefinitionStatusService> snapshotDefinitions() {
+    return statuses.values().stream().map(StatusSnapshot::status).toList();
+  }
+
+  public void stop() {
+    ControlConnection.Subscription id = subscription;
+    if (id != null) {
+      try {
+        id.close();
+      } catch (Exception ignore) {
+      }
+      subscription = null;
+    }
+    statuses.clear();
+  }
+
+  @Override
+  public void close() {
+    stop();
+  }
+
+  private ServiceStatusRow toRow(Key key, StatusSnapshot snapshot, long nowMs) {
+    DefinitionStatusService status = snapshot.status();
+    Map<String, String> tags = status.tags() == null ? Map.of() : status.tags();
+    Long heartbeatMs = positive(status.lastHeartbeatEpochMs());
+    Instant lastHeartbeatUtc = heartbeatMs == null ? null : Instant.ofEpochMilli(heartbeatMs);
+    Instant lastSeenUtc = snapshot.receivedTimeUtc();
+    String state = deriveState(status.state(), heartbeatMs, snapshot.receivedTimeUtc(), nowMs);
+    String host =
+        defaultText(
+            firstNonBlank(
+                status.host(),
+                status.advertiseHost(),
+                status.routeHost(),
+                tags.get("host"),
+                tags.get("hostname")));
+    String user =
+        defaultText(
+            firstNonBlank(
+                tags.get("user"),
+                tags.get("username"),
+                tags.get("runAsUser"),
+                tags.get("owner")));
+    String pid =
+        defaultText(firstNonBlank(tags.get("pid"), tags.get("processId"), tags.get("process.id")));
+    String runtime =
+        defaultText(
+            firstNonBlank(
+                status.transport(),
+                tags.get("runtime"),
+                tags.get("serviceType"),
+                tags.get("protocol"),
+                tags.get("transport"),
+                status.uri()));
+    String cpu = defaultText(formatPercent(firstNonBlank(tags.get("cpu"), tags.get("cpuPercent"))));
+    String heap =
+        defaultText(
+            firstNonBlank(
+                formatBytes(parseLong(tags.get("heapUsedBytes"))),
+                formatBytes(parseLong(tags.get("heapBytes"))),
+                tags.get("heap")));
+    String uptime =
+        defaultText(
+            firstNonBlank(
+                renderUptimeFromStart(status.startTimestampEpochMs(), nowMs),
+                formatDuration(parseLong(tags.get("uptimeMs"))),
+                tags.get("uptime")));
+    return new ServiceStatusRow(
+        key.group(),
+        key.name(),
+        key.instanceName(),
+        state,
+        host,
+        user,
+        pid,
+        runtime,
+        cpu,
+        heap,
+        uptime,
+        lastHeartbeatUtc,
+        lastSeenUtc);
+  }
+
+  private String deriveState(
+      DefinitionStatusService.State rawState, Long heartbeatMs, Instant lastSeenUtc, long nowMs) {
+    if (isOfflineState(rawState)) {
+      return "OFFLINE";
+    }
+    if (isStale(heartbeatMs, lastSeenUtc, nowMs)) {
+      return "STALE";
+    }
+    if (isOnlineState(rawState)) {
+      return "ONLINE";
+    }
+    return "UNKNOWN";
+  }
+
+  private boolean isStale(Long heartbeatMs, Instant lastSeenUtc, long nowMs) {
+    long referenceMs = heartbeatMs == null ? 0L : heartbeatMs;
+    if (referenceMs <= 0L && lastSeenUtc != null) {
+      referenceMs = lastSeenUtc.toEpochMilli();
+    }
+    if (referenceMs <= 0L) {
+      return true;
+    }
+    return nowMs - referenceMs > staleAfter.toMillis();
+  }
+
+  private boolean isOnlineState(DefinitionStatusService.State state) {
+    return switch (state == null ? DefinitionStatusService.State.UNKNOWN : state) {
+      case ONLINE -> true;
+      default -> false;
+    };
+  }
+
+  private boolean isOfflineState(DefinitionStatusService.State state) {
+    return switch (state == null ? DefinitionStatusService.State.UNKNOWN : state) {
+      case OFFLINE -> true;
+      default -> false;
+    };
+  }
+
+  public void awaitRecovery(Duration timeout) {
+    long millis = timeout == null ? 30000L : Math.max(1L, timeout.toMillis());
+    try {
+      boolean done = recoveryLatch.await(millis, TimeUnit.MILLISECONDS);
+      if (!done) {
+        throw new IllegalStateException(
+            "ServiceStatusCache initial recovery did not complete (GroupEnd not observed)");
+      }
+    } catch (InterruptedException ex) {
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException("Interrupted while waiting for ServiceStatusCache recovery", ex);
+    }
+  }
+
+  private void handleMessage(Message message) {
+    if (message == null) {
+      return;
+    }
+    int command = message.getCommand();
+    if (command == Message.Command.GroupEnd) {
+      recovered.set(true);
+      recoveryLatch.countDown();
+      return;
+    }
+    if (command != Message.Command.SOW
+        && command != Message.Command.Publish
+        && command != Message.Command.OOF
+        && command != Message.Command.SOWDelete) {
+      return;
+    }
+    String payload = message.getData();
+    if (Strings.isBlank(payload)) {
+      return;
+    }
+    try {
+      Definition definition = DiscoveryCodec.decode(payload);
+      if (!(definition instanceof DefinitionStatusService status)) {
+        return;
+      }
+      Key key = key(status.group(), status.name(), status.instance());
+      if (key == null) {
+        return;
+      }
+      if (command == Message.Command.OOF || command == Message.Command.SOWDelete) {
+        statuses.remove(key);
+        return;
+      }
+      statuses.put(key, new StatusSnapshot(status, Instant.now(clock)));
+    } catch (Exception ex) {
+      LOGGER.warn("Ignoring malformed service status message command={} reason={}", command, ex.toString());
+    }
+  }
+
+  private static String renderUptimeFromStart(Long startEpochMs, long nowMs) {
+    if (startEpochMs == null || startEpochMs <= 0L || nowMs < startEpochMs) {
+      return null;
+    }
+    return formatDuration(nowMs - startEpochMs);
+  }
+
+  private static String formatPercent(String value) {
+    if (Strings.isBlank(value)) {
+      return null;
+    }
+    String trimmed = value.trim();
+    if (trimmed.endsWith("%")) {
+      return trimmed;
+    }
+    return trimmed + "%";
+  }
+
+  private static String formatBytes(Long bytes) {
+    if (bytes == null || bytes < 0) {
+      return null;
+    }
+    String[] units = {"B", "KiB", "MiB", "GiB", "TiB"};
+    double scaled = bytes;
+    int unit = 0;
+    while (scaled >= 1024.0 && unit < units.length - 1) {
+      scaled /= 1024.0;
+      unit++;
+    }
+    return unit == 0
+        ? bytes + " B"
+        : String.format(java.util.Locale.ROOT, "%.1f %s", scaled, units[unit]);
+  }
+
+  private static String formatDuration(Long millis) {
+    if (millis == null || millis <= 0L) {
+      return null;
+    }
+    long totalSeconds = millis / 1000L;
+    if (totalSeconds <= 0L) {
+      return "0s";
+    }
+    long days = totalSeconds / 86_400;
+    long remainder = totalSeconds % 86_400;
+    long hours = remainder / 3_600;
+    remainder %= 3_600;
+    long minutes = remainder / 60;
+    long seconds = remainder % 60;
+    List<String> parts = new java.util.ArrayList<>(4);
+    if (days > 0) {
+      parts.add(days + "d");
+    }
+    if (hours > 0) {
+      parts.add(hours + "h");
+    }
+    if (minutes > 0) {
+      parts.add(minutes + "m");
+    }
+    if (seconds > 0 && parts.isEmpty()) {
+      parts.add(seconds + "s");
+    }
+    return parts.isEmpty() ? "0s" : String.join(" ", parts);
+  }
+
+  private static Long parseLong(String value) {
+    if (Strings.isBlank(value)) {
+      return null;
+    }
+    try {
+      return Long.parseLong(value.trim());
+    } catch (NumberFormatException ignore) {
+      return null;
+    }
+  }
+
+  private static Long positive(Long value) {
+    return value == null || value <= 0L ? null : value;
+  }
+
+  private static String firstNonBlank(String... values) {
+    if (values == null) {
+      return null;
+    }
+    for (String value : values) {
+      if (Strings.isNotBlank(value)) {
+        return value.trim();
+      }
+    }
+    return null;
+  }
+
+  private static String defaultText(String value) {
+    String normalized = Strings.trimToNull(value);
+    return normalized == null ? UNKNOWN : normalized;
+  }
+
+  private static Duration resolveStaleAfter(long statusCadenceSeconds) {
+    long cadence = statusCadenceSeconds <= 0L ? DEFAULT_STATUS_CADENCE_SECONDS : statusCadenceSeconds;
+    long staleSeconds = Math.max(60L, cadence * 2L);
+    return Duration.ofSeconds(staleSeconds);
+  }
+
+  public void onStatusMessage(Message message) {
+    handleMessage(message);
+  }
+
+  private static Key key(String group, String name, String instanceName) {
+    String normalizedGroup = normalizeKey(group);
+    String normalizedName = normalizeKey(name);
+    String normalizedInstance = normalizeKey(instanceName);
+    if (normalizedGroup == null || normalizedName == null || normalizedInstance == null) {
+      return null;
+    }
+    return new Key(normalizedGroup, normalizedName, normalizedInstance);
+  }
+
+  private static String normalizeKey(String value) {
+    return Strings.trimToNull(value);
+  }
+
+  private record Key(String group, String name, String instanceName) {}
+
+  private record StatusSnapshot(DefinitionStatusService status, Instant receivedTimeUtc) {}
+}
+
+
+
+
+
+
+
+
+===== FILE: fabric-lite/src/main/java/org/pronzato/fabric/api/control/status/service/ServiceStatusPublisher.java =====
+
+
+package org.pronzato.fabric.api.control.status.service;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import java.io.Closeable;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import org.pronzato.fabric.api.control.ControlConnection;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryTopics;
+import org.pronzato.fabric.api.control.discovery.codec.DiscoveryCodec;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionHbService;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStatusService;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
+import org.pronzato.fabric.api.services.common.ServiceAdvertise;
+import org.pronzato.fabric.api.util.Strings;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public final class ServiceStatusPublisher implements Closeable {
+  private static final Logger LOGGER = LoggerFactory.getLogger(ServiceStatusPublisher.class);
+  private static final boolean STATUS_DEBUG = false;
+  private static final long DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 10L;
+  private static final long DEFAULT_STATUS_INTERVAL_SECONDS = 30L;
+  private static final int DEFAULT_TTL_SECONDS = 30;
+  private static final String STATUS_ONLINE = "ONLINE";
+  private static final String STATUS_OFFLINE = "OFFLINE";
+
+  private final ObjectMapper om =
+      DiscoveryCodec.mapper().copy().configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
+  private final ControlConnection control;
+  private final ScheduledExecutorService ses;
+  private final boolean ownsScheduler;
+  private final long heartbeatIntervalSec;
+  private final long statusIntervalSec;
+  private final int ttlSeconds;
+  private final String group;
+  private final String region;
+  private final String serviceName;
+  private final String serviceInstanceId;
+  private final String serviceHost;
+  private final int servicePort;
+  private final boolean tlsRequired;
+  private final String routeHost;
+  private final Integer routePort;
+  private final String routeAuthority;
+  private final long serviceStartEpochMs;
+  private final String serviceAppName;
+  private final String serviceAppInstanceId;
+  private final String serviceAppGroup;
+  private final Map<String, String> attrs;
+  private volatile String sessionId;
+  private volatile String sessionKey;
+  private volatile boolean open = true;
+  private volatile ScheduledFuture<?> heartbeatTask;
+  private volatile ScheduledFuture<?> statusTask;
+
+  public ServiceStatusPublisher(
+      ControlConnection control,
+      String group,
+      String service,
+      String instanceId,
+      String host,
+      int port,
+      String region,
+      long heartbeatSeconds,
+      long statusSeconds,
+      int ttlSeconds,
+      boolean tlsRequired,
+      String routeHost,
+      Integer routePort,
+      String routeAuthority,
+      String appName,
+      String appInstance,
+      String appGroup,
+      Map<String, String> attrs,
+      ScheduledExecutorService scheduler) {
+    this.control = Objects.requireNonNull(control, "control");
+    this.group = Objects.requireNonNull(group, "group");
+    this.serviceName = Objects.requireNonNull(service, "service");
+    this.serviceInstanceId = Objects.requireNonNull(instanceId, "instanceId");
+    this.serviceHost = host;
+    this.servicePort = port;
+    this.heartbeatIntervalSec =
+        heartbeatSeconds <= 0 ? DEFAULT_HEARTBEAT_INTERVAL_SECONDS : heartbeatSeconds;
+    this.statusIntervalSec = statusSeconds <= 0 ? DEFAULT_STATUS_INTERVAL_SECONDS : statusSeconds;
+    this.ttlSeconds = ttlSeconds <= 0 ? DEFAULT_TTL_SECONDS : ttlSeconds;
+    this.tlsRequired = tlsRequired;
+    this.routeHost = routeHost;
+    this.routePort = routePort;
+    this.routeAuthority = routeAuthority;
+    this.serviceStartEpochMs = System.currentTimeMillis();
+    Map<String, String> attrCopy = Strings.isEmpty(attrs) ? Map.of() : Map.copyOf(attrs);
+    this.attrs = new ConcurrentHashMap<>(attrCopy);
+    String resolvedRegion = region;
+    if (Strings.isBlank(resolvedRegion)) {
+      resolvedRegion = attrCopy.get("region");
+    }
+    this.region = Strings.isBlank(resolvedRegion) ? "AMRS" : resolvedRegion;
+    this.serviceAppName = Strings.firstNonBlank(appName, serviceName);
+    this.serviceAppInstanceId = Strings.firstNonBlank(appInstance, serviceInstanceId);
+    this.serviceAppGroup = Strings.firstNonBlank(appGroup, group);
+    if (scheduler == null) {
+      this.ses = Executors.newSingleThreadScheduledExecutor();
+      this.ownsScheduler = true;
+    } else {
+      this.ses = scheduler;
+      this.ownsScheduler = false;
+    }
+  }
+
+  public void start() {
+    publishServiceStartOrThrow();
+    heartbeatTask =
+        ses.scheduleAtFixedRate(
+            this::publishHeartbeatSafe, heartbeatIntervalSec, heartbeatIntervalSec, TimeUnit.SECONDS);
+    statusTask =
+        ses.scheduleAtFixedRate(
+            this::publishStatusSafe, statusIntervalSec, statusIntervalSec, TimeUnit.SECONDS);
+  }
+
+  public ServiceStatusPublisher withSessionLineage(String sessionId, String sessionKey) {
+    this.sessionId = Strings.trimToNull(sessionId);
+    this.sessionKey = Strings.trimToNull(sessionKey);
+    return this;
+  }
+
+  @Override
+  public void close() {
+    if (!open) {
+      return;
+    }
+    open = false;
+    publishStatusSafe(STATUS_OFFLINE);
+    publishHeartbeatSafe();
+    ScheduledFuture<?> task = heartbeatTask;
+    heartbeatTask = null;
+    if (task != null) {
+      task.cancel(true);
+    }
+    ScheduledFuture<?> status = statusTask;
+    statusTask = null;
+    if (status != null) {
+      status.cancel(true);
+    }
+    if (ownsScheduler) {
+      ses.shutdownNow();
+    }
+  }
+
+  private void publishHeartbeatSafe() {
+    try {
+      publishServiceHeartbeat(STATUS_ONLINE);
+    } catch (Exception e) {
+      LOGGER.error("[Status] service heartbeat publish failed", e);
+    }
+  }
+
+  private void publishStatusSafe() {
+    publishStatusSafe(STATUS_ONLINE);
+  }
+
+  private void publishStatusSafe(String status) {
+    try {
+      publishServiceStatus(status);
+    } catch (Exception e) {
+      LOGGER.error("[Status] service status publish failed for status={}", status, e);
+    }
+  }
+
+  private void publishServiceStartOrThrow() {
+    validateServiceHeartbeatContract();
+    try {
+      publishServiceStatus(STATUS_ONLINE);
+      publishServiceHeartbeat(STATUS_ONLINE);
+    } catch (Exception ex) {
+      throw new IllegalStateException(
+          "Failed to publish initial service heartbeat/status: serviceId="
+              + valueOrUnknown(group)
+              + "/"
+              + valueOrUnknown(serviceName)
+              + ", instanceId="
+              + valueOrUnknown(serviceInstanceId),
+          ex);
+    }
+  }
+
+  private void validateServiceHeartbeatContract() {
+    ServiceAdvertise.requireRoutableHost(serviceHost, "advertiseHost");
+    if (servicePort <= 0) {
+      throw new IllegalStateException(
+          "Failed to publish service heartbeat: serviceId="
+              + valueOrUnknown(group)
+              + "/"
+              + valueOrUnknown(serviceName)
+              + ", instanceId="
+              + valueOrUnknown(serviceInstanceId)
+              + ", advertisePort is missing/invalid. Configure bind.port or advertise.port.");
+    }
+    if (tlsRequired) {
+      String tlsTermination = Strings.trimToNull(attrs.get("tlsTermination"));
+      if (tlsTermination == null) {
+        throw new IllegalStateException(
+            "Failed to publish service heartbeat: serviceId="
+                + valueOrUnknown(group)
+                + "/"
+                + valueOrUnknown(serviceName)
+                + ", instanceId="
+                + valueOrUnknown(serviceInstanceId)
+                + ", tlsEnabled=true but tlsTermination is missing.");
+      }
+    }
+  }
+
+  private void publishServiceStatus(String status) throws Exception {
+    DefinitionStatusService definition = buildServiceStatus(status);
+    if (definition == null) {
+      return;
+    }
+    publishStatusDefinition(definition);
+  }
+
+  private void publishServiceHeartbeat(String status) throws Exception {
+    DefinitionHbService heartbeat = buildServiceHeartbeat();
+    if (heartbeat == null) {
+      return;
+    }
+    String payload = om.writeValueAsString(heartbeat);
+    if (STATUS_DEBUG) {
+      LOGGER.debug("[Status] publish topic={} status={} payload={}", DiscoveryTopics.HEARTBEAT, status, payload);
+    }
+    int ttl = ttlSeconds > 0 ? ttlSeconds : 0;
+    control.amps().publish(DiscoveryTopics.HEARTBEAT, payload, ttl);
+  }
+
+  private void publishStatusDefinition(
+      org.pronzato.fabric.api.control.discovery.definitions.Definition definition) throws Exception {
+    if (definition == null) {
+      return;
+    }
+    String payload = om.writeValueAsString(definition);
+    if (STATUS_DEBUG) {
+      LOGGER.debug("[Status] publish topic={} payload={}", DiscoveryTopics.STATUS, payload);
+    }
+    control.amps().publish(DiscoveryTopics.STATUS, payload);
+  }
+
+  private DefinitionStatusService buildServiceStatus(String status) {
+    String normalizedGroup = Strings.trimToNull(group);
+    String normalizedName = Strings.trimToNull(serviceName);
+    String normalizedInstance = Strings.trimToNull(serviceInstanceId);
+    if (normalizedGroup == null || normalizedName == null || normalizedInstance == null) {
+      return null;
+    }
+    DefinitionEnvelope envelope = statusEnvelope(DefinitionType.STATUS_SERVICE, normalizedName);
+    if (envelope == null) {
+      return null;
+    }
+    long nowMs = System.currentTimeMillis();
+    Integer port = servicePort > 0 ? servicePort : null;
+    String transport = resolveTransport();
+    String uri = resolveUri(port);
+    Map<String, String> tagsSnapshot = attrs.isEmpty() ? Map.of() : Map.copyOf(attrs);
+    String advertiseHost = Strings.trimToNull(serviceHost);
+    Integer advertisePort = port;
+    String bindHost = Strings.trimToNull(attrs.get("bindHost"));
+    Integer bindPort = parseInteger(attrs.get("bindPort"));
+    Boolean tlsEnabled = tlsRequired;
+    String tlsTermination =
+        firstNonBlank(Strings.trimToNull(attrs.get("tlsTermination")), tlsRequired ? "PASSTHROUGH" : null);
+    Boolean kerberosEnabled = parseBoolean(attrs.get("kerberosEnabled"));
+    if (kerberosEnabled == null) {
+      kerberosEnabled = false;
+    }
+    String kerberosSpn = Strings.trimToNull(attrs.get("kerberosSpn"));
+    String derivedSpn = Strings.trimToNull(attrs.get("derivedSpn"));
+    Long startEpochMs = serviceStartEpochMs > 0L ? serviceStartEpochMs : null;
+    DefinitionStatusService.State state = null;
+    if (status != null) {
+      try {
+        state = DefinitionStatusService.State.valueOf(status);
+      } catch (IllegalArgumentException ignore) {
+        state = DefinitionStatusService.State.ONLINE;
+      }
+    }
+    if (state == null) {
+      state = DefinitionStatusService.State.ONLINE;
+    }
+    if (state == DefinitionStatusService.State.UNKNOWN) {
+      state = DefinitionStatusService.State.ONLINE;
+    }
+    return new DefinitionStatusService(
+        envelope,
+        normalizedGroup,
+        DefinitionType.STATUS_SERVICE,
+        normalizedName,
+        normalizedInstance,
+        state,
+        nowMs,
+        startEpochMs,
+        null,
+        transport,
+        uri,
+        advertiseHost,
+        advertisePort,
+        bindHost,
+        bindPort,
+        tlsEnabled,
+        tlsTermination,
+        kerberosEnabled,
+        kerberosSpn,
+        derivedSpn,
+        Strings.trimToNull(serviceHost),
+        port,
+        tlsRequired,
+        Strings.trimToNull(routeHost),
+        routePort,
+        Strings.trimToNull(routeAuthority),
+        Strings.trimToNull(region),
+        Strings.trimToNull(serviceAppName),
+        Strings.trimToNull(serviceAppInstanceId),
+        Strings.trimToNull(serviceAppGroup),
+        tagsSnapshot,
+        sessionId,
+        sessionKey);
+  }
+
+  private DefinitionHbService buildServiceHeartbeat() {
+    String normalizedGroup = Strings.trimToNull(group);
+    String normalizedName = Strings.trimToNull(serviceName);
+    String normalizedInstance = Strings.trimToNull(serviceInstanceId);
+    if (normalizedGroup == null || normalizedName == null || normalizedInstance == null) {
+      return null;
+    }
+    DefinitionEnvelope envelope = statusEnvelope(DefinitionType.HEARTBEAT_SERVICE, normalizedName);
+    if (envelope == null) {
+      return null;
+    }
+    Integer port = servicePort > 0 ? servicePort : null;
+    String transport = resolveTransport();
+    String uri = resolveUri(port);
+    Map<String, String> tagsSnapshot = attrs.isEmpty() ? Map.of() : Map.copyOf(attrs);
+    String advertiseHost = Strings.trimToNull(serviceHost);
+    Integer advertisePort = port;
+    String bindHost = Strings.trimToNull(attrs.get("bindHost"));
+    Integer bindPort = parseInteger(attrs.get("bindPort"));
+    Boolean tlsEnabled = tlsRequired;
+    String tlsTermination =
+        firstNonBlank(Strings.trimToNull(attrs.get("tlsTermination")), tlsRequired ? "PASSTHROUGH" : null);
+    Boolean kerberosEnabled = parseBoolean(attrs.get("kerberosEnabled"));
+    if (kerberosEnabled == null) {
+      kerberosEnabled = false;
+    }
+    String kerberosSpn = Strings.trimToNull(attrs.get("kerberosSpn"));
+    String derivedSpn = Strings.trimToNull(attrs.get("derivedSpn"));
+    long nowMs = System.currentTimeMillis();
+    return new DefinitionHbService(
+        envelope,
+        normalizedGroup,
+        DefinitionType.HEARTBEAT_SERVICE,
+        normalizedName,
+        normalizedInstance,
+        transport,
+        uri,
+        advertiseHost,
+        advertisePort,
+        bindHost,
+        bindPort,
+        tlsEnabled,
+        tlsTermination,
+        kerberosEnabled,
+        kerberosSpn,
+        derivedSpn,
+        Strings.trimToNull(serviceHost),
+        port,
+        tlsRequired,
+        Strings.trimToNull(routeHost),
+        routePort,
+        Strings.trimToNull(routeAuthority),
+        Strings.trimToNull(region),
+        nowMs,
+        tagsSnapshot);
+  }
+
+  private DefinitionEnvelope statusEnvelope(DefinitionType type, String name) {
+    String normalizedGroup = Strings.trimToNull(group);
+    String normalizedName = Strings.trimToNull(name);
+    if (normalizedGroup == null || normalizedName == null || type == null) {
+      return null;
+    }
+    return new DefinitionEnvelope(
+        normalizedGroup,
+        type,
+        normalizedName,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null);
+  }
+
+  private String resolveTransport() {
+    if (Strings.isEmpty(attrs)) {
+      return null;
+    }
+    return firstNonBlank(attrs.get("transport"), attrs.get("protocol"), attrs.get("serviceType"));
+  }
+
+  private String resolveUri(Integer port) {
+    String authority = firstNonBlank(routeAuthority, routeHost, serviceHost);
+    if (authority == null) {
+      return null;
+    }
+    if (authority.contains(":")) {
+      return authority;
+    }
+    int resolvedPort = port == null ? 0 : port;
+    if (resolvedPort <= 0 && routePort != null) {
+      resolvedPort = routePort;
+    }
+    return resolvedPort > 0 ? authority + ":" + resolvedPort : authority;
+  }
+
+  private static String firstNonBlank(String... values) {
+    if (values == null) {
+      return null;
+    }
+    for (String value : values) {
+      if (Strings.isNotBlank(value)) {
+        return value.trim();
+      }
+    }
+    return null;
+  }
+
+  private static Integer parseInteger(String value) {
+    if (Strings.isBlank(value)) {
+      return null;
+    }
+    try {
+      return Integer.parseInt(value.trim());
+    } catch (NumberFormatException ignore) {
+      return null;
+    }
+  }
+
+  private static Boolean parseBoolean(String value) {
+    if (Strings.isBlank(value)) {
+      return null;
+    }
+    String normalized = value.trim();
+    if ("true".equalsIgnoreCase(normalized) || "yes".equalsIgnoreCase(normalized)) {
+      return true;
+    }
+    if ("false".equalsIgnoreCase(normalized) || "no".equalsIgnoreCase(normalized)) {
+      return false;
+    }
+    return null;
+  }
+
+  private static String valueOrUnknown(String value) {
+    return Strings.isBlank(value) ? "<unknown>" : value;
+  }
+}
+
