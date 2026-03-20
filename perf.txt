@@ -1,33 +1,170 @@
-org.pronzato.fabric.api.agents
+org.pronzato.fabric.api.tools
 
-===== FILE: fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentAnswer.java =====
-package org.pronzato.fabric.api.agents;
+===== FILE: fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/GetAssetRequest.java =====
+package org.pronzato.fabric.api.tools;
 
-import java.util.ArrayList;
-import java.util.List;
+public record GetAssetRequest(
+    String assetId,
+    String requestId,
+    String subject,
+    String delegatedSubject,
+    String lane) {
 
-public record AgentAnswer(
-    String text, List<String> assetIds, List<String> datasetIds, List<String> evidence) {
-
-  public AgentAnswer {
-    text = normalize(text);
-    assetIds = normalizeList(assetIds);
-    datasetIds = normalizeList(datasetIds);
-    evidence = normalizeList(evidence);
+  public GetAssetRequest {
+    assetId = normalize(assetId);
+    requestId = normalize(requestId);
+    subject = normalize(subject);
+    delegatedSubject = normalize(delegatedSubject);
+    lane = normalize(lane);
   }
 
-  private static List<String> normalizeList(List<String> values) {
-    if (values == null || values.isEmpty()) {
-      return List.of();
+  private static String normalize(String value) {
+    if (value == null) {
+      return null;
     }
-    List<String> copy = new ArrayList<>(values.size());
-    for (String value : values) {
-      String normalized = normalize(value);
-      if (normalized != null) {
-        copy.add(normalized);
-      }
+    String trimmed = value.trim();
+    return trimmed.isEmpty() ? null : trimmed;
+  }
+}
+
+===== FILE: fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/GetAssetResponse.java =====
+package org.pronzato.fabric.api.tools;
+
+import org.pronzato.fabric.api.catalog.CatalogManager.CatalogDetails;
+
+public record GetAssetResponse(
+    String requestId,
+    ToolStatus status,
+    String message,
+    String assetId,
+    CatalogDetails asset) {
+
+  public GetAssetResponse {
+    requestId = normalize(requestId);
+    status = status == null ? ToolStatus.ERROR : status;
+    message = normalize(message);
+    assetId = normalize(assetId);
+  }
+
+  public boolean found() {
+    return asset != null;
+  }
+
+  private static String normalize(String value) {
+    if (value == null) {
+      return null;
     }
-    return copy.isEmpty() ? List.of() : List.copyOf(copy);
+    String trimmed = value.trim();
+    return trimmed.isEmpty() ? null : trimmed;
+  }
+}
+
+
+
+===== FILE: fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/GetRelatedAssetsRequest.java =====
+package org.pronzato.fabric.api.tools;
+
+import org.pronzato.fabric.api.control.discovery.lifecycle.RelationshipType;
+
+public record GetRelatedAssetsRequest(
+    String assetId,
+    RelationshipType relationshipType,
+    Integer depth,
+    String requestId,
+    String subject,
+    String delegatedSubject,
+    String lane) {
+
+  public static final int DEFAULT_DEPTH = 1;
+  public static final int MAX_DEPTH = 3;
+
+  public GetRelatedAssetsRequest {
+    assetId = normalize(assetId);
+    depth = normalizeDepth(depth);
+    requestId = normalize(requestId);
+    subject = normalize(subject);
+    delegatedSubject = normalize(delegatedSubject);
+    lane = normalize(lane);
+  }
+
+  private static Integer normalizeDepth(Integer value) {
+    if (value == null || value <= 0) {
+      return DEFAULT_DEPTH;
+    }
+    return Math.min(MAX_DEPTH, value);
+  }
+
+  private static String normalize(String value) {
+    if (value == null) {
+      return null;
+    }
+    String trimmed = value.trim();
+    return trimmed.isEmpty() ? null : trimmed;
+  }
+}
+
+===== FILE: fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/GetRelatedAssetsResponse.java =====
+package org.pronzato.fabric.api.tools;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import org.pronzato.fabric.api.catalog.CatalogManager.CatalogRelationshipView;
+import org.pronzato.fabric.api.control.discovery.lifecycle.RelationshipType;
+
+public record GetRelatedAssetsResponse(
+    String requestId,
+    ToolStatus status,
+    String message,
+    String assetId,
+    int depth,
+    Map<RelationshipType, List<CatalogRelationshipView>> relationshipsByType,
+    int relationshipCount) {
+
+  public GetRelatedAssetsResponse {
+    requestId = normalize(requestId);
+    status = status == null ? ToolStatus.ERROR : status;
+    message = normalize(message);
+    assetId = normalize(assetId);
+    depth = Math.max(1, depth);
+    relationshipsByType = copy(relationshipsByType);
+    relationshipCount = Math.max(0, relationshipCount);
+  }
+
+  private static Map<RelationshipType, List<CatalogRelationshipView>> copy(
+      Map<RelationshipType, List<CatalogRelationshipView>> value) {
+    if (value == null || value.isEmpty()) {
+      return Map.of();
+    }
+    LinkedHashMap<RelationshipType, List<CatalogRelationshipView>> copied = new LinkedHashMap<>();
+    for (Map.Entry<RelationshipType, List<CatalogRelationshipView>> entry : value.entrySet()) {
+      List<CatalogRelationshipView> relationships =
+          entry.getValue() == null ? List.of() : List.copyOf(new ArrayList<>(entry.getValue()));
+      copied.put(entry.getKey(), relationships);
+    }
+    return Map.copyOf(copied);
+  }
+
+  private static String normalize(String value) {
+    if (value == null) {
+      return null;
+    }
+    String trimmed = value.trim();
+    return trimmed.isEmpty() ? null : trimmed;
+  }
+}
+
+
+
+===== FILE: fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/QueryDatasetColumn.java =====
+package org.pronzato.fabric.api.tools;
+
+public record QueryDatasetColumn(String name, String type) {
+
+  public QueryDatasetColumn {
+    name = normalize(name);
+    type = normalize(type);
   }
 
   private static String normalize(String value) {
@@ -39,267 +176,31 @@ public record AgentAnswer(
   }
 }
 
+===== FILE: fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/QueryDatasetRequest.java =====
+package org.pronzato.fabric.api.tools;
 
-===== FILE: fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentExecutionTrace.java =====
-package org.pronzato.fabric.api.agents;
+import java.time.Duration;
 
-import java.util.ArrayList;
-import java.util.List;
-
-public record AgentExecutionTrace(
-    String requestId,
-    String prompt,
-    String subject,
-    String lane,
-    AgentReasonerMode reasonerMode,
-    String scenarioId,
-    String interpretedIntent,
-    AgentLimits limits,
-    List<String> candidateAssetIds,
-    List<String> selectedAssetIds,
-    List<String> deniedAssetIds,
-    List<String> filteredAssetIds,
-    List<String> answerAssembly,
-    String startedAtUtc,
-    String finishedAtUtc,
-    long durationMs,
-    int stepCount,
-    int toolCallCount,
-    List<AgentPlanStep> steps,
-    List<AgentToolCall> toolCalls) {
-
-  public AgentExecutionTrace {
-    requestId = normalize(requestId);
-    prompt = normalize(prompt);
-    subject = normalize(subject);
-    lane = normalize(lane);
-    reasonerMode = reasonerMode == null ? AgentReasonerMode.AUTO : reasonerMode;
-    scenarioId = normalize(scenarioId);
-    interpretedIntent = normalize(interpretedIntent);
-    limits = limits == null ? AgentLimits.defaults() : limits;
-    candidateAssetIds = normalizeList(candidateAssetIds);
-    selectedAssetIds = normalizeList(selectedAssetIds);
-    deniedAssetIds = normalizeList(deniedAssetIds);
-    filteredAssetIds = normalizeList(filteredAssetIds);
-    answerAssembly = normalizeList(answerAssembly);
-    startedAtUtc = normalize(startedAtUtc);
-    finishedAtUtc = normalize(finishedAtUtc);
-    durationMs = Math.max(0L, durationMs);
-    stepCount = Math.max(0, stepCount);
-    toolCallCount = Math.max(0, toolCallCount);
-    steps = steps == null ? List.of() : List.copyOf(new ArrayList<>(steps));
-    toolCalls = toolCalls == null ? List.of() : List.copyOf(new ArrayList<>(toolCalls));
-  }
-
-  private static List<String> normalizeList(List<String> values) {
-    if (values == null || values.isEmpty()) {
-      return List.of();
-    }
-    List<String> copy = new ArrayList<>(values.size());
-    for (String value : values) {
-      String normalized = normalize(value);
-      if (normalized != null) {
-        copy.add(normalized);
-      }
-    }
-    return copy.isEmpty() ? List.of() : List.copyOf(copy);
-  }
-
-  private static String normalize(String value) {
-    if (value == null) {
-      return null;
-    }
-    String trimmed = value.trim();
-    return trimmed.isEmpty() ? null : trimmed;
-  }
-}
-
-===== FILE: fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentLimits.java =====
-package org.pronzato.fabric.api.agents;
-
-public record AgentLimits(
-    int maxSteps,
-    int maxToolCalls,
-    int maxAssetsInspected,
-    int maxRelatedDepth,
-    int maxDatasetQueries) {
-
-  public static final int DEFAULT_MAX_STEPS = 8;
-  public static final int DEFAULT_MAX_TOOL_CALLS = 8;
-  public static final int DEFAULT_MAX_ASSETS_INSPECTED = 5;
-  public static final int DEFAULT_MAX_RELATED_DEPTH = 1;
-  public static final int DEFAULT_MAX_DATASET_QUERIES = 1;
-
-  public static final int HARD_MAX_STEPS = 20;
-  public static final int HARD_MAX_TOOL_CALLS = 20;
-  public static final int HARD_MAX_ASSETS_INSPECTED = 20;
-  public static final int HARD_MAX_RELATED_DEPTH = 3;
-  public static final int HARD_MAX_DATASET_QUERIES = 3;
-
-  public AgentLimits {
-    maxSteps = clamp(maxSteps, DEFAULT_MAX_STEPS, HARD_MAX_STEPS);
-    maxToolCalls = clamp(maxToolCalls, DEFAULT_MAX_TOOL_CALLS, HARD_MAX_TOOL_CALLS);
-    maxAssetsInspected =
-        clamp(maxAssetsInspected, DEFAULT_MAX_ASSETS_INSPECTED, HARD_MAX_ASSETS_INSPECTED);
-    maxRelatedDepth = clamp(maxRelatedDepth, DEFAULT_MAX_RELATED_DEPTH, HARD_MAX_RELATED_DEPTH);
-    maxDatasetQueries =
-        clamp(maxDatasetQueries, DEFAULT_MAX_DATASET_QUERIES, HARD_MAX_DATASET_QUERIES);
-  }
-
-  public static AgentLimits defaults() {
-    return new AgentLimits(
-        DEFAULT_MAX_STEPS,
-        DEFAULT_MAX_TOOL_CALLS,
-        DEFAULT_MAX_ASSETS_INSPECTED,
-        DEFAULT_MAX_RELATED_DEPTH,
-        DEFAULT_MAX_DATASET_QUERIES);
-  }
-
-  public AgentLimits merge(AgentLimits overrides) {
-    if (overrides == null) {
-      return this;
-    }
-    return new AgentLimits(
-        clamp(overrides.maxSteps(), maxSteps, HARD_MAX_STEPS),
-        clamp(overrides.maxToolCalls(), maxToolCalls, HARD_MAX_TOOL_CALLS),
-        clamp(overrides.maxAssetsInspected(), maxAssetsInspected, HARD_MAX_ASSETS_INSPECTED),
-        clamp(overrides.maxRelatedDepth(), maxRelatedDepth, HARD_MAX_RELATED_DEPTH),
-        clamp(overrides.maxDatasetQueries(), maxDatasetQueries, HARD_MAX_DATASET_QUERIES));
-  }
-
-  private static int clamp(int value, int fallback, int max) {
-    int candidate = value <= 0 ? fallback : value;
-    return Math.max(1, Math.min(max, candidate));
-  }
-}
-
-
-===== FILE: fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentManager.java =====
-package org.pronzato.fabric.api.agents;
-
-public interface AgentManager extends AutoCloseable {
-
-  default AgentResponse execute(String prompt) {
-    return execute(
-        new AgentRequest(
-            prompt, null, null, null, AgentReasonerMode.AUTO, null, null, null, null, null, null));
-  }
-
-  AgentResponse execute(AgentRequest request);
-
-  @Override
-  default void close() {}
-}
-
-===== FILE: fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentPlanStep.java =====
-package org.pronzato.fabric.api.agents;
-
-import java.util.ArrayList;
-import java.util.List;
-
-public record AgentPlanStep(
-    int stepNumber,
-    String stepName,
-    AgentStepStatus status,
-    String summary,
-    String toolName,
-    String toolRequestId,
-    List<String> assetIds) {
-
-  public AgentPlanStep {
-    stepNumber = Math.max(1, stepNumber);
-    stepName = normalize(stepName);
-    status = status == null ? AgentStepStatus.FAILED : status;
-    summary = normalize(summary);
-    toolName = normalize(toolName);
-    toolRequestId = normalize(toolRequestId);
-    assetIds = normalizeList(assetIds);
-  }
-
-  private static List<String> normalizeList(List<String> values) {
-    if (values == null || values.isEmpty()) {
-      return List.of();
-    }
-    List<String> copy = new ArrayList<>(values.size());
-    for (String value : values) {
-      String normalized = normalize(value);
-      if (normalized != null) {
-        copy.add(normalized);
-      }
-    }
-    return copy.isEmpty() ? List.of() : List.copyOf(copy);
-  }
-
-  private static String normalize(String value) {
-    if (value == null) {
-      return null;
-    }
-    String trimmed = value.trim();
-    return trimmed.isEmpty() ? null : trimmed;
-  }
-}
-
-
-===== FILE: fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentReasonerMode.java =====
-package org.pronzato.fabric.api.agents;
-
-import java.util.Locale;
-
-public enum AgentReasonerMode {
-  AUTO,
-  DETERMINISTIC,
-  SCRIPTED,
-  MODEL;
-
-  public static AgentReasonerMode parse(String value) {
-    if (value == null) {
-      return AUTO;
-    }
-    String normalized = value.trim();
-    if (normalized.isEmpty()) {
-      return AUTO;
-    }
-    try {
-      return AgentReasonerMode.valueOf(normalized.toUpperCase(Locale.ROOT));
-    } catch (IllegalArgumentException ex) {
-      return AUTO;
-    }
-  }
-}
-
-===== FILE: fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentRequest.java =====
-package org.pronzato.fabric.api.agents;
-
-public record AgentRequest(
-    String prompt,
-    String seedAssetId,
+public record QueryDatasetRequest(
     String datasetId,
-    String datasetQuery,
-    AgentReasonerMode reasonerMode,
-    String scenarioId,
-    AgentLimits limits,
+    String query,
+    Integer limit,
+    Duration timeout,
     String requestId,
     String subject,
     String delegatedSubject,
     String lane) {
 
-  public AgentRequest {
-    prompt = normalize(prompt);
-    seedAssetId = normalize(seedAssetId);
+  public QueryDatasetRequest {
     datasetId = normalize(datasetId);
-    datasetQuery = normalize(datasetQuery);
-    reasonerMode = reasonerMode == null ? AgentReasonerMode.AUTO : reasonerMode;
-    scenarioId = normalize(scenarioId);
-    limits = limits == null ? AgentLimits.defaults() : limits;
+    query = normalize(query);
     requestId = normalize(requestId);
     subject = normalize(subject);
     delegatedSubject = normalize(delegatedSubject);
     lane = normalize(lane);
-  }
-
-  public static AgentRequest defaults() {
-    return new AgentRequest(
-        null, null, null, null, AgentReasonerMode.AUTO, null, AgentLimits.defaults(), null, null, null, null);
+    if (timeout != null && timeout.isNegative()) {
+      timeout = Duration.ZERO;
+    }
   }
 
   private static String normalize(String value) {
@@ -311,42 +212,145 @@ public record AgentRequest(
   }
 }
 
-===== FILE: fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentResponse.java =====
-package org.pronzato.fabric.api.agents;
+===== FILE: fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/QueryDatasetResponse.java =====
+package org.pronzato.fabric.api.tools;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
-public record AgentResponse(
+public record QueryDatasetResponse(
     String requestId,
-    AgentStatus status,
-    AgentAnswer answer,
-    List<String> usedAssets,
-    List<String> warnings,
-    List<String> errors,
-    AgentExecutionTrace trace) {
+    ToolStatus status,
+    String message,
+    String datasetId,
+    int appliedLimit,
+    String appliedTimeout,
+    List<QueryDatasetColumn> schema,
+    List<List<Object>> rows,
+    int rowCount,
+    boolean truncated) {
 
-  public AgentResponse {
+  public QueryDatasetResponse {
     requestId = normalize(requestId);
-    status = status == null ? AgentStatus.FAILED : status;
-    answer = answer == null ? new AgentAnswer("", List.of(), List.of(), List.of()) : answer;
-    usedAssets = normalizeList(usedAssets);
-    warnings = normalizeList(warnings);
-    errors = normalizeList(errors);
+    status = status == null ? ToolStatus.ERROR : status;
+    message = normalize(message);
+    datasetId = normalize(datasetId);
+    appliedLimit = Math.max(0, appliedLimit);
+    appliedTimeout = normalize(appliedTimeout);
+    schema = schema == null ? List.of() : List.copyOf(new ArrayList<>(schema));
+    rows = immutableRows(rows);
+    rowCount = Math.max(0, rowCount);
   }
 
-  private static List<String> normalizeList(List<String> values) {
+  private static List<List<Object>> immutableRows(List<List<Object>> value) {
+    if (value == null || value.isEmpty()) {
+      return List.of();
+    }
+    List<List<Object>> copy = new ArrayList<>(value.size());
+    for (List<Object> row : value) {
+      copy.add(row == null ? List.of() : Collections.unmodifiableList(new ArrayList<>(row)));
+    }
+    return Collections.unmodifiableList(copy);
+  }
+
+  private static String normalize(String value) {
+    if (value == null) {
+      return null;
+    }
+    String trimmed = value.trim();
+    return trimmed.isEmpty() ? null : trimmed;
+  }
+}
+
+===== FILE: fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/SearchAssetsRequest.java =====
+package org.pronzato.fabric.api.tools;
+
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+
+public record SearchAssetsRequest(
+    String query,
+    String type,
+    String domain,
+    List<String> tags,
+    String owner,
+    String trust,
+    String freshness,
+    Integer limit,
+    String requestId,
+    String subject,
+    String delegatedSubject,
+    String lane,
+    String seedAssetId) {
+
+  public SearchAssetsRequest {
+    query = normalize(query);
+    type = normalize(type);
+    domain = normalize(domain);
+    tags = normalizeTags(tags);
+    owner = normalize(owner);
+    trust = normalize(trust);
+    freshness = normalize(freshness);
+    requestId = normalize(requestId);
+    subject = normalize(subject);
+    delegatedSubject = normalize(delegatedSubject);
+    lane = normalize(lane);
+    seedAssetId = normalize(seedAssetId);
+  }
+
+  public static SearchAssetsRequest defaults() {
+    return new SearchAssetsRequest(
+        null, null, null, List.of(), null, null, null, null, null, null, null, null, null);
+  }
+
+  private static List<String> normalizeTags(List<String> values) {
     if (values == null || values.isEmpty()) {
       return List.of();
     }
-    List<String> copy = new ArrayList<>(values.size());
+    LinkedHashSet<String> deduped = new LinkedHashSet<>();
     for (String value : values) {
       String normalized = normalize(value);
       if (normalized != null) {
-        copy.add(normalized);
+        deduped.add(normalized);
       }
     }
-    return copy.isEmpty() ? List.of() : List.copyOf(copy);
+    return deduped.isEmpty() ? List.of() : List.copyOf(new ArrayList<>(deduped));
+  }
+
+  private static String normalize(String value) {
+    if (value == null) {
+      return null;
+    }
+    String trimmed = value.trim();
+    return trimmed.isEmpty() ? null : trimmed;
+  }
+}
+
+===== FILE: fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/SearchAssetsResponse.java =====
+package org.pronzato.fabric.api.tools;
+
+import java.util.ArrayList;
+import java.util.List;
+import org.pronzato.fabric.api.catalog.CatalogManager.CatalogSearchFacet;
+import org.pronzato.fabric.api.catalog.CatalogManager.CatalogSummary;
+
+public record SearchAssetsResponse(
+    String requestId,
+    ToolStatus status,
+    String message,
+    List<CatalogSummary> results,
+    CatalogSearchFacet facets,
+    int totalCount) {
+
+  public SearchAssetsResponse {
+    requestId = normalize(requestId);
+    status = status == null ? ToolStatus.ERROR : status;
+    message = normalize(message);
+    results = results == null ? List.of() : List.copyOf(new ArrayList<>(results));
+    facets = facets == null ? CatalogSearchFacet.empty() : facets;
+    totalCount = Math.max(0, totalCount);
   }
 
   private static String normalize(String value) {
@@ -359,34 +363,90 @@ public record AgentResponse(
 }
 
 
-===== FILE: fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentSessions.java =====
-package org.pronzato.fabric.api.agents;
 
+===== FILE: fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/ToolGatewayService.java =====
+package org.pronzato.fabric.api.tools;
+
+public interface ToolGatewayService extends AutoCloseable {
+
+  SearchAssetsResponse searchAssets(SearchAssetsRequest request);
+
+  GetAssetResponse getAsset(GetAssetRequest request);
+
+  GetRelatedAssetsResponse getRelatedAssets(GetRelatedAssetsRequest request);
+
+  QueryDatasetResponse queryDataset(QueryDatasetRequest request);
+
+  @Override
+  default void close() {}
+}
+
+===== FILE: fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/ToolGatewaySessions.java =====
+package org.pronzato.fabric.api.tools;
+
+import java.util.List;
 import java.util.Objects;
+import java.util.function.Supplier;
 import org.pronzato.fabric.api.Fabric;
-import org.pronzato.fabric.api.agents.manager.AgentManagerImpl;
+import org.pronzato.fabric.api.control.discovery.cache.DiscoveryCache;
+import org.pronzato.fabric.api.control.discovery.definitions.Definition;
+import org.pronzato.fabric.api.data.DataManagers;
+import org.pronzato.fabric.api.data.RowManager;
 import org.pronzato.fabric.api.control.session.SessionContext;
-import org.pronzato.fabric.api.tools.ToolGatewayService;
-import org.pronzato.fabric.api.tools.ToolGatewaySessions;
+import org.pronzato.fabric.api.control.session.SessionImpl;
+import org.pronzato.fabric.api.tools.manager.ToolGatewayServiceImpl;
 import org.pronzato.fabric.api.util.Strings;
 
-public final class AgentSessions {
-  private AgentSessions() {}
+public final class ToolGatewaySessions {
+  private ToolGatewaySessions() {}
 
-  public static AgentManager attach(Fabric.Session session) {
+  public static ToolGatewayService attach(Fabric.Session session) {
     Objects.requireNonNull(session, "session");
-    ToolGatewayService tools = ToolGatewaySessions.attach(session);
     SessionContext context = session.context();
-    AgentManager delegate =
-        new AgentManagerImpl(tools, defaultSubject(context), null, defaultLane(context));
-    return new SessionBoundAgentManager(delegate, tools);
+    String defaultSubject = defaultSubject(context);
+    String defaultLane = defaultLane(context);
+    return new ToolGatewayServiceImpl(
+        session.catalog(),
+        definitionsSupplier(session),
+        rowManagerSupplier(session),
+        defaultSubject,
+        null,
+        defaultLane);
+  }
+
+  private static Supplier<List<Definition>> definitionsSupplier(Fabric.Session session) {
+    if (!(session instanceof SessionImpl impl)) {
+      return List::of;
+    }
+    return () -> {
+      DiscoveryCache cache = impl.discoveryCache();
+      return cache == null ? List.of() : cache.allDefinitions();
+    };
+  }
+
+  private static Supplier<RowManager> rowManagerSupplier(Fabric.Session session) {
+    return () -> {
+      DataManagers managers = session.data();
+      if (managers == null) {
+        return null;
+      }
+      try {
+        return managers.direct().rows();
+      } catch (RuntimeException directEx) {
+        try {
+          return managers.service().rows();
+        } catch (RuntimeException serviceEx) {
+          return null;
+        }
+      }
+    };
   }
 
   private static String defaultSubject(SessionContext context) {
     String group = context == null ? null : normalize(context.getGroup());
     String app = context == null ? null : normalize(context.getAppName());
     if (group == null || app == null) {
-      return "app:agent/system";
+      return "app:tools/system";
     }
     return "app:" + group + "/" + app;
   }
@@ -402,426 +462,703 @@ public final class AgentSessions {
     String trimmed = value.trim();
     return trimmed.isEmpty() ? null : trimmed;
   }
-
-  private static final class SessionBoundAgentManager implements AgentManager {
-    private final AgentManager delegate;
-    private final ToolGatewayService tools;
-
-    private SessionBoundAgentManager(AgentManager delegate, ToolGatewayService tools) {
-      this.delegate = delegate;
-      this.tools = tools;
-    }
-
-    @Override
-    public AgentResponse execute(AgentRequest request) {
-      return delegate.execute(request);
-    }
-
-    @Override
-    public void close() {
-      try {
-        delegate.close();
-      } catch (Exception ignore) {
-      }
-      try {
-        tools.close();
-      } catch (Exception ignore) {
-      }
-    }
-  }
 }
 
 
 
-===== FILE: fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentStatus.java =====
-package org.pronzato.fabric.api.agents;
+===== FILE: fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/ToolStatus.java =====
+package org.pronzato.fabric.api.tools;
 
-public enum AgentStatus {
-  COMPLETED,
-  PARTIAL,
+public enum ToolStatus {
+  OK,
+  NOT_FOUND,
   DENIED,
-  FAILED,
-  INVALID_REQUEST
+  INVALID_REQUEST,
+  TOO_BUSY,
+  ERROR
 }
 
-===== FILE: fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentStepStatus.java =====
-package org.pronzato.fabric.api.agents;
+org.pronzato.fabric.api.tools.manager
 
-public enum AgentStepStatus {
-  COMPLETED,
-  SKIPPED,
-  FAILED
-}
+===== FILE: fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/manager/ToolGatewayServiceImpl.java =====
+package org.pronzato.fabric.api.tools.manager;
 
-
-===== FILE: fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentToolCall.java =====
-package org.pronzato.fabric.api.agents;
-
-import org.pronzato.fabric.api.tools.ToolStatus;
-
-public record AgentToolCall(
-    int sequence,
-    String toolName,
-    String toolRequestId,
-    String assetId,
-    String datasetId,
-    ToolStatus status,
-    String message,
-    long durationMs) {
-
-  public AgentToolCall {
-    sequence = Math.max(1, sequence);
-    toolName = normalize(toolName);
-    toolRequestId = normalize(toolRequestId);
-    assetId = normalize(assetId);
-    datasetId = normalize(datasetId);
-    status = status == null ? ToolStatus.ERROR : status;
-    message = normalize(message);
-    durationMs = Math.max(0L, durationMs);
-  }
-
-  private static String normalize(String value) {
-    if (value == null) {
-      return null;
-    }
-    String trimmed = value.trim();
-    return trimmed.isEmpty() ? null : trimmed;
-  }
-}
-
-
-org.pronzato.fabric.api.agents.manager
-
-===== FILE: fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/manager/AgentManagerImpl.java =====
-package org.pronzato.fabric.api.agents.manager;
-
-import java.time.Instant;
+import java.math.BigDecimal;
+import java.time.Duration;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.ZonedDateTime;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
-import org.pronzato.fabric.api.agents.AgentAnswer;
-import org.pronzato.fabric.api.agents.AgentExecutionTrace;
-import org.pronzato.fabric.api.agents.AgentLimits;
-import org.pronzato.fabric.api.agents.AgentManager;
-import org.pronzato.fabric.api.agents.AgentReasonerMode;
-import org.pronzato.fabric.api.agents.AgentRequest;
-import org.pronzato.fabric.api.agents.AgentResponse;
-import org.pronzato.fabric.api.agents.AgentStatus;
-import org.pronzato.fabric.api.agents.reasoner.AgentReasoner;
-import org.pronzato.fabric.api.agents.reasoner.AgentReasonerRequest;
-import org.pronzato.fabric.api.agents.reasoner.AgentReasonerResult;
-import org.pronzato.fabric.api.agents.reasoner.DeterministicAgentReasoner;
-import org.pronzato.fabric.api.agents.reasoner.ScriptedAgentReasoner;
-import org.pronzato.fabric.api.agents.reasoner.UnsupportedModelBackedAgentReasoner;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.Supplier;
+import org.pronzato.fabric.api.catalog.CatalogManager.CatalogAccessContext;
+import org.pronzato.fabric.api.catalog.CatalogManager;
+import org.pronzato.fabric.api.catalog.CatalogManager.CatalogDetails;
+import org.pronzato.fabric.api.catalog.CatalogManager.CatalogRelationshipView;
+import org.pronzato.fabric.api.catalog.CatalogManager.CatalogSearchQuery;
+import org.pronzato.fabric.api.catalog.CatalogManager.CatalogSearchResult;
+import org.pronzato.fabric.api.catalog.CatalogManager.CatalogSummary;
+import org.pronzato.fabric.api.control.discovery.definitions.Definition;
+import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
+import org.pronzato.fabric.api.control.discovery.definitions.common.Semantic;
+import org.pronzato.fabric.api.control.discovery.lifecycle.AssetLifecycleGraph;
+import org.pronzato.fabric.api.control.discovery.lifecycle.AssetLifecycleGraphBuilder;
+import org.pronzato.fabric.api.control.discovery.lifecycle.RelationshipType;
+import org.pronzato.fabric.api.data.RowManager;
+import org.pronzato.fabric.api.data.RowResult;
+import org.pronzato.fabric.api.data.dataset.DatasetId;
+import org.pronzato.fabric.api.tools.GetAssetRequest;
+import org.pronzato.fabric.api.tools.GetAssetResponse;
+import org.pronzato.fabric.api.tools.GetRelatedAssetsRequest;
+import org.pronzato.fabric.api.tools.GetRelatedAssetsResponse;
+import org.pronzato.fabric.api.tools.QueryDatasetColumn;
+import org.pronzato.fabric.api.tools.QueryDatasetRequest;
+import org.pronzato.fabric.api.tools.QueryDatasetResponse;
+import org.pronzato.fabric.api.tools.SearchAssetsRequest;
+import org.pronzato.fabric.api.tools.SearchAssetsResponse;
 import org.pronzato.fabric.api.tools.ToolGatewayService;
+import org.pronzato.fabric.api.tools.ToolStatus;
 import org.pronzato.fabric.api.util.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public final class AgentManagerImpl implements AgentManager {
-  private static final Logger LOGGER = LoggerFactory.getLogger(AgentManagerImpl.class);
+public final class ToolGatewayServiceImpl implements ToolGatewayService {
+  private static final Logger LOGGER = LoggerFactory.getLogger(ToolGatewayServiceImpl.class);
 
-  private static final Set<String> FORBIDDEN_INTENT_TOKENS =
+  private static final int DEFAULT_MAX_SEARCH_LIMIT = 200;
+  private static final int DEFAULT_MAX_QUERY_LIMIT = 1000;
+  private static final int DEFAULT_QUERY_LIMIT = 200;
+  private static final Duration DEFAULT_MAX_QUERY_TIMEOUT = Duration.ofSeconds(10);
+  private static final Duration DEFAULT_QUERY_TIMEOUT = Duration.ofSeconds(10);
+  private static final int DEFAULT_MAX_CONCURRENT_QUERIES = 4;
+
+  private static final Set<String> FORBIDDEN_FILTER_KEYWORDS =
       Set.of(
-          "write",
-          "update",
           "insert",
+          "update",
           "delete",
-          "remove",
+          "merge",
+          "create",
+          "alter",
           "drop",
           "truncate",
-          "alter",
-          "create",
           "grant",
           "revoke",
-          "promote",
-          "deploy",
-          "execute");
+          "call",
+          "copy",
+          "attach",
+          "detach");
 
-  private final ToolGatewayService toolGatewayService;
+  private final CatalogManager catalogService;
+  private final Supplier<List<Definition>> definitionsSupplier;
+  private final Supplier<RowManager> rowManagerSupplier;
   private final String defaultSubject;
   private final String defaultDelegatedSubject;
   private final String defaultLane;
-  private final AgentLimits defaultLimits;
-  private final AgentReasoner deterministicReasoner;
-  private final AgentReasoner scriptedReasoner;
-  private final AgentReasoner modelReasoner;
+  private final int maxSearchLimit;
+  private final int maxQueryLimit;
+  private final Duration maxQueryTimeout;
+  private final int maxRelatedDepth;
+  private final Semaphore queryPermits;
+  private final ExecutorService queryExecutor;
 
-  public AgentManagerImpl(
-      ToolGatewayService toolGatewayService,
+  public ToolGatewayServiceImpl(
+      CatalogManager catalogService,
+      Supplier<List<Definition>> definitionsSupplier,
+      Supplier<RowManager> rowManagerSupplier,
       String defaultSubject,
       String defaultDelegatedSubject,
       String defaultLane) {
     this(
-        toolGatewayService,
+        catalogService,
+        definitionsSupplier,
+        rowManagerSupplier,
         defaultSubject,
         defaultDelegatedSubject,
         defaultLane,
-        AgentLimits.defaults());
+        DEFAULT_MAX_SEARCH_LIMIT,
+        DEFAULT_MAX_QUERY_LIMIT,
+        DEFAULT_MAX_QUERY_TIMEOUT,
+        GetRelatedAssetsRequest.MAX_DEPTH,
+        DEFAULT_MAX_CONCURRENT_QUERIES);
   }
 
-  public AgentManagerImpl(
-      ToolGatewayService toolGatewayService,
+  public ToolGatewayServiceImpl(
+      CatalogManager catalogService,
+      Supplier<List<Definition>> definitionsSupplier,
+      String defaultSubject,
+      String defaultDelegatedSubject,
+      String defaultLane) {
+    this(
+        catalogService,
+        definitionsSupplier,
+        () -> null,
+        defaultSubject,
+        defaultDelegatedSubject,
+        defaultLane);
+  }
+
+  public ToolGatewayServiceImpl(
+      CatalogManager catalogService,
+      Supplier<List<Definition>> definitionsSupplier,
+      Supplier<RowManager> rowManagerSupplier,
       String defaultSubject,
       String defaultDelegatedSubject,
       String defaultLane,
-      AgentLimits defaultLimits) {
-    this.toolGatewayService = Objects.requireNonNull(toolGatewayService, "toolGatewayService");
+      Integer maxSearchLimit,
+      Integer maxQueryLimit,
+      Duration maxQueryTimeout,
+      Integer maxRelatedDepth,
+      Integer maxConcurrentQueries) {
+    this.catalogService = Objects.requireNonNull(catalogService, "catalogService");
+    this.definitionsSupplier = definitionsSupplier == null ? List::of : definitionsSupplier;
+    this.rowManagerSupplier = rowManagerSupplier == null ? () -> null : rowManagerSupplier;
     this.defaultSubject = normalize(defaultSubject);
     this.defaultDelegatedSubject = normalize(defaultDelegatedSubject);
     this.defaultLane = normalize(defaultLane);
-    this.defaultLimits = defaultLimits == null ? AgentLimits.defaults() : defaultLimits;
-    this.deterministicReasoner = new DeterministicAgentReasoner(toolGatewayService);
-    this.scriptedReasoner = new ScriptedAgentReasoner(toolGatewayService);
-    this.modelReasoner = new UnsupportedModelBackedAgentReasoner();
+    this.maxSearchLimit = normalizePositive(maxSearchLimit, DEFAULT_MAX_SEARCH_LIMIT);
+    this.maxQueryLimit = normalizePositive(maxQueryLimit, DEFAULT_MAX_QUERY_LIMIT);
+    this.maxQueryTimeout =
+        maxQueryTimeout == null || maxQueryTimeout.isNegative() || maxQueryTimeout.isZero()
+            ? DEFAULT_MAX_QUERY_TIMEOUT
+            : maxQueryTimeout;
+    this.maxRelatedDepth = normalizePositive(maxRelatedDepth, GetRelatedAssetsRequest.MAX_DEPTH);
+    int concurrency = normalizePositive(maxConcurrentQueries, DEFAULT_MAX_CONCURRENT_QUERIES);
+    this.queryPermits = new Semaphore(concurrency, true);
+    this.queryExecutor =
+        Executors.newCachedThreadPool(
+            runnable -> {
+              Thread thread = new Thread(runnable, "fabric-tool-gateway-query");
+              thread.setDaemon(true);
+              return thread;
+            });
   }
 
   @Override
-  public AgentResponse execute(AgentRequest request) {
-    AgentRequest resolved = request == null ? AgentRequest.defaults() : request;
-    String requestId = Strings.firstNonBlank(normalize(resolved.requestId()), "agent-" + UUID.randomUUID());
-    String prompt = normalize(resolved.prompt());
-    String subject = Strings.firstNonBlank(normalize(resolved.subject()), defaultSubject, "app:agent/system");
-    String delegatedSubject =
-        Strings.firstNonBlank(normalize(resolved.delegatedSubject()), defaultDelegatedSubject);
-    String lane = Strings.firstNonBlank(normalize(resolved.lane()), defaultLane, "dev");
-    AgentLimits limits = defaultLimits.merge(resolved.limits());
-    String scenarioId = normalize(resolved.scenarioId());
-    AgentReasonerMode selectedMode = selectMode(resolved.reasonerMode(), scenarioId);
-    String startedAt = Instant.now().toString();
-    long startedMs = System.currentTimeMillis();
-
-    LOGGER.info(
-        "[AgentRuntime] requestId={} subject={} lane={} mode={} scenario={} prompt={}",
-        requestId,
-        subject,
-        lane,
-        selectedMode,
-        Strings.firstNonBlank(scenarioId, "<none>"),
-        Strings.firstNonBlank(prompt, "<none>"));
-
-    if (prompt == null) {
-      return buildResponse(
-          requestId,
-          prompt,
-          selectedMode,
-          scenarioId,
-          startedAt,
-          startedMs,
-          subject,
-          lane,
-          limits,
-          new AgentReasonerResult(
-              AgentStatus.INVALID_REQUEST,
-              "invalid_request",
-              "Prompt is required for agent execution.",
-              List.of(),
-              List.of(),
-              List.of(),
-              List.of(),
-              List.of("prompt is required"),
-              List.of(),
-              List.of(),
-              List.of(),
-              List.of(),
-              List.of("validate_prompt=failed"),
-              List.of(),
-              List.of()));
-    }
-    if (containsForbiddenIntent(prompt)) {
-      return buildResponse(
-          requestId,
-          prompt,
-          selectedMode,
-          scenarioId,
-          startedAt,
-          startedMs,
-          subject,
-          lane,
-          limits,
-          new AgentReasonerResult(
-              AgentStatus.INVALID_REQUEST,
-              "write_intent_rejected",
-              "Read-only agent runtime rejected the request because it appears to require mutating actions.",
-              List.of(),
-              List.of(),
-              List.of("allowed_tools=search_assets,get_asset,get_related_assets,query_dataset"),
-              List.of(),
-              List.of(
-                  "Agent runtime v1 is read-only and does not support write/delete/promotion actions."),
-              List.of(),
-              List.of(),
-              List.of(),
-              List.of(),
-              List.of("validate_read_only=failed"),
-              List.of(),
-              List.of()));
-    }
-
-    AgentReasonerResult reasonerResult;
+  public SearchAssetsResponse searchAssets(SearchAssetsRequest request) {
+    SearchAssetsRequest resolved = request == null ? SearchAssetsRequest.defaults() : request;
+    String requestId = requestId(resolved.requestId());
+    CatalogAccessContext accessContext =
+        accessContext(
+            resolved.subject(),
+            resolved.delegatedSubject(),
+            resolved.lane(),
+            resolved.seedAssetId());
+    int boundedLimit =
+        Math.max(
+            1,
+            Math.min(
+                Math.min(maxSearchLimit, CatalogSearchQuery.MAX_LIMIT),
+                resolved.limit() == null ? CatalogSearchQuery.DEFAULT_LIMIT : resolved.limit()));
     try {
-      AgentReasoner reasoner = selectReasoner(selectedMode);
-      AgentReasonerRequest reasonerRequest =
-          new AgentReasonerRequest(
-              requestId,
-              prompt,
-              normalize(resolved.seedAssetId()),
-              normalize(resolved.datasetId()),
-              normalize(resolved.datasetQuery()),
-              subject,
-              delegatedSubject,
-              lane,
-              limits,
-              selectedMode,
-              scenarioId);
-      reasonerResult = reasoner.execute(reasonerRequest);
+      CatalogSearchQuery query =
+          new CatalogSearchQuery(
+              resolved.query(),
+              resolved.type(),
+              resolved.domain(),
+              resolved.tags(),
+              resolved.owner(),
+              resolved.trust(),
+              resolved.freshness(),
+              boundedLimit,
+              resolved.seedAssetId());
+      CatalogSearchResult result = catalogService.search(query, accessContext);
+      logInvocation(
+          "search_assets",
+          requestId,
+          accessContext.subject(),
+          null,
+          ToolStatus.OK,
+          "returned=" + result.results().size());
+      return new SearchAssetsResponse(
+          requestId,
+          ToolStatus.OK,
+          null,
+          result.results(),
+          result.facets(),
+          result.totalCount());
     } catch (RuntimeException ex) {
-      reasonerResult =
-          new AgentReasonerResult(
-              AgentStatus.FAILED,
-              "reasoner_exception",
-              "Agent reasoner failed: " + ex.getMessage(),
-              List.of(),
-              List.of(),
-              List.of(),
-              List.of("reasoner_failure"),
-              List.of("Agent reasoner failed: " + ex.getMessage()),
-              List.of(),
-              List.of(),
-              List.of(),
-              List.of(),
-              List.of("reasoner_execution=failed"),
-              List.of(),
-              List.of());
+      logInvocation(
+          "search_assets",
+          requestId,
+          accessContext.subject(),
+          null,
+          ToolStatus.ERROR,
+          ex.getMessage());
+      return new SearchAssetsResponse(
+          requestId, ToolStatus.ERROR, "Search failed: " + ex.getMessage(), List.of(), null, 0);
     }
-
-    return buildResponse(
-        requestId,
-        prompt,
-        selectedMode,
-        scenarioId,
-        startedAt,
-        startedMs,
-        subject,
-        lane,
-        limits,
-        reasonerResult);
   }
 
-  private static AgentResponse buildResponse(
-      String requestId,
-      String prompt,
-      AgentReasonerMode selectedMode,
-      String scenarioId,
-      String startedAt,
-      long startedMs,
-      String subject,
-      String lane,
-      AgentLimits limits,
-      AgentReasonerResult result) {
-    String finishedAt = Instant.now().toString();
-    long durationMs = Math.max(0L, System.currentTimeMillis() - startedMs);
-    AgentReasonerResult resolved =
-        result == null
-            ? new AgentReasonerResult(
-                AgentStatus.FAILED,
-                "missing_reasoner_result",
-                "Agent execution failed.",
-                List.of(),
-                List.of(),
-                List.of(),
-                List.of(),
-                List.of("Agent execution failed."),
-                List.of(),
-                List.of(),
-                List.of(),
-                List.of(),
-                List.of(),
-                List.of(),
-                List.of())
-            : result;
-
-    AgentExecutionTrace trace =
-        new AgentExecutionTrace(
+  @Override
+  public GetAssetResponse getAsset(GetAssetRequest request) {
+    String assetId = normalize(request == null ? null : request.assetId());
+    String requestId = requestId(request == null ? null : request.requestId());
+    if (assetId == null) {
+      return new GetAssetResponse(
+          requestId, ToolStatus.INVALID_REQUEST, "assetId is required", null, null);
+    }
+    CatalogAccessContext accessContext =
+        accessContext(
+            request == null ? null : request.subject(),
+            request == null ? null : request.delegatedSubject(),
+            request == null ? null : request.lane(),
+            null);
+    try {
+      Optional<CatalogDetails> details = catalogService.getAsset(assetId, accessContext);
+      if (details.isPresent()) {
+        logInvocation(
+            "get_asset",
             requestId,
-            prompt,
-            subject,
-            lane,
-            selectedMode,
-            scenarioId,
-            resolved.interpretedIntent(),
-            limits,
-            resolved.candidateAssetIds(),
-            resolved.selectedAssetIds(),
-            resolved.deniedAssetIds(),
-            resolved.filteredAssetIds(),
-            resolved.answerAssembly(),
-            startedAt,
-            finishedAt,
-            durationMs,
-            resolved.steps().size(),
-            resolved.toolCalls().size(),
-            resolved.steps(),
-            resolved.toolCalls());
-    AgentAnswer answer =
-        new AgentAnswer(
-            resolved.answerText(), resolved.usedAssets(), resolved.datasetAssets(), resolved.evidence());
-    List<String> usedAssets =
-        resolved.usedAssets() == null ? List.of() : List.copyOf(new ArrayList<>(resolved.usedAssets()));
-    List<String> warnings =
-        resolved.warnings() == null ? List.of() : List.copyOf(new ArrayList<>(resolved.warnings()));
-    List<String> errors =
-        resolved.errors() == null ? List.of() : List.copyOf(new ArrayList<>(resolved.errors()));
-    AgentStatus status = resolved.status() == null ? AgentStatus.FAILED : resolved.status();
-    LOGGER.info(
-        "[AgentRuntime] requestId={} subject={} lane={} mode={} scenario={} status={} steps={} toolCalls={} warnings={} errors={} durationMs={}",
-        requestId,
-        subject,
-        lane,
-        selectedMode,
-        Strings.firstNonBlank(scenarioId, "<none>"),
-        status,
-        trace.stepCount(),
-        trace.toolCallCount(),
-        warnings.size(),
-        errors.size(),
-        durationMs);
-    return new AgentResponse(requestId, status, answer, usedAssets, warnings, errors, trace);
+            accessContext.subject(),
+            assetId,
+            ToolStatus.OK,
+            "found=true");
+        return new GetAssetResponse(requestId, ToolStatus.OK, null, assetId, details.get());
+      }
+      ToolStatus status = assetExists(assetId) ? ToolStatus.DENIED : ToolStatus.NOT_FOUND;
+      String message =
+          status == ToolStatus.DENIED
+              ? "Access denied for asset: " + assetId
+              : "Asset not found: " + assetId;
+      logInvocation("get_asset", requestId, accessContext.subject(), assetId, status, message);
+      return new GetAssetResponse(requestId, status, message, assetId, null);
+    } catch (RuntimeException ex) {
+      logInvocation(
+          "get_asset",
+          requestId,
+          accessContext.subject(),
+          assetId,
+          ToolStatus.ERROR,
+          ex.getMessage());
+      return new GetAssetResponse(
+          requestId, ToolStatus.ERROR, "Get asset failed: " + ex.getMessage(), assetId, null);
+    }
   }
 
-  private AgentReasoner selectReasoner(AgentReasonerMode mode) {
-    if (mode == AgentReasonerMode.SCRIPTED) {
-      return scriptedReasoner;
+  @Override
+  public GetRelatedAssetsResponse getRelatedAssets(GetRelatedAssetsRequest request) {
+    String assetId = normalize(request == null ? null : request.assetId());
+    String requestId = requestId(request == null ? null : request.requestId());
+    if (assetId == null) {
+      return new GetRelatedAssetsResponse(
+          requestId,
+          ToolStatus.INVALID_REQUEST,
+          "assetId is required",
+          null,
+          GetRelatedAssetsRequest.DEFAULT_DEPTH,
+          Map.of(),
+          0);
     }
-    if (mode == AgentReasonerMode.MODEL) {
-      return modelReasoner;
+    int depth =
+        Math.max(
+            1,
+            Math.min(
+                maxRelatedDepth,
+                request == null || request.depth() == null
+                    ? GetRelatedAssetsRequest.DEFAULT_DEPTH
+                    : request.depth()));
+    RelationshipType filterType = request == null ? null : request.relationshipType();
+    CatalogAccessContext accessContext =
+        accessContext(
+            request == null ? null : request.subject(),
+            request == null ? null : request.delegatedSubject(),
+            request == null ? null : request.lane(),
+            assetId);
+    try {
+      Optional<CatalogDetails> root = catalogService.getAsset(assetId, accessContext);
+      if (root.isEmpty()) {
+        ToolStatus status = assetExists(assetId) ? ToolStatus.DENIED : ToolStatus.NOT_FOUND;
+        String message =
+            status == ToolStatus.DENIED
+                ? "Access denied for asset: " + assetId
+                : "Asset not found: " + assetId;
+        logInvocation("get_related_assets", requestId, accessContext.subject(), assetId, status, message);
+        return new GetRelatedAssetsResponse(requestId, status, message, assetId, depth, Map.of(), 0);
+      }
+
+      Map<RelationshipType, List<CatalogRelationshipView>> relationships =
+          collectRelated(assetId, accessContext, depth, filterType);
+      int relationshipCount = countRelationships(relationships);
+      logInvocation(
+          "get_related_assets",
+          requestId,
+          accessContext.subject(),
+          assetId,
+          ToolStatus.OK,
+          "relationships=" + relationshipCount);
+      return new GetRelatedAssetsResponse(
+          requestId, ToolStatus.OK, null, assetId, depth, relationships, relationshipCount);
+    } catch (RuntimeException ex) {
+      logInvocation(
+          "get_related_assets",
+          requestId,
+          accessContext.subject(),
+          assetId,
+          ToolStatus.ERROR,
+          ex.getMessage());
+      return new GetRelatedAssetsResponse(
+          requestId,
+          ToolStatus.ERROR,
+          "Get related assets failed: " + ex.getMessage(),
+          assetId,
+          depth,
+          Map.of(),
+          0);
     }
-    return deterministicReasoner;
   }
 
-  private static AgentReasonerMode selectMode(AgentReasonerMode requestedMode, String scenarioId) {
-    AgentReasonerMode mode = requestedMode == null ? AgentReasonerMode.AUTO : requestedMode;
-    if (mode == AgentReasonerMode.AUTO) {
-      return scenarioId == null ? AgentReasonerMode.DETERMINISTIC : AgentReasonerMode.SCRIPTED;
+  @Override
+  public QueryDatasetResponse queryDataset(QueryDatasetRequest request) {
+    String requestId = requestId(request == null ? null : request.requestId());
+    String datasetInput = normalize(request == null ? null : request.datasetId());
+    if (datasetInput == null) {
+      return new QueryDatasetResponse(
+          requestId,
+          ToolStatus.INVALID_REQUEST,
+          "datasetId is required",
+          null,
+          0,
+          null,
+          List.of(),
+          List.of(),
+          0,
+          false);
     }
-    return mode;
+    CatalogAccessContext accessContext =
+        accessContext(
+            request == null ? null : request.subject(),
+            request == null ? null : request.delegatedSubject(),
+            request == null ? null : request.lane(),
+            datasetInput);
+    String canonicalDatasetId;
+    try {
+      canonicalDatasetId = DatasetId.parse(datasetInput).toString();
+    } catch (RuntimeException ex) {
+      return new QueryDatasetResponse(
+          requestId,
+          ToolStatus.INVALID_REQUEST,
+          "Invalid dataset id: " + datasetInput,
+          datasetInput,
+          0,
+          null,
+          List.of(),
+          List.of(),
+          0,
+          false);
+    }
+    Optional<CatalogDetails> assetDetails = catalogService.getAsset(canonicalDatasetId, accessContext);
+    if (assetDetails.isEmpty()) {
+      ToolStatus status = assetExists(canonicalDatasetId) ? ToolStatus.DENIED : ToolStatus.NOT_FOUND;
+      String message =
+          status == ToolStatus.DENIED
+              ? "Access denied for dataset: " + canonicalDatasetId
+              : "Dataset not found: " + canonicalDatasetId;
+      logInvocation("query_dataset", requestId, accessContext.subject(), canonicalDatasetId, status, message);
+      return new QueryDatasetResponse(
+          requestId, status, message, canonicalDatasetId, 0, null, List.of(), List.of(), 0, false);
+    }
+
+    CatalogDetails details = assetDetails.get();
+    CatalogSummary summary = details.summary();
+    if (summary == null || summary.type() != DefinitionType.DATASET) {
+      return new QueryDatasetResponse(
+          requestId,
+          ToolStatus.INVALID_REQUEST,
+          "Asset is not a dataset: " + canonicalDatasetId,
+          canonicalDatasetId,
+          0,
+          null,
+          List.of(),
+          List.of(),
+          0,
+          false);
+    }
+    if (!isReadToolAllowed(details.toolHints())) {
+      String message = "Tool action class is not read-safe for dataset: " + canonicalDatasetId;
+      logInvocation("query_dataset", requestId, accessContext.subject(), canonicalDatasetId, ToolStatus.DENIED, message);
+      return new QueryDatasetResponse(
+          requestId,
+          ToolStatus.DENIED,
+          message,
+          canonicalDatasetId,
+          0,
+          null,
+          List.of(),
+          List.of(),
+          0,
+          false);
+    }
+
+    int hintLimit =
+        Math.max(
+            1,
+            Math.min(
+                maxQueryLimit,
+                details.toolHints() == null
+                    ? DEFAULT_QUERY_LIMIT
+                    : Math.max(1, details.toolHints().safeDefaultLimit())));
+    int appliedLimit =
+        Math.max(
+            1,
+            Math.min(
+                Math.min(hintLimit, maxQueryLimit),
+                request == null || request.limit() == null ? hintLimit : request.limit()));
+    Duration hintTimeout =
+        minDuration(
+            parseDuration(
+                details.toolHints() == null ? null : details.toolHints().safeDefaultTimeout(),
+                DEFAULT_QUERY_TIMEOUT),
+            maxQueryTimeout);
+    Duration requestedTimeout = request == null ? null : request.timeout();
+    Duration appliedTimeout =
+        requestedTimeout == null || requestedTimeout.isZero() || requestedTimeout.isNegative()
+            ? hintTimeout
+            : minDuration(requestedTimeout, hintTimeout);
+    if (appliedTimeout == null || appliedTimeout.isZero() || appliedTimeout.isNegative()) {
+      appliedTimeout = DEFAULT_QUERY_TIMEOUT;
+    }
+
+    String filter;
+    try {
+      filter = validateFilter(request == null ? null : request.query());
+    } catch (IllegalArgumentException ex) {
+      return new QueryDatasetResponse(
+          requestId,
+          ToolStatus.INVALID_REQUEST,
+          ex.getMessage(),
+          canonicalDatasetId,
+          appliedLimit,
+          appliedTimeout.toString(),
+          List.of(),
+          List.of(),
+          0,
+          false);
+    }
+
+    if (!queryPermits.tryAcquire()) {
+      String message = "Tool query concurrency limit reached";
+      logInvocation("query_dataset", requestId, accessContext.subject(), canonicalDatasetId, ToolStatus.TOO_BUSY, message);
+      return new QueryDatasetResponse(
+          requestId,
+          ToolStatus.TOO_BUSY,
+          message,
+          canonicalDatasetId,
+          appliedLimit,
+          appliedTimeout.toString(),
+          List.of(),
+          List.of(),
+          0,
+          false);
+    }
+
+    try {
+      RowManager rowManager = rowManagerSupplier.get();
+      if (rowManager == null) {
+        String message = "No runtime data plane available for query_dataset";
+        logInvocation("query_dataset", requestId, accessContext.subject(), canonicalDatasetId, ToolStatus.ERROR, message);
+        return new QueryDatasetResponse(
+            requestId,
+            ToolStatus.ERROR,
+            message,
+            canonicalDatasetId,
+            appliedLimit,
+            appliedTimeout.toString(),
+            List.of(),
+            List.of(),
+            0,
+            false);
+      }
+      DatasetId datasetId = DatasetId.parse(canonicalDatasetId);
+      String sql = buildDatasetPreviewSql(datasetId, filter, appliedLimit);
+      RowResult result =
+          runWithTimeout(
+              () -> rowManager.querySql(sql),
+              appliedTimeout);
+      List<List<Object>> rows = result == null ? List.of() : result.rows();
+      List<String> columns = result == null ? List.of() : result.columns();
+      List<QueryDatasetColumn> schema = inferSchema(columns, rows);
+      int rowCount = rows == null ? 0 : rows.size();
+      boolean truncated = rowCount >= appliedLimit;
+      logInvocation(
+          "query_dataset",
+          requestId,
+          accessContext.subject(),
+          canonicalDatasetId,
+          ToolStatus.OK,
+          "rows=" + rowCount + " truncated=" + truncated);
+      return new QueryDatasetResponse(
+          requestId,
+          ToolStatus.OK,
+          null,
+          canonicalDatasetId,
+          appliedLimit,
+          appliedTimeout.toString(),
+          schema,
+          rows,
+          rowCount,
+          truncated);
+    } catch (TimeoutException ex) {
+      String message = "query_dataset timeout after " + appliedTimeout;
+      logInvocation("query_dataset", requestId, accessContext.subject(), canonicalDatasetId, ToolStatus.ERROR, message);
+      return new QueryDatasetResponse(
+          requestId,
+          ToolStatus.ERROR,
+          message,
+          canonicalDatasetId,
+          appliedLimit,
+          appliedTimeout.toString(),
+          List.of(),
+          List.of(),
+          0,
+          false);
+    } catch (RuntimeException ex) {
+      logInvocation(
+          "query_dataset",
+          requestId,
+          accessContext.subject(),
+          canonicalDatasetId,
+          ToolStatus.ERROR,
+          ex.getMessage());
+      return new QueryDatasetResponse(
+          requestId,
+          ToolStatus.ERROR,
+          "query_dataset failed: " + ex.getMessage(),
+          canonicalDatasetId,
+          appliedLimit,
+          appliedTimeout.toString(),
+          List.of(),
+          List.of(),
+          0,
+          false);
+    } finally {
+      queryPermits.release();
+    }
   }
 
-  private static boolean containsForbiddenIntent(String prompt) {
-    String normalized = normalize(prompt);
-    if (normalized == null) {
-      return false;
-    }
-    String lower = normalized.toLowerCase(Locale.ROOT);
-    for (String token : FORBIDDEN_INTENT_TOKENS) {
-      if (containsToken(lower, token)) {
-        return true;
+  @Override
+  public void close() {
+    queryExecutor.shutdownNow();
+  }
+
+  private Map<RelationshipType, List<CatalogRelationshipView>> collectRelated(
+      String rootAssetId,
+      CatalogAccessContext accessContext,
+      int depth,
+      RelationshipType filterType) {
+    LinkedHashMap<RelationshipType, List<CatalogRelationshipView>> aggregate = new LinkedHashMap<>();
+    Set<String> seenEdges = new LinkedHashSet<>();
+    Set<String> visitedAssets = new LinkedHashSet<>();
+    ArrayDeque<TraversalNode> queue = new ArrayDeque<>();
+    queue.add(new TraversalNode(rootAssetId, 0));
+    visitedAssets.add(rootAssetId);
+
+    while (!queue.isEmpty()) {
+      TraversalNode current = queue.removeFirst();
+      if (current.depth() >= depth) {
+        continue;
+      }
+      Map<RelationshipType, List<CatalogRelationshipView>> relatedByType =
+          catalogService.getRelatedAssets(current.assetId(), accessContext);
+      for (Map.Entry<RelationshipType, List<CatalogRelationshipView>> entry : relatedByType.entrySet()) {
+        if (filterType != null && filterType != entry.getKey()) {
+          continue;
+        }
+        List<CatalogRelationshipView> relationships =
+            entry.getValue() == null ? List.of() : entry.getValue();
+        for (CatalogRelationshipView relationship : relationships) {
+          if (relationship == null) {
+            continue;
+          }
+          String edgeKey = edgeKey(relationship);
+          if (!seenEdges.add(edgeKey)) {
+            continue;
+          }
+          aggregate.computeIfAbsent(entry.getKey(), ignored -> new ArrayList<>()).add(relationship);
+          String nextAssetId = resolveNextAssetId(current.assetId(), relationship);
+          if (nextAssetId != null && visitedAssets.add(nextAssetId)) {
+            queue.addLast(new TraversalNode(nextAssetId, current.depth() + 1));
+          }
+        }
       }
     }
-    return false;
+
+    for (List<CatalogRelationshipView> relationships : aggregate.values()) {
+      relationships.sort(
+          Comparator.comparing(CatalogRelationshipView::fromAssetId)
+              .thenComparing(CatalogRelationshipView::toAssetId)
+              .thenComparing(view -> view.relationshipType().name()));
+    }
+    return Map.copyOf(aggregate);
+  }
+
+  private static int countRelationships(Map<RelationshipType, List<CatalogRelationshipView>> relationshipsByType) {
+    int total = 0;
+    if (relationshipsByType == null || relationshipsByType.isEmpty()) {
+      return total;
+    }
+    for (List<CatalogRelationshipView> values : relationshipsByType.values()) {
+      total += values == null ? 0 : values.size();
+    }
+    return total;
+  }
+
+  private String validateFilter(String query) {
+    String normalized = normalize(query);
+    if (normalized == null) {
+      return null;
+    }
+    if (normalized.contains(";")) {
+      throw new IllegalArgumentException("query must be a single read-only filter expression");
+    }
+    String lower = normalized.toLowerCase(Locale.ROOT);
+    if (lower.startsWith("select") || lower.startsWith("with")) {
+      throw new IllegalArgumentException(
+          "query_dataset expects a filter expression, not a full SQL statement");
+    }
+    for (String forbidden : FORBIDDEN_FILTER_KEYWORDS) {
+      if (containsToken(lower, forbidden)) {
+        throw new IllegalArgumentException("query contains forbidden keyword: " + forbidden);
+      }
+    }
+    return normalized;
+  }
+
+  private static String buildDatasetPreviewSql(DatasetId datasetId, String filter, int limit) {
+    StringBuilder sql = new StringBuilder("select * from ").append(sqlToken(datasetId));
+    String normalizedFilter = normalize(filter);
+    if (normalizedFilter != null) {
+      sql.append(" where ").append(normalizedFilter);
+    }
+    sql.append(" limit ").append(limit);
+    return sql.toString();
+  }
+
+  private static String sqlToken(DatasetId datasetId) {
+    Objects.requireNonNull(datasetId, "datasetId");
+    return quoteIdentifier(datasetId.namespace()) + "." + quoteIdentifier(datasetId.name());
+  }
+
+  private static String quoteIdentifier(String identifier) {
+    return "\"" + identifier.replace("\"", "\"\"") + "\"";
   }
 
   private static boolean containsToken(String text, String token) {
@@ -839,315 +1176,162 @@ public final class AgentManagerImpl implements AgentManager {
     return false;
   }
 
-  private static String normalize(String value) {
-    if (value == null) {
-      return null;
-    }
-    String trimmed = value.trim();
-    return trimmed.isEmpty() ? null : trimmed;
-  }
-}
-
-org.pronzato.fabric.api.agents.reasoner
-
-===== FILE: fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/reasoner/AgentReasoner.java =====
-package org.pronzato.fabric.api.agents.reasoner;
-
-import org.pronzato.fabric.api.agents.AgentReasonerMode;
-
-public interface AgentReasoner {
-
-  AgentReasonerMode mode();
-
-  AgentReasonerResult execute(AgentReasonerRequest request);
-}
-
-===== FILE: fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/reasoner/AgentReasonerRequest.java =====
-package org.pronzato.fabric.api.agents.reasoner;
-
-import org.pronzato.fabric.api.agents.AgentLimits;
-import org.pronzato.fabric.api.agents.AgentReasonerMode;
-
-public record AgentReasonerRequest(
-    String requestId,
-    String prompt,
-    String seedAssetId,
-    String datasetId,
-    String datasetQuery,
-    String subject,
-    String delegatedSubject,
-    String lane,
-    AgentLimits limits,
-    AgentReasonerMode mode,
-    String scenarioId) {
-
-  public AgentReasonerRequest {
-    requestId = normalize(requestId);
-    prompt = normalize(prompt);
-    seedAssetId = normalize(seedAssetId);
-    datasetId = normalize(datasetId);
-    datasetQuery = normalize(datasetQuery);
-    subject = normalize(subject);
-    delegatedSubject = normalize(delegatedSubject);
-    lane = normalize(lane);
-    limits = limits == null ? AgentLimits.defaults() : limits;
-    mode = mode == null ? AgentReasonerMode.AUTO : mode;
-    scenarioId = normalize(scenarioId);
+  private boolean isReadToolAllowed(Semantic.ToolHints hints) {
+    Semantic.ToolHints resolved =
+        hints == null ? new Semantic.ToolHints(null, null, null, null, null, null) : hints;
+    Semantic.ActionClass actionClass = resolved.actionClass();
+    boolean allowedAction =
+        actionClass == Semantic.ActionClass.READ || actionClass == Semantic.ActionClass.ANALYZE;
+    boolean readOnly = Boolean.TRUE.equals(resolved.readOnly());
+    boolean idempotent = Boolean.TRUE.equals(resolved.idempotent());
+    return allowedAction && readOnly && idempotent;
   }
 
-  private static String normalize(String value) {
-    if (value == null) {
-      return null;
-    }
-    String trimmed = value.trim();
-    return trimmed.isEmpty() ? null : trimmed;
-  }
-}
-
-===== FILE: fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/reasoner/AgentReasonerResult.java =====
-package org.pronzato.fabric.api.agents.reasoner;
-
-import java.util.ArrayList;
-import java.util.List;
-import org.pronzato.fabric.api.agents.AgentPlanStep;
-import org.pronzato.fabric.api.agents.AgentStatus;
-import org.pronzato.fabric.api.agents.AgentToolCall;
-
-public record AgentReasonerResult(
-    AgentStatus status,
-    String interpretedIntent,
-    String answerText,
-    List<String> usedAssets,
-    List<String> datasetAssets,
-    List<String> evidence,
-    List<String> warnings,
-    List<String> errors,
-    List<String> candidateAssetIds,
-    List<String> selectedAssetIds,
-    List<String> deniedAssetIds,
-    List<String> filteredAssetIds,
-    List<String> answerAssembly,
-    List<AgentPlanStep> steps,
-    List<AgentToolCall> toolCalls) {
-
-  public AgentReasonerResult {
-    status = status == null ? AgentStatus.FAILED : status;
-    interpretedIntent = normalize(interpretedIntent);
-    answerText = normalizeText(answerText);
-    usedAssets = normalizeList(usedAssets);
-    datasetAssets = normalizeList(datasetAssets);
-    evidence = normalizeList(evidence);
-    warnings = normalizeList(warnings);
-    errors = normalizeList(errors);
-    candidateAssetIds = normalizeList(candidateAssetIds);
-    selectedAssetIds = normalizeList(selectedAssetIds);
-    deniedAssetIds = normalizeList(deniedAssetIds);
-    filteredAssetIds = normalizeList(filteredAssetIds);
-    answerAssembly = normalizeList(answerAssembly);
-    steps = steps == null ? List.of() : List.copyOf(new ArrayList<>(steps));
-    toolCalls = toolCalls == null ? List.of() : List.copyOf(new ArrayList<>(toolCalls));
-  }
-
-  private static List<String> normalizeList(List<String> values) {
-    if (values == null || values.isEmpty()) {
+  private static List<QueryDatasetColumn> inferSchema(List<String> columns, List<List<Object>> rows) {
+    if (columns == null || columns.isEmpty()) {
       return List.of();
     }
-    List<String> copy = new ArrayList<>(values.size());
-    for (String value : values) {
-      String normalized = normalize(value);
-      if (normalized != null) {
-        copy.add(normalized);
+    List<QueryDatasetColumn> schema = new ArrayList<>(columns.size());
+    for (int index = 0; index < columns.size(); index++) {
+      String column = columns.get(index);
+      String type = inferColumnType(rows, index);
+      schema.add(new QueryDatasetColumn(column, type));
+    }
+    return List.copyOf(schema);
+  }
+
+  private static String inferColumnType(List<List<Object>> rows, int columnIndex) {
+    if (rows == null || rows.isEmpty()) {
+      return "UNKNOWN";
+    }
+    for (List<Object> row : rows) {
+      if (row == null || columnIndex < 0 || columnIndex >= row.size()) {
+        continue;
       }
-    }
-    return copy.isEmpty() ? List.of() : List.copyOf(copy);
-  }
-
-  private static String normalizeText(String value) {
-    if (value == null) {
-      return "";
-    }
-    String trimmed = value.trim();
-    return trimmed.isEmpty() ? "" : trimmed;
-  }
-
-  private static String normalize(String value) {
-    if (value == null) {
-      return null;
-    }
-    String trimmed = value.trim();
-    return trimmed.isEmpty() ? null : trimmed;
-  }
-}
-
-===== FILE: fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/reasoner/AgentReasonerSupport.java =====
-package org.pronzato.fabric.api.agents.reasoner;
-
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import org.pronzato.fabric.api.agents.AgentLimits;
-import org.pronzato.fabric.api.agents.AgentStatus;
-import org.pronzato.fabric.api.agents.AgentToolCall;
-import org.pronzato.fabric.api.catalog.CatalogManager.CatalogDetails;
-import org.pronzato.fabric.api.catalog.CatalogManager.CatalogRelationshipView;
-import org.pronzato.fabric.api.catalog.CatalogManager.CatalogSummary;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
-import org.pronzato.fabric.api.tools.QueryDatasetResponse;
-import org.pronzato.fabric.api.tools.ToolStatus;
-import org.pronzato.fabric.api.util.Strings;
-
-final class AgentReasonerSupport {
-  private AgentReasonerSupport() {}
-
-  static boolean canRunStep(int currentStepNumber, AgentLimits limits, List<String> warnings) {
-    if (currentStepNumber < limits.maxSteps()) {
-      return true;
-    }
-    warnings.add("Agent max step limit reached: " + limits.maxSteps());
-    return false;
-  }
-
-  static boolean canRunTool(List<AgentToolCall> toolCalls, AgentLimits limits, List<String> warnings) {
-    if (toolCalls.size() < limits.maxToolCalls()) {
-      return true;
-    }
-    warnings.add("Agent max tool call limit reached: " + limits.maxToolCalls());
-    return false;
-  }
-
-  static AgentStatus deriveStatus(
-      List<AgentToolCall> toolCalls,
-      List<String> warnings,
-      List<String> errors,
-      Map<String, CatalogDetails> detailsByAsset,
-      QueryDatasetResponse datasetResponse) {
-    if (!errors.isEmpty() && detailsByAsset.isEmpty() && !querySucceeded(datasetResponse)) {
-      boolean onlyDeniedOrMissing = true;
-      for (AgentToolCall toolCall : toolCalls) {
-        if (toolCall == null) {
-          continue;
-        }
-        ToolStatus status = toolCall.status();
-        if (status != ToolStatus.DENIED && status != ToolStatus.NOT_FOUND) {
-          onlyDeniedOrMissing = false;
-          break;
-        }
+      Object value = row.get(columnIndex);
+      if (value == null) {
+        continue;
       }
-      return onlyDeniedOrMissing ? AgentStatus.DENIED : AgentStatus.FAILED;
+      if (value instanceof Integer || value instanceof Short || value instanceof Byte) {
+        return "INTEGER";
+      }
+      if (value instanceof Long) {
+        return "BIGINT";
+      }
+      if (value instanceof Float || value instanceof Double || value instanceof BigDecimal) {
+        return "DECIMAL";
+      }
+      if (value instanceof Boolean) {
+        return "BOOLEAN";
+      }
+      if (value instanceof LocalDate) {
+        return "DATE";
+      }
+      if (value instanceof LocalDateTime || value instanceof OffsetDateTime || value instanceof ZonedDateTime) {
+        return "TIMESTAMP";
+      }
+      if (value instanceof byte[]) {
+        return "BINARY";
+      }
+      return "STRING";
     }
-    if (!errors.isEmpty() || !warnings.isEmpty()) {
-      return AgentStatus.PARTIAL;
-    }
-    return AgentStatus.COMPLETED;
+    return "UNKNOWN";
   }
 
-  static void recordToolIssue(
-      ToolStatus status, String message, List<String> warnings, List<String> errors) {
-    String resolved = Strings.firstNonBlank(normalize(message), "Tool call did not succeed.");
-    if (status == ToolStatus.ERROR || status == ToolStatus.INVALID_REQUEST) {
-      errors.add(resolved);
-      return;
+  private <T> T runWithTimeout(Callable<T> task, Duration timeout) throws TimeoutException {
+    Future<T> future = queryExecutor.submit(task);
+    try {
+      long timeoutMs = Math.max(1L, timeout.toMillis());
+      return future.get(timeoutMs, TimeUnit.MILLISECONDS);
+    } catch (TimeoutException ex) {
+      future.cancel(true);
+      throw ex;
+    } catch (RuntimeException ex) {
+      throw ex;
+    } catch (Exception ex) {
+      throw new IllegalStateException(ex.getMessage(), ex);
     }
-    warnings.add(resolved);
   }
 
-  static boolean querySucceeded(QueryDatasetResponse response) {
-    return response != null && response.status() == ToolStatus.OK;
+  private CatalogAccessContext accessContext(
+      String subject,
+      String delegatedSubject,
+      String lane,
+      String seedAssetId) {
+    return new CatalogAccessContext(
+        Strings.firstNonBlank(normalize(subject), defaultSubject, "app:tools/system"),
+        Strings.firstNonBlank(normalize(delegatedSubject), defaultDelegatedSubject),
+        Strings.firstNonBlank(normalize(lane), defaultLane, "dev"),
+        normalize(seedAssetId));
   }
 
-  static boolean isDataset(CatalogSummary summary, String assetId) {
-    if (summary != null && summary.type() == DefinitionType.DATASET) {
-      return true;
+  private boolean assetExists(String assetId) {
+    String normalized = normalize(assetId);
+    if (normalized == null) {
+      return false;
     }
-    return assetId != null && assetId.startsWith("dataset:");
+    List<Definition> definitions = safeDefinitions();
+    if (definitions.isEmpty()) {
+      return false;
+    }
+    AssetLifecycleGraph graph = AssetLifecycleGraphBuilder.build(definitions);
+    String resolved = graph.resolveAssetId(normalized);
+    return resolved != null || graph.nodes().containsKey(normalized);
   }
 
-  static String firstDatasetId(Set<String> datasetAssets) {
-    if (datasetAssets == null || datasetAssets.isEmpty()) {
-      return null;
-    }
-    return datasetAssets.iterator().next();
-  }
-
-  static String firstAssetId(Map<String, CatalogDetails> detailsByAsset, Set<String> usedAssets) {
-    if (!detailsByAsset.isEmpty()) {
-      return detailsByAsset.keySet().iterator().next();
-    }
-    if (usedAssets == null || usedAssets.isEmpty()) {
-      return null;
-    }
-    return usedAssets.iterator().next();
-  }
-
-  static List<String> collectRelatedAssetIds(Map<?, List<CatalogRelationshipView>> relationshipsByType) {
-    if (relationshipsByType == null || relationshipsByType.isEmpty()) {
+  private List<Definition> safeDefinitions() {
+    try {
+      List<Definition> definitions = definitionsSupplier.get();
+      return definitions == null ? List.of() : List.copyOf(definitions);
+    } catch (RuntimeException ex) {
       return List.of();
     }
-    LinkedHashSet<String> assetIds = new LinkedHashSet<>();
-    for (List<CatalogRelationshipView> values : relationshipsByType.values()) {
-      if (values == null || values.isEmpty()) {
-        continue;
-      }
-      for (CatalogRelationshipView relationship : values) {
-        if (relationship == null) {
-          continue;
-        }
-        String from = normalize(relationship.fromAssetId());
-        String to = normalize(relationship.toAssetId());
-        if (from != null) {
-          assetIds.add(from);
-        }
-        if (to != null) {
-          assetIds.add(to);
-        }
-      }
-    }
-    return List.copyOf(assetIds);
   }
 
-  static String normalize(String value) {
-    if (value == null) {
+  private void logInvocation(
+      String toolName,
+      String requestId,
+      String subject,
+      String assetId,
+      ToolStatus status,
+      String message) {
+    LOGGER.info(
+        "[ToolGateway] tool={} requestId={} subject={} assetId={} status={} message={}",
+        toolName,
+        requestId,
+        Strings.firstNonBlank(subject, "<none>"),
+        Strings.firstNonBlank(assetId, "<none>"),
+        status,
+        Strings.firstNonBlank(message, ""));
+  }
+
+  private static String resolveNextAssetId(String currentAssetId, CatalogRelationshipView relationship) {
+    String from = normalize(relationship.fromAssetId());
+    String to = normalize(relationship.toAssetId());
+    if (from == null && to == null) {
       return null;
     }
-    String trimmed = value.trim();
-    return trimmed.isEmpty() ? null : trimmed;
-  }
-}
-
-
-
-===== FILE: fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/reasoner/AgentScenario.java =====
-package org.pronzato.fabric.api.agents.reasoner;
-
-import java.util.ArrayList;
-import java.util.List;
-
-public record AgentScenario(String id, String title, String summary, List<String> keywords) {
-
-  public AgentScenario {
-    id = normalize(id);
-    title = normalize(title);
-    summary = normalize(summary);
-    keywords = keywords == null ? List.of() : List.copyOf(new ArrayList<>(keywords));
+    if (currentAssetId != null && currentAssetId.equals(from)) {
+      return to;
+    }
+    if (currentAssetId != null && currentAssetId.equals(to)) {
+      return from;
+    }
+    return to == null ? from : to;
   }
 
-  public boolean matchesPrompt(String prompt) {
-    String normalizedPrompt = normalize(prompt);
-    if (normalizedPrompt == null || keywords.isEmpty()) {
-      return false;
-    }
-    String lowerPrompt = normalizedPrompt.toLowerCase();
-    for (String keyword : keywords) {
-      if (keyword == null) {
-        continue;
-      }
-      String candidate = keyword.trim().toLowerCase();
-      if (!candidate.isEmpty() && lowerPrompt.contains(candidate)) {
-        return true;
-      }
-    }
-    return false;
+  private static String edgeKey(CatalogRelationshipView relationship) {
+    return Strings.firstNonBlank(normalize(relationship.fromAssetId()), "")
+        + "|"
+        + Strings.firstNonBlank(normalize(relationship.toAssetId()), "")
+        + "|"
+        + relationship.relationshipType().name()
+        + "|"
+        + relationship.direction().name();
+  }
+
+  private static String requestId(String requestId) {
+    return Strings.firstNonBlank(normalize(requestId), "tool-" + UUID.randomUUID());
   }
 
   private static String normalize(String value) {
@@ -1157,1340 +1341,42 @@ public record AgentScenario(String id, String title, String summary, List<String
     String trimmed = value.trim();
     return trimmed.isEmpty() ? null : trimmed;
   }
-}
 
-===== FILE: fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/reasoner/AgentScenarioRegistry.java =====
-package org.pronzato.fabric.api.agents.reasoner;
-
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-
-public final class AgentScenarioRegistry {
-  public static final String RELATED_ASSETS = "related-assets";
-  public static final String EXPLAIN_RELATIONSHIPS = "explain-relationships";
-  public static final String DATASET_RECOMMENDATION = "dataset-recommendation";
-  public static final String ENTITLEMENT_VISIBILITY = "entitlement-visibility";
-  public static final String TOOL_CHOICE_EXPLANATION = "tool-choice-explanation";
-
-  private final Map<String, AgentScenario> scenariosById;
-
-  public AgentScenarioRegistry() {
-    LinkedHashMap<String, AgentScenario> map = new LinkedHashMap<>();
-    register(
-        map,
-        new AgentScenario(
-            RELATED_ASSETS,
-            "Find Related Assets",
-            "Find seed candidates and traverse relationships.",
-            List.of("related", "dependency", "depends", "lineage")));
-    register(
-        map,
-        new AgentScenario(
-            EXPLAIN_RELATIONSHIPS,
-            "Explain Config-Service-Dataset Links",
-            "Explain why config, service, and dataset assets relate.",
-            List.of("config", "service", "dataset", "explain")));
-    register(
-        map,
-        new AgentScenario(
-            DATASET_RECOMMENDATION,
-            "Dataset Recommendation",
-            "Recommend and optionally query datasets for a question.",
-            List.of("dataset", "query", "metric", "kpi")));
-    register(
-        map,
-        new AgentScenario(
-            ENTITLEMENT_VISIBILITY,
-            "Entitlement Visibility",
-            "Demonstrate visibility and denied/filtered assets.",
-            List.of("entitlement", "access", "denied", "visible")));
-    register(
-        map,
-        new AgentScenario(
-            TOOL_CHOICE_EXPLANATION,
-            "Tool Choice Explanation",
-            "Explain why each tool call was selected.",
-            List.of("why", "tool", "choose", "reason")));
-    this.scenariosById = Map.copyOf(map);
+  private static Duration parseDuration(String text, Duration fallback) {
+    String normalized = normalize(text);
+    if (normalized == null) {
+      return fallback;
+    }
+    try {
+      Duration parsed = Duration.parse(normalized);
+      if (parsed.isNegative() || parsed.isZero()) {
+        return fallback;
+      }
+      return parsed;
+    } catch (RuntimeException ex) {
+      return fallback;
+    }
   }
 
-  public AgentScenario resolve(String scenarioId, String prompt) {
-    String normalizedId = normalize(scenarioId);
-    if (normalizedId != null) {
-      AgentScenario explicit = scenariosById.get(normalizedId);
-      if (explicit != null) {
-        return explicit;
-      }
+  private static Duration minDuration(Duration first, Duration second) {
+    if (first == null) {
+      return second;
     }
-    for (AgentScenario scenario : scenariosById.values()) {
-      if (scenario.matchesPrompt(prompt)) {
-        return scenario;
-      }
+    if (second == null) {
+      return first;
     }
-    return scenariosById.get(RELATED_ASSETS);
+    return first.compareTo(second) <= 0 ? first : second;
   }
 
-  public List<AgentScenario> scenarios() {
-    return List.copyOf(scenariosById.values());
+  private static int normalizePositive(Integer value, int fallback) {
+    if (value == null || value <= 0) {
+      return fallback;
+    }
+    return value;
   }
 
-  private static void register(Map<String, AgentScenario> map, AgentScenario scenario) {
-    if (scenario == null || normalize(scenario.id()) == null) {
-      return;
-    }
-    map.put(scenario.id(), scenario);
-  }
-
-  private static String normalize(String value) {
-    if (value == null) {
-      return null;
-    }
-    String trimmed = value.trim();
-    return trimmed.isEmpty() ? null : trimmed;
-  }
-}
-
-===== FILE: fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/reasoner/DeterministicAgentReasoner.java =====
-package org.pronzato.fabric.api.agents.reasoner;
-
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Set;
-import org.pronzato.fabric.api.agents.AgentLimits;
-import org.pronzato.fabric.api.agents.AgentPlanStep;
-import org.pronzato.fabric.api.agents.AgentReasonerMode;
-import org.pronzato.fabric.api.agents.AgentStatus;
-import org.pronzato.fabric.api.agents.AgentStepStatus;
-import org.pronzato.fabric.api.agents.AgentToolCall;
-import org.pronzato.fabric.api.catalog.CatalogManager.CatalogDetails;
-import org.pronzato.fabric.api.catalog.CatalogManager.CatalogSummary;
-import org.pronzato.fabric.api.tools.GetAssetRequest;
-import org.pronzato.fabric.api.tools.GetAssetResponse;
-import org.pronzato.fabric.api.tools.GetRelatedAssetsRequest;
-import org.pronzato.fabric.api.tools.GetRelatedAssetsResponse;
-import org.pronzato.fabric.api.tools.QueryDatasetRequest;
-import org.pronzato.fabric.api.tools.QueryDatasetResponse;
-import org.pronzato.fabric.api.tools.SearchAssetsRequest;
-import org.pronzato.fabric.api.tools.SearchAssetsResponse;
-import org.pronzato.fabric.api.tools.ToolGatewayService;
-import org.pronzato.fabric.api.tools.ToolStatus;
-import org.pronzato.fabric.api.util.Strings;
-
-public final class DeterministicAgentReasoner implements AgentReasoner {
-  private final ToolGatewayService toolGatewayService;
-
-  public DeterministicAgentReasoner(ToolGatewayService toolGatewayService) {
-    this.toolGatewayService = Objects.requireNonNull(toolGatewayService, "toolGatewayService");
-  }
-
-  @Override
-  public AgentReasonerMode mode() {
-    return AgentReasonerMode.DETERMINISTIC;
-  }
-
-  @Override
-  public AgentReasonerResult execute(AgentReasonerRequest request) {
-    AgentReasonerRequest resolved = request == null ? emptyRequest() : request;
-    AgentLimits limits = resolved.limits();
-    List<AgentPlanStep> steps = new ArrayList<>();
-    List<AgentToolCall> toolCalls = new ArrayList<>();
-    List<String> warnings = new ArrayList<>();
-    List<String> errors = new ArrayList<>();
-    LinkedHashSet<String> usedAssets = new LinkedHashSet<>();
-    LinkedHashSet<String> datasetAssets = new LinkedHashSet<>();
-    LinkedHashSet<String> candidateAssets = new LinkedHashSet<>();
-    LinkedHashSet<String> selectedAssets = new LinkedHashSet<>();
-    LinkedHashSet<String> deniedAssets = new LinkedHashSet<>();
-    LinkedHashSet<String> filteredAssets = new LinkedHashSet<>();
-    List<String> evidence = new ArrayList<>();
-    List<String> answerAssembly = new ArrayList<>();
-    Map<String, CatalogDetails> detailsByAsset = new LinkedHashMap<>();
-
-    String interpretedIntent = interpretIntent(resolved.prompt(), resolved.datasetQuery());
-    answerAssembly.add("interpreted_intent=" + interpretedIntent);
-
-    int stepNumber = 0;
-    GetRelatedAssetsResponse relatedResponse = null;
-    QueryDatasetResponse datasetResponse = null;
-
-    String seedAssetId = AgentReasonerSupport.normalize(resolved.seedAssetId());
-    if (seedAssetId != null
-        && AgentReasonerSupport.canRunStep(stepNumber, limits, warnings)
-        && AgentReasonerSupport.canRunTool(toolCalls, limits, warnings)) {
-      stepNumber++;
-      String toolRequestId = resolved.requestId() + "-tool-" + (toolCalls.size() + 1);
-      long startedTool = System.currentTimeMillis();
-      GetAssetResponse response =
-          toolGatewayService.getAsset(
-              new GetAssetRequest(
-                  seedAssetId,
-                  toolRequestId,
-                  resolved.subject(),
-                  resolved.delegatedSubject(),
-                  resolved.lane()));
-      long duration = System.currentTimeMillis() - startedTool;
-      toolCalls.add(
-          new AgentToolCall(
-              toolCalls.size() + 1,
-              "get_asset",
-              toolRequestId,
-              seedAssetId,
-              null,
-              response.status(),
-              response.message(),
-              duration));
-      if (response.status() == ToolStatus.OK && response.asset() != null) {
-        CatalogDetails details = response.asset();
-        String canonicalId =
-            AgentReasonerSupport.normalize(
-                details.summary() == null ? response.assetId() : details.summary().assetId());
-        if (canonicalId != null) {
-          candidateAssets.add(canonicalId);
-          selectedAssets.add(canonicalId);
-          usedAssets.add(canonicalId);
-          detailsByAsset.put(canonicalId, details);
-          if (AgentReasonerSupport.isDataset(details.summary(), canonicalId)) {
-            datasetAssets.add(canonicalId);
-          }
-        }
-        steps.add(
-            new AgentPlanStep(
-                stepNumber,
-                "resolve_seed_asset",
-                AgentStepStatus.COMPLETED,
-                "Resolved seed asset",
-                "get_asset",
-                toolRequestId,
-                List.of(canonicalId == null ? seedAssetId : canonicalId)));
-      } else {
-        if (response.status() == ToolStatus.DENIED) {
-          deniedAssets.add(seedAssetId);
-        } else if (response.status() == ToolStatus.NOT_FOUND) {
-          filteredAssets.add(seedAssetId);
-        }
-        AgentReasonerSupport.recordToolIssue(response.status(), response.message(), warnings, errors);
-        steps.add(
-            new AgentPlanStep(
-                stepNumber,
-                "resolve_seed_asset",
-                response.status() == ToolStatus.ERROR ? AgentStepStatus.FAILED : AgentStepStatus.SKIPPED,
-                Strings.firstNonBlank(response.message(), "Seed asset could not be resolved"),
-                "get_asset",
-                toolRequestId,
-                List.of(seedAssetId)));
-      }
-    }
-
-    if (usedAssets.isEmpty()
-        && AgentReasonerSupport.canRunStep(stepNumber, limits, warnings)
-        && AgentReasonerSupport.canRunTool(toolCalls, limits, warnings)) {
-      stepNumber++;
-      String toolRequestId = resolved.requestId() + "-tool-" + (toolCalls.size() + 1);
-      long startedTool = System.currentTimeMillis();
-      SearchAssetsResponse response =
-          toolGatewayService.searchAssets(
-              new SearchAssetsRequest(
-                  resolved.prompt(),
-                  null,
-                  null,
-                  List.of(),
-                  null,
-                  null,
-                  null,
-                  limits.maxAssetsInspected(),
-                  toolRequestId,
-                  resolved.subject(),
-                  resolved.delegatedSubject(),
-                  resolved.lane(),
-                  seedAssetId));
-      long duration = System.currentTimeMillis() - startedTool;
-      toolCalls.add(
-          new AgentToolCall(
-              toolCalls.size() + 1,
-              "search_assets",
-              toolRequestId,
-              null,
-              null,
-              response.status(),
-              response.message(),
-              duration));
-      if (response.status() == ToolStatus.OK) {
-        List<String> selected = new ArrayList<>();
-        for (CatalogSummary summary : response.results()) {
-          if (summary == null) {
-            continue;
-          }
-          String assetId = AgentReasonerSupport.normalize(summary.assetId());
-          if (assetId == null) {
-            continue;
-          }
-          candidateAssets.add(assetId);
-          selectedAssets.add(assetId);
-          usedAssets.add(assetId);
-          selected.add(assetId);
-          if (AgentReasonerSupport.isDataset(summary, assetId)) {
-            datasetAssets.add(assetId);
-          }
-          if (usedAssets.size() >= limits.maxAssetsInspected()) {
-            break;
-          }
-        }
-        if (response.totalCount() > response.results().size()) {
-          filteredAssets.add("search_assets:omitted=" + (response.totalCount() - response.results().size()));
-        }
-        if (selected.isEmpty()) {
-          warnings.add("search_assets returned no authorized assets.");
-          steps.add(
-              new AgentPlanStep(
-                  stepNumber,
-                  "search_assets",
-                  AgentStepStatus.SKIPPED,
-                  "No assets matched the prompt.",
-                  "search_assets",
-                  toolRequestId,
-                  List.of()));
-        } else {
-          steps.add(
-              new AgentPlanStep(
-                  stepNumber,
-                  "search_assets",
-                  AgentStepStatus.COMPLETED,
-                  "Selected " + selected.size() + " candidate assets.",
-                  "search_assets",
-                  toolRequestId,
-                  selected));
-        }
-      } else {
-        AgentReasonerSupport.recordToolIssue(response.status(), response.message(), warnings, errors);
-        steps.add(
-            new AgentPlanStep(
-                stepNumber,
-                "search_assets",
-                response.status() == ToolStatus.ERROR ? AgentStepStatus.FAILED : AgentStepStatus.SKIPPED,
-                Strings.firstNonBlank(response.message(), "search_assets failed"),
-                "search_assets",
-                toolRequestId,
-                List.of()));
-      }
-    }
-
-    List<String> assetsToInspect = new ArrayList<>(usedAssets);
-    for (String assetId : assetsToInspect) {
-      if (detailsByAsset.containsKey(assetId)) {
-        continue;
-      }
-      if (!AgentReasonerSupport.canRunStep(stepNumber, limits, warnings)
-          || !AgentReasonerSupport.canRunTool(toolCalls, limits, warnings)) {
-        break;
-      }
-      stepNumber++;
-      String toolRequestId = resolved.requestId() + "-tool-" + (toolCalls.size() + 1);
-      long startedTool = System.currentTimeMillis();
-      GetAssetResponse response =
-          toolGatewayService.getAsset(
-              new GetAssetRequest(
-                  assetId,
-                  toolRequestId,
-                  resolved.subject(),
-                  resolved.delegatedSubject(),
-                  resolved.lane()));
-      long duration = System.currentTimeMillis() - startedTool;
-      toolCalls.add(
-          new AgentToolCall(
-              toolCalls.size() + 1,
-              "get_asset",
-              toolRequestId,
-              assetId,
-              null,
-              response.status(),
-              response.message(),
-              duration));
-      if (response.status() == ToolStatus.OK && response.asset() != null) {
-        CatalogDetails details = response.asset();
-        detailsByAsset.put(assetId, details);
-        if (AgentReasonerSupport.isDataset(details.summary(), assetId)) {
-          datasetAssets.add(assetId);
-        }
-        steps.add(
-            new AgentPlanStep(
-                stepNumber,
-                "inspect_asset",
-                AgentStepStatus.COMPLETED,
-                "Loaded semantic details for asset.",
-                "get_asset",
-                toolRequestId,
-                List.of(assetId)));
-      } else {
-        if (response.status() == ToolStatus.DENIED) {
-          deniedAssets.add(assetId);
-        } else if (response.status() == ToolStatus.NOT_FOUND) {
-          filteredAssets.add(assetId);
-        }
-        AgentReasonerSupport.recordToolIssue(response.status(), response.message(), warnings, errors);
-        steps.add(
-            new AgentPlanStep(
-                stepNumber,
-                "inspect_asset",
-                response.status() == ToolStatus.ERROR ? AgentStepStatus.FAILED : AgentStepStatus.SKIPPED,
-                Strings.firstNonBlank(response.message(), "Asset detail fetch failed"),
-                "get_asset",
-                toolRequestId,
-                List.of(assetId)));
-      }
-      if (detailsByAsset.size() >= limits.maxAssetsInspected()) {
-        break;
-      }
-    }
-
-    String relatedRoot = AgentReasonerSupport.firstAssetId(detailsByAsset, usedAssets);
-    if (relatedRoot != null
-        && limits.maxRelatedDepth() > 0
-        && AgentReasonerSupport.canRunStep(stepNumber, limits, warnings)
-        && AgentReasonerSupport.canRunTool(toolCalls, limits, warnings)) {
-      stepNumber++;
-      String toolRequestId = resolved.requestId() + "-tool-" + (toolCalls.size() + 1);
-      long startedTool = System.currentTimeMillis();
-      relatedResponse =
-          toolGatewayService.getRelatedAssets(
-              new GetRelatedAssetsRequest(
-                  relatedRoot,
-                  null,
-                  limits.maxRelatedDepth(),
-                  toolRequestId,
-                  resolved.subject(),
-                  resolved.delegatedSubject(),
-                  resolved.lane()));
-      long duration = System.currentTimeMillis() - startedTool;
-      toolCalls.add(
-          new AgentToolCall(
-              toolCalls.size() + 1,
-              "get_related_assets",
-              toolRequestId,
-              relatedRoot,
-              null,
-              relatedResponse.status(),
-              relatedResponse.message(),
-              duration));
-      if (relatedResponse.status() == ToolStatus.OK) {
-        List<String> relatedIds =
-            AgentReasonerSupport.collectRelatedAssetIds(relatedResponse.relationshipsByType());
-        for (String assetId : relatedIds) {
-          candidateAssets.add(assetId);
-          usedAssets.add(assetId);
-          if (assetId.startsWith("dataset:")) {
-            datasetAssets.add(assetId);
-          }
-        }
-        steps.add(
-            new AgentPlanStep(
-                stepNumber,
-                "traverse_related_assets",
-                AgentStepStatus.COMPLETED,
-                "Collected " + relatedResponse.relationshipCount() + " relationships.",
-                "get_related_assets",
-                toolRequestId,
-                relatedIds));
-      } else {
-        if (relatedResponse.status() == ToolStatus.DENIED) {
-          deniedAssets.add(relatedRoot);
-        }
-        AgentReasonerSupport.recordToolIssue(
-            relatedResponse.status(), relatedResponse.message(), warnings, errors);
-        steps.add(
-            new AgentPlanStep(
-                stepNumber,
-                "traverse_related_assets",
-                relatedResponse.status() == ToolStatus.ERROR
-                    ? AgentStepStatus.FAILED
-                    : AgentStepStatus.SKIPPED,
-                Strings.firstNonBlank(relatedResponse.message(), "Relationship traversal failed"),
-                "get_related_assets",
-                toolRequestId,
-                List.of(relatedRoot)));
-      }
-    }
-
-    String queryDatasetId =
-        Strings.firstNonBlank(
-            AgentReasonerSupport.normalize(resolved.datasetId()),
-            AgentReasonerSupport.firstDatasetId(datasetAssets));
-    if (queryDatasetId != null
-        && limits.maxDatasetQueries() > 0
-        && AgentReasonerSupport.canRunStep(stepNumber, limits, warnings)
-        && AgentReasonerSupport.canRunTool(toolCalls, limits, warnings)) {
-      stepNumber++;
-      String toolRequestId = resolved.requestId() + "-tool-" + (toolCalls.size() + 1);
-      long startedTool = System.currentTimeMillis();
-      datasetResponse =
-          toolGatewayService.queryDataset(
-              new QueryDatasetRequest(
-                  queryDatasetId,
-                  AgentReasonerSupport.normalize(resolved.datasetQuery()),
-                  null,
-                  null,
-                  toolRequestId,
-                  resolved.subject(),
-                  resolved.delegatedSubject(),
-                  resolved.lane()));
-      long duration = System.currentTimeMillis() - startedTool;
-      toolCalls.add(
-          new AgentToolCall(
-              toolCalls.size() + 1,
-              "query_dataset",
-              toolRequestId,
-              queryDatasetId,
-              queryDatasetId,
-              datasetResponse.status(),
-              datasetResponse.message(),
-              duration));
-      if (datasetResponse.status() == ToolStatus.OK) {
-        datasetAssets.add(queryDatasetId);
-        evidence.add(
-            "query_dataset rows="
-                + datasetResponse.rowCount()
-                + " truncated="
-                + datasetResponse.truncated());
-        steps.add(
-            new AgentPlanStep(
-                stepNumber,
-                "query_dataset",
-                AgentStepStatus.COMPLETED,
-                "Queried dataset rows=" + datasetResponse.rowCount(),
-                "query_dataset",
-                toolRequestId,
-                List.of(queryDatasetId)));
-      } else {
-        if (datasetResponse.status() == ToolStatus.DENIED) {
-          deniedAssets.add(queryDatasetId);
-        }
-        AgentReasonerSupport.recordToolIssue(
-            datasetResponse.status(), datasetResponse.message(), warnings, errors);
-        steps.add(
-            new AgentPlanStep(
-                stepNumber,
-                "query_dataset",
-                datasetResponse.status() == ToolStatus.ERROR
-                    ? AgentStepStatus.FAILED
-                    : AgentStepStatus.SKIPPED,
-                Strings.firstNonBlank(datasetResponse.message(), "Dataset query failed"),
-                "query_dataset",
-                toolRequestId,
-                List.of(queryDatasetId)));
-      }
-    }
-
-    answerAssembly.add("resolved_assets=" + detailsByAsset.size());
-    answerAssembly.add("related_traversal=" + (relatedResponse != null));
-    answerAssembly.add("dataset_query_attempted=" + (datasetResponse != null));
-    String answerText =
-        buildAnswerText(
-            resolved.prompt(),
-            detailsByAsset,
-            relatedResponse,
-            datasetResponse,
-            warnings,
-            errors,
-            limits,
-            toolCalls.size(),
-            interpretedIntent);
-    AgentStatus status =
-        AgentReasonerSupport.deriveStatus(toolCalls, warnings, errors, detailsByAsset, datasetResponse);
-    return new AgentReasonerResult(
-        status,
-        interpretedIntent,
-        answerText,
-        new ArrayList<>(usedAssets),
-        new ArrayList<>(datasetAssets),
-        evidence,
-        warnings,
-        errors,
-        new ArrayList<>(candidateAssets),
-        new ArrayList<>(selectedAssets),
-        new ArrayList<>(deniedAssets),
-        new ArrayList<>(filteredAssets),
-        answerAssembly,
-        steps,
-        toolCalls);
-  }
-
-  private static String buildAnswerText(
-      String prompt,
-      Map<String, CatalogDetails> detailsByAsset,
-      GetRelatedAssetsResponse relatedResponse,
-      QueryDatasetResponse datasetResponse,
-      List<String> warnings,
-      List<String> errors,
-      AgentLimits limits,
-      int toolCalls,
-      String interpretedIntent) {
-    StringBuilder builder = new StringBuilder();
-    builder.append("Question: ").append(prompt).append('\n');
-    builder.append("Intent: ").append(interpretedIntent).append('\n');
-    builder
-        .append("Execution: toolCalls=")
-        .append(toolCalls)
-        .append(", maxSteps=")
-        .append(limits.maxSteps())
-        .append(", maxToolCalls=")
-        .append(limits.maxToolCalls())
-        .append('\n');
-
-    if (detailsByAsset.isEmpty()) {
-      builder.append("No authorized assets were resolved.\n");
-    } else {
-      builder.append("Relevant assets:\n");
-      for (Map.Entry<String, CatalogDetails> entry : detailsByAsset.entrySet()) {
-        CatalogSummary summary = entry.getValue() == null ? null : entry.getValue().summary();
-        String title = summary == null ? null : AgentReasonerSupport.normalize(summary.title());
-        String type = summary == null || summary.type() == null ? "UNKNOWN" : summary.type().name();
-        builder.append("- ").append(entry.getKey()).append(" (").append(type).append(')');
-        if (title != null) {
-          builder.append(" - ").append(title);
-        }
-        builder.append('\n');
-      }
-    }
-
-    if (relatedResponse != null && relatedResponse.status() == ToolStatus.OK) {
-      builder
-          .append("Relationship traversal returned ")
-          .append(relatedResponse.relationshipCount())
-          .append(" relationships at depth ")
-          .append(relatedResponse.depth())
-          .append(".\n");
-    }
-
-    if (datasetResponse != null) {
-      builder.append("Dataset query status: ").append(datasetResponse.status().name());
-      if (datasetResponse.status() == ToolStatus.OK) {
-        builder
-            .append(" (rows=")
-            .append(datasetResponse.rowCount())
-            .append(", truncated=")
-            .append(datasetResponse.truncated())
-            .append(')');
-      } else if (AgentReasonerSupport.normalize(datasetResponse.message()) != null) {
-        builder.append(" (").append(datasetResponse.message()).append(')');
-      }
-      builder.append(".\n");
-    }
-
-    if (!warnings.isEmpty()) {
-      builder.append("Warnings: ").append(warnings.size()).append(".\n");
-    }
-    if (!errors.isEmpty()) {
-      builder.append("Errors: ").append(errors.size()).append(".\n");
-    }
-    return builder.toString().trim();
-  }
-
-  private static String interpretIntent(String prompt, String datasetQuery) {
-    String normalizedPrompt = AgentReasonerSupport.normalize(prompt);
-    if (normalizedPrompt == null) {
-      return "unknown";
-    }
-    String lower = normalizedPrompt.toLowerCase();
-    if (lower.contains("why")) {
-      return "explain_reasoning";
-    }
-    if (lower.contains("entitlement") || lower.contains("access") || lower.contains("visible")) {
-      return "visibility_analysis";
-    }
-    if (lower.contains("dataset") || AgentReasonerSupport.normalize(datasetQuery) != null) {
-      return "dataset_discovery_or_query";
-    }
-    if (lower.contains("related") || lower.contains("depend")) {
-      return "relationship_traversal";
-    }
-    return "semantic_asset_discovery";
-  }
-
-  private static AgentReasonerRequest emptyRequest() {
-    return new AgentReasonerRequest(
-        "agent-unknown",
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        AgentLimits.defaults(),
-        AgentReasonerMode.DETERMINISTIC,
-        null);
-  }
+  private record TraversalNode(String assetId, int depth) {}
 }
 
 
-
-===== FILE: fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/reasoner/ModelBackedAgentReasoner.java =====
-package org.pronzato.fabric.api.agents.reasoner;
-
-import org.pronzato.fabric.api.agents.AgentReasonerMode;
-
-public interface ModelBackedAgentReasoner extends AgentReasoner {
-
-  @Override
-  default AgentReasonerMode mode() {
-    return AgentReasonerMode.MODEL;
-  }
-}
-
-===== FILE: fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/reasoner/ScriptedAgentReasoner.java =====
-package org.pronzato.fabric.api.agents.reasoner;
-
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import org.pronzato.fabric.api.agents.AgentLimits;
-import org.pronzato.fabric.api.agents.AgentPlanStep;
-import org.pronzato.fabric.api.agents.AgentReasonerMode;
-import org.pronzato.fabric.api.agents.AgentStatus;
-import org.pronzato.fabric.api.agents.AgentStepStatus;
-import org.pronzato.fabric.api.agents.AgentToolCall;
-import org.pronzato.fabric.api.catalog.CatalogManager.CatalogDetails;
-import org.pronzato.fabric.api.catalog.CatalogManager.CatalogSummary;
-import org.pronzato.fabric.api.tools.GetAssetRequest;
-import org.pronzato.fabric.api.tools.GetAssetResponse;
-import org.pronzato.fabric.api.tools.GetRelatedAssetsRequest;
-import org.pronzato.fabric.api.tools.GetRelatedAssetsResponse;
-import org.pronzato.fabric.api.tools.QueryDatasetRequest;
-import org.pronzato.fabric.api.tools.QueryDatasetResponse;
-import org.pronzato.fabric.api.tools.SearchAssetsRequest;
-import org.pronzato.fabric.api.tools.SearchAssetsResponse;
-import org.pronzato.fabric.api.tools.ToolGatewayService;
-import org.pronzato.fabric.api.tools.ToolStatus;
-import org.pronzato.fabric.api.util.Strings;
-
-public final class ScriptedAgentReasoner implements AgentReasoner {
-  private final ToolGatewayService toolGatewayService;
-  private final AgentScenarioRegistry scenarios;
-
-  public ScriptedAgentReasoner(ToolGatewayService toolGatewayService) {
-    this(toolGatewayService, new AgentScenarioRegistry());
-  }
-
-  public ScriptedAgentReasoner(ToolGatewayService toolGatewayService, AgentScenarioRegistry scenarios) {
-    this.toolGatewayService = Objects.requireNonNull(toolGatewayService, "toolGatewayService");
-    this.scenarios = scenarios == null ? new AgentScenarioRegistry() : scenarios;
-  }
-
-  @Override
-  public AgentReasonerMode mode() {
-    return AgentReasonerMode.SCRIPTED;
-  }
-
-  @Override
-  public AgentReasonerResult execute(AgentReasonerRequest request) {
-    AgentReasonerRequest resolved = request == null ? emptyRequest() : request;
-    AgentScenario scenario = scenarios.resolve(resolved.scenarioId(), resolved.prompt());
-    Execution execution = new Execution(resolved, scenario);
-    execution.answerAssembly.add("scenario=" + scenario.id());
-    execution.answerAssembly.add("scenario_title=" + scenario.title());
-
-    runScenarioFlow(execution);
-    execution.inspectDiscoveredAssets();
-
-    String selectedDataset = Strings.firstNonBlank(resolved.datasetId(), execution.firstDatasetId());
-    if (shouldQueryDataset(execution, selectedDataset)) {
-      execution.queryDataset(
-          selectedDataset,
-          Strings.firstNonBlank(resolved.datasetQuery(), defaultDatasetQuery(execution.scenario.id())),
-          "query_dataset");
-    }
-
-    String answerText = buildAnswerText(execution);
-    AgentStatus status =
-        AgentReasonerSupport.deriveStatus(
-            execution.toolCalls,
-            execution.warnings,
-            execution.errors,
-            execution.detailsByAsset,
-            execution.datasetResponse);
-
-    return new AgentReasonerResult(
-        status,
-        "scripted:" + execution.scenario.id(),
-        answerText,
-        new ArrayList<>(execution.usedAssets),
-        new ArrayList<>(execution.datasetAssets),
-        execution.evidence,
-        execution.warnings,
-        execution.errors,
-        new ArrayList<>(execution.candidateAssets),
-        new ArrayList<>(execution.selectedAssets),
-        new ArrayList<>(execution.deniedAssets),
-        new ArrayList<>(execution.filteredAssets),
-        execution.answerAssembly,
-        execution.steps,
-        execution.toolCalls);
-  }
-
-  private static void runScenarioFlow(Execution execution) {
-    String scenarioId = execution.scenario.id();
-    if (AgentScenarioRegistry.RELATED_ASSETS.equals(scenarioId)) {
-      runRelatedAssetsScenario(execution);
-      return;
-    }
-    if (AgentScenarioRegistry.EXPLAIN_RELATIONSHIPS.equals(scenarioId)) {
-      runExplainRelationshipsScenario(execution);
-      return;
-    }
-    if (AgentScenarioRegistry.DATASET_RECOMMENDATION.equals(scenarioId)) {
-      runDatasetRecommendationScenario(execution);
-      return;
-    }
-    if (AgentScenarioRegistry.ENTITLEMENT_VISIBILITY.equals(scenarioId)) {
-      runEntitlementVisibilityScenario(execution);
-      return;
-    }
-    runToolChoiceScenario(execution);
-  }
-
-  private static void runRelatedAssetsScenario(Execution execution) {
-    execution.answerAssembly.add("scripted_step=resolve_seed_or_search");
-    execution.resolveSeedAsset();
-    if (execution.usedAssets.isEmpty()) {
-      execution.searchAssets("search_assets", execution.request.limits().maxAssetsInspected());
-    }
-    execution.traverseRelated(execution.firstKnownAsset(), execution.request.limits().maxRelatedDepth());
-  }
-
-  private static void runExplainRelationshipsScenario(Execution execution) {
-    execution.answerAssembly.add("scripted_step=collect_assets_to_explain");
-    execution.resolveSeedAsset();
-    if (execution.usedAssets.isEmpty()) {
-      execution.searchAssets("search_assets", Math.min(3, execution.request.limits().maxAssetsInspected()));
-    }
-    execution.traverseRelated(execution.firstKnownAsset(), Math.min(2, execution.request.limits().maxRelatedDepth()));
-  }
-
-  private static void runDatasetRecommendationScenario(Execution execution) {
-    execution.answerAssembly.add("scripted_step=discover_dataset_candidates");
-    if (execution.request.datasetId() != null) {
-      execution.getAsset(execution.request.datasetId(), "resolve_dataset_seed");
-    }
-    execution.searchAssets("search_assets", execution.request.limits().maxAssetsInspected());
-    execution.traverseRelated(execution.firstKnownAsset(), 1);
-  }
-
-  private static void runEntitlementVisibilityScenario(Execution execution) {
-    execution.answerAssembly.add("scripted_step=demonstrate_visibility");
-    execution.resolveSeedAsset();
-    execution.searchAssets("search_assets", Math.min(4, execution.request.limits().maxAssetsInspected()));
-    if (!execution.selectedAssets.isEmpty()) {
-      int inspected = 0;
-      for (String assetId : execution.selectedAssets) {
-        execution.getAsset(assetId, "inspect_visibility_asset");
-        inspected++;
-        if (inspected >= 2) {
-          break;
-        }
-      }
-    }
-  }
-
-  private static void runToolChoiceScenario(Execution execution) {
-    execution.answerAssembly.add("scripted_step=explain_tool_choices");
-    execution.searchAssets("search_assets", Math.min(3, execution.request.limits().maxAssetsInspected()));
-    execution.traverseRelated(execution.firstKnownAsset(), 1);
-  }
-
-  private static boolean shouldQueryDataset(Execution execution, String datasetId) {
-    if (datasetId == null) {
-      return false;
-    }
-    if (execution.request.limits().maxDatasetQueries() <= 0) {
-      return false;
-    }
-    if (execution.request.datasetId() != null || execution.request.datasetQuery() != null) {
-      return true;
-    }
-    return AgentScenarioRegistry.DATASET_RECOMMENDATION.equals(execution.scenario.id());
-  }
-
-  private static String defaultDatasetQuery(String scenarioId) {
-    if (AgentScenarioRegistry.DATASET_RECOMMENDATION.equals(scenarioId)) {
-      return "true";
-    }
-    return null;
-  }
-
-  private static String buildAnswerText(Execution execution) {
-    StringBuilder builder = new StringBuilder();
-    builder.append("Question: ").append(execution.request.prompt()).append('\n');
-    builder
-        .append("Scenario: ")
-        .append(execution.scenario.id())
-        .append(" - ")
-        .append(execution.scenario.title())
-        .append('\n');
-    builder
-        .append("Execution: toolCalls=")
-        .append(execution.toolCalls.size())
-        .append(", selectedAssets=")
-        .append(execution.selectedAssets.size())
-        .append(", deniedOrFiltered=")
-        .append(execution.deniedAssets.size() + execution.filteredAssets.size())
-        .append('\n');
-    if (execution.detailsByAsset.isEmpty()) {
-      builder.append("No authorized assets were resolved for this scenario.\n");
-    } else {
-      builder.append("Scenario assets:\n");
-      for (Map.Entry<String, CatalogDetails> entry : execution.detailsByAsset.entrySet()) {
-        CatalogSummary summary = entry.getValue() == null ? null : entry.getValue().summary();
-        String type = summary == null || summary.type() == null ? "UNKNOWN" : summary.type().name();
-        String title = summary == null ? null : AgentReasonerSupport.normalize(summary.title());
-        builder.append("- ").append(entry.getKey()).append(" (").append(type).append(')');
-        if (title != null) {
-          builder.append(" - ").append(title);
-        }
-        builder.append('\n');
-      }
-    }
-    if (execution.relatedResponse != null && execution.relatedResponse.status() == ToolStatus.OK) {
-      builder
-          .append("Related assets discovered: ")
-          .append(execution.relatedResponse.relationshipCount())
-          .append('\n');
-    }
-    if (execution.datasetResponse != null) {
-      builder
-          .append("Dataset query status: ")
-          .append(execution.datasetResponse.status());
-      if (execution.datasetResponse.status() == ToolStatus.OK) {
-        builder.append(" rows=").append(execution.datasetResponse.rowCount());
-      }
-      builder.append('\n');
-    }
-    if (!execution.deniedAssets.isEmpty()) {
-      builder.append("Denied assets: ").append(String.join(", ", execution.deniedAssets)).append('\n');
-    }
-    if (!execution.filteredAssets.isEmpty()) {
-      builder.append("Filtered assets: ").append(String.join(", ", execution.filteredAssets)).append('\n');
-    }
-    if (!execution.warnings.isEmpty()) {
-      builder.append("Warnings: ").append(execution.warnings.size()).append('\n');
-    }
-    if (!execution.errors.isEmpty()) {
-      builder.append("Errors: ").append(execution.errors.size()).append('\n');
-    }
-    return builder.toString().trim();
-  }
-
-  private static AgentReasonerRequest emptyRequest() {
-    return new AgentReasonerRequest(
-        "agent-scripted",
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        AgentLimits.defaults(),
-        AgentReasonerMode.SCRIPTED,
-        null);
-  }
-
-  private final class Execution {
-    private final AgentReasonerRequest request;
-    private final AgentScenario scenario;
-    private final List<AgentPlanStep> steps = new ArrayList<>();
-    private final List<AgentToolCall> toolCalls = new ArrayList<>();
-    private final List<String> warnings = new ArrayList<>();
-    private final List<String> errors = new ArrayList<>();
-    private final List<String> evidence = new ArrayList<>();
-    private final List<String> answerAssembly = new ArrayList<>();
-    private final LinkedHashSet<String> usedAssets = new LinkedHashSet<>();
-    private final LinkedHashSet<String> datasetAssets = new LinkedHashSet<>();
-    private final LinkedHashSet<String> candidateAssets = new LinkedHashSet<>();
-    private final LinkedHashSet<String> selectedAssets = new LinkedHashSet<>();
-    private final LinkedHashSet<String> deniedAssets = new LinkedHashSet<>();
-    private final LinkedHashSet<String> filteredAssets = new LinkedHashSet<>();
-    private final Map<String, CatalogDetails> detailsByAsset = new LinkedHashMap<>();
-    private int stepNumber = 0;
-    private GetRelatedAssetsResponse relatedResponse;
-    private QueryDatasetResponse datasetResponse;
-
-    private Execution(AgentReasonerRequest request, AgentScenario scenario) {
-      this.request = request;
-      this.scenario = scenario;
-    }
-
-    private void resolveSeedAsset() {
-      if (request.seedAssetId() == null) {
-        return;
-      }
-      getAsset(request.seedAssetId(), "resolve_seed_asset");
-    }
-
-    private void getAsset(String assetId, String stepName) {
-      if (assetId == null) {
-        return;
-      }
-      if (!canRun()) {
-        return;
-      }
-      stepNumber++;
-      String toolRequestId = toolRequestId();
-      long startedTool = System.currentTimeMillis();
-      GetAssetResponse response =
-          toolGatewayService.getAsset(
-              new GetAssetRequest(
-                  assetId,
-                  toolRequestId,
-                  request.subject(),
-                  request.delegatedSubject(),
-                  request.lane()));
-      long duration = System.currentTimeMillis() - startedTool;
-      toolCalls.add(
-          new AgentToolCall(
-              toolCalls.size() + 1,
-              "get_asset",
-              toolRequestId,
-              assetId,
-              null,
-              response.status(),
-              response.message(),
-              duration));
-      if (response.status() == ToolStatus.OK && response.asset() != null) {
-        CatalogDetails details = response.asset();
-        String canonicalId =
-            AgentReasonerSupport.normalize(
-                details.summary() == null ? response.assetId() : details.summary().assetId());
-        String resolvedId = canonicalId == null ? assetId : canonicalId;
-        candidateAssets.add(resolvedId);
-        selectedAssets.add(resolvedId);
-        usedAssets.add(resolvedId);
-        detailsByAsset.put(resolvedId, details);
-        if (AgentReasonerSupport.isDataset(details.summary(), resolvedId)) {
-          datasetAssets.add(resolvedId);
-        }
-        steps.add(
-            new AgentPlanStep(
-                stepNumber,
-                stepName,
-                AgentStepStatus.COMPLETED,
-                "Loaded asset details for scenario.",
-                "get_asset",
-                toolRequestId,
-                List.of(resolvedId)));
-        return;
-      }
-
-      if (response.status() == ToolStatus.DENIED) {
-        deniedAssets.add(assetId);
-      } else if (response.status() == ToolStatus.NOT_FOUND) {
-        filteredAssets.add(assetId);
-      }
-      AgentReasonerSupport.recordToolIssue(response.status(), response.message(), warnings, errors);
-      steps.add(
-          new AgentPlanStep(
-              stepNumber,
-              stepName,
-              response.status() == ToolStatus.ERROR ? AgentStepStatus.FAILED : AgentStepStatus.SKIPPED,
-              Strings.firstNonBlank(response.message(), "Asset could not be resolved"),
-              "get_asset",
-              toolRequestId,
-              List.of(assetId)));
-    }
-
-    private void searchAssets(String stepName, int preferredLimit) {
-      if (!canRun()) {
-        return;
-      }
-      stepNumber++;
-      int limit = Math.max(1, Math.min(preferredLimit, request.limits().maxAssetsInspected()));
-      String toolRequestId = toolRequestId();
-      long startedTool = System.currentTimeMillis();
-      SearchAssetsResponse response =
-          toolGatewayService.searchAssets(
-              new SearchAssetsRequest(
-                  request.prompt(),
-                  null,
-                  null,
-                  List.of(),
-                  null,
-                  null,
-                  null,
-                  limit,
-                  toolRequestId,
-                  request.subject(),
-                  request.delegatedSubject(),
-                  request.lane(),
-                  request.seedAssetId()));
-      long duration = System.currentTimeMillis() - startedTool;
-      toolCalls.add(
-          new AgentToolCall(
-              toolCalls.size() + 1,
-              "search_assets",
-              toolRequestId,
-              null,
-              null,
-              response.status(),
-              response.message(),
-              duration));
-      if (response.status() == ToolStatus.OK) {
-        List<String> selected = new ArrayList<>();
-        for (CatalogSummary summary : response.results()) {
-          if (summary == null) {
-            continue;
-          }
-          String assetId = AgentReasonerSupport.normalize(summary.assetId());
-          if (assetId == null) {
-            continue;
-          }
-          candidateAssets.add(assetId);
-          selectedAssets.add(assetId);
-          usedAssets.add(assetId);
-          selected.add(assetId);
-          if (AgentReasonerSupport.isDataset(summary, assetId)) {
-            datasetAssets.add(assetId);
-          }
-          if (selected.size() >= request.limits().maxAssetsInspected()) {
-            break;
-          }
-        }
-        if (response.totalCount() > response.results().size()) {
-          filteredAssets.add(
-              "search_assets:omitted=" + (response.totalCount() - response.results().size()));
-        }
-        AgentStepStatus status = selected.isEmpty() ? AgentStepStatus.SKIPPED : AgentStepStatus.COMPLETED;
-        String summary =
-            selected.isEmpty()
-                ? "No authorized assets matched scripted search."
-                : "Scripted search selected " + selected.size() + " assets.";
-        steps.add(
-            new AgentPlanStep(
-                stepNumber, stepName, status, summary, "search_assets", toolRequestId, selected));
-        return;
-      }
-
-      AgentReasonerSupport.recordToolIssue(response.status(), response.message(), warnings, errors);
-      steps.add(
-          new AgentPlanStep(
-              stepNumber,
-              stepName,
-              response.status() == ToolStatus.ERROR ? AgentStepStatus.FAILED : AgentStepStatus.SKIPPED,
-              Strings.firstNonBlank(response.message(), "search_assets failed"),
-              "search_assets",
-              toolRequestId,
-              List.of()));
-    }
-
-    private void inspectDiscoveredAssets() {
-      int inspected = 0;
-      for (String assetId : new ArrayList<>(selectedAssets)) {
-        if (detailsByAsset.containsKey(assetId)) {
-          continue;
-        }
-        if (inspected >= request.limits().maxAssetsInspected()) {
-          break;
-        }
-        getAsset(assetId, "inspect_asset");
-        inspected++;
-      }
-    }
-
-    private void traverseRelated(String rootAssetId, int depth) {
-      if (rootAssetId == null || depth <= 0) {
-        return;
-      }
-      if (!canRun()) {
-        return;
-      }
-      stepNumber++;
-      String toolRequestId = toolRequestId();
-      int boundedDepth = Math.max(1, Math.min(depth, request.limits().maxRelatedDepth()));
-      long startedTool = System.currentTimeMillis();
-      relatedResponse =
-          toolGatewayService.getRelatedAssets(
-              new GetRelatedAssetsRequest(
-                  rootAssetId,
-                  null,
-                  boundedDepth,
-                  toolRequestId,
-                  request.subject(),
-                  request.delegatedSubject(),
-                  request.lane()));
-      long duration = System.currentTimeMillis() - startedTool;
-      toolCalls.add(
-          new AgentToolCall(
-              toolCalls.size() + 1,
-              "get_related_assets",
-              toolRequestId,
-              rootAssetId,
-              null,
-              relatedResponse.status(),
-              relatedResponse.message(),
-              duration));
-      if (relatedResponse.status() == ToolStatus.OK) {
-        List<String> relatedIds =
-            AgentReasonerSupport.collectRelatedAssetIds(relatedResponse.relationshipsByType());
-        for (String relatedId : relatedIds) {
-          candidateAssets.add(relatedId);
-          usedAssets.add(relatedId);
-          if (relatedId.startsWith("dataset:")) {
-            datasetAssets.add(relatedId);
-          }
-        }
-        steps.add(
-            new AgentPlanStep(
-                stepNumber,
-                "traverse_related_assets",
-                AgentStepStatus.COMPLETED,
-                "Scripted traversal returned " + relatedResponse.relationshipCount() + " relationships.",
-                "get_related_assets",
-                toolRequestId,
-                relatedIds));
-        return;
-      }
-
-      if (relatedResponse.status() == ToolStatus.DENIED) {
-        deniedAssets.add(rootAssetId);
-      }
-      AgentReasonerSupport.recordToolIssue(
-          relatedResponse.status(), relatedResponse.message(), warnings, errors);
-      steps.add(
-          new AgentPlanStep(
-              stepNumber,
-              "traverse_related_assets",
-              relatedResponse.status() == ToolStatus.ERROR
-                  ? AgentStepStatus.FAILED
-                  : AgentStepStatus.SKIPPED,
-              Strings.firstNonBlank(relatedResponse.message(), "Relationship traversal failed"),
-              "get_related_assets",
-              toolRequestId,
-              List.of(rootAssetId)));
-    }
-
-    private void queryDataset(String datasetId, String query, String stepName) {
-      if (datasetId == null || request.limits().maxDatasetQueries() <= 0) {
-        return;
-      }
-      if (!canRun()) {
-        return;
-      }
-      stepNumber++;
-      String toolRequestId = toolRequestId();
-      long startedTool = System.currentTimeMillis();
-      datasetResponse =
-          toolGatewayService.queryDataset(
-              new QueryDatasetRequest(
-                  datasetId,
-                  AgentReasonerSupport.normalize(query),
-                  null,
-                  null,
-                  toolRequestId,
-                  request.subject(),
-                  request.delegatedSubject(),
-                  request.lane()));
-      long duration = System.currentTimeMillis() - startedTool;
-      toolCalls.add(
-          new AgentToolCall(
-              toolCalls.size() + 1,
-              "query_dataset",
-              toolRequestId,
-              datasetId,
-              datasetId,
-              datasetResponse.status(),
-              datasetResponse.message(),
-              duration));
-      if (datasetResponse.status() == ToolStatus.OK) {
-        datasetAssets.add(datasetId);
-        evidence.add(
-            "scripted_query_dataset rows="
-                + datasetResponse.rowCount()
-                + " truncated="
-                + datasetResponse.truncated());
-        steps.add(
-            new AgentPlanStep(
-                stepNumber,
-                stepName,
-                AgentStepStatus.COMPLETED,
-                "Queried dataset rows=" + datasetResponse.rowCount(),
-                "query_dataset",
-                toolRequestId,
-                List.of(datasetId)));
-        return;
-      }
-
-      if (datasetResponse.status() == ToolStatus.DENIED) {
-        deniedAssets.add(datasetId);
-      }
-      AgentReasonerSupport.recordToolIssue(
-          datasetResponse.status(), datasetResponse.message(), warnings, errors);
-      steps.add(
-          new AgentPlanStep(
-              stepNumber,
-              stepName,
-              datasetResponse.status() == ToolStatus.ERROR
-                  ? AgentStepStatus.FAILED
-                  : AgentStepStatus.SKIPPED,
-              Strings.firstNonBlank(datasetResponse.message(), "Dataset query failed"),
-              "query_dataset",
-              toolRequestId,
-              List.of(datasetId)));
-    }
-
-    private String firstDatasetId() {
-      return AgentReasonerSupport.firstDatasetId(datasetAssets);
-    }
-
-    private String firstKnownAsset() {
-      return AgentReasonerSupport.firstAssetId(detailsByAsset, usedAssets);
-    }
-
-    private String toolRequestId() {
-      return request.requestId() + "-tool-" + (toolCalls.size() + 1);
-    }
-
-    private boolean canRun() {
-      return AgentReasonerSupport.canRunStep(stepNumber, request.limits(), warnings)
-          && AgentReasonerSupport.canRunTool(toolCalls, request.limits(), warnings);
-    }
-  }
-}
-
-
-
-===== FILE: fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/reasoner/UnsupportedModelBackedAgentReasoner.java =====
-package org.pronzato.fabric.api.agents.reasoner;
-
-import java.util.List;
-import org.pronzato.fabric.api.agents.AgentStatus;
-
-public final class UnsupportedModelBackedAgentReasoner implements ModelBackedAgentReasoner {
-
-  @Override
-  public AgentReasonerResult execute(AgentReasonerRequest request) {
-    String reason =
-        "Model-backed agent reasoning is intentionally deferred until an enterprise provider/runtime is approved.";
-    return new AgentReasonerResult(
-        AgentStatus.FAILED,
-        "model_unavailable",
-        reason,
-        List.of(),
-        List.of(),
-        List.of("reasoner_mode=MODEL"),
-        List.of(reason),
-        List.of(),
-        List.of(),
-        List.of(),
-        List.of(),
-        List.of(),
-        List.of("final_answer=unsupported_model_reasoner"),
-        List.of(),
-        List.of());
-  }
-}
 
