@@ -1,1491 +1,348 @@
-package org.pronzato.fabric.api.control.discovery.definitions;
-
-import com.fasterxml.jackson.annotation.JsonEnumDefaultValue;
-
-public enum DefinitionType {
-  CONNECTION,
-  APP,
-  SERVICE,
-  STREAM,
-  INGEST,
-  INGEST_SOURCE,
-  DATASET,
-  SCHEMA,
-  PLATFORM,
-  SECRETS_KDF,
-  ENVIRONMENT,
-  ENTITLEMENT,
-  DASHBOARD,
-  CONFIG,
-  CONFIG_LAYER,
-  CONFIG_CHANGE,
-  STATUS_APP,
-  STATUS_SERVICE,
-  STATUS_DATA,
-  HEARTBEAT_SERVICE,
-  @JsonEnumDefaultValue
-  UNKNOWN
-}
-
-
-
-
-
-
-
-package org.pronzato.fabric.api.control.discovery.cache;
-
-import java.util.EnumMap;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import org.pronzato.fabric.api.control.discovery.definitions.Definition;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionApp;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfig;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfigLayer;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfigChange;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConnection;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDashboard;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEntitlement;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvironment;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngest;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngestSource;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionPlatform;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionSchema;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionService;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStatusApp;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStream;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
-import org.pronzato.fabric.api.util.Strings;
-import org.slf4j.Logger;
-
-final class DiscoveryCacheType {
-
-  private DiscoveryCacheType() {}
-
-  static DefinitionType toType(
-      Class<?> clazz,
-      Map<Class<? extends Definition>, DefinitionType> classToType,
-      Set<String> unmappedDefinitionClasses,
-      Logger logger) {
-    if (clazz == null || !Definition.class.isAssignableFrom(clazz)) {
-      return DefinitionType.UNKNOWN;
-    }
-    @SuppressWarnings("unchecked")
-    Class<? extends Definition> definitionClass = (Class<? extends Definition>) clazz;
-    DefinitionType type = classToType.get(definitionClass);
-    if (type != null) {
-      return type;
-    }
-    String className = definitionClass.getName();
-    if (unmappedDefinitionClasses.add(className)) {
-      logger.warn(
-          "[DiscoveryCache][Compatibility] unmapped definition class {}; treating as UNKNOWN",
-          className);
-    }
-    return DefinitionType.UNKNOWN;
-  }
-
-  static boolean isCacheableType(
-      DefinitionType type, Map<DefinitionType, Class<? extends Definition>> cacheableDefinitions) {
-    return type != null && type != DefinitionType.UNKNOWN && cacheableDefinitions.containsKey(type);
-  }
-
-  static DefinitionType definitionType(Definition definition) {
-    DefinitionEnvelope envelope = definitionEnvelope(definition);
-    return envelope == null ? null : envelope.type();
-  }
-
-  static String definitionGroup(Definition definition) {
-    DefinitionEnvelope envelope = definitionEnvelope(definition);
-    return envelope == null ? null : envelope.group();
-  }
-
-  static String definitionName(Definition definition) {
-    DefinitionEnvelope envelope = definitionEnvelope(definition);
-    return envelope == null ? null : envelope.name();
-  }
-
-  static DefinitionEnvelope definitionEnvelope(Definition definition) {
-    return definition == null ? null : definition.envelope();
-  }
-
-  static String normalize(String value) {
-    return Strings.trimToNull(value);
-  }
-
-  static String safe(Object value) {
-    return value == null ? "" : String.valueOf(value);
-  }
-
-  static String schemaName(DefinitionSchema schema) {
-    DefinitionEnvelope envelope = schema == null ? null : schema.envelope();
-    return Strings.firstNonBlank(envelope == null ? null : envelope.name(), "");
-  }
-
-  static String schemaTypeName(DefinitionSchema schema) {
-    return schema == null || schema.schemaType() == null ? "" : schema.schemaType().name();
-  }
-
-  static Map<DefinitionType, Class<? extends Definition>> cacheableDefinitions() {
-    EnumMap<DefinitionType, Class<? extends Definition>> map = new EnumMap<>(DefinitionType.class);
-    map.put(DefinitionType.APP, DefinitionApp.class);
-    map.put(DefinitionType.CONNECTION, DefinitionConnection.class);
-    map.put(DefinitionType.DATASET, DefinitionDataset.class);
-    map.put(DefinitionType.STREAM, DefinitionStream.class);
-    map.put(DefinitionType.INGEST, DefinitionIngest.class);
-    map.put(DefinitionType.INGEST_SOURCE, DefinitionIngestSource.class);
-    map.put(DefinitionType.ENVIRONMENT, DefinitionEnvironment.class);
-    map.put(DefinitionType.PLATFORM, DefinitionPlatform.class);
-    map.put(DefinitionType.SCHEMA, DefinitionSchema.class);
-    map.put(DefinitionType.SERVICE, DefinitionService.class);
-    map.put(DefinitionType.ENTITLEMENT, DefinitionEntitlement.class);
-    map.put(DefinitionType.DASHBOARD, DefinitionDashboard.class);
-    map.put(DefinitionType.CONFIG_LAYER, DefinitionConfigLayer.class);
-    map.put(DefinitionType.CONFIG, DefinitionConfig.class);
-    map.put(DefinitionType.CONFIG_CHANGE, DefinitionConfigChange.class);
-    map.put(DefinitionType.STATUS_APP, DefinitionStatusApp.class);
-    // No concrete class is modeled yet, but the bootstrap record is still cacheable.
-    map.put(DefinitionType.SECRETS_KDF, Definition.class);
-    return Map.copyOf(map);
-  }
-
-  static Map<Class<? extends Definition>, DefinitionType> classToType(
-      Map<DefinitionType, Class<? extends Definition>> cacheableDefinitions) {
-    ConcurrentHashMap<Class<? extends Definition>, DefinitionType> reverse = new ConcurrentHashMap<>();
-    for (Map.Entry<DefinitionType, Class<? extends Definition>> entry : cacheableDefinitions.entrySet()) {
-      Class<? extends Definition> definitionClass = entry.getValue();
-      if (definitionClass == Definition.class) {
-        continue;
-      }
-      reverse.putIfAbsent(definitionClass, entry.getKey());
-    }
-    return Map.copyOf(reverse);
-  }
-}
-
-
-
-
-
-
-
-
-
-
-
-package org.pronzato.fabric.api.control.discovery.codec;
-
-import com.fasterxml.jackson.annotation.JsonInclude;
-import com.fasterxml.jackson.databind.DeserializationFeature;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.SerializationFeature;
-import com.fasterxml.jackson.databind.node.ObjectNode;
-import java.io.IOException;
-import java.util.concurrent.ConcurrentHashMap;
-import org.pronzato.fabric.api.control.discovery.definitions.Definition;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionApp;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConnection;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDataset;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEntitlement;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvelope;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionEnvironment;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionHbService;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngest;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionIngestSource;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfig;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfigLayer;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionConfigChange;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionPlatform;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionSchema;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionService;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionDashboard;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStatusApp;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStatusData;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStatusService;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionStream;
-import org.pronzato.fabric.api.control.discovery.definitions.DefinitionType;
-import org.pronzato.fabric.api.util.Strings;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-public final class DiscoveryCodec {
-  private static final Logger LOGGER = LoggerFactory.getLogger(DiscoveryCodec.class);
-  private static final long UNKNOWN_TYPE_LOG_WINDOW_MS = 30_000L;
-  private static final ConcurrentHashMap<String, Long> UNKNOWN_TYPE_LAST_LOG =
-      new ConcurrentHashMap<>();
-  private static final ObjectMapper MAPPER =
-      new ObjectMapper()
-          .setSerializationInclusion(JsonInclude.Include.NON_NULL)
-          .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
-          .enable(DeserializationFeature.READ_UNKNOWN_ENUM_VALUES_USING_DEFAULT_VALUE)
-          .disable(SerializationFeature.FAIL_ON_EMPTY_BEANS)
-          .findAndRegisterModules();
-
-  private DiscoveryCodec() {}
-
-  public static ObjectMapper mapper() {
-    return MAPPER;
-  }
-
-  public static Definition decode(String json) {
-    String normalized = Strings.trimToNull(json);
-    if (normalized == null) {
-      throw new IllegalArgumentException("definition data is required");
-    }
-    try {
-      return decode(MAPPER.readTree(normalized));
-    } catch (IOException ex) {
-      throw new IllegalArgumentException("definition data must be valid JSON", ex);
-    }
-  }
-
-  public static Definition decode(byte[] data) {
-    if (data == null || data.length == 0) {
-      throw new IllegalArgumentException("definition data is required");
-    }
-    try {
-      return decode(MAPPER.readTree(data));
-    } catch (IOException ex) {
-      throw new IllegalArgumentException("definition data must be valid JSON", ex);
-    }
-  }
-
-  public static Definition decode(JsonNode node) {
-    if (node == null || node.isNull() || node.isMissingNode() || !node.isObject()) {
-      return null;
-    }
-    ObjectNode root = (ObjectNode) node;
-    JsonNode envelopeNode = root.get("envelope");
-    if (envelopeNode == null || envelopeNode.isNull() || !envelopeNode.isObject()) {
-      return null;
-    }
-    ObjectNode envelopeRoot = (ObjectNode) envelopeNode;
-    String typeText = asText(envelopeRoot.get("type"));
-    String group = asText(envelopeRoot.get("group"));
-    String name = asText(envelopeRoot.get("name"));
-    String uuid = asText(envelopeRoot.get("uuid"));
-    DefinitionType type = parseType(typeText);
-    if (type == DefinitionType.UNKNOWN || !isSupportedDecodeType(type)) {
-      logUnknownTypeWithDedupe(group, typeText, name, uuid);
-      return null;
-    }
-    DefinitionEnvelope envelope = decodeEnvelope(envelopeRoot, type);
-    if (envelope == null) {
-      return null;
-    }
-    try {
-      Definition decoded =
-          switch (type) {
-            case APP -> MAPPER.treeToValue(root, DefinitionApp.class);
-            case ENVIRONMENT -> MAPPER.treeToValue(root, DefinitionEnvironment.class);
-            case CONNECTION -> MAPPER.treeToValue(root, DefinitionConnection.class);
-            case DATASET -> MAPPER.treeToValue(root, DefinitionDataset.class);
-            case STREAM -> MAPPER.treeToValue(root, DefinitionStream.class);
-            case INGEST -> MAPPER.treeToValue(root, DefinitionIngest.class);
-            case INGEST_SOURCE -> MAPPER.treeToValue(root, DefinitionIngestSource.class);
-            case PLATFORM -> MAPPER.treeToValue(root, DefinitionPlatform.class);
-            case SCHEMA -> MAPPER.treeToValue(root, DefinitionSchema.class);
-            case SERVICE -> MAPPER.treeToValue(root, DefinitionService.class);
-            case ENTITLEMENT -> MAPPER.treeToValue(root, DefinitionEntitlement.class);
-            case DASHBOARD -> MAPPER.treeToValue(root, DefinitionDashboard.class);
-            case CONFIG -> MAPPER.treeToValue(root, DefinitionConfig.class);
-            case CONFIG_LAYER -> MAPPER.treeToValue(root, DefinitionConfigLayer.class);
-            case CONFIG_CHANGE -> MAPPER.treeToValue(root, DefinitionConfigChange.class);
-            case STATUS_APP -> MAPPER.treeToValue(root, DefinitionStatusApp.class);
-            case STATUS_SERVICE -> MAPPER.treeToValue(root, DefinitionStatusService.class);
-            case STATUS_DATA -> MAPPER.treeToValue(root, DefinitionStatusData.class);
-            case HEARTBEAT_SERVICE -> MAPPER.treeToValue(root, DefinitionHbService.class);
-            default -> throw new IllegalArgumentException("Unsupported definition type=" + type);
-          };
-      if (decoded.envelope() == null) {
-        throw new DefinitionDecodeException(
-            "Decoded definition missing envelope for type=" + type, envelope, root.deepCopy(), null);
-      }
-      return decoded;
-    } catch (DefinitionDecodeException ex) {
-      throw ex;
-    } catch (Exception ex) {
-      throw new DefinitionDecodeException(
-          "Unable to decode definition for type=" + type, envelope, root.deepCopy(), ex);
-    }
-  }
-
-  private static DefinitionEnvelope decodeEnvelope(ObjectNode envelopeNode, DefinitionType type) {
-    String group = asText(envelopeNode.get("group"));
-    String name = asText(envelopeNode.get("name"));
-    if (isBlank(group) || isBlank(name)) {
-      return null;
-    }
-    DefinitionEnvelope envelope =
-        new DefinitionEnvelope(
-            group,
-            type,
-            name,
-            asText(envelopeNode.get("uuid")),
-            asBoolean(envelopeNode.get("enabled")),
-            asText(envelopeNode.get("lifecycleStatus")),
-            asText(envelopeNode.get("createdTimeUtc")),
-            asText(envelopeNode.get("createdBy")),
-            asText(envelopeNode.get("updatedTimeUtc")),
-            asText(envelopeNode.get("updatedBy")));
-    return envelope;
-  }
-
-  private static DefinitionType parseType(String value) {
-    if (isBlank(value)) {
-      return DefinitionType.UNKNOWN;
-    }
-    try {
-      return DefinitionType.valueOf(value);
-    } catch (IllegalArgumentException ex) {
-      return DefinitionType.UNKNOWN;
-    }
-  }
-
-  private static String asText(JsonNode node) {
-    if (node == null || node.isNull() || !node.isTextual()) {
-      return null;
-    }
-    return node.textValue();
-  }
-
-  private static Boolean asBoolean(JsonNode node) {
-    return node == null || node.isNull() || !node.isBoolean() ? null : node.booleanValue();
-  }
-
-  private static boolean isBlank(String value) {
-    return value == null || value.isBlank();
-  }
-
-  private static void logUnknownTypeWithDedupe(
-      String group, String typeText, String name, String uuid) {
-    String key = safe(group) + "|" + safe(typeText) + "|" + safe(name) + "|" + safe(uuid);
-    long now = System.currentTimeMillis();
-    Long last = UNKNOWN_TYPE_LAST_LOG.get(key);
-    if (last != null && now - last <= UNKNOWN_TYPE_LOG_WINDOW_MS) {
-      return;
-    }
-    UNKNOWN_TYPE_LAST_LOG.put(key, now);
-    LOGGER.debug("[Discovery][UnknownType][Ignored] group={} typeText={} name={} uuid={}", group, typeText, name, uuid);
-  }
-
-  private static String safe(String value) {
-    return value == null ? "" : value;
-  }
-
-  private static boolean isSupportedDecodeType(DefinitionType type) {
-    if (type == null) {
-      return false;
-    }
-    return switch (type) {
-      case APP,
-          ENVIRONMENT,
-          CONNECTION,
-          DATASET,
-          STREAM,
-          INGEST,
-          INGEST_SOURCE,
-          PLATFORM,
-          SCHEMA,
-          SERVICE,
-          ENTITLEMENT,
-          DASHBOARD,
-          CONFIG,
-          CONFIG_LAYER,
-          CONFIG_CHANGE,
-          STATUS_APP,
-          STATUS_SERVICE,
-          STATUS_DATA,
-          HEARTBEAT_SERVICE -> true;
-      default -> false;
-    };
-  }
-
-  public static final class DefinitionDecodeException extends RuntimeException {
-    private final DefinitionEnvelope envelope;
-    private final JsonNode payload;
-
-    public DefinitionDecodeException(
-        String message, DefinitionEnvelope envelope, JsonNode payload, Throwable cause) {
-      super(message, cause);
-      this.envelope = envelope;
-      this.payload = payload;
-    }
-
-    public DefinitionEnvelope getEnvelope() {
-      return envelope;
-    }
-
-    public JsonNode getPayload() {
-      return payload;
-    }
-  }
-}
-
-
-
-
-package org.pronzato.fabric.api.control.discovery.definitions;
-
-import com.fasterxml.jackson.annotation.JsonInclude;
-import com.fasterxml.jackson.annotation.JsonProperty;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import org.pronzato.fabric.api.control.discovery.definitions.common.Semantic;
-
-@JsonInclude(JsonInclude.Include.NON_NULL)
-public record DefinitionDashboard(
-    @JsonProperty("envelope") DefinitionEnvelope envelope,
-    String title,
-    String description,
-    String category,
-    List<String> tags,
-    DashboardMode mode,
-    DashboardVisibility visibility,
-    DashboardExecutionMode executionMode,
-    DashboardLayout layout,
-    List<DashboardFilter> filters,
-    List<DashboardWidget> widgets,
-    RefreshPolicy refreshPolicy,
-    Semantic semantic
-) implements Definition {
-
-  public DefinitionDashboard {
-    Objects.requireNonNull(envelope, "envelope is required");
-    if (envelope.group() == null || envelope.group().isBlank()) {
-      throw new IllegalArgumentException("envelope.group is required");
-    }
-    if (envelope.name() == null || envelope.name().isBlank()) {
-      throw new IllegalArgumentException("envelope.name is required");
-    }
-    if (envelope.type() != DefinitionType.DASHBOARD) {
-      throw new IllegalArgumentException("envelope.type must be DASHBOARD");
-    }
-  }
-
-  public enum DashboardMode {
-    STANDARD,
-    FULL_SCREEN
-  }
-
-  public enum DashboardVisibility {
-    PUBLIC,
-    GROUP,
-    USER
-  }
-
-  public enum DashboardExecutionMode {
-    SHARED,
-    PER_USER
-  }
-
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  public record DashboardLayout(
-      Integer columns,
-      String gap,
-      List<DashboardSection> sections
-  ) {}
-
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  public record DashboardSection(
-      String id,
-      String title,
-      Integer columns,
-      List<DashboardPlacement> placements
-  ) {}
-
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  public record DashboardPlacement(
-      String widgetId,
-      Integer colSpan,
-      Integer rowSpan
-  ) {}
-
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  public record DashboardFilter(
-      String id,
-      String title,
-      FilterType type,
-      String field,
-      Boolean required,
-      String placeholder,
-      String defaultValue,
-      List<String> defaultValues,
-      List<FilterOption> options,
-      FilterSource source
-  ) {}
-
-  public enum FilterType {
-    GROUP,
-    SELECT,
-    MULTI_SELECT,
-    TEXT,
-    DATE,
-    TIME,
-    DATE_RANGE
-  }
-
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  public record FilterOption(
-      String value,
-      String label
-  ) {}
-
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  public record FilterSource(
-      SourceType type,
-      String ref,
-      String valueField,
-      String labelField
-  ) {}
-
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  public record DashboardWidget(
-      String id,
-      String title,
-      WidgetType type,
-      String subtitle,
-      String description,
-      RefreshPolicy refreshPolicy,
-      List<String> filterBindings,
-      List<WidgetAction> actions,
-      Drilldown drilldown,
-      WidgetSource source,
-      DashboardPlacement layout,
-      KpiWidget kpi,
-      TableWidget table,
-      ChartWidget chart,
-      StreamWidget stream,
-      StatusWidget status,
-      ActionWidget action
-  ) {}
-
-  public enum WidgetType {
-    KPI,
-    TABLE,
-    CHART,
-    STREAM,
-    STATUS,
-    ACTION
-  }
-
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  public record WidgetSource(
-      SourceType type,
-      SourceMode mode,
-      String ref,
-      String query,
-      String stream,
-      String service,
-      String method,
-      Integer limit,
-      Map<String, String> parameters
-  ) {}
-
-  public enum SourceType {
-    DATASET,
-    MATERIALIZED_VIEW,
-    STREAM,
-    SERVICE,
-    INLINE
-  }
-
-  public enum SourceMode {
-    SNAPSHOT,
-    LIVE
-  }
-
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  public record RefreshPolicy(
-      RefreshMode mode,
-      Integer intervalSeconds
-  ) {}
-
-  public enum RefreshMode {
-    MANUAL,
-    INTERVAL,
-    LIVE,
-    ON_FILTER_CHANGE,
-    ON_LINK_EVENT
-  }
-
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  public record KpiWidget(
-      String valueField,
-      String secondaryField,
-      String format,
-      StatusRule statusRule
-  ) {}
-
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  public record TableWidget(
-      List<TableColumn> columns,
-      Integer defaultLimit,
-      Boolean pageable,
-      Boolean selectable,
-      List<RowAction> rowActions
-  ) {}
-
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  public record TableColumn(
-      String field,
-      String title,
-      Integer width,
-      Boolean visible,
-      String format
-  ) {}
-
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  public record RowAction(
-      String id,
-      String label,
-      ActionType type,
-      String style,
-      Drilldown drilldown,
-      WidgetAction action
-  ) {}
-
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  public record ChartWidget(
-      ChartType chartType,
-      String categoryField,
-      String valueField,
-      String seriesField,
-      Boolean clickable
-  ) {}
-
-  public enum ChartType {
-    BAR,
-    LINE,
-    AREA,
-    DONUT
-  }
-
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  public record StreamWidget(
-      StreamMode mode,
-      Integer maxRows,
-      Boolean autoStart,
-      List<TableColumn> columns
-  ) {}
-
-  public enum StreamMode {
-    EVENT,
-    TABLE,
-    HYBRID
-  }
-
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  public record StatusWidget(
-      String valueField,
-      List<StatusRule> rules
-  ) {}
-
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  public record StatusRule(
-      String when,
-      String label,
-      String severity
-  ) {}
-
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  public record ActionWidget(
-      String label,
-      ActionType actionType,
-      Boolean confirm,
-      String confirmMessage,
-      Map<String, String> inputs
-  ) {}
-
-  public enum ActionType {
-    SERVICE_CALL,
-    DATA_UPDATE,
-    NAVIGATE,
-    CUSTOM
-  }
-
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  public record Drilldown(
-      DrilldownType type,
-      String target,
-      Map<String, String> parameterMappings
-  ) {}
-
-  public enum DrilldownType {
-    DASHBOARD,
-    DIALOG,
-    FILTER
-  }
-
-  @JsonInclude(JsonInclude.Include.NON_NULL)
-  public record WidgetAction(
-      String id,
-      ActionType type,
-      String targetWidgetId,
-      Map<String, String> parameterMappings
-  ) {}
-}
-
-
-
-
-
-
-{
-  "envelope": {
-    "group": "lab",
-    "type": "DASHBOARD",
-    "name": "orders-dashboard",
-    "uuid": "8d6f9a7c-3c5d-4e93-b2b7-5f6f7c0f9d41",
-    "enabled": true,
-    "lifecycleStatus": "ACTIVE",
-    "createdTimeUtc": "2026-03-20T00:00:00Z",
-    "createdBy": "studio",
-    "updatedTimeUtc": "2026-03-20T00:00:00Z",
-    "updatedBy": "studio"
-  },
-  "title": "Orders Dashboard",
-  "description": "Live and historical view of trading orders across desks.",
-  "category": "Trading",
-  "tags": [
-    "orders",
-    "trading",
-    "lab"
-  ],
-  "mode": "STANDARD",
-  "visibility": "GROUP",
-  "executionMode": "SHARED",
-  "layout": {
-    "columns": 12,
-    "gap": "md",
-    "sections": [
-      {
-        "id": "summary",
-        "title": "Summary",
-        "columns": 12,
-        "placements": [
-          {
-            "widgetId": "kpi_total_orders",
-            "colSpan": 3,
-            "rowSpan": 1
-          },
-          {
-            "widgetId": "kpi_total_notional",
-            "colSpan": 3,
-            "rowSpan": 1
-          },
-          {
-            "widgetId": "kpi_latest_order_count",
-            "colSpan": 3,
-            "rowSpan": 1
-          }
-        ]
-      },
-      {
-        "id": "orders",
-        "title": "Orders",
-        "columns": 12,
-        "placements": [
-          {
-            "widgetId": "orders_table",
-            "colSpan": 12,
-            "rowSpan": 4
-          }
-        ]
-      },
-      {
-        "id": "live",
-        "title": "Live Orders",
-        "columns": 12,
-        "placements": [
-          {
-            "widgetId": "orders_stream",
-            "colSpan": 12,
-            "rowSpan": 4
-          }
-        ]
-      }
-    ]
-  },
-  "filters": [
-    {
-      "id": "group",
-      "title": "Group",
-      "type": "GROUP",
-      "field": "group",
-      "required": true,
-      "defaultValue": "lab"
-    },
-    {
-      "id": "desk",
-      "title": "Desk",
-      "type": "SELECT",
-      "field": "desk",
-      "required": false,
-      "source": {
-        "type": "DATASET",
-        "ref": "dataset:lab/default/desks",
-        "valueField": "desk",
-        "labelField": "desk"
-      }
-    },
-    {
-      "id": "created_date",
-      "title": "Trade Date",
-      "type": "DATE",
-      "field": "created_date",
-      "required": false
-    }
-  ],
-  "widgets": [
-    {
-      "id": "kpi_total_orders",
-      "title": "Total Orders",
-      "type": "KPI",
-      "refreshPolicy": {
-        "mode": "INTERVAL",
-        "intervalSeconds": 30
-      },
-      "filterBindings": [
-        "group",
-        "desk",
-        "created_date"
-      ],
-      "layout": {
-        "widgetId": "kpi_total_orders",
-        "colSpan": 3,
-        "rowSpan": 1
-      },
-      "source": {
-        "type": "DATASET",
-        "mode": "SNAPSHOT",
-        "ref": "dataset:lab/default/orders",
-        "query": "SELECT COUNT(*) AS total_orders FROM dataset('lab.default.orders')",
-        "limit": 1
-      },
-      "kpi": {
-        "valueField": "total_orders"
-      }
-    },
-    {
-      "id": "kpi_total_notional",
-      "title": "Total Notional",
-      "type": "KPI",
-      "refreshPolicy": {
-        "mode": "INTERVAL",
-        "intervalSeconds": 30
-      },
-      "filterBindings": [
-        "group",
-        "desk",
-        "created_date"
-      ],
-      "layout": {
-        "widgetId": "kpi_total_notional",
-        "colSpan": 3,
-        "rowSpan": 1
-      },
-      "source": {
-        "type": "DATASET",
-        "mode": "SNAPSHOT",
-        "ref": "dataset:lab/default/orders",
-        "query": "SELECT SUM(quantity * price) AS total_notional FROM dataset('lab.default.orders')",
-        "limit": 1
-      },
-      "kpi": {
-        "valueField": "total_notional",
-        "format": "currency"
-      }
-    },
-    {
-      "id": "kpi_latest_order_count",
-      "title": "Latest Order Qty",
-      "type": "KPI",
-      "subtitle": "Live stream-driven",
-      "refreshPolicy": {
-        "mode": "LIVE"
-      },
-      "filterBindings": [
-        "group",
-        "desk"
-      ],
-      "layout": {
-        "widgetId": "kpi_latest_order_count",
-        "colSpan": 3,
-        "rowSpan": 1
-      },
-      "source": {
-        "type": "STREAM",
-        "mode": "LIVE",
-        "stream": "stream:lab/default/orders_stream"
-      },
-      "kpi": {
-        "valueField": "quantity"
-      }
-    },
-    {
-      "id": "orders_table",
-      "title": "Orders",
-      "type": "TABLE",
-      "refreshPolicy": {
-        "mode": "MANUAL"
-      },
-      "filterBindings": [
-        "group",
-        "desk",
-        "created_date"
-      ],
-      "layout": {
-        "widgetId": "orders_table",
-        "colSpan": 12,
-        "rowSpan": 4
-      },
-      "source": {
-        "type": "DATASET",
-        "mode": "SNAPSHOT",
-        "ref": "dataset:lab/default/orders",
-        "limit": 25
-      },
-      "table": {
-        "defaultLimit": 25,
-        "pageable": true,
-        "selectable": true,
-        "columns": [
-          {
-            "field": "order_id",
-            "title": "Order ID",
-            "visible": true
-          },
-          {
-            "field": "desk",
-            "title": "Desk",
-            "visible": true
-          },
-          {
-            "field": "symbol",
-            "title": "Symbol",
-            "visible": true
-          },
-          {
-            "field": "side",
-            "title": "Side",
-            "visible": true
-          },
-          {
-            "field": "quantity",
-            "title": "Qty",
-            "visible": true
-          },
-          {
-            "field": "price",
-            "title": "Price",
-            "visible": true
-          },
-          {
-            "field": "status",
-            "title": "Status",
-            "visible": true
-          }
-        ]
-      }
-    },
-    {
-      "id": "orders_stream",
-      "title": "Live Orders",
-      "type": "STREAM",
-      "refreshPolicy": {
-        "mode": "LIVE"
-      },
-      "filterBindings": [
-        "group",
-        "desk"
-      ],
-      "layout": {
-        "widgetId": "orders_stream",
-        "colSpan": 12,
-        "rowSpan": 4
-      },
-      "source": {
-        "type": "STREAM",
-        "mode": "LIVE",
-        "stream": "stream:lab/default/orders_stream"
-      },
-      "stream": {
-        "mode": "TABLE",
-        "maxRows": 500,
-        "autoStart": true,
-        "columns": [
-          {
-            "field": "order_id",
-            "title": "Order ID",
-            "visible": true
-          },
-          {
-            "field": "desk",
-            "title": "Desk",
-            "visible": true
-          },
-          {
-            "field": "symbol",
-            "title": "Symbol",
-            "visible": true
-          },
-          {
-            "field": "side",
-            "title": "Side",
-            "visible": true
-          },
-          {
-            "field": "quantity",
-            "title": "Qty",
-            "visible": true
-          },
-          {
-            "field": "price",
-            "title": "Price",
-            "visible": true
-          },
-          {
-            "field": "status",
-            "title": "Status",
-            "visible": true
-          }
-        ]
-      }
-    }
-  ],
-  "refreshPolicy": {
-    "mode": "MANUAL"
-  }
-}
-
-
-
-
-
-
-
-
-
-
-{
-  "envelope": {
-    "group": "lab",
-    "type": "DASHBOARD",
-    "name": "positions-dashboard",
-    "uuid": "3a5c8d74-1f2b-4d9e-a6c7-8b92e4f17d53",
-    "enabled": true,
-    "lifecycleStatus": "ACTIVE",
-    "createdTimeUtc": "2026-03-20T00:00:00Z",
-    "createdBy": "studio",
-    "updatedTimeUtc": "2026-03-20T00:00:00Z",
-    "updatedBy": "studio"
-  },
-  "title": "Positions Dashboard",
-  "description": "Current positions, exposure, and live position updates across desks.",
-  "category": "Trading",
-  "tags": [
-    "positions",
-    "risk",
-    "trading",
-    "lab"
-  ],
-  "mode": "STANDARD",
-  "visibility": "GROUP",
-  "executionMode": "SHARED",
-  "layout": {
-    "columns": 12,
-    "gap": "md",
-    "sections": [
-      {
-        "id": "summary",
-        "title": "Summary",
-        "columns": 12,
-        "placements": [
-          {
-            "widgetId": "kpi_total_positions",
-            "colSpan": 3,
-            "rowSpan": 1
-          },
-          {
-            "widgetId": "kpi_net_quantity",
-            "colSpan": 3,
-            "rowSpan": 1
-          },
-          {
-            "widgetId": "kpi_total_market_value",
-            "colSpan": 3,
-            "rowSpan": 1
-          },
-          {
-            "widgetId": "kpi_total_pnl",
-            "colSpan": 3,
-            "rowSpan": 1
-          }
-        ]
-      },
-      {
-        "id": "positions",
-        "title": "Positions",
-        "columns": 12,
-        "placements": [
-          {
-            "widgetId": "positions_table",
-            "colSpan": 12,
-            "rowSpan": 4
-          }
-        ]
-      },
-      {
-        "id": "live",
-        "title": "Live Position Updates",
-        "columns": 12,
-        "placements": [
-          {
-            "widgetId": "positions_stream",
-            "colSpan": 12,
-            "rowSpan": 4
-          }
-        ]
-      }
-    ]
-  },
-  "filters": [
-    {
-      "id": "group",
-      "title": "Group",
-      "type": "GROUP",
-      "field": "group",
-      "required": true,
-      "defaultValue": "lab"
-    },
-    {
-      "id": "desk",
-      "title": "Desk",
-      "type": "SELECT",
-      "field": "desk",
-      "required": false,
-      "source": {
-        "type": "DATASET",
-        "ref": "dataset:lab/default/desks",
-        "valueField": "desk",
-        "labelField": "desk"
-      }
-    },
-    {
-      "id": "account_id",
-      "title": "Account",
-      "type": "TEXT",
-      "field": "account_id",
-      "required": false
-    },
-    {
-      "id": "symbol",
-      "title": "Symbol",
-      "type": "TEXT",
-      "field": "symbol",
-      "required": false
-    }
-  ],
-  "widgets": [
-    {
-      "id": "kpi_total_positions",
-      "title": "Total Positions",
-      "type": "KPI",
-      "refreshPolicy": {
-        "mode": "INTERVAL",
-        "intervalSeconds": 30
-      },
-      "filterBindings": [
-        "group",
-        "desk",
-        "account_id",
-        "symbol"
-      ],
-      "layout": {
-        "widgetId": "kpi_total_positions",
-        "colSpan": 3,
-        "rowSpan": 1
-      },
-      "source": {
-        "type": "DATASET",
-        "mode": "SNAPSHOT",
-        "ref": "dataset:lab/default/positions",
-        "query": "SELECT COUNT(*) AS total_positions FROM dataset('lab.default.positions')",
-        "limit": 1
-      },
-      "kpi": {
-        "valueField": "total_positions"
-      }
-    },
-    {
-      "id": "kpi_net_quantity",
-      "title": "Net Quantity",
-      "type": "KPI",
-      "refreshPolicy": {
-        "mode": "INTERVAL",
-        "intervalSeconds": 30
-      },
-      "filterBindings": [
-        "group",
-        "desk",
-        "account_id",
-        "symbol"
-      ],
-      "layout": {
-        "widgetId": "kpi_net_quantity",
-        "colSpan": 3,
-        "rowSpan": 1
-      },
-      "source": {
-        "type": "DATASET",
-        "mode": "SNAPSHOT",
-        "ref": "dataset:lab/default/positions",
-        "query": "SELECT SUM(quantity) AS net_quantity FROM dataset('lab.default.positions')",
-        "limit": 1
-      },
-      "kpi": {
-        "valueField": "net_quantity"
-      }
-    },
-    {
-      "id": "kpi_total_market_value",
-      "title": "Market Value",
-      "type": "KPI",
-      "refreshPolicy": {
-        "mode": "INTERVAL",
-        "intervalSeconds": 30
-      },
-      "filterBindings": [
-        "group",
-        "desk",
-        "account_id",
-        "symbol"
-      ],
-      "layout": {
-        "widgetId": "kpi_total_market_value",
-        "colSpan": 3,
-        "rowSpan": 1
-      },
-      "source": {
-        "type": "DATASET",
-        "mode": "SNAPSHOT",
-        "ref": "dataset:lab/default/positions",
-        "query": "SELECT SUM(market_value) AS total_market_value FROM dataset('lab.default.positions')",
-        "limit": 1
-      },
-      "kpi": {
-        "valueField": "total_market_value",
-        "format": "currency"
-      }
-    },
-    {
-      "id": "kpi_total_pnl",
-      "title": "PnL",
-      "type": "KPI",
-      "refreshPolicy": {
-        "mode": "INTERVAL",
-        "intervalSeconds": 30
-      },
-      "filterBindings": [
-        "group",
-        "desk",
-        "account_id",
-        "symbol"
-      ],
-      "layout": {
-        "widgetId": "kpi_total_pnl",
-        "colSpan": 3,
-        "rowSpan": 1
-      },
-      "source": {
-        "type": "DATASET",
-        "mode": "SNAPSHOT",
-        "ref": "dataset:lab/default/positions",
-        "query": "SELECT SUM(pnl) AS total_pnl FROM dataset('lab.default.positions')",
-        "limit": 1
-      },
-      "kpi": {
-        "valueField": "total_pnl",
-        "format": "currency",
-        "statusRule": {
-          "when": "value >= 0",
-          "label": "Positive",
-          "severity": "SUCCESS"
-        }
-      }
-    },
-    {
-      "id": "positions_table",
-      "title": "Positions",
-      "type": "TABLE",
-      "refreshPolicy": {
-        "mode": "MANUAL"
-      },
-      "filterBindings": [
-        "group",
-        "desk",
-        "account_id",
-        "symbol"
-      ],
-      "layout": {
-        "widgetId": "positions_table",
-        "colSpan": 12,
-        "rowSpan": 4
-      },
-      "source": {
-        "type": "DATASET",
-        "mode": "SNAPSHOT",
-        "ref": "dataset:lab/default/positions",
-        "limit": 50
-      },
-      "table": {
-        "defaultLimit": 50,
-        "pageable": true,
-        "selectable": true,
-        "columns": [
-          {
-            "field": "position_id",
-            "title": "Position ID",
-            "visible": true
-          },
-          {
-            "field": "account_id",
-            "title": "Account",
-            "visible": true
-          },
-          {
-            "field": "desk",
-            "title": "Desk",
-            "visible": true
-          },
-          {
-            "field": "book",
-            "title": "Book",
-            "visible": true
-          },
-          {
-            "field": "instrument_id",
-            "title": "Instrument",
-            "visible": true
-          },
-          {
-            "field": "symbol",
-            "title": "Symbol",
-            "visible": true
-          },
-          {
-            "field": "quantity",
-            "title": "Qty",
-            "visible": true
-          },
-          {
-            "field": "average_price",
-            "title": "Avg Price",
-            "visible": true
-          },
-          {
-            "field": "market_value",
-            "title": "Market Value",
-            "visible": true,
-            "format": "currency"
-          },
-          {
-            "field": "pnl",
-            "title": "PnL",
-            "visible": true,
-            "format": "currency"
-          },
-          {
-            "field": "as_of_date",
-            "title": "As Of",
-            "visible": true
-          }
-        ]
-      }
-    },
-    {
-      "id": "positions_stream",
-      "title": "Live Position Updates",
-      "type": "STREAM",
-      "refreshPolicy": {
-        "mode": "LIVE"
-      },
-      "filterBindings": [
-        "group",
-        "desk",
-        "account_id",
-        "symbol"
-      ],
-      "layout": {
-        "widgetId": "positions_stream",
-        "colSpan": 12,
-        "rowSpan": 4
-      },
-      "source": {
-        "type": "STREAM",
-        "mode": "LIVE",
-        "stream": "stream:lab/default/positions_stream"
-      },
-      "stream": {
-        "mode": "TABLE",
-        "maxRows": 500,
-        "autoStart": true,
-        "columns": [
-          {
-            "field": "position_id",
-            "title": "Position ID",
-            "visible": true
-          },
-          {
-            "field": "account_id",
-            "title": "Account",
-            "visible": true
-          },
-          {
-            "field": "desk",
-            "title": "Desk",
-            "visible": true
-          },
-          {
-            "field": "symbol",
-            "title": "Symbol",
-            "visible": true
-          },
-          {
-            "field": "quantity",
-            "title": "Qty",
-            "visible": true
-          },
-          {
-            "field": "market_value",
-            "title": "Market Value",
-            "visible": true,
-            "format": "currency"
-          },
-          {
-            "field": "pnl",
-            "title": "PnL",
-            "visible": true,
-            "format": "currency"
-          }
-        ]
-      }
-    }
-  ],
-  "refreshPolicy": {
-    "mode": "MANUAL"
-  }
-}
-
-
-
-
-
-
-
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/app
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/badge
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/component
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/controller
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dashboard
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dialog
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/agents
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/catalog
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/configs
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/discovery
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/docs
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/component
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/graph
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/json
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/model
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/provider
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/platform
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/status
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/storage
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/grid
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/help
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/layout
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/menu
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/realtime
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/security
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/session
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/support
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/theme
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/tree
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/util
+mkdir -p fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/view
+
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/app/StitchApplication.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/app/StitchLauncher.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/app/StitchSettings.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/app/StitchSpringRuntime.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/badge/StitchStatusBadge.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/component/StitchActionIcons.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/component/StitchActionStyles.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/component/StitchBooleanToggle.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/component/StitchComponentCodes.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/component/StitchEmptyState.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/component/StitchFiltersBar.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/component/StitchGroupFilter.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/component/StitchInspectorPreviewPanel.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/component/StitchJsonDiffPanel.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/component/StitchResultsPagination.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/component/StitchResultsSearch.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/component/StitchResultsToolbar.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/component/StitchSection.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/component/StitchSectionHeader.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/component/StitchShellUserArea.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/component/StitchSummaryStrip.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/component/StitchTabbedDetailsPanel.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/component/StitchTabs.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/component/StitchWorkflowQueuePanel.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/controller/StitchDocsResourceController.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/controller/StitchSsoController.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dashboard/StitchDashboardActionHandler.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dashboard/StitchDashboardActionRequest.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dashboard/StitchDashboardActionResult.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dashboard/StitchDashboardActions.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dashboard/StitchDashboardAuthoringBrowserScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dashboard/StitchDashboardBrowserScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dashboard/StitchDashboardCatalog.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dashboard/StitchDashboardDataRequest.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dashboard/StitchDashboardDataSource.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dashboard/StitchDashboardDataSources.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dashboard/StitchDashboardDefinitionRef.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dashboard/StitchDashboardDefinitionStore.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dashboard/StitchDashboardDefinitionSupport.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dashboard/StitchDashboardDescriptor.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dashboard/StitchDashboardDescriptorLoader.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dashboard/StitchDashboardEditorScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dashboard/StitchDashboardRegistry.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dashboard/StitchDashboardScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dialog/StitchDialog.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dialog/StitchDialogs.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dialog/StitchJsonDialog.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dialog/StitchJsonDiffDialog.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/dialog/StitchUnsavedChangesDialog.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/agents/StitchAgentsFeature.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/agents/StitchAgentsListScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/agents/StitchAgentsPlaygroundScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/agents/StitchAgentsProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/agents/StitchAgentsScenarioEditorDialog.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/agents/StitchAgentsScenariosScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/agents/StitchAgentsSessionState.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/agents/StitchAgentsToolEditorDialog.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/agents/StitchAgentsToolsScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/agents/StitchAgentsTraceRunDialog.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/agents/StitchAgentsTraceViewerScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/agents/StitchAgentsUiSupport.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetDraftCustomizer.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetEditorDescriptor.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetEditorDescriptors.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetEditorDialog.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetEditorPanel.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetResultsConfig.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetsAppsView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetsColumn.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetsConfigsView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetsConnectionsView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetsDataProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetsDataProviders.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetsDatasetsView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetsEditorProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetsFeature.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetsIngestionView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetSourceSpec.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetsRow.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetsSchemasView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetsScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetsScreenConfig.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetsServicesView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetsSort.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetsStreamsView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetsView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetsViewSupport.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetUiBuilder.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchAssetUiDescriptor.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/assets/StitchSchemaPresentationSupport.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit/StitchAuditBrowserScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit/StitchAuditColumn.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit/StitchAuditConfigsFeedAdapter.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit/StitchAuditConfigsView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit/StitchAuditDetailsDialog.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit/StitchAuditDetailsModel.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit/StitchAuditDirectFeedSupport.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit/StitchAuditDiscoveryFeedAdapter.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit/StitchAuditDiscoveryView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit/StitchAuditEntitlementsFeedAdapter.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit/StitchAuditEntitlementsView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit/StitchAuditFeature.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit/StitchAuditFeedAdapter.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit/StitchAuditFilterBar.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit/StitchAuditFilterDefinition.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit/StitchAuditFilterModel.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit/StitchAuditPage.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit/StitchAuditProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit/StitchAuditRelatedContext.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit/StitchAuditRow.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit/StitchAuditScreenConfig.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit/StitchAuditStatusFeedAdapter.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/audit/StitchAuditStatusView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/catalog/StitchCatalogBrowserScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/catalog/StitchCatalogDetailsDialog.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/catalog/StitchCatalogFeature.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/catalog/StitchCatalogImpactPanel.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/catalog/StitchCatalogImpactSupport.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/catalog/StitchCatalogProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/catalog/StitchCatalogRelationshipPanel.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/catalog/StitchCatalogRow.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/catalog/StitchCatalogScreenConfig.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/catalog/StitchCatalogSemanticEditorPanel.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/configs/StitchConfigCompareDialog.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/configs/StitchConfigDagDialog.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/configs/StitchConfigJsonModesDialog.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/configs/StitchConfigLayerIdentitySupport.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/configs/StitchConfigLayerInspector.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/configs/StitchConfigsApprovalsProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/configs/StitchConfigScheduleControls.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/configs/StitchConfigsControlScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/configs/StitchConfigsControlView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/configs/StitchConfigSelectionBar.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/configs/StitchConfigSelectionContext.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/configs/StitchConfigsFeature.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/configs/StitchConfigsProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/configs/StitchConfigsRollbacksProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/configs/StitchConfigsSchemasProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/configs/StitchConfigsScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/configs/StitchConfigsScreenConfig.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/configs/StitchConfigSubmissionDialog.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/configs/StitchConfigsViewScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/configs/StitchConfigsWatcherProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/configs/StitchConfigsWatcherScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchDataFeature.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchDatasetDetails.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchDatasetLiveProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchDatasetLiveScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchDatasetLiveScreenConfig.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchDatasetProviderSupport.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchDatasetsDetailsDialog.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchDatasetsProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchDatasetsRow.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchDatasetsScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchDatasetsScreenConfig.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchDatasetsView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchDatasetViewProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchDatasetViewScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchDatasetViewScreenConfig.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchStreamDefinitionSupport.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchStreamDetails.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchStreamDetailsDialog.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchStreamEventViewScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchStreamHybridViewScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchStreamPayloadSupport.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchStreamsLiveDialog.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchStreamsProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchStreamsRow.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchStreamsScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchStreamsScreenConfig.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchStreamsView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchStreamTabularViewScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/data/StitchStreamViewSupport.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/discovery/StitchDiscoveryBrowserProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/discovery/StitchDiscoveryBrowserScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/discovery/StitchDiscoveryBrowserScreenConfig.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/discovery/StitchDiscoveryFeature.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/docs/StitchDocsBrowserProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/docs/StitchDocsBrowserScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/docs/StitchDocsBrowserScreenConfig.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/docs/StitchDocsFeature.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/component/StitchDatasetEntitlementsDialog.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/component/StitchDatasetEntitlementsPolicyEditor.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/component/StitchEntitlementsAccessEditor.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/component/StitchEntitlementsDialogShell.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/component/StitchEntitlementsSubjectPicker.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/component/StitchNamespaceEntitlementsDialog.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/component/StitchServiceEntitlementsDialog.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/graph/StitchEntitlementsGraphDialog.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/graph/StitchEntitlementsGraphSupport.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/json/StitchEntitlementsJsonView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/model/StitchDatasetEntitlementPolicy.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/model/StitchDatasetEntitlementsState.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/model/StitchEntitlementColumnMaskRule.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/model/StitchEntitlementContext.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/model/StitchEntitlementEffect.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/model/StitchEntitlementPolicy.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/model/StitchEntitlementRowFilterRule.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/model/StitchEntitlementRule.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/model/StitchEntitlementSubject.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/model/StitchEntitlementSubjectType.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/model/StitchNamespaceEntitlementsState.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/model/StitchServiceEntitlementsState.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/package-info.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/provider/StitchDatasetEntitlementsProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/provider/StitchEntitlementsAdminProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/provider/StitchEntitlementsLookupProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/provider/StitchEntitlementsProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/provider/StitchEntitlementsProviderSupport.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/provider/StitchServiceEntitlementsProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/StitchEntitlementsAdminRow.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/StitchEntitlementsAdminScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/StitchEntitlementsAdminScreenConfig.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/StitchEntitlementsAdminView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/entitlements/StitchEntitlementsFeature.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/platform/StitchGroupsGroupEditor.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/platform/StitchGroupsOuEditor.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/platform/StitchGroupsTreeAdapter.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/platform/StitchPlatformDataProviders.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/platform/StitchPlatformFeature.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/platform/StitchPlatformGroupsProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/platform/StitchPlatformGroupsScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/platform/StitchPlatformGroupsScreenConfig.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/platform/StitchPlatformGroupsView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/status/StitchStatusAppsView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/status/StitchStatusColumn.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/status/StitchStatusDataProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/status/StitchStatusDataProviders.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/status/StitchStatusDataView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/status/StitchStatusDetailsDialog.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/status/StitchStatusFeature.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/status/StitchStatusRow.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/status/StitchStatusScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/status/StitchStatusScreenConfig.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/status/StitchStatusServicesView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/status/StitchStatusSort.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/status/StitchStatusSourceSelection.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/status/StitchStatusTimeFormat.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/status/StitchStatusView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/StitchFeatureRegistry.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/StitchFeatures.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/StitchFeatureSet.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/storage/StitchStorageS3BrowserProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/storage/StitchStorageS3BrowserScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/storage/StitchStorageS3BrowserScreenConfig.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/storage/StitchStorageS3QueryProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/storage/StitchStorageS3QueryScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/feature/storage/StitchStorageS3QueryScreenConfig.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/grid/StitchGrid.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/grid/StitchGridColumn.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/grid/StitchRowActions.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/help/StitchReferenceView.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/layout/StitchShellLayout.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/menu/StitchMenuBuilder.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/menu/StitchMenuContributionRegistry.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/menu/StitchMenuEntry.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/menu/StitchMenuEntryId.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/menu/StitchMenuItem.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/menu/StitchMenuNodeBuilder.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/menu/StitchMenuProvider.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/menu/StitchMenusBuilder.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/menu/StitchSubmenuBuilder.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/realtime/StitchEventLogShell.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/realtime/StitchLiveTableChangeTracker.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/realtime/StitchLiveTableDelta.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/realtime/StitchLiveTableHighlightMode.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/realtime/StitchLiveTableShell.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/realtime/StitchRealtimeConflationMode.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/realtime/StitchRealtimeConnectionState.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/realtime/StitchRealtimeHeaderStatus.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/realtime/StitchRealtimeSource.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/realtime/StitchRealtimeStatusBar.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/realtime/StitchRealtimeStatusRegistry.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/realtime/StitchRealtimeSubscriptionController.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/realtime/StitchRealtimeUpdate.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/realtime/StitchRealtimeUpdatePolicy.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/realtime/StitchRealtimeWatcherShell.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/realtime/StitchSubscriptionControls.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/realtime/StitchSubscriptionScope.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/realtime/StitchUiUpdateDispatcher.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/security/ServletSsoRequestAdapter.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/security/ServletSsoResponseAdapter.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/security/StitchGroupAccess.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/security/StitchIdentityContext.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/security/StitchSsoFilter.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/security/StitchSsoUsers.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/session/StitchFabricSettings.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/session/StitchGroupSelectionContext.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/session/StitchRuntimeContext.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/Stitch.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/StitchRuntime.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/support/StitchCloseables.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/support/StitchDetailsDialogSupport.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/support/StitchTextSupport.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/theme/StitchTheme.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/tree/StitchDirtyStateSupport.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/tree/StitchEditableDetailPanel.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/tree/StitchEditorModeController.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/tree/StitchHierarchicalBrowserScreen.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/tree/StitchHierarchicalBrowserShell.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/tree/StitchHierarchicalKeyAdapter.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/tree/StitchTreeLayout.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/tree/StitchTreeNav.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/tree/StitchTreeNodeAdapter.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/util/StitchComponents.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/view/StitchGroupedResultsPage.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/view/StitchPage.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/view/StitchPageActions.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/view/StitchPageHeader.java
+touch fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/view/StitchResultsView.java
