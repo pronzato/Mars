@@ -1,1 +1,293 @@
-null
+mkdir -p fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents
+mkdir -p fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/manager
+mkdir -p fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/reasoner
+
+touch fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentAnswer.java
+touch fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentExecutionTrace.java
+touch fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentLimits.java
+touch fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentManager.java
+touch fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentPlanStep.java
+touch fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentReasonerMode.java
+touch fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentRequest.java
+touch fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentResponse.java
+touch fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentSessions.java
+touch fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentStatus.java
+touch fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentStepStatus.java
+touch fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/AgentToolCall.java
+touch fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/manager/AgentManagerImpl.java
+touch fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/reasoner/AgentReasoner.java
+touch fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/reasoner/AgentReasonerRequest.java
+touch fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/reasoner/AgentReasonerResult.java
+touch fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/reasoner/AgentReasonerSupport.java
+touch fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/reasoner/AgentScenario.java
+touch fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/reasoner/AgentScenarioRegistry.java
+touch fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/reasoner/DeterministicAgentReasoner.java
+touch fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/reasoner/ModelBackedAgentReasoner.java
+touch fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/reasoner/ScriptedAgentReasoner.java
+touch fabric-lite-agents/src/main/java/org/pronzato/fabric/api/agents/reasoner/UnsupportedModelBackedAgentReasoner.java
+
+
+
+
+
+
+mkdir -p fabric-lite-lab/src/main/java/demo/echo
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/configs
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/connectors/s3
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/ingest/amps
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/ingest/api
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/ingest/s3
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/odbc
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/query
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/grpc
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/checkpoints
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/connections
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/data
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/basics
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/ingest
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/parquet
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/schemas
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/services
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/sql
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/views
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/ingest/amps
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/ingest/api
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/ingest/s3
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/parquet
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/schemas
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/services/grpc
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/session
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/views
+mkdir -p fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/session
+
+touch fabric-lite-lab/src/main/java/demo/echo/EchoData.java
+touch fabric-lite-lab/src/main/java/demo/echo/EchoDataOrBuilder.java
+touch fabric-lite-lab/src/main/java/demo/echo/EchoGrpc.java
+touch fabric-lite-lab/src/main/java/demo/echo/EchoProto.java
+touch fabric-lite-lab/src/main/java/demo/echo/EchoReply.java
+touch fabric-lite-lab/src/main/java/demo/echo/EchoReplyOrBuilder.java
+touch fabric-lite-lab/src/main/java/demo/echo/EchoRequest.java
+touch fabric-lite-lab/src/main/java/demo/echo/EchoRequestOrBuilder.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/configs/ClientAlgoConfig.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/configs/ConfigDecoderTransformerDemo.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/configs/FabricToClientAlgoConfigTransformer.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/configs/LabConfig.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/configs/LabConfigAdmin.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/configs/LabConfigCode.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/configs/LabConfigMetadata.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/configs/LabConfigSubscribe.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/configs/LabConfigTemplate.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/configs/LabConfigTransform.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/connectors/s3/LabS3.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/ingest/amps/LabMarketDataAmpsIngestMemory.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/ingest/amps/LabMarketDataAmpsIngestParquet.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/ingest/amps/LabMarketDataAmpsIngestParquetAgent.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/ingest/amps/LabMarketDataAmpsPublisher.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/ingest/api/LabIngestApiDashboardStreams.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/ingest/api/LabIngestApiParquetCounterparties.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/ingest/api/LabIngestApiParquetDesks.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/ingest/api/LabIngestApiParquetInstruments.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/ingest/api/LabIngestApiParquetOrders.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/ingest/api/LabIngestApiParquetPositions.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/ingest/s3/LabIngestApiS3Orders.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/odbc/LabMixedSourceJoin.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/odbc/LabOdbc.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/odbc/LabOdbcConnectionTest.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/odbc/LabOdbcDatasetQuery.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/odbc/LabOdbcIngestSource.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/query/LabQueryDirect.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/query/LabQueryDirectSimple.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/query/LabQueryService.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/data/query/LabQueryServiceClient.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/grpc/LabGrpcClient.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/grpc/LabGrpcService.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/grpc/LabGrpcServiceMulti.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/LabSql.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/LabUtil.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/checkpoints/LabIngestAmpsWithCheckpoint.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/connections/LabAmpsConfigTail.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/connections/LabConnections.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/data/LabAmpsIngestFromConfig.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/data/LabDataClient.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/data/LabDataIngest.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/data/LabDataQuery.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/data/LabIngestAmpsToParquet.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/data/LabIngestApiToParquet.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/data/LabIngestJsonSmoke.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/data/LabIngestNvFixSmoke.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/data/LabIngestSmoke.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/data/LabIngestStress.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/data/LabSchemaSample.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/basics/GoldenAmpsConfigTail.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/basics/GoldenDirectQuery.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/basics/GoldenDirectTabularQuery.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/basics/GoldenSessionBootstrap.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/GoldenSuite.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/ingest/GoldenAmpsIngestAgentJsonToParquet.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/ingest/GoldenAmpsIngestAgentNvFixToParquet.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/ingest/GoldenAmpsSampleRegisterRunJsonToParquet.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/ingest/GoldenApiIngestToParquet.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/parquet/GoldenParquetMaintenanceCompact.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/schemas/GoldenSchemaRegisterUpdateDelete.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/schemas/GoldenSchemaVersioningAndSelection.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/services/GoldenDualPlaneRemoteToLocalJoin.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/services/GoldenServiceDiscoverStreamDatasets.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/services/GoldenServiceGetTableSchema.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/services/GoldenServiceIngestFlight.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/services/GoldenServiceListTables.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/services/GoldenServiceQueryTabularFlightSql.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/services/GoldenServiceRoutingResilience.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/services/GoldenServiceStreamBackpressure.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/services/GoldenServiceStreamCancel.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/services/GoldenServiceStreamDatasetIpc.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/services/GoldenServiceStreamFiltered.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/services/GoldenServiceStreamMultiClient.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/services/GoldenServiceStreamMultiDataset.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/services/GoldenServiceStreamPrivateEntitled.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/services/GoldenServiceStreamPublicFanout.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/services/GoldenServiceStreamPublicMultiDataset.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/services/GoldenServiceStreamResume.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/sql/GoldenDirectQuerySqlRows.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/sql/GoldenDirectQuerySqlTabularIpc.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/sql/GoldenOdbcConnectionTest.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/sql/GoldenOdbcDatasetQuery.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/sql/GoldenServiceQuerySqlTabularIpc.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/golden/views/GoldenViewRefreshGraph.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/ingest/amps/LabDuckDbActiveAmpsDemo.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/ingest/amps/LabIngestAmpsAgent.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/ingest/amps/LabIngestAmpsAgentRun.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/ingest/amps/LabIngestAmpsOrdersJson.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/ingest/amps/LabIngestAmpsOrdersJsonPublish.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/ingest/amps/LabIngestAmpsOrdersNvFix.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/ingest/amps/LabIngestAmpsOrdersNvFixPublish.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/ingest/api/LabIngestApiCounterpartiesHist.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/ingest/api/LabIngestApiInstrumentsHist.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/ingest/api/LabIngestApiOrdersHist.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/ingest/api/LabIngestApiPositionsHist.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/ingest/s3/LabIngestS3.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/LabDemoSupport.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/parquet/LabParquetCompactOrders.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/schemas/LabSchemas.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/services/grpc/LabGrpcClientDenyTest.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/services/grpc/LabGrpcRoutingEntitlementsTest.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/session/LabSession.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/views/LabViewChain.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/views/LabViewManual.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/views/LabViewPeriodic.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/misc/views/LabViewRefreshGraph.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/session/LabSession.java
+touch fabric-lite-lab/src/main/java/org/pronzato/fabric/client/lab/session/LabSessionAccess.java
+
+
+
+
+
+mkdir -p fabric-lite-services/src/main/java/org/pronzato/fabric/client/lab
+mkdir -p fabric-lite-services/src/main/java/org/pronzato/fabric/service/archive
+mkdir -p fabric-lite-services/src/main/java/org/pronzato/fabric/service/archive/configs
+mkdir -p fabric-lite-services/src/main/java/org/pronzato/fabric/service/archive/discovery
+mkdir -p fabric-lite-services/src/main/java/org/pronzato/fabric/service/archive/entitlements
+mkdir -p fabric-lite-services/src/main/java/org/pronzato/fabric/service/archive/status
+mkdir -p fabric-lite-services/src/main/java/org/pronzato/fabric/service/config
+mkdir -p fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/engine
+mkdir -p fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc
+mkdir -p fabric-lite-services/src/main/java/org/pronzato/fabric/service/data
+mkdir -p fabric-lite-services/src/main/java/org/pronzato/fabric/service/data/active
+
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/client/lab/LabClientConfig.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/client/lab/LabClientConfigRaw.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/archive/configs/ArchiveConfigs.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/archive/discovery/ArchiveDiscovery.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/archive/entitlements/ArchiveEntitlements.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/archive/LaunchArchivers.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/archive/status/ArchiveStatus.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/ConfigService.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/engine/ConfigEngine.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/engine/ConfigMapper.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/AuditEvent.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/AuditEventOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ChangeMode.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ChangeState.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ConfigCodegen.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ConfigCodegenOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ConfigInfo.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ConfigInfoOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ConfigLineage.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ConfigLineageOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ConfigResolved.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ConfigResolvedOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ConfigUpdate.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ConfigUpdateOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/DecisionAction.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/DecisionRequest.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/DecisionRequestOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/EffectiveEntry.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/EffectiveEntryOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/FabricConfigProto.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/FabricConfigServiceGrpc.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/GenerateRequest.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/GenerateRequestOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/GenerateResponse.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/GenerateResponseOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/Language.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/LineageResponse.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/LineageResponseOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ListConfigsRequest.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ListConfigsRequestOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ListConfigsResponse.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ListConfigsResponseOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ListLayersRequest.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ListLayersRequestOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ListLayersResponse.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ListLayersResponseOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ListWorkflowsRequest.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ListWorkflowsRequestOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ListWorkflowsResponse.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ListWorkflowsResponseOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/PublishedConfig.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/PublishedConfigOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ResolveAtRequest.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ResolveAtRequestOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ResolveRequest.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ResolveRequestOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ResolveResponse.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/ResolveResponseOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/SubscribeRequest.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/SubscribeRequestOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/UpdateRequest.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/UpdateRequestMessage.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/UpdateRequestMessageOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/UpdateRequestOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/UpdateResponse.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/UpdateResponseOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/UpdateResult.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/UpdateResultOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/WorkflowStatus.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/WorkflowStatusMessage.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/WorkflowStatusMessageOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/config/grpc/WorkflowStatusOrBuilder.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/data/active/ActiveMarketData.java
+touch fabric-lite-services/src/main/java/org/pronzato/fabric/service/data/DataService.java
+
+
+
+mkdir -p fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools
+mkdir -p fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/manager
+
+touch fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/GetAssetRequest.java
+touch fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/GetAssetResponse.java
+touch fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/GetRelatedAssetsRequest.java
+touch fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/GetRelatedAssetsResponse.java
+touch fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/manager/ToolGatewayServiceImpl.java
+touch fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/QueryDatasetColumn.java
+touch fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/QueryDatasetRequest.java
+touch fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/QueryDatasetResponse.java
+touch fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/SearchAssetsRequest.java
+touch fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/SearchAssetsResponse.java
+touch fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/ToolGatewayService.java
+touch fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/ToolGatewaySessions.java
+touch fabric-lite-tools/src/main/java/org/pronzato/fabric/api/tools/ToolStatus.java
+
