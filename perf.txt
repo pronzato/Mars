@@ -1,14 +1,34 @@
-      <plugin>
-        <groupId>com.vaadin</groupId>
-        <artifactId>vaadin-maven-plugin</artifactId>
-        <version>${vaadin.version}</version>
-        <executions>
-          <execution>
-            <phase>prepare-package</phase>
-            <goals>
-              <goal>prepare-frontend</goal>
-              <goal>build-frontend</goal>
-            </goals>
-          </execution>
-        </executions>
-      </plugin>
+target/
+*.class
+*.pyc
+temp.txt
+node_modules/
+__pycache__/
+/data/
+**/.build/
+**/build/
+vault/*
+!vault/.gitkeep
+!vault/README.md
+fabric-api/vault/
+fabric-config/src/main/resources/metadata/
+fabric-all.jar
+import-exec.log
+bin/*.jar
+
+tmp/
+.tmp/
+
+demo_connection.log
+
+fabric-api/src/main/resources/duckdb/
+**/build/duckdb/*.wal
+**/build/duckdb/*.duckdb
+# Ignore Vaadin-generated frontend/dev artifacts for any module
+**/src/main/frontend/generated/
+**/src/main/frontend/index.html
+**/vite.generated.ts
+**/.vaadin/
+**/.vaadin-node-tasks.lock
+**/types.d.ts
+
