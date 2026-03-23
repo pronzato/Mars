@@ -1,1 +1,9 @@
 & 'C:\Program Files\Git\bin\bash.exe' -lc "cd /c/dev/fabric && PATH=/usr/bin:`$PATH ./fabric-lite-config/scripts/generate-tls.sh --output ./vault/tls2 --name demo --subject localhost --roles both"
+
+
+Get-FileHash prod.bundle -Algorithm SHA256
+
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("prod.bundle")) | Set-Content -NoNewline "prod.bundle.b64"
+
+
+[IO.File]::WriteAllBytes("prod.bundle", [Convert]::FromBase64String((Get-Content "prod.bundle.b64" -Raw)))
