@@ -3,7 +3,6 @@
 
 Get-FileHash prod.bundle -Algorithm SHA256
 
-[Convert]::ToBase64String([IO.File]::ReadAllBytes("prod.bundle")) | Set-Content -NoNewline "prod.bundle.b64"
+[Convert]::ToBase64String([IO.File]::ReadAllBytes((Resolve-Path .\prod.bundle))) | Set-Content -NoNewline .\prod.bundle.b64
 
-
-[IO.File]::WriteAllBytes("prod.bundle", [Convert]::FromBase64String((Get-Content "prod.bundle.b64" -Raw)))
+[IO.File]::WriteAllBytes((Resolve-Path .\prod.bundle), [Convert]::FromBase64String((Get-Content .\prod.bundle.b64 -Raw)))
