@@ -1,286 +1,634 @@
-npm config set registry "https://artifacts.horizon.bankofamerica.com/artifactory/api/npm/virtual-npm/"
-npm config set strict-ssl false
-npm login
-npm config get registry
-npm ping
+package org.pronzato.fabric.lite.patch;
 
-main
-====
-  <properties>
-    <maven.compiler.release>21</maven.compiler.release>
-    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 
-    <!-- libs -->
-    <grpc.version>1.66.0</grpc.version>
-    <protobuf.version>4.30.2</protobuf.version>
-    <protobuf.skip>false</protobuf.skip>
-    <jackson.version>2.17.2</jackson.version>
-    <amps.client.version>5.3.3.4</amps.client.version>
-    <arrow.version>18.3.0</arrow.version>
-    <duckdb.version>1.5.0.0</duckdb.version>
-    <aws.sdk.version>2.27.19</aws.sdk.version>
-    <mongodb.driver.version>5.1.0</mongodb.driver.version>
-    <nimbus.version>11.26</nimbus.version>
-    <nimbus.jwt.version>10.0.2</nimbus.jwt.version>
-    <junit.version>5.10.2</junit.version>
-    <mockito.version>4.11.0</mockito.version>
-    <bytebuddy.version>1.14.12</bytebuddy.version>
-    <fabric.arrow.add-opens>--add-opens=java.base/java.nio=ALL-UNNAMED</fabric.arrow.add-opens>
-    <surefire.plugin.version>3.2.5</surefire.plugin.version>
-    <bouncycastle.version>1.78.1</bouncycastle.version>
-    <slf4j.version>2.0.16</slf4j.version>
-    <logback.version>1.5.9</logback.version>
-    <jacoco.plugin.version>0.8.12</jacoco.plugin.version>
-    <jacoco.skip>true</jacoco.skip>
-    <shade.skip>true</shade.skip>
+public final class PatchGenerator {
+  private static final String DEFAULT_PATCH_RELATIVE = "docs/patches/patch.txt";
+  private static final String PATCH_FORMAT = "FABRIC_PATCH_V1";
+  private static final String CONTENT_ENCODING_BASE64 = "BASE64";
 
-    <!-- default: frontend work is off unless a module opts in -->
-    <vaadin.skip>true</vaadin.skip>
-    <frontend.skip>true</frontend.skip>
+  private PatchGenerator() {}
 
-    <node.version>v20.11.1</node.version>
+  public static void main(String[] args) {
+    if (args.length > 2) {
+      System.err.println(
+          "Usage: java org.pronzato.fabric.lite.patch.PatchGenerator [patch.txt] [repoRoot]");
+      System.exit(2);
+    }
 
-    <!-- app modules override this if they want an uber jar -->
-    <stitch.uber.skip>true</stitch.uber.skip>
-  </properties>
+    Path cwd = Paths.get("").toAbsolutePath().normalize();
+    Path repoRoot;
+    Path patchPath;
+    try {
+      if (args.length == 0) {
+        repoRoot = findRepoRoot(cwd);
+        patchPath = repoRoot.resolve(DEFAULT_PATCH_RELATIVE).normalize();
+      } else if (args.length == 1) {
+        repoRoot = findRepoRoot(cwd);
+        patchPath = resolveFrom(cwd, args[0]);
+      } else {
+        patchPath = resolveFrom(cwd, args[0]);
+        repoRoot = resolveFrom(cwd, args[1]);
+      }
 
-  <modules>
-    <module>fabric-kdc</module>
-    <module>fabric-mcp</module>
-    <module>fabric-lite</module>
-    <module>fabric-lite-tools</module>
-    <module>fabric-lite-agents</module>
-    <module>fabric-lite-config</module>
-    <module>fabric-lite-lab</module>
-    <module>fabric-lite-services</module>
-    <module>fabric-lite-stitch</module>
-    <module>fabric-lite-stitch-demo</module>
-    <module>fabric-lite-stitch-studio</module>
-    <module>fabric-lite-velocity</module>
-    <module>fabric-lite-vaadin</module>
-    <module>fabric-lite-studio</module>
-    <module>fabric-lite-mongodb</module>
-    <module>fabric-test-oc</module>
-  </modules>
+      generatePatch(repoRoot, patchPath);
+    } catch (Exception e) {
+      System.err.println("Patch generation failed: " + e.getMessage());
+      System.exit(1);
+    }
+  }
 
-  <dependencyManagement>
-    <dependencies>
-      <dependency>
-        <groupId>io.grpc</groupId>
-        <artifactId>grpc-bom</artifactId>
-        <version>1.66.0</version>
-        <type>pom</type>
-        <scope>import</scope>
-      </dependency>
-      <dependency>
-        <groupId>net.bytebuddy</groupId>
-        <artifactId>byte-buddy</artifactId>
-        <version>${bytebuddy.version}</version>
-      </dependency>
-      <dependency>
-        <groupId>net.bytebuddy</groupId>
-        <artifactId>byte-buddy-agent</artifactId>
-        <version>${bytebuddy.version}</version>
-      </dependency>
-      <dependency>
-        <groupId>com.google.protobuf</groupId>
-        <artifactId>protobuf-java</artifactId>
-        <version>${protobuf.version}</version>
-      </dependency>
-      <dependency>
-        <groupId>com.google.protobuf</groupId>
-        <artifactId>protobuf-java-util</artifactId>
-        <version>${protobuf.version}</version>
-      </dependency>
-      <dependency>
-        <groupId>com.google.protobuf</groupId>
-        <artifactId>protobuf-javalite</artifactId>
-        <version>${protobuf.version}</version>
-      </dependency>
-    </dependencies>
-  </dependencyManagement>
+  private static void generatePatch(Path repoRoot, Path patchPath) throws IOException {
+    if (!Files.isDirectory(repoRoot)) {
+      throw new IllegalArgumentException("Repo root is not a directory: " + repoRoot);
+    }
 
-  <build>
-    <pluginManagement>
-      <plugins>
-      </plugins>
-    </pluginManagement>
-    <plugins>
-      <plugin>
-        <artifactId>maven-antrun-plugin</artifactId>
-        <version>3.1.0</version>
-        <executions>
-          <execution>
-            <id>fabric-build-id</id>
-            <phase>process-resources</phase>
-            <goals>
-              <goal>run</goal>
-            </goals>
-            <configuration>
-              <exportAntProperties>true</exportAntProperties>
-              <target>
-                <property name="fabric.build.file" value="${project.basedir}/.build/build-info.properties" />
-                <mkdir dir="${project.basedir}/.build" />
-                <propertyfile file="${fabric.build.file}" comment="Fabric build metadata">
-                  <entry key="build.projectVersion" type="string" value="${project.version}" />
-                  <entry key="build.number" type="int" operation="+" value="1" />
-                </propertyfile>
-                <property file="${fabric.build.file}" />
-                <tstamp>
-                  <format property="fabric.build.timestamp" pattern="yyyy-MM-dd'T'HH:mm:ss'Z'" timezone="UTC" />
-                </tstamp>
-                <property name="fabric.build.number" value="${build.number}" />
-                <property name="fabric.build.id" value="${project.version}.${fabric.build.number}" />
-                <mkdir dir="${project.build.outputDirectory}" />
-                <echo file="${project.build.outputDirectory}/build-info.properties">
-build.id=${fabric.build.id}
-build.number=${fabric.build.number}
-build.timestamp=${fabric.build.timestamp}
-build.projectVersion=${project.version}
-</echo>
-              </target>
-            </configuration>
-          </execution>
-        </executions>
-      </plugin>
+    String baselineSha = runGit(repoRoot, "rev-parse", "HEAD").trim();
+    List<String> diffLines = runGitLines(repoRoot, "diff", "--name-status", "HEAD");
+    List<String> untrackedLines = runGitLines(repoRoot, "ls-files", "--others", "--exclude-standard");
 
-      <plugin>
-        <artifactId>maven-compiler-plugin</artifactId>
-        <version>3.11.0</version>
-        <configuration>
-          <release>${maven.compiler.release}</release>
-          <showDeprecation>true</showDeprecation>
-          <showWarnings>true</showWarnings>
-        </configuration>
-      </plugin>
+    Set<String> writeSet = new HashSet<>();
+    Set<String> deleteSet = new HashSet<>();
 
-      <plugin>
-        <groupId>org.jacoco</groupId>
-        <artifactId>jacoco-maven-plugin</artifactId>
-        <version>${jacoco.plugin.version}</version>
-        <configuration>
-          <skip>${jacoco.skip}</skip>
-        </configuration>
-        <executions>
-          <execution>
-            <id>prepare-agent</id>
-            <goals>
-              <goal>prepare-agent</goal>
-            </goals>
-          </execution>
-          <execution>
-            <id>report</id>
-            <phase>verify</phase>
-            <goals>
-              <goal>report</goal>
-            </goals>
-          </execution>
-          <execution>
-            <id>jacoco-check</id>
-            <phase>verify</phase>
-            <goals>
-              <goal>check</goal>
-            </goals>
-            <configuration>
-              <rules>
-                <rule>
-                  <element>BUNDLE</element>
-                  <limits>
-                    <limit>
-                      <counter>LINE</counter>
-                      <value>COVEREDRATIO</value>
-                      <minimum>0.90</minimum>
-                    </limit>
-                  </limits>
-                </rule>
-              </rules>
-            </configuration>
-          </execution>
-        </executions>
-      </plugin>
-    </plugins>
-  </build>
+    for (String line : diffLines) {
+      if (line == null || line.isBlank()) {
+        continue;
+      }
+      String[] parts = line.split("\t");
+      if (parts.length < 2) {
+        continue;
+      }
+      String status = parts[0].trim();
+      if (status.startsWith("D")) {
+        String deletedPath = normalizePath(parts[parts.length - 1]);
+        if (isPatchablePath(deletedPath)) {
+          deleteSet.add(deletedPath);
+        }
+      } else if (status.startsWith("R") && parts.length >= 3) {
+        // Rename: delete old path, write new path.
+        String oldPath = normalizePath(parts[1]);
+        String newPath = normalizePath(parts[2]);
+        if (isPatchablePath(oldPath)) {
+          deleteSet.add(oldPath);
+        }
+        if (isPatchablePath(newPath)) {
+          writeSet.add(newPath);
+        }
+      } else {
+        String changedPath = normalizePath(parts[parts.length - 1]);
+        if (isPatchablePath(changedPath)) {
+          writeSet.add(changedPath);
+        }
+      }
+    }
 
-  <profiles>
-    <profile>
-      <id>fast</id>
-      <modules>
-        <module>fabric-api</module>
-      </modules>
-    </profile>
+    for (String line : untrackedLines) {
+      if (line == null || line.isBlank()) {
+        continue;
+      }
+      String path = normalizePath(line);
+      if (isPatchablePath(path)) {
+        writeSet.add(path);
+      }
+    }
 
-    <profile>
-      <id>meta-ci</id>
-      <activation>
-        <activeByDefault>false</activeByDefault>
-      </activation>
-      <properties>
-        <skipITs>true</skipITs>
-        <maven.test.skip>true</maven.test.skip>
-        <protobuf.skip>true</protobuf.skip>
-      </properties>
-      <build>
-        <plugins>
-          <plugin>
-            <artifactId>maven-surefire-plugin</artifactId>
-            <version>${surefire.plugin.version}</version>
-            <configuration>
-              <includes>
-                <include>**/fabric/config/**/*Test.java</include>
-                <include>**/fabric/config/demo/**/*Test.java</include>
-              </includes>
-              <excludes>
-                <exclude>**/*ConnectionManager*Test.java</exclude>
-                <exclude>**/*Kerberos*Test.java</exclude>
-                <exclude>**/*Duckdb*Test.java</exclude>
-                <exclude>**/*DuckDB*Test.java</exclude>
-                <exclude>**/*RowsetManagerRemoteTest.java</exclude>
-                <exclude>**/*TabularRemoteTest.java</exclude>
-                <exclude>**/*GrpcPepIntegrationTest.java</exclude>
-                <exclude>**/*DataEntitlementsParityIntegrationTest.java</exclude>
-                <exclude>**/*MaterializedServiceTest.java</exclude>
-                <exclude>**/*Feed*Test.java</exclude>
-                <exclude>**/*FileFeed*Test.java</exclude>
-                <exclude>**/*ParquetFeed*Test.java</exclude>
-                <exclude>**/*ImpalaFeed*Test.java</exclude>
-                <exclude>**/*LegacyFabricDataServiceCatalogTest.java</exclude>
-                <exclude>**/*DataNameResolverTest.java</exclude>
-                <exclude>**/*RowsetManagerTest.java</exclude>
-                <exclude>**/*TabularStreamEngineTest.java</exclude>
-                <exclude>**/*DefaultHotCacheManagerTest.java</exclude>
-                <exclude>**/*ConfigCacheLastGoodTest.java</exclude>
-                <exclude>**/*Asset*Test.java</exclude>
-                <exclude>**/*CompactionExecutorManifestTest.java</exclude>
-              </excludes>
-              <failIfNoTests>false</failIfNoTests>
-            </configuration>
-          </plugin>
-          <plugin>
-            <artifactId>maven-failsafe-plugin</artifactId>
-            <version>${surefire.plugin.version}</version>
-            <configuration>
-              <skipTests>true</skipTests>
-            </configuration>
-          </plugin>
-        </plugins>
-      </build>
-    </profile>
-  </profiles>
-</project>
+    List<PatchEntry> entries = new ArrayList<>();
+    for (String path : writeSet) {
+      entries.add(PatchEntry.write(path));
+    }
+    for (String path : deleteSet) {
+      if (!writeSet.contains(path)) {
+        entries.add(PatchEntry.delete(path));
+      }
+    }
+
+    entries.sort((a, b) -> {
+      int c1 = a.module.compareTo(b.module);
+      if (c1 != 0) {
+        return c1;
+      }
+      int c2 = a.packageName.compareTo(b.packageName);
+      if (c2 != 0) {
+        return c2;
+      }
+      int c3 = a.fileName.compareTo(b.fileName);
+      if (c3 != 0) {
+        return c3;
+      }
+      return a.action.compareTo(b.action);
+    });
+
+    int writeCount = (int) entries.stream().filter(e -> e.action == Action.WRITE).count();
+    int deleteCount = (int) entries.stream().filter(e -> e.action == Action.DELETE).count();
+
+    Path parent = patchPath.getParent();
+    if (parent != null) {
+      Files.createDirectories(parent);
+    }
+
+    try (BufferedWriter writer = Files.newBufferedWriter(patchPath, StandardCharsets.UTF_8)) {
+      writer.write("PATCH_FORMAT: " + PATCH_FORMAT);
+      writer.newLine();
+      writer.write("BASELINE_SHA: " + baselineSha);
+      writer.newLine();
+      writer.write("GENERATED_AT_UTC: " + Instant.now().toString());
+      writer.newLine();
+      writer.write("TOTAL_FILES: " + entries.size());
+      writer.newLine();
+      writer.write("WRITE_COUNT: " + writeCount);
+      writer.newLine();
+      writer.write("DELETE_COUNT: " + deleteCount);
+      writer.newLine();
+      writer.newLine();
+
+      if (entries.isEmpty()) {
+        writer.write("NO_CHANGES");
+        writer.newLine();
+      } else {
+        for (PatchEntry entry : entries) {
+          writer.write("BEGIN_FILE");
+          writer.newLine();
+          writer.write("ACTION: " + entry.action.name());
+          writer.newLine();
+          writer.write("PATH: " + entry.path);
+          writer.newLine();
+          writer.write("MODULE: " + entry.module);
+          writer.newLine();
+          writer.write("PACKAGE: " + entry.packageName);
+          writer.newLine();
+
+          if (entry.action == Action.WRITE) {
+            Path sourceFile = repoRoot.resolve(entry.path).normalize();
+            if (!Files.isRegularFile(sourceFile)) {
+              throw new IllegalArgumentException("WRITE entry source file missing: " + entry.path);
+            }
+            byte[] contentBytes = Files.readAllBytes(sourceFile);
+            String content = Base64.getEncoder().encodeToString(contentBytes);
+            writer.write("CONTENT_ENCODING: " + CONTENT_ENCODING_BASE64);
+            writer.newLine();
+            writer.write("CONTENT_START");
+            writer.newLine();
+            writer.write(content);
+            if (!content.endsWith("\n") && !content.endsWith("\r")) {
+              writer.newLine();
+            }
+            writer.write("CONTENT_END");
+            writer.newLine();
+          }
+
+          writer.write("END_FILE");
+          writer.newLine();
+          writer.newLine();
+        }
+      }
+    }
+
+    System.out.println("Generated patch: " + patchPath);
+    System.out.println("Baseline SHA    : " + baselineSha);
+    System.out.println("WRITE entries   : " + writeCount);
+    System.out.println("DELETE entries  : " + deleteCount);
+    System.out.println("TOTAL entries   : " + entries.size());
+  }
+
+  private static String normalizePath(String pathText) {
+    return pathText.trim().replace('\\', '/');
+  }
+
+  private static boolean isPatchablePath(String path) {
+    String normalized = normalizePath(path);
+    if (normalized.endsWith(".java")) {
+      return true;
+    }
+    return normalized.contains("/src/main/resources/");
+  }
+
+  private static String runGit(Path repoRoot, String... args) throws IOException {
+    Process process = startGit(repoRoot, args);
+    try {
+      String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+      String error = new String(process.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
+      int exit = process.waitFor();
+      if (exit != 0) {
+        throw new IOException("git command failed (" + String.join(" ", args) + "): " + error.trim());
+      }
+      return output;
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new IOException("git command interrupted", e);
+    }
+  }
+
+  private static List<String> runGitLines(Path repoRoot, String... args) throws IOException {
+    String output = runGit(repoRoot, args);
+    String[] lines = output.split("\\R");
+    List<String> result = new ArrayList<>();
+    for (String line : lines) {
+      if (!line.isBlank()) {
+        result.add(line);
+      }
+    }
+    return result;
+  }
+
+  private static Process startGit(Path repoRoot, String... args) throws IOException {
+    List<String> command = new ArrayList<>();
+    command.add("git");
+    for (String arg : args) {
+      command.add(arg);
+    }
+    ProcessBuilder pb = new ProcessBuilder(command);
+    pb.directory(repoRoot.toFile());
+    return pb.start();
+  }
+
+  private static Path findRepoRoot(Path start) {
+    Path current = start;
+    while (current != null) {
+      Path gitDir = current.resolve(".git");
+      Path patchFile = current.resolve(DEFAULT_PATCH_RELATIVE);
+      if (Files.exists(gitDir) || Files.exists(patchFile)) {
+        return current;
+      }
+      current = current.getParent();
+    }
+    throw new IllegalArgumentException(
+        "Could not find repo root (missing .git and " + DEFAULT_PATCH_RELATIVE + ") from " + start);
+  }
+
+  private static Path resolveFrom(Path base, String pathText) {
+    Path path = Paths.get(pathText);
+    if (!path.isAbsolute()) {
+      path = base.resolve(path);
+    }
+    return path.toAbsolutePath().normalize();
+  }
+
+  private enum Action {
+    WRITE,
+    DELETE
+  }
+
+  private static final class PatchEntry {
+    private final Action action;
+    private final String path;
+    private final String module;
+    private final String packageName;
+    private final String fileName;
+
+    private PatchEntry(Action action, String path) {
+      this.action = action;
+      this.path = path;
+      this.module = module(path);
+      this.packageName = packageName(path);
+      this.fileName = fileName(path);
+    }
+
+    private static PatchEntry write(String path) {
+      return new PatchEntry(Action.WRITE, path);
+    }
+
+    private static PatchEntry delete(String path) {
+      return new PatchEntry(Action.DELETE, path);
+    }
+
+    private static String module(String path) {
+      int slash = path.indexOf('/');
+      return slash > 0 ? path.substring(0, slash) : "";
+    }
+
+    private static String packageName(String path) {
+      String norm = path.replace('\\', '/');
+      String marker = "/java/";
+      int javaIdx = norm.indexOf(marker);
+      if (javaIdx >= 0) {
+        int start = javaIdx + marker.length();
+        int lastSlash = norm.lastIndexOf('/');
+        if (lastSlash > start) {
+          return norm.substring(start, lastSlash).replace('/', '.');
+        }
+      }
+      int slash = norm.lastIndexOf('/');
+      return slash > 0 ? norm.substring(0, slash) : "";
+    }
+
+    private static String fileName(String path) {
+      int slash = path.lastIndexOf('/');
+      return slash >= 0 ? path.substring(slash + 1) : path;
+    }
+  }
+}
+
+
+
+
+
+
+
+package org.pronzato.fabric.lite.patch;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+import java.util.Base64;
+
+public final class PatchInstaller {
+  private static final String DEFAULT_PATCH_RELATIVE = "docs/patches/patch.txt";
+  private static final String CONTENT_ENCODING_BASE64 = "BASE64";
+  private static final String CONTENT_ENCODING_UTF8 = "UTF-8";
+
+  private PatchInstaller() {}
+
+  public static void main(String[] args) {
+    if (args.length > 2) {
+      System.err.println(
+          "Usage: java org.pronzato.fabric.lite.patch.PatchInstaller [patch.txt] [repoRoot]");
+      System.exit(2);
+    }
+
+    Path cwd = Paths.get("").toAbsolutePath().normalize();
+    Path repoRoot;
+    Path patchPath;
+
+    try {
+      if (args.length == 0) {
+        repoRoot = findRepoRoot(cwd);
+        patchPath = repoRoot.resolve(DEFAULT_PATCH_RELATIVE).normalize();
+      } else if (args.length == 1) {
+        repoRoot = findRepoRoot(cwd);
+        patchPath = resolveFrom(cwd, args[0]);
+      } else {
+        patchPath = resolveFrom(cwd, args[0]);
+        repoRoot = resolveFrom(cwd, args[1]);
+      }
+    } catch (Exception e) {
+      System.err.println("Patch initialization failed: " + e.getMessage());
+      System.exit(2);
+      return;
+    }
+
+    try {
+      runInstaller(patchPath, repoRoot);
+    } catch (Exception e) {
+      System.err.println("Patch installation failed: " + e.getMessage());
+      System.exit(1);
+    }
+  }
+
+  private static void runInstaller(Path patchPath, Path repoRoot) throws IOException {
+    if (!Files.exists(patchPath)) {
+      throw new IllegalArgumentException("Patch file does not exist: " + patchPath);
+    }
+    if (!Files.isDirectory(repoRoot)) {
+      throw new IllegalArgumentException("Repo root is not a directory: " + repoRoot);
+    }
+
+    int writes = 0;
+    int deletes = 0;
+    int deleteSkipped = 0;
+    int errors = 0;
+    boolean noChanges = false;
+
+    try (BufferedReader reader = Files.newBufferedReader(patchPath, StandardCharsets.UTF_8)) {
+      String line;
+      int lineNo = 0;
+      boolean started = false;
+
+      while ((line = reader.readLine()) != null) {
+        lineNo++;
+        if (line.isBlank()) {
+          continue;
+        }
+        if ("NO_CHANGES".equals(line)) {
+          noChanges = true;
+          break;
+        }
+        if ("BEGIN_FILE".equals(line)) {
+          started = true;
+          PatchEntry entry = readEntry(reader, lineNo);
+          lineNo = entry.lastLineNumber;
+          Path target = resolveTarget(repoRoot, entry.path);
+
+          try {
+            if (entry.action == Action.WRITE) {
+              Path parent = target.getParent();
+              if (parent != null) {
+                Files.createDirectories(parent);
+              }
+              Files.write(
+                  target,
+                  entry.contentBytes,
+                  StandardOpenOption.CREATE,
+                  StandardOpenOption.TRUNCATE_EXISTING);
+              writes++;
+              System.out.println("WRITE  " + entry.path);
+            } else {
+              if (Files.exists(target)) {
+                Files.delete(target);
+                deletes++;
+                System.out.println("DELETE " + entry.path);
+              } else {
+                deleteSkipped++;
+                System.out.println("SKIP_DELETE_MISSING " + entry.path);
+              }
+            }
+          } catch (Exception e) {
+            errors++;
+            System.err.println("ERROR applying " + entry.action + " for " + entry.path + ": " + e.getMessage());
+          }
+          continue;
+        }
+
+        if (!started) {
+          continue;
+        }
+        throw new IllegalArgumentException("Malformed patch at line " + lineNo + ": expected BEGIN_FILE or EOF");
+      }
+    }
+
+    if (noChanges) {
+      System.out.println("Patch contains NO_CHANGES. Nothing to apply.");
+    }
+
+    System.out.println();
+    System.out.println("Patch apply summary");
+    System.out.println("  repoRoot            : " + repoRoot);
+    System.out.println("  patchFile           : " + patchPath);
+    System.out.println("  files written       : " + writes);
+    System.out.println("  files deleted       : " + deletes);
+    System.out.println("  delete skipped      : " + deleteSkipped);
+    System.out.println("  errors              : " + errors);
+
+    if (errors > 0) {
+      throw new IllegalStateException("Patch completed with " + errors + " error(s).");
+    }
+  }
+
+  private static Path findRepoRoot(Path start) {
+    Path current = start;
+    while (current != null) {
+      Path candidatePatch = current.resolve(DEFAULT_PATCH_RELATIVE).normalize();
+      if (Files.exists(candidatePatch)) {
+        return current;
+      }
+      current = current.getParent();
+    }
+    throw new IllegalArgumentException(
+        "Could not find repo root containing " + DEFAULT_PATCH_RELATIVE + " starting from " + start);
+  }
+
+  private static Path resolveFrom(Path base, String pathText) {
+    Path path = Paths.get(pathText);
+    if (!path.isAbsolute()) {
+      path = base.resolve(path);
+    }
+    return path.toAbsolutePath().normalize();
+  }
+
+  private static PatchEntry readEntry(BufferedReader reader, int beginLineNo) throws IOException {
+    int lineNo = beginLineNo;
+
+    String actionLine = reader.readLine();
+    lineNo++;
+    String pathLine = reader.readLine();
+    lineNo++;
+    String moduleLine = reader.readLine();
+    lineNo++;
+    String packageLine = reader.readLine();
+    lineNo++;
+
+    String actionValue = parseField(actionLine, "ACTION", lineNo - 3);
+    String pathValue = parseField(pathLine, "PATH", lineNo - 2);
+    parseField(moduleLine, "MODULE", lineNo - 1); // parsed for validation; not used by installer
+    parseField(packageLine, "PACKAGE", lineNo); // parsed for validation; not used by installer
+
+    Action action;
+    if ("WRITE".equals(actionValue)) {
+      action = Action.WRITE;
+    } else if ("DELETE".equals(actionValue)) {
+      action = Action.DELETE;
+    } else {
+      throw new IllegalArgumentException("Invalid ACTION at line " + (lineNo - 3) + ": " + actionValue);
+    }
+
+    byte[] contentBytes = new byte[0];
+    if (action == Action.WRITE) {
+      String contentEncoding = CONTENT_ENCODING_UTF8;
+      String contentStart = reader.readLine();
+      lineNo++;
+      if (contentStart != null && contentStart.startsWith("CONTENT_ENCODING:")) {
+        contentEncoding = parseField(contentStart, "CONTENT_ENCODING", lineNo);
+        contentStart = reader.readLine();
+        lineNo++;
+      }
+      if (!"CONTENT_START".equals(contentStart)) {
+        throw new IllegalArgumentException("Malformed patch at line " + lineNo + ": expected CONTENT_START");
+      }
+
+      StringBuilder content = new StringBuilder();
+      String line;
+      while ((line = reader.readLine()) != null) {
+        lineNo++;
+        if ("CONTENT_END".equals(line)) {
+          break;
+        }
+        content.append(line).append('\n');
+      }
+      if (content.length() > 0) {
+        content.setLength(content.length() - 1);
+      }
+      if (line == null) {
+        throw new IllegalArgumentException("Malformed patch: missing CONTENT_END for " + pathValue);
+      }
+
+      contentBytes = decodeContent(content.toString(), contentEncoding, pathValue);
+    }
+
+    String endFile = reader.readLine();
+    lineNo++;
+    if (!"END_FILE".equals(endFile)) {
+      throw new IllegalArgumentException("Malformed patch at line " + lineNo + ": expected END_FILE");
+    }
+
+    return new PatchEntry(action, pathValue, contentBytes, lineNo);
+  }
+
+  private static String parseField(String line, String key, int lineNo) {
+    String prefix = key + ":";
+    if (line == null || !line.startsWith(prefix)) {
+      throw new IllegalArgumentException("Malformed patch at line " + lineNo + ": expected " + key + ":");
+    }
+    return line.substring(prefix.length()).trim();
+  }
+
+  private static Path resolveTarget(Path repoRoot, String relativePath) {
+    String normalizedRelative = relativePath.replace('\\', '/');
+    Path target = repoRoot.resolve(normalizedRelative).normalize();
+    if (!target.startsWith(repoRoot)) {
+      throw new IllegalArgumentException("Unsafe path outside repo root: " + relativePath);
+    }
+    return target;
+  }
+
+  private static byte[] decodeContent(String content, String encoding, String pathValue) {
+    if (CONTENT_ENCODING_BASE64.equalsIgnoreCase(encoding)) {
+      try {
+        return Base64.getDecoder().decode(content.replaceAll("\\s+", ""));
+      } catch (IllegalArgumentException e) {
+        throw new IllegalArgumentException("Invalid BASE64 content for " + pathValue + ": " + e.getMessage(), e);
+      }
+    }
+    if (CONTENT_ENCODING_UTF8.equalsIgnoreCase(encoding)) {
+      return content.getBytes(StandardCharsets.UTF_8);
+    }
+    throw new IllegalArgumentException("Unsupported CONTENT_ENCODING for " + pathValue + ": " + encoding);
+  }
+
+  private enum Action {
+    WRITE,
+    DELETE
+  }
+
+  private static final class PatchEntry {
+    private final Action action;
+    private final String path;
+    private final byte[] contentBytes;
+    private final int lastLineNumber;
+
+    private PatchEntry(Action action, String path, byte[] contentBytes, int lastLineNumber) {
+      this.action = action;
+      this.path = path;
+      this.contentBytes = contentBytes;
+      this.lastLineNumber = lastLineNumber;
+    }
+  }
+}
+
+
 
 
 
 
 demo
 ====
-  <artifactId>fabric-lite-stitch-demo</artifactId>
-  <name>fabric-lite-stitch-demo</name>
-  <packaging>jar</packaging>
-
   <properties>
     <spring-boot.version>3.4.2</spring-boot.version>
     <vaadin.version>24.6.2</vaadin.version>
-    <stitch.uber.skip>false</stitch.uber.skip>
+    <stitch.uber.skip>true</stitch.uber.skip>
     <stitch.prod.bundle.exists>false</stitch.prod.bundle.exists>
   </properties>
 
@@ -368,6 +716,13 @@ demo
                 <unzip src="${stitch.prod.bundle}"
                        dest="${project.build.outputDirectory}/META-INF/VAADIN"
                        overwrite="true"/>
+                <fail message="Missing flow-build-info.json in local production bundle at ${stitch.prod.bundle}">
+                  <condition>
+                    <not>
+                      <available file="${project.build.outputDirectory}/META-INF/VAADIN/config/flow-build-info.json"/>
+                    </not>
+                  </condition>
+                </fail>
               </target>
             </configuration>
           </execution>
@@ -462,6 +817,13 @@ demo
                         </not>
                       </condition>
                     </fail>
+                    <fail message="Missing generated flow-build-info.json at ${stitch.vaadin.output}/config/flow-build-info.json">
+                      <condition>
+                        <not>
+                          <available file="${stitch.vaadin.output}/config/flow-build-info.json"/>
+                        </not>
+                      </condition>
+                    </fail>
                     <mkdir dir="${project.basedir}/src/main/bundles"/>
                     <zip destfile="${project.basedir}/src/main/bundles/prod.bundle"
                          basedir="${stitch.vaadin.output}"/>
@@ -514,7 +876,7 @@ studio
   <properties>
     <spring-boot.version>3.4.2</spring-boot.version>
     <vaadin.version>24.6.2</vaadin.version>
-    <stitch.uber.skip>false</stitch.uber.skip>
+    <stitch.uber.skip>true</stitch.uber.skip>
     <stitch.prod.bundle.exists>false</stitch.prod.bundle.exists>
   </properties>
 
@@ -602,6 +964,13 @@ studio
                 <unzip src="${stitch.prod.bundle}"
                        dest="${project.build.outputDirectory}/META-INF/VAADIN"
                        overwrite="true"/>
+                <fail message="Missing flow-build-info.json in local production bundle at ${stitch.prod.bundle}">
+                  <condition>
+                    <not>
+                      <available file="${project.build.outputDirectory}/META-INF/VAADIN/config/flow-build-info.json"/>
+                    </not>
+                  </condition>
+                </fail>
               </target>
             </configuration>
           </execution>
@@ -696,6 +1065,13 @@ studio
                         </not>
                       </condition>
                     </fail>
+                    <fail message="Missing generated flow-build-info.json at ${stitch.vaadin.output}/config/flow-build-info.json">
+                      <condition>
+                        <not>
+                          <available file="${stitch.vaadin.output}/config/flow-build-info.json"/>
+                        </not>
+                      </condition>
+                    </fail>
                     <mkdir dir="${project.basedir}/src/main/bundles"/>
                     <zip destfile="${project.basedir}/src/main/bundles/prod.bundle"
                          basedir="${stitch.vaadin.output}"/>
@@ -740,3 +1116,73 @@ studio
     </profile>
   </profiles>
 </project>
+
+
+
+
+
+PATCH_FORMAT: FABRIC_PATCH_V1
+BASELINE_SHA: 5f0f957464d7afb0bb89aa6f02e410c976d2c2e5
+GENERATED_AT_UTC: 2026-03-24T21:22:50.984469700Z
+TOTAL_FILES: 5
+WRITE_COUNT: 5
+DELETE_COUNT: 0
+
+BEGIN_FILE
+ACTION: WRITE
+PATH: fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/Stitch.java
+MODULE: fabric-lite-stitch
+PACKAGE: org.pronzato.fabric.stitch
+CONTENT_ENCODING: BASE64
+CONTENT_START
+cGFja2FnZSBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaDsKCmltcG9ydCBqYXZhLnV0aWwuTGlua2VkSGFzaE1hcDsKaW1wb3J0IGphdmEudXRpbC5MaXN0OwppbXBvcnQgamF2YS51dGlsLk1hcDsKaW1wb3J0IGphdmEudXRpbC5PYmplY3RzOwppbXBvcnQgamF2YS51dGlsLlNldDsKaW1wb3J0IGphdmEudXRpbC5mdW5jdGlvbi5Db25zdW1lcjsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLmFwcC5TdGl0Y2hMYXVuY2hlcjsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLmFwcC5TdGl0Y2hTZXR0aW5nczsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLmRhc2hib2FyZC5TdGl0Y2hEYXNoYm9hcmRSdW50aW1lUHJvdmlkZXI7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5mZWF0dXJlLlN0aXRjaEZlYXR1cmVzOwppbXBvcnQgb3JnLnByb256YXRvLmZhYnJpYy5zdGl0Y2gubWVudS5TdGl0Y2hNZW51SXRlbTsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLm1lbnUuU3RpdGNoTWVudXNCdWlsZGVyOwppbXBvcnQgb3JnLnByb256YXRvLmZhYnJpYy5zdGl0Y2gubWVudS5TdGl0Y2hNZW51UHJvdmlkZXI7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5zZXNzaW9uLlN0aXRjaEZhYnJpY1NldHRpbmdzOwoKcHVibGljIGZpbmFsIGNsYXNzIFN0aXRjaCB7CiAgcHJpdmF0ZSBmaW5hbCBTdGl0Y2hGYWJyaWNTZXR0aW5ncyBmYWJyaWM7CiAgcHJpdmF0ZSBmaW5hbCBTdGl0Y2hTZXR0aW5ncyBzdGl0Y2g7CiAgcHJpdmF0ZSBmaW5hbCBTdGl0Y2hGZWF0dXJlcyBmZWF0dXJlczsKICBwcml2YXRlIGZpbmFsIENsYXNzPD8+IGFwcGxpY2F0aW9uQ2xhc3M7CiAgcHJpdmF0ZSBmaW5hbCBTdGl0Y2hNZW51UHJvdmlkZXIgbWVudVByb3ZpZGVyOwogIHByaXZhdGUgZmluYWwgU3RpdGNoRGFzaGJvYXJkUnVudGltZVByb3ZpZGVyIGRhc2hib2FyZFJ1bnRpbWVQcm92aWRlcjsKCiAgcHJpdmF0ZSBTdGl0Y2goQnVpbGRlciBidWlsZGVyKSB7CiAgICB0aGlzLmZhYnJpYyA9IGJ1aWxkZXIuZmFicmljQnVpbGRlci5idWlsZCgpOwogICAgdGhpcy5zdGl0Y2ggPSBidWlsZGVyLnN0aXRjaEJ1aWxkZXIuYnVpbGQoKTsKICAgIFNldDxTdHJpbmc+IHJlcXVlc3RlZEVudHJpZXMgPSBidWlsZGVyLm1lbnVzQnVpbGRlci5yZWZlcmVuY2VkRW50cnlJZHMoKTsKICAgIHRoaXMuZmVhdHVyZXMgPSBidWlsZGVyLmZlYXR1cmVzQnVpbGRlci5idWlsZChyZXF1ZXN0ZWRFbnRyaWVzKTsKICAgIHRoaXMuYXBwbGljYXRpb25DbGFzcyA9IGJ1aWxkZXIuYXBwbGljYXRpb25DbGFzczsKICAgIHRoaXMubWVudVByb3ZpZGVyID0KICAgICAgICBidWlsZGVyLm1lbnVQcm92aWRlciAhPSBudWxsCiAgICAgICAgICAgID8gYnVpbGRlci5tZW51UHJvdmlkZXIKICAgICAgICAgICAgOiBjb21wb3NlTWVudVByb3ZpZGVyKAogICAgICAgICAgICAgICAgYnVpbGRlci5tZW51c0J1aWxkZXIuYnVpbGQoZmVhdHVyZXMucmVnaXN0cnkoKS5tZW51Q29udHJpYnV0aW9ucygpKSk7CiAgICB0aGlzLmRhc2hib2FyZFJ1bnRpbWVQcm92aWRlciA9IGJ1aWxkZXIuZGFzaGJvYXJkUnVudGltZVByb3ZpZGVyOwogIH0KCiAgcHVibGljIHN0YXRpYyBCdWlsZGVyIGJ1aWxkZXIoKSB7CiAgICByZXR1cm4gbmV3IEJ1aWxkZXIoKTsKICB9CgogIHB1YmxpYyBTdGl0Y2hGYWJyaWNTZXR0aW5ncyBmYWJyaWMoKSB7CiAgICByZXR1cm4gZmFicmljOwogIH0KCiAgcHVibGljIFN0aXRjaFNldHRpbmdzIHN0aXRjaCgpIHsKICAgIHJldHVybiBzdGl0Y2g7CiAgfQoKICBwdWJsaWMgU3RpdGNoRmVhdHVyZXMgZmVhdHVyZXMoKSB7CiAgICByZXR1cm4gZmVhdHVyZXM7CiAgfQoKICBwdWJsaWMgU3RpdGNoRGFzaGJvYXJkUnVudGltZVByb3ZpZGVyIGRhc2hib2FyZFJ1bnRpbWVQcm92aWRlcigpIHsKICAgIHJldHVybiBkYXNoYm9hcmRSdW50aW1lUHJvdmlkZXI7CiAgfQoKICBwdWJsaWMgU3RpdGNoUnVudGltZSBzdGFydCgpIHsKICAgIHJldHVybiBzdGFydChuZXcgU3RyaW5nWzBdKTsKICB9CgogIHB1YmxpYyBTdGl0Y2hSdW50aW1lIHN0YXJ0KFN0cmluZy4uLiBhcmdzKSB7CiAgICByZXR1cm4gU3RpdGNoTGF1bmNoZXIucnVuKAogICAgICAgIE9iamVjdHMucmVxdWlyZU5vbk51bGwoYXBwbGljYXRpb25DbGFzcywgImFwcGxpY2F0aW9uQ2xhc3MgaXMgcmVxdWlyZWQgZm9yIHN0YXJ0KCkiKSwKICAgICAgICB0aGlzLAogICAgICAgIG1lbnVQcm92aWRlciwKICAgICAgICBhcmdzID09IG51bGwgPyBuZXcgU3RyaW5nWzBdIDogYXJncyk7CiAgfQoKICBwdWJsaWMgTWFwPFN0cmluZywgT2JqZWN0PiBhc1NwcmluZ0RlZmF1bHRzKCkgewogICAgTWFwPFN0cmluZywgT2JqZWN0PiB2YWx1ZXMgPSBuZXcgTGlua2VkSGFzaE1hcDw+KHN0aXRjaC5hc1NwcmluZ0RlZmF1bHRzKCkpOwogICAgdmFsdWVzLnB1dCgic3RpdGNoLmZhYnJpYy5ncm91cCIsIGZhYnJpYy5ncm91cCgpKTsKICAgIHZhbHVlcy5wdXQoInN0aXRjaC5mYWJyaWMubmFtZSIsIGZhYnJpYy5uYW1lKCkpOwogICAgdmFsdWVzLnB1dCgic3RpdGNoLmZhYnJpYy5pbnN0YW5jZSIsIGZhYnJpYy5pbnN0YW5jZSgpKTsKICAgIHZhbHVlcy5wdXQoInN0aXRjaC5mYWJyaWMuZGlzY292ZXJ5VXJscyIsIGZhYnJpYy5kaXNjb3ZlcnlVcmxzKCkpOwogICAgdmFsdWVzLnB1dCgic3RpdGNoLmZhYnJpYy5rZXJiZXJvc0tleXRhYiIsIGZhYnJpYy5rZXJiZXJvc0tleXRhYigpKTsKICAgIHZhbHVlcy5wdXQoInN0aXRjaC5mYWJyaWMua2VyYmVyb3NVc2VybmFtZSIsIGZhYnJpYy5rZXJiZXJvc1VzZXJuYW1lKCkpOwogICAgaWYgKGZhYnJpYy5rZWtGaWxlKCkgIT0gbnVsbCkgewogICAgICB2YWx1ZXMucHV0KCJzdGl0Y2guZmFicmljLmtla0ZpbGUiLCBmYWJyaWMua2VrRmlsZSgpKTsKICAgIH0KICAgIGlmIChmYWJyaWMudHJ1c3RDZXJ0KCkgIT0gbnVsbCkgewogICAgICB2YWx1ZXMucHV0KCJzdGl0Y2guZmFicmljLnRydXN0Q2VydCIsIGZhYnJpYy50cnVzdENlcnQoKSk7CiAgICB9CiAgICByZXR1cm4gTWFwLmNvcHlPZih2YWx1ZXMpOwogIH0KCiAgcHJpdmF0ZSBzdGF0aWMgU3RpdGNoTWVudVByb3ZpZGVyIGNvbXBvc2VNZW51UHJvdmlkZXIoTGlzdDxTdGl0Y2hNZW51SXRlbT4gbWVudXMpIHsKICAgIGlmIChtZW51cyA9PSBudWxsIHx8IG1lbnVzLmlzRW1wdHkoKSkgewogICAgICByZXR1cm4gbnVsbDsKICAgIH0KICAgIExpc3Q8U3RpdGNoTWVudUl0ZW0+IHJlc29sdmVkTWVudXMgPSBMaXN0LmNvcHlPZihtZW51cyk7CiAgICByZXR1cm4gKCkgLT4gcmVzb2x2ZWRNZW51czsKICB9CgogIHB1YmxpYyBzdGF0aWMgZmluYWwgY2xhc3MgQnVpbGRlciB7CiAgICBwcml2YXRlIGZpbmFsIFN0aXRjaEZhYnJpY1NldHRpbmdzLkJ1aWxkZXIgZmFicmljQnVpbGRlciA9IFN0aXRjaEZhYnJpY1NldHRpbmdzLmJ1aWxkZXIoKTsKICAgIHByaXZhdGUgZmluYWwgU3RpdGNoU2V0dGluZ3MuQnVpbGRlciBzdGl0Y2hCdWlsZGVyID0gU3RpdGNoU2V0dGluZ3MuYnVpbGRlcigpOwogICAgcHJpdmF0ZSBmaW5hbCBTdGl0Y2hGZWF0dXJlcy5CdWlsZGVyIGZlYXR1cmVzQnVpbGRlciA9IFN0aXRjaEZlYXR1cmVzLmJ1aWxkZXIoKTsKICAgIHByaXZhdGUgZmluYWwgU3RpdGNoTWVudXNCdWlsZGVyIG1lbnVzQnVpbGRlciA9IG5ldyBTdGl0Y2hNZW51c0J1aWxkZXIoKTsKICAgIHByaXZhdGUgU3RpdGNoTWVudVByb3ZpZGVyIG1lbnVQcm92aWRlcjsKICAgIHByaXZhdGUgU3RpdGNoRGFzaGJvYXJkUnVudGltZVByb3ZpZGVyIGRhc2hib2FyZFJ1bnRpbWVQcm92aWRlcjsKICAgIHByaXZhdGUgQ2xhc3M8Pz4gYXBwbGljYXRpb25DbGFzczsKCiAgICBwcml2YXRlIEJ1aWxkZXIoKSB7fQoKICAgIHB1YmxpYyBCdWlsZGVyIHdpdGhBcHBsaWNhdGlvbkNsYXNzKENsYXNzPD8+IHZhbHVlKSB7CiAgICAgIHRoaXMuYXBwbGljYXRpb25DbGFzcyA9IE9iamVjdHMucmVxdWlyZU5vbk51bGwodmFsdWUsICJ2YWx1ZSIpOwogICAgICByZXR1cm4gdGhpczsKICAgIH0KCiAgICBwdWJsaWMgQnVpbGRlciB3aXRoRmFicmljKENvbnN1bWVyPFN0aXRjaEZhYnJpY1NldHRpbmdzLkJ1aWxkZXI+IGN1c3RvbWl6ZXIpIHsKICAgICAgT2JqZWN0cy5yZXF1aXJlTm9uTnVsbChjdXN0b21pemVyLCAiY3VzdG9taXplciIpLmFjY2VwdChmYWJyaWNCdWlsZGVyKTsKICAgICAgcmV0dXJuIHRoaXM7CiAgICB9CgogICAgcHVibGljIEJ1aWxkZXIgd2l0aFN0aXRjaChDb25zdW1lcjxTdGl0Y2hTZXR0aW5ncy5CdWlsZGVyPiBjdXN0b21pemVyKSB7CiAgICAgIE9iamVjdHMucmVxdWlyZU5vbk51bGwoY3VzdG9taXplciwgImN1c3RvbWl6ZXIiKS5hY2NlcHQoc3RpdGNoQnVpbGRlcik7CiAgICAgIHJldHVybiB0aGlzOwogICAgfQoKICAgIHB1YmxpYyBCdWlsZGVyIHdpdGhNZW51cyhDb25zdW1lcjxTdGl0Y2hNZW51c0J1aWxkZXI+IGN1c3RvbWl6ZXIpIHsKICAgICAgT2JqZWN0cy5yZXF1aXJlTm9uTnVsbChjdXN0b21pemVyLCAiY3VzdG9taXplciIpLmFjY2VwdChtZW51c0J1aWxkZXIpOwogICAgICByZXR1cm4gdGhpczsKICAgIH0KCiAgICBwdWJsaWMgQnVpbGRlciB3aXRoRmVhdHVyZXMoQ29uc3VtZXI8U3RpdGNoRmVhdHVyZXMuQnVpbGRlcj4gY3VzdG9taXplcikgewogICAgICBPYmplY3RzLnJlcXVpcmVOb25OdWxsKGN1c3RvbWl6ZXIsICJjdXN0b21pemVyIikuYWNjZXB0KGZlYXR1cmVzQnVpbGRlcik7CiAgICAgIHJldHVybiB0aGlzOwogICAgfQoKICAgIHB1YmxpYyBCdWlsZGVyIHdpdGhNZW51UHJvdmlkZXIoU3RpdGNoTWVudVByb3ZpZGVyIHZhbHVlKSB7CiAgICAgIHRoaXMubWVudVByb3ZpZGVyID0gT2JqZWN0cy5yZXF1aXJlTm9uTnVsbCh2YWx1ZSwgInZhbHVlIik7CiAgICAgIHJldHVybiB0aGlzOwogICAgfQoKICAgIHB1YmxpYyBCdWlsZGVyIHdpdGhEYXNoYm9hcmRSdW50aW1lUHJvdmlkZXIoU3RpdGNoRGFzaGJvYXJkUnVudGltZVByb3ZpZGVyIHZhbHVlKSB7CiAgICAgIHRoaXMuZGFzaGJvYXJkUnVudGltZVByb3ZpZGVyID0gT2JqZWN0cy5yZXF1aXJlTm9uTnVsbCh2YWx1ZSwgInZhbHVlIik7CiAgICAgIHJldHVybiB0aGlzOwogICAgfQoKICAgIHB1YmxpYyBTdGl0Y2ggYnVpbGQoKSB7CiAgICAgIHJldHVybiBuZXcgU3RpdGNoKHRoaXMpOwogICAgfQogIH0KfQo=
+CONTENT_END
+END_FILE
+
+BEGIN_FILE
+ACTION: WRITE
+PATH: fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/app/StitchLauncher.java
+MODULE: fabric-lite-stitch
+PACKAGE: org.pronzato.fabric.stitch.app
+CONTENT_ENCODING: BASE64
+CONTENT_START
+cGFja2FnZSBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5hcHA7CgppbXBvcnQgamF2YS51dGlsLkxpbmtlZEhhc2hNYXA7CmltcG9ydCBqYXZhLnV0aWwuTGlzdDsKaW1wb3J0IGphdmEudXRpbC5NYXA7CmltcG9ydCBqYXZhLnV0aWwuT2JqZWN0czsKaW1wb3J0IGphdmEudXRpbC5jb25jdXJyZW50LkNvbXBsZXRhYmxlRnV0dXJlOwppbXBvcnQgb3JnLnByb256YXRvLmZhYnJpYy5hcGkuRmFicmljOwppbXBvcnQgb3JnLnByb256YXRvLmZhYnJpYy5hcGkuY29ubmVjdG9ycy5hbXBzLkFtcHNDb25uZWN0aW9uOwppbXBvcnQgb3JnLnByb256YXRvLmZhYnJpYy5hcGkuY29ubmVjdG9ycy5odHRwLkh0dHBDb25uZWN0aW9uOwppbXBvcnQgb3JnLnByb256YXRvLmZhYnJpYy5hcGkuY29ubmVjdG9ycy5vZGJjLk9kYmNDb25uZWN0aW9uOwppbXBvcnQgb3JnLnByb256YXRvLmZhYnJpYy5hcGkuY29ubmVjdG9ycy5zMy5TM0Nvbm5lY3Rpb247CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLmFwaS5jb250cm9sLnBsdWdpbnMuQ29ubmVjdGlvblJlcXVlc3Q7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLmFwaS5jb250cm9sLnNlY3VyaXR5LnNzby5EZWZhdWx0U3NvU2VydmljZTsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuYXBpLmNvbnRyb2wuc2VjdXJpdHkuc3NvLlNzb0NvbmZpZzsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuYXBpLmNvbnRyb2wuc2VjdXJpdHkuc3NvLlNzb1NlcnZpY2U7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLmFwaS51dGlsLlN0cmluZ3M7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5TdGl0Y2g7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5TdGl0Y2hSdW50aW1lOwppbXBvcnQgb3JnLnByb256YXRvLmZhYnJpYy5zdGl0Y2guY29udHJvbGxlci5TdGl0Y2hEb2NzUmVzb3VyY2VDb250cm9sbGVyOwppbXBvcnQgb3JnLnByb256YXRvLmZhYnJpYy5zdGl0Y2guY29udHJvbGxlci5TdGl0Y2hTc29Db250cm9sbGVyOwppbXBvcnQgb3JnLnByb256YXRvLmZhYnJpYy5zdGl0Y2guZGFzaGJvYXJkLlN0aXRjaERhc2hib2FyZFJ1bnRpbWVQcm92aWRlcjsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLmZlYXR1cmUuYXNzZXRzLlN0aXRjaEFzc2V0c0RhdGFQcm92aWRlcnM7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5mZWF0dXJlLmFnZW50cy5TdGl0Y2hBZ2VudHNQcm92aWRlcjsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLmZlYXR1cmUuYXVkaXQuU3RpdGNoQXVkaXRDb25maWdzRmVlZEFkYXB0ZXI7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5mZWF0dXJlLmF1ZGl0LlN0aXRjaEF1ZGl0RGlzY292ZXJ5RmVlZEFkYXB0ZXI7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5mZWF0dXJlLmF1ZGl0LlN0aXRjaEF1ZGl0RW50aXRsZW1lbnRzRmVlZEFkYXB0ZXI7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5mZWF0dXJlLmF1ZGl0LlN0aXRjaEF1ZGl0UHJvdmlkZXI7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5mZWF0dXJlLmF1ZGl0LlN0aXRjaEF1ZGl0U3RhdHVzRmVlZEFkYXB0ZXI7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5mZWF0dXJlLmNhdGFsb2cuU3RpdGNoQ2F0YWxvZ1Byb3ZpZGVyOwppbXBvcnQgb3JnLnByb256YXRvLmZhYnJpYy5zdGl0Y2guZmVhdHVyZS5jb25maWdzLlN0aXRjaENvbmZpZ3NBcHByb3ZhbHNQcm92aWRlcjsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLmZlYXR1cmUuY29uZmlncy5TdGl0Y2hDb25maWdzUHJvdmlkZXI7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5mZWF0dXJlLmNvbmZpZ3MuU3RpdGNoQ29uZmlnc1JvbGxiYWNrc1Byb3ZpZGVyOwppbXBvcnQgb3JnLnByb256YXRvLmZhYnJpYy5zdGl0Y2guZmVhdHVyZS5jb25maWdzLlN0aXRjaENvbmZpZ3NTY2hlbWFzUHJvdmlkZXI7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5mZWF0dXJlLmNvbmZpZ3MuU3RpdGNoQ29uZmlnc1dhdGNoZXJQcm92aWRlcjsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLmZlYXR1cmUuZGF0YS5TdGl0Y2hEYXRhc2V0c1Byb3ZpZGVyOwppbXBvcnQgb3JnLnByb256YXRvLmZhYnJpYy5zdGl0Y2guZmVhdHVyZS5kYXRhLlN0aXRjaERhdGFzZXRMaXZlUHJvdmlkZXI7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5mZWF0dXJlLmRhdGEuU3RpdGNoRGF0YXNldFZpZXdQcm92aWRlcjsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLmZlYXR1cmUuZGF0YS5TdGl0Y2hTdHJlYW1zUHJvdmlkZXI7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5mZWF0dXJlLmRvY3MuU3RpdGNoRG9jc0Jyb3dzZXJQcm92aWRlcjsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLmZlYXR1cmUuZGlzY292ZXJ5LlN0aXRjaERpc2NvdmVyeUJyb3dzZXJQcm92aWRlcjsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLmZlYXR1cmUuZW50aXRsZW1lbnRzLnByb3ZpZGVyLlN0aXRjaEVudGl0bGVtZW50c0FkbWluUHJvdmlkZXI7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5mZWF0dXJlLnBsYXRmb3JtLlN0aXRjaFBsYXRmb3JtRGF0YVByb3ZpZGVyczsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLmZlYXR1cmUuc3RvcmFnZS5TdGl0Y2hTdG9yYWdlUzNCcm93c2VyUHJvdmlkZXI7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5mZWF0dXJlLnN0b3JhZ2UuU3RpdGNoU3RvcmFnZVMzUXVlcnlQcm92aWRlcjsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLmZlYXR1cmUuc3RhdHVzLlN0aXRjaFN0YXR1c0RhdGFQcm92aWRlcnM7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5tZW51LlN0aXRjaE1lbnVQcm92aWRlcjsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLnJlYWx0aW1lLlN0aXRjaFJlYWx0aW1lU3RhdHVzUmVnaXN0cnk7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5zZWN1cml0eS5TdGl0Y2hTc29GaWx0ZXI7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5zZWN1cml0eS5TdGl0Y2hTc29Vc2VyczsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLnNlc3Npb24uU3RpdGNoUnVudGltZUNvbnRleHQ7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC51dGlsLlN0aXRjaENvbXBvbmVudHM7CmltcG9ydCBvcmcuc2xmNGouTG9nZ2VyOwppbXBvcnQgb3JnLnNsZjRqLkxvZ2dlckZhY3Rvcnk7CmltcG9ydCBvcmcuc3ByaW5nZnJhbWV3b3JrLmJvb3QuQXBwbGljYXRpb25SdW5uZXI7CmltcG9ydCBvcmcuc3ByaW5nZnJhbWV3b3JrLmJvb3QuQmFubmVyOwppbXBvcnQgb3JnLnNwcmluZ2ZyYW1ld29yay5ib290LlNwcmluZ0FwcGxpY2F0aW9uOwppbXBvcnQgb3JnLnNwcmluZ2ZyYW1ld29yay5ib290LmF1dG9jb25maWd1cmUuQXV0b0NvbmZpZ3VyYXRpb25QYWNrYWdlczsKaW1wb3J0IG9yZy5zcHJpbmdmcmFtZXdvcmsuYm9vdC53ZWIuc2VydmxldC5GaWx0ZXJSZWdpc3RyYXRpb25CZWFuOwppbXBvcnQgb3JnLnNwcmluZ2ZyYW1ld29yay5jb250ZXh0LmFubm90YXRpb24uQ2xhc3NQYXRoQmVhbkRlZmluaXRpb25TY2FubmVyOwppbXBvcnQgb3JnLnNwcmluZ2ZyYW1ld29yay5jb250ZXh0LkFwcGxpY2F0aW9uQ29udGV4dEluaXRpYWxpemVyOwppbXBvcnQgb3JnLnNwcmluZ2ZyYW1ld29yay5jb250ZXh0LkNvbmZpZ3VyYWJsZUFwcGxpY2F0aW9uQ29udGV4dDsKaW1wb3J0IG9yZy5zcHJpbmdmcmFtZXdvcmsuY29udGV4dC5zdXBwb3J0LkdlbmVyaWNBcHBsaWNhdGlvbkNvbnRleHQ7CmltcG9ydCBvcmcuc3ByaW5nZnJhbWV3b3JrLmNvcmUuT3JkZXJlZDsKCnB1YmxpYyBmaW5hbCBjbGFzcyBTdGl0Y2hMYXVuY2hlciB7CiAgcHJpdmF0ZSBzdGF0aWMgZmluYWwgTG9nZ2VyIExPR0dFUiA9IExvZ2dlckZhY3RvcnkuZ2V0TG9nZ2VyKFN0aXRjaExhdW5jaGVyLmNsYXNzKTsKCiAgcHJpdmF0ZSBTdGl0Y2hMYXVuY2hlcigpIHt9CgogIHB1YmxpYyBzdGF0aWMgU3RpdGNoUnVudGltZSBydW4oQ2xhc3M8Pz4gYXBwQ2xhc3MsIFN0aXRjaCBzdGl0Y2gpIHsKICAgIHJldHVybiBydW4oYXBwQ2xhc3MsIHN0aXRjaCwgbnVsbCk7CiAgfQoKICBwdWJsaWMgc3RhdGljIFN0aXRjaFJ1bnRpbWUgcnVuKAogICAgICBDbGFzczw/PiBhcHBDbGFzcywgU3RpdGNoIHN0aXRjaCwgU3RpdGNoTWVudVByb3ZpZGVyIHN0aXRjaE1lbnVQcm92aWRlcikgewogICAgcmV0dXJuIHJ1bihhcHBDbGFzcywgc3RpdGNoLCBzdGl0Y2hNZW51UHJvdmlkZXIsIG5ldyBTdHJpbmdbMF0pOwogIH0KCiAgcHVibGljIHN0YXRpYyBTdGl0Y2hSdW50aW1lIHJ1bigKICAgICAgQ2xhc3M8Pz4gYXBwQ2xhc3MsCiAgICAgIFN0aXRjaCBzdGl0Y2gsCiAgICAgIFN0aXRjaE1lbnVQcm92aWRlciBzdGl0Y2hNZW51UHJvdmlkZXIsCiAgICAgIFN0cmluZy4uLiBhcmdzKSB7CiAgICBPYmplY3RzLnJlcXVpcmVOb25OdWxsKGFwcENsYXNzLCAiYXBwQ2xhc3MiKTsKICAgIE9iamVjdHMucmVxdWlyZU5vbk51bGwoc3RpdGNoLCAic3RpdGNoIik7CiAgICBTdGl0Y2hDb21wb25lbnRzLmNvbmZpZ3VyZURlYnVnTGFiZWxzKHN0aXRjaC5zdGl0Y2goKS5jb21wb25lbnRMYWJlbHNFbmFibGVkKCkpOwogICAgU3RpdGNoU3ByaW5nUnVudGltZS5zZXRQYWdlVGl0bGUoc3RpdGNoLnN0aXRjaCgpLmFwcFRpdGxlKCkpOwogICAgU3RpdGNoU3ByaW5nUnVudGltZS5zZXRGYXZpY29uUGF0aChzdGl0Y2guc3RpdGNoKCkuc2hlbGwoKS5icmFuZExvZ29QYXRoKCkpOwogICAgTWFwPFN0cmluZywgT2JqZWN0PiBkZWZhdWx0VmFsdWVzID0gZGVmYXVsdFByb3BlcnRpZXMoc3RpdGNoKTsKICAgIGVuc3VyZVZhYWRpbkJ1bmRsZUZvclByb2R1Y3Rpb24oYXBwQ2xhc3MsIGRlZmF1bHRWYWx1ZXMpOwoKICAgIFNwcmluZ0FwcGxpY2F0aW9uIGFwcCA9IG5ldyBTcHJpbmdBcHBsaWNhdGlvbihTdGl0Y2hTcHJpbmdSdW50aW1lLmNsYXNzKTsKICAgIGFwcC5zZXRCYW5uZXJNb2RlKHN0aXRjaC5zdGl0Y2goKS5zdGFydHVwQmFubmVyRW5hYmxlZCgpID8gQmFubmVyLk1vZGUuQ09OU09MRSA6IEJhbm5lci5Nb2RlLk9GRik7CiAgICBhcHAuc2V0UmVnaXN0ZXJTaHV0ZG93bkhvb2sodHJ1ZSk7CiAgICBhcHAuc2V0RGVmYXVsdFByb3BlcnRpZXMoZGVmYXVsdFZhbHVlcyk7CiAgICBhcHAuYWRkSW5pdGlhbGl6ZXJzKHN0aXRjaEluaXRpYWxpemVyKGFwcENsYXNzLCBzdGl0Y2gsIHN0aXRjaE1lbnVQcm92aWRlcikpOwogICAgQ29uZmlndXJhYmxlQXBwbGljYXRpb25Db250ZXh0IGNvbnRleHQgPSBhcHAucnVuKGFyZ3MgPT0gbnVsbCA/IG5ldyBTdHJpbmdbMF0gOiBhcmdzKTsKICAgIHJldHVybiBuZXcgU3RpdGNoUnVudGltZShjb250ZXh0KTsKICB9CgogIHByaXZhdGUgc3RhdGljIE1hcDxTdHJpbmcsIE9iamVjdD4gZGVmYXVsdFByb3BlcnRpZXMoU3RpdGNoIHN0aXRjaCkgewogICAgTWFwPFN0cmluZywgT2JqZWN0PiB2YWx1ZXMgPSBuZXcgTGlua2VkSGFzaE1hcDw+KHN0aXRjaC5hc1NwcmluZ0RlZmF1bHRzKCkpOwogICAgLy8gU3RpdGNoIGFwcHMgcnVuIHByb2R1Y3Rpb24tbW9kZSBieSBkZWZhdWx0IHVuZGVyIHRoZSBzdHJpY3Qgbm8tbm9kZSBwb2xpY3kuCiAgICAvLyBEZXYgbW9kZSBtdXN0IG5ldmVyIGJlIHRoZSBkZWZhdWx0IGV4ZWN1dGlvbiBwYXRoLgogICAgdmFsdWVzLnB1dCgidmFhZGluLnByb2R1Y3Rpb25Nb2RlIiwgcmVzb2x2ZVZhYWRpblByb2R1Y3Rpb25Nb2RlKHZhbHVlcykpOwogICAgcmV0dXJuIE1hcC5jb3B5T2YodmFsdWVzKTsKICB9CgogIHByaXZhdGUgc3RhdGljIFN0cmluZyByZXNvbHZlVmFhZGluUHJvZHVjdGlvbk1vZGUoTWFwPFN0cmluZywgT2JqZWN0PiB2YWx1ZXMpIHsKICAgIFN0cmluZyBjb25maWd1cmVkTW9kZSA9CiAgICAgICAgZmlyc3ROb25CbGFuaygKICAgICAgICAgICAgU3lzdGVtLmdldGVudigiVkFBRElOX1BST0RVQ1RJT05fTU9ERSIpLAogICAgICAgICAgICBTeXN0ZW0uZ2V0UHJvcGVydHkoIlZBQURJTl9QUk9EVUNUSU9OX01PREUiKSwKICAgICAgICAgICAgU3lzdGVtLmdldFByb3BlcnR5KCJ2YWFkaW4ucHJvZHVjdGlvbk1vZGUiKSwKICAgICAgICAgICAgdmFsdWVzID09IG51bGwgPyBudWxsIDogT2JqZWN0cy50b1N0cmluZyh2YWx1ZXMuZ2V0KCJ2YWFkaW4ucHJvZHVjdGlvbk1vZGUiKSwgbnVsbCkpOwogICAgcmV0dXJuIGNvbmZpZ3VyZWRNb2RlID09IG51bGwgPyAidHJ1ZSIgOiBjb25maWd1cmVkTW9kZTsKICB9CgogIHByaXZhdGUgc3RhdGljIFN0cmluZyBmaXJzdE5vbkJsYW5rKFN0cmluZy4uLiB2YWx1ZXMpIHsKICAgIGlmICh2YWx1ZXMgPT0gbnVsbCB8fCB2YWx1ZXMubGVuZ3RoID09IDApIHsKICAgICAgcmV0dXJuIG51bGw7CiAgICB9CiAgICBmb3IgKFN0cmluZyB2YWx1ZSA6IHZhbHVlcykgewogICAgICBpZiAodmFsdWUgIT0gbnVsbCAmJiAhdmFsdWUuaXNCbGFuaygpKSB7CiAgICAgICAgcmV0dXJuIHZhbHVlOwogICAgICB9CiAgICB9CiAgICByZXR1cm4gbnVsbDsKICB9CgogIHByaXZhdGUgc3RhdGljIHZvaWQgZW5zdXJlVmFhZGluQnVuZGxlRm9yUHJvZHVjdGlvbigKICAgICAgQ2xhc3M8Pz4gYXBwQ2xhc3MsIE1hcDxTdHJpbmcsIE9iamVjdD4gZGVmYXVsdFZhbHVlcykgewogICAgYm9vbGVhbiBwcm9kdWN0aW9uTW9kZSA9CiAgICAgICAgQm9vbGVhbi5wYXJzZUJvb2xlYW4oT2JqZWN0cy50b1N0cmluZyhkZWZhdWx0VmFsdWVzLmdldCgidmFhZGluLnByb2R1Y3Rpb25Nb2RlIiksICJmYWxzZSIpKTsKICAgIGlmICghcHJvZHVjdGlvbk1vZGUpIHsKICAgICAgcmV0dXJuOwogICAgfQogICAgU3RpdGNoVmFhZGluQnVuZGxlQm9vdHN0cmFwLmVuc3VyZU9uRXhwbG9kZWRDbGFzc3BhdGgoYXBwQ2xhc3MpOwogIH0KCiAgcHJpdmF0ZSBzdGF0aWMgQXBwbGljYXRpb25Db250ZXh0SW5pdGlhbGl6ZXI8R2VuZXJpY0FwcGxpY2F0aW9uQ29udGV4dD4gc3RpdGNoSW5pdGlhbGl6ZXIoCiAgICAgIENsYXNzPD8+IGFwcENsYXNzLCBTdGl0Y2ggc3RpdGNoLCBTdGl0Y2hNZW51UHJvdmlkZXIgc3RpdGNoTWVudVByb3ZpZGVyKSB7CiAgICByZXR1cm4gY29udGV4dCAtPiB7CiAgICAgIGlmIChhcHBDbGFzcy5nZXRQYWNrYWdlTmFtZSgpID09IG51bGwgfHwgYXBwQ2xhc3MuZ2V0UGFja2FnZU5hbWUoKS5pc0JsYW5rKCkpIHsKICAgICAgICB0aHJvdyBuZXcgSWxsZWdhbFN0YXRlRXhjZXB0aW9uKCJhcHBsaWNhdGlvbkNsYXNzIG11c3QgYmUgaW4gYSBuYW1lZCBwYWNrYWdlIik7CiAgICAgIH0KICAgICAgQXV0b0NvbmZpZ3VyYXRpb25QYWNrYWdlcy5yZWdpc3RlcigKICAgICAgICAgIGNvbnRleHQsIGFwcENsYXNzLmdldFBhY2thZ2VOYW1lKCksIFN0aXRjaC5jbGFzcy5nZXRQYWNrYWdlTmFtZSgpKTsKICAgICAgbmV3IENsYXNzUGF0aEJlYW5EZWZpbml0aW9uU2Nhbm5lcihjb250ZXh0KS5zY2FuKGFwcENsYXNzLmdldFBhY2thZ2VOYW1lKCkpOwogICAgICBjb250ZXh0LnJlZ2lzdGVyQmVhbihTdGl0Y2guY2xhc3MsICgpIC0+IHN0aXRjaCk7CiAgICAgIGNvbnRleHQucmVnaXN0ZXJCZWFuKAogICAgICAgICAgRmFicmljLlNlc3Npb24uY2xhc3MsCiAgICAgICAgICAoKSAtPiB7CiAgICAgICAgICAgIHRyeSB7CiAgICAgICAgICAgICAgcmV0dXJuIGNyZWF0ZVNlc3Npb24oc3RpdGNoKTsKICAgICAgICAgICAgfSBjYXRjaCAoRXhjZXB0aW9uIGVycm9yKSB7CiAgICAgICAgICAgICAgdGhyb3cgbmV3IElsbGVnYWxTdGF0ZUV4Y2VwdGlvbigiVW5hYmxlIHRvIGNyZWF0ZSBGYWJyaWMgc2Vzc2lvbiIsIGVycm9yKTsKICAgICAgICAgICAgfQogICAgICAgICAgfSwKICAgICAgICAgIGRlZmluaXRpb24gLT4gZGVmaW5pdGlvbi5zZXREZXN0cm95TWV0aG9kTmFtZSgiY2xvc2UiKSk7CiAgICAgIGNvbnRleHQucmVnaXN0ZXJCZWFuKAogICAgICAgICAgU3RpdGNoUnVudGltZUNvbnRleHQuY2xhc3MsCiAgICAgICAgICAoKSAtPgogICAgICAgICAgICAgIFN0aXRjaFJ1bnRpbWVDb250ZXh0Lm9mKAogICAgICAgICAgICAgICAgICBjb250ZXh0LmdldEJlYW4oU3RpdGNoLmNsYXNzKSwgY29udGV4dC5nZXRCZWFuKEZhYnJpYy5TZXNzaW9uLmNsYXNzKSkpOwogICAgICBjb250ZXh0LnJlZ2lzdGVyQmVhbigKICAgICAgICAgIFNzb0NvbmZpZy5jbGFzcywgKCkgLT4gYnVpbGRTc29Db25maWcoY29udGV4dC5nZXRCZWFuKFN0aXRjaC5jbGFzcykuc3RpdGNoKCkpKTsKICAgICAgY29udGV4dC5yZWdpc3RlckJlYW4oU3NvU2VydmljZS5jbGFzcywgKCkgLT4gbmV3IERlZmF1bHRTc29TZXJ2aWNlKGNvbnRleHQuZ2V0QmVhbihTc29Db25maWcuY2xhc3MpKSk7CiAgICAgIGNvbnRleHQucmVnaXN0ZXJCZWFuKAogICAgICAgICAgU3RpdGNoU3NvVXNlcnMuY2xhc3MsICgpIC0+IG5ldyBTdGl0Y2hTc29Vc2Vycyhjb250ZXh0LmdldEJlYW4oU3RpdGNoLmNsYXNzKS5zdGl0Y2goKSkpOwogICAgICBjb250ZXh0LnJlZ2lzdGVyQmVhbigKICAgICAgICAgIFN0aXRjaFNzb0ZpbHRlci5jbGFzcywKICAgICAgICAgICgpIC0+CiAgICAgICAgICAgICAgbmV3IFN0aXRjaFNzb0ZpbHRlcigKICAgICAgICAgICAgICAgICAgY29udGV4dC5nZXRCZWFuKFNzb1NlcnZpY2UuY2xhc3MpLAogICAgICAgICAgICAgICAgICBjb250ZXh0LmdldEJlYW4oU3NvQ29uZmlnLmNsYXNzKSwKICAgICAgICAgICAgICAgICAgY29udGV4dC5nZXRCZWFuKFN0aXRjaC5jbGFzcykuc3RpdGNoKCkuc3NvKCkuZmFsbGJhY2tTdWJqZWN0KCkpKTsKICAgICAgY29udGV4dC5yZWdpc3RlckJlYW4oCiAgICAgICAgICAic3RpdGNoU3NvRmlsdGVyUmVnaXN0cmF0aW9uIiwKICAgICAgICAgIEZpbHRlclJlZ2lzdHJhdGlvbkJlYW4uY2xhc3MsCiAgICAgICAgICAoKSAtPiB7CiAgICAgICAgICAgIEZpbHRlclJlZ2lzdHJhdGlvbkJlYW48U3RpdGNoU3NvRmlsdGVyPiByZWdpc3RyYXRpb24gPSBuZXcgRmlsdGVyUmVnaXN0cmF0aW9uQmVhbjw+KCk7CiAgICAgICAgICAgIHJlZ2lzdHJhdGlvbi5zZXRGaWx0ZXIoY29udGV4dC5nZXRCZWFuKFN0aXRjaFNzb0ZpbHRlci5jbGFzcykpOwogICAgICAgICAgICByZWdpc3RyYXRpb24uYWRkVXJsUGF0dGVybnMoIi8qIik7CiAgICAgICAgICAgIHJlZ2lzdHJhdGlvbi5zZXRPcmRlcihPcmRlcmVkLkhJR0hFU1RfUFJFQ0VERU5DRSk7CiAgICAgICAgICAgIHJlZ2lzdHJhdGlvbi5zZXROYW1lKCJzdGl0Y2hTc29GaWx0ZXIiKTsKICAgICAgICAgICAgcmV0dXJuIHJlZ2lzdHJhdGlvbjsKICAgICAgICAgIH0pOwogICAgICBjb250ZXh0LnJlZ2lzdGVyQmVhbigKICAgICAgICAgIFN0aXRjaFNzb0NvbnRyb2xsZXIuY2xhc3MsCiAgICAgICAgICAoKSAtPgogICAgICAgICAgICAgIG5ldyBTdGl0Y2hTc29Db250cm9sbGVyKAogICAgICAgICAgICAgICAgICBjb250ZXh0LmdldEJlYW4oU3NvU2VydmljZS5jbGFzcyksCiAgICAgICAgICAgICAgICAgIGNvbnRleHQuZ2V0QmVhbihTc29Db25maWcuY2xhc3MpLAogICAgICAgICAgICAgICAgICBjb250ZXh0LmdldEJlYW4oU3RpdGNoU3NvVXNlcnMuY2xhc3MpLAogICAgICAgICAgICAgICAgICBjb250ZXh0LmdldEJlYW4oU3RpdGNoLmNsYXNzKS5zdGl0Y2goKSkpOwogICAgICBjb250ZXh0LnJlZ2lzdGVyQmVhbigKICAgICAgICAgIFN0aXRjaFN0YXR1c0RhdGFQcm92aWRlcnMuY2xhc3MsCiAgICAgICAgICAoKSAtPiBuZXcgU3RpdGNoU3RhdHVzRGF0YVByb3ZpZGVycyhjb250ZXh0LmdldEJlYW4oU3RpdGNoUnVudGltZUNvbnRleHQuY2xhc3MpKSk7CiAgICAgIGNvbnRleHQucmVnaXN0ZXJCZWFuKAogICAgICAgICAgU3RpdGNoQXNzZXRzRGF0YVByb3ZpZGVycy5jbGFzcywKICAgICAgICAgICgpIC0+IG5ldyBTdGl0Y2hBc3NldHNEYXRhUHJvdmlkZXJzKGNvbnRleHQuZ2V0QmVhbihTdGl0Y2hSdW50aW1lQ29udGV4dC5jbGFzcykpKTsKICAgICAgY29udGV4dC5yZWdpc3RlckJlYW4oCiAgICAgICAgICBTdGl0Y2hQbGF0Zm9ybURhdGFQcm92aWRlcnMuY2xhc3MsCiAgICAgICAgICAoKSAtPiBuZXcgU3RpdGNoUGxhdGZvcm1EYXRhUHJvdmlkZXJzKGNvbnRleHQuZ2V0QmVhbihTdGl0Y2hSdW50aW1lQ29udGV4dC5jbGFzcykpKTsKICAgICAgY29udGV4dC5yZWdpc3RlckJlYW4oCiAgICAgICAgICBTdGl0Y2hEaXNjb3ZlcnlCcm93c2VyUHJvdmlkZXIuY2xhc3MsCiAgICAgICAgICAoKSAtPiBuZXcgU3RpdGNoRGlzY292ZXJ5QnJvd3NlclByb3ZpZGVyKGNvbnRleHQuZ2V0QmVhbihTdGl0Y2hSdW50aW1lQ29udGV4dC5jbGFzcykpKTsKICAgICAgY29udGV4dC5yZWdpc3RlckJlYW4oCiAgICAgICAgICBTdGl0Y2hEYXRhc2V0c1Byb3ZpZGVyLmNsYXNzLAogICAgICAgICAgKCkgLT4gbmV3IFN0aXRjaERhdGFzZXRzUHJvdmlkZXIoY29udGV4dC5nZXRCZWFuKFN0aXRjaFJ1bnRpbWVDb250ZXh0LmNsYXNzKSkpOwogICAgICBjb250ZXh0LnJlZ2lzdGVyQmVhbigKICAgICAgICAgIFN0aXRjaERhdGFzZXRWaWV3UHJvdmlkZXIuY2xhc3MsCiAgICAgICAgICAoKSAtPiBuZXcgU3RpdGNoRGF0YXNldFZpZXdQcm92aWRlcihjb250ZXh0LmdldEJlYW4oU3RpdGNoUnVudGltZUNvbnRleHQuY2xhc3MpKSk7CiAgICAgIGNvbnRleHQucmVnaXN0ZXJCZWFuKAogICAgICAgICAgU3RpdGNoRGF0YXNldExpdmVQcm92aWRlci5jbGFzcywKICAgICAgICAgICgpIC0+CiAgICAgICAgICAgICAgbmV3IFN0aXRjaERhdGFzZXRMaXZlUHJvdmlkZXIoCiAgICAgICAgICAgICAgICAgIGNvbnRleHQuZ2V0QmVhbihTdGl0Y2hSdW50aW1lQ29udGV4dC5jbGFzcyksCiAgICAgICAgICAgICAgICAgIGNvbnRleHQuZ2V0QmVhbihTdGl0Y2hEYXRhc2V0c1Byb3ZpZGVyLmNsYXNzKSkpOwogICAgICBjb250ZXh0LnJlZ2lzdGVyQmVhbigKICAgICAgICAgIFN0aXRjaFN0b3JhZ2VTM0Jyb3dzZXJQcm92aWRlci5jbGFzcywKICAgICAgICAgICgpIC0+IG5ldyBTdGl0Y2hTdG9yYWdlUzNCcm93c2VyUHJvdmlkZXIoY29udGV4dC5nZXRCZWFuKFN0aXRjaFJ1bnRpbWVDb250ZXh0LmNsYXNzKSkpOwogICAgICBjb250ZXh0LnJlZ2lzdGVyQmVhbigKICAgICAgICAgIFN0aXRjaFN0b3JhZ2VTM1F1ZXJ5UHJvdmlkZXIuY2xhc3MsCiAgICAgICAgICAoKSAtPiBuZXcgU3RpdGNoU3RvcmFnZVMzUXVlcnlQcm92aWRlcihjb250ZXh0LmdldEJlYW4oU3RpdGNoUnVudGltZUNvbnRleHQuY2xhc3MpKSk7CiAgICAgIGNvbnRleHQucmVnaXN0ZXJCZWFuKAogICAgICAgICAgU3RpdGNoU3RyZWFtc1Byb3ZpZGVyLmNsYXNzLAogICAgICAgICAgKCkgLT4gbmV3IFN0aXRjaFN0cmVhbXNQcm92aWRlcihjb250ZXh0LmdldEJlYW4oU3RpdGNoUnVudGltZUNvbnRleHQuY2xhc3MpKSk7CiAgICAgIGNvbnRleHQucmVnaXN0ZXJCZWFuKAogICAgICAgICAgU3RpdGNoRW50aXRsZW1lbnRzQWRtaW5Qcm92aWRlci5jbGFzcywKICAgICAgICAgICgpIC0+CiAgICAgICAgICAgICAgbmV3IFN0aXRjaEVudGl0bGVtZW50c0FkbWluUHJvdmlkZXIoCiAgICAgICAgICAgICAgICAgIGNvbnRleHQuZ2V0QmVhbihTdGl0Y2hBc3NldHNEYXRhUHJvdmlkZXJzLmNsYXNzKSwKICAgICAgICAgICAgICAgICAgY29udGV4dC5nZXRCZWFuKFN0aXRjaERhdGFzZXRzUHJvdmlkZXIuY2xhc3MpKSk7CiAgICAgIGNvbnRleHQucmVnaXN0ZXJCZWFuKAogICAgICAgICAgU3RpdGNoRG9jc0Jyb3dzZXJQcm92aWRlci5jbGFzcywKICAgICAgICAgICgpIC0+IG5ldyBTdGl0Y2hEb2NzQnJvd3NlclByb3ZpZGVyKGNvbnRleHQuZ2V0QmVhbihTdGl0Y2hSdW50aW1lQ29udGV4dC5jbGFzcykpKTsKICAgICAgY29udGV4dC5yZWdpc3RlckJlYW4oCiAgICAgICAgICBTdGl0Y2hEb2NzUmVzb3VyY2VDb250cm9sbGVyLmNsYXNzLAogICAgICAgICAgKCkgLT4gbmV3IFN0aXRjaERvY3NSZXNvdXJjZUNvbnRyb2xsZXIoY29udGV4dC5nZXRCZWFuKFN0aXRjaERvY3NCcm93c2VyUHJvdmlkZXIuY2xhc3MpKSk7CiAgICAgIGNvbnRleHQucmVnaXN0ZXJCZWFuKAogICAgICAgICAgU3RpdGNoQ2F0YWxvZ1Byb3ZpZGVyLmNsYXNzLAogICAgICAgICAgKCkgLT4gbmV3IFN0aXRjaENhdGFsb2dQcm92aWRlcihjb250ZXh0LmdldEJlYW4oU3RpdGNoUnVudGltZUNvbnRleHQuY2xhc3MpKSk7CiAgICAgIGNvbnRleHQucmVnaXN0ZXJCZWFuKAogICAgICAgICAgU3RpdGNoQWdlbnRzUHJvdmlkZXIuY2xhc3MsCiAgICAgICAgICAoKSAtPiBuZXcgU3RpdGNoQWdlbnRzUHJvdmlkZXIoY29udGV4dC5nZXRCZWFuKFN0aXRjaFJ1bnRpbWVDb250ZXh0LmNsYXNzKSkpOwogICAgICBjb250ZXh0LnJlZ2lzdGVyQmVhbigKICAgICAgICAgIFN0aXRjaENvbmZpZ3NQcm92aWRlci5jbGFzcywKICAgICAgICAgICgpIC0+IG5ldyBTdGl0Y2hDb25maWdzUHJvdmlkZXIoY29udGV4dC5nZXRCZWFuKFN0aXRjaFJ1bnRpbWVDb250ZXh0LmNsYXNzKSkpOwogICAgICBjb250ZXh0LnJlZ2lzdGVyQmVhbigKICAgICAgICAgIFN0aXRjaENvbmZpZ3NBcHByb3ZhbHNQcm92aWRlci5jbGFzcywKICAgICAgICAgICgpIC0+CiAgICAgICAgICAgICAgbmV3IFN0aXRjaENvbmZpZ3NBcHByb3ZhbHNQcm92aWRlcigKICAgICAgICAgICAgICAgICAgY29udGV4dC5nZXRCZWFuKFN0aXRjaFJ1bnRpbWVDb250ZXh0LmNsYXNzKSwKICAgICAgICAgICAgICAgICAgY29udGV4dC5nZXRCZWFuKFN0aXRjaENvbmZpZ3NQcm92aWRlci5jbGFzcykpKTsKICAgICAgY29udGV4dC5yZWdpc3RlckJlYW4oCiAgICAgICAgICBTdGl0Y2hDb25maWdzUm9sbGJhY2tzUHJvdmlkZXIuY2xhc3MsCiAgICAgICAgICAoKSAtPgogICAgICAgICAgICAgIG5ldyBTdGl0Y2hDb25maWdzUm9sbGJhY2tzUHJvdmlkZXIoCiAgICAgICAgICAgICAgICAgIGNvbnRleHQuZ2V0QmVhbihTdGl0Y2hSdW50aW1lQ29udGV4dC5jbGFzcyksCiAgICAgICAgICAgICAgICAgIGNvbnRleHQuZ2V0QmVhbihTdGl0Y2hDb25maWdzUHJvdmlkZXIuY2xhc3MpKSk7CiAgICAgIGNvbnRleHQucmVnaXN0ZXJCZWFuKAogICAgICAgICAgU3RpdGNoQ29uZmlnc1NjaGVtYXNQcm92aWRlci5jbGFzcywKICAgICAgICAgICgpIC0+CiAgICAgICAgICAgICAgbmV3IFN0aXRjaENvbmZpZ3NTY2hlbWFzUHJvdmlkZXIoCiAgICAgICAgICAgICAgICAgIGNvbnRleHQuZ2V0QmVhbihTdGl0Y2hSdW50aW1lQ29udGV4dC5jbGFzcyksCiAgICAgICAgICAgICAgICAgIGNvbnRleHQuZ2V0QmVhbihTdGl0Y2hDb25maWdzUHJvdmlkZXIuY2xhc3MpKSk7CiAgICAgIGNvbnRleHQucmVnaXN0ZXJCZWFuKAogICAgICAgICAgU3RpdGNoQ29uZmlnc1dhdGNoZXJQcm92aWRlci5jbGFzcywKICAgICAgICAgICgpIC0+CiAgICAgICAgICAgICAgbmV3IFN0aXRjaENvbmZpZ3NXYXRjaGVyUHJvdmlkZXIoCiAgICAgICAgICAgICAgICAgIGNvbnRleHQuZ2V0QmVhbihTdGl0Y2hSdW50aW1lQ29udGV4dC5jbGFzcyksCiAgICAgICAgICAgICAgICAgIGNvbnRleHQuZ2V0QmVhbihTdGl0Y2hDb25maWdzUHJvdmlkZXIuY2xhc3MpKSk7CiAgICAgIGNvbnRleHQucmVnaXN0ZXJCZWFuKAogICAgICAgICAgU3RpdGNoQXVkaXRTdGF0dXNGZWVkQWRhcHRlci5jbGFzcywKICAgICAgICAgICgpIC0+IG5ldyBTdGl0Y2hBdWRpdFN0YXR1c0ZlZWRBZGFwdGVyKGNvbnRleHQuZ2V0QmVhbihTdGl0Y2hSdW50aW1lQ29udGV4dC5jbGFzcykpKTsKICAgICAgY29udGV4dC5yZWdpc3RlckJlYW4oCiAgICAgICAgICBTdGl0Y2hBdWRpdENvbmZpZ3NGZWVkQWRhcHRlci5jbGFzcywKICAgICAgICAgICgpIC0+IG5ldyBTdGl0Y2hBdWRpdENvbmZpZ3NGZWVkQWRhcHRlcihjb250ZXh0LmdldEJlYW4oU3RpdGNoUnVudGltZUNvbnRleHQuY2xhc3MpKSk7CiAgICAgIGNvbnRleHQucmVnaXN0ZXJCZWFuKAogICAgICAgICAgU3RpdGNoQXVkaXREaXNjb3ZlcnlGZWVkQWRhcHRlci5jbGFzcywKICAgICAgICAgICgpIC0+IG5ldyBTdGl0Y2hBdWRpdERpc2NvdmVyeUZlZWRBZGFwdGVyKGNvbnRleHQuZ2V0QmVhbihTdGl0Y2hSdW50aW1lQ29udGV4dC5jbGFzcykpKTsKICAgICAgY29udGV4dC5yZWdpc3RlckJlYW4oCiAgICAgICAgICBTdGl0Y2hBdWRpdEVudGl0bGVtZW50c0ZlZWRBZGFwdGVyLmNsYXNzLAogICAgICAgICAgKCkgLT4gbmV3IFN0aXRjaEF1ZGl0RW50aXRsZW1lbnRzRmVlZEFkYXB0ZXIoY29udGV4dC5nZXRCZWFuKFN0aXRjaFJ1bnRpbWVDb250ZXh0LmNsYXNzKSkpOwogICAgICBjb250ZXh0LnJlZ2lzdGVyQmVhbigKICAgICAgICAgIFN0aXRjaEF1ZGl0UHJvdmlkZXIuY2xhc3MsCiAgICAgICAgICAoKSAtPgogICAgICAgICAgICAgIG5ldyBTdGl0Y2hBdWRpdFByb3ZpZGVyKAogICAgICAgICAgICAgICAgICBMaXN0LmNvcHlPZihjb250ZXh0LmdldEJlYW5zT2ZUeXBlKG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLmZlYXR1cmUuYXVkaXQuU3RpdGNoQXVkaXRGZWVkQWRhcHRlci5jbGFzcykudmFsdWVzKCkpKSk7CiAgICAgIGNvbnRleHQucmVnaXN0ZXJCZWFuKAogICAgICAgICAgU3RpdGNoUmVhbHRpbWVTdGF0dXNSZWdpc3RyeS5jbGFzcywgU3RpdGNoUmVhbHRpbWVTdGF0dXNSZWdpc3RyeTo6bmV3KTsKICAgICAgcmVnaXN0ZXJDb25uZWN0aW9uV2FybXVwUnVubmVyKGNvbnRleHQsIHN0aXRjaCk7CiAgICAgIGlmIChzdGl0Y2hNZW51UHJvdmlkZXIgIT0gbnVsbCkgewogICAgICAgIGNvbnRleHQucmVnaXN0ZXJCZWFuKFN0aXRjaE1lbnVQcm92aWRlci5jbGFzcywgKCkgLT4gc3RpdGNoTWVudVByb3ZpZGVyKTsKICAgICAgfQogICAgICBpZiAoc3RpdGNoLmRhc2hib2FyZFJ1bnRpbWVQcm92aWRlcigpICE9IG51bGwpIHsKICAgICAgICBjb250ZXh0LnJlZ2lzdGVyQmVhbigKICAgICAgICAgICAgU3RpdGNoRGFzaGJvYXJkUnVudGltZVByb3ZpZGVyLmNsYXNzLCBzdGl0Y2g6OmRhc2hib2FyZFJ1bnRpbWVQcm92aWRlcik7CiAgICAgIH0KICAgIH07CiAgfQoKICBwcml2YXRlIHN0YXRpYyB2b2lkIHJlZ2lzdGVyQ29ubmVjdGlvbldhcm11cFJ1bm5lcigKICAgICAgR2VuZXJpY0FwcGxpY2F0aW9uQ29udGV4dCBjb250ZXh0LCBTdGl0Y2ggc3RpdGNoKSB7CiAgICBMaXN0PFN0cmluZz4gbmFtZXMgPSBzdGl0Y2guc3RpdGNoKCkuY29ubmVjdGlvbldhcm11cE5hbWVzKCk7CiAgICBpZiAobmFtZXMuaXNFbXB0eSgpKSB7CiAgICAgIHJldHVybjsKICAgIH0KICAgIGNvbnRleHQucmVnaXN0ZXJCZWFuKAogICAgICAgICJzdGl0Y2hDb25uZWN0aW9uV2FybXVwUnVubmVyIiwKICAgICAgICBBcHBsaWNhdGlvblJ1bm5lci5jbGFzcywKICAgICAgICAoKSAtPgogICAgICAgICAgICBhcmdzIC0+CiAgICAgICAgICAgICAgICBDb21wbGV0YWJsZUZ1dHVyZS5ydW5Bc3luYygKICAgICAgICAgICAgICAgICAgICAoKSAtPiBydW5Db25uZWN0aW9uV2FybXVwKGNvbnRleHQuZ2V0QmVhbihTdGl0Y2hSdW50aW1lQ29udGV4dC5jbGFzcykpKSk7CiAgfQoKICBwcml2YXRlIHN0YXRpYyB2b2lkIHJ1bkNvbm5lY3Rpb25XYXJtdXAoU3RpdGNoUnVudGltZUNvbnRleHQgcnVudGltZUNvbnRleHQpIHsKICAgIExpc3Q8U3RyaW5nPiBuYW1lcyA9IHJ1bnRpbWVDb250ZXh0LnNldHRpbmdzKCkuY29ubmVjdGlvbldhcm11cE5hbWVzKCk7CiAgICBmb3IgKFN0cmluZyBjb25uZWN0aW9uTmFtZSA6IG5hbWVzKSB7CiAgICAgIHdhcm11cENvbm5lY3Rpb24ocnVudGltZUNvbnRleHQsIGNvbm5lY3Rpb25OYW1lKTsKICAgIH0KICB9CgogIHByaXZhdGUgc3RhdGljIHZvaWQgd2FybXVwQ29ubmVjdGlvbigKICAgICAgU3RpdGNoUnVudGltZUNvbnRleHQgcnVudGltZUNvbnRleHQsIFN0cmluZyBjb25uZWN0aW9uTmFtZSkgewogICAgbG9uZyBzdGFydGVkQXQgPSBTeXN0ZW0ubmFub1RpbWUoKTsKICAgIExPR0dFUi5pbmZvKCJbU3RpdGNoXVtDb25uZWN0aW9uV2FybXVwXSBzdGFydCBjb25uZWN0aW9uPXt9IiwgY29ubmVjdGlvbk5hbWUpOwogICAgdHJ5IHsKICAgICAgQXV0b0Nsb3NlYWJsZSBoYW5kbGUgPQogICAgICAgICAgcnVudGltZUNvbnRleHQKICAgICAgICAgICAgICAuc2Vzc2lvbigpCiAgICAgICAgICAgICAgLmNvbm5lY3Rpb25zKCkKICAgICAgICAgICAgICAuZ2V0KAogICAgICAgICAgICAgICAgICBDb25uZWN0aW9uUmVxdWVzdC5idWlsZGVyKEF1dG9DbG9zZWFibGUuY2xhc3MpCiAgICAgICAgICAgICAgICAgICAgICAud2l0aENvbm5lY3Rpb25OYW1lKGNvbm5lY3Rpb25OYW1lKQogICAgICAgICAgICAgICAgICAgICAgLmJ1aWxkKCkpOwogICAgICBTdHJpbmcgdHlwZSA9IHRvdWNoV2FybXVwSGFuZGxlKGhhbmRsZSk7CiAgICAgIGxvbmcgZWxhcHNlZE1zID0gKFN5c3RlbS5uYW5vVGltZSgpIC0gc3RhcnRlZEF0KSAvIDFfMDAwXzAwMEw7CiAgICAgIExPR0dFUi5pbmZvKAogICAgICAgICAgIltTdGl0Y2hdW0Nvbm5lY3Rpb25XYXJtdXBdIHN1Y2Nlc3MgY29ubmVjdGlvbj17fSB0eXBlPXt9IGVsYXBzZWRNcz17fSIsCiAgICAgICAgICBjb25uZWN0aW9uTmFtZSwKICAgICAgICAgIHR5cGUsCiAgICAgICAgICBlbGFwc2VkTXMpOwogICAgfSBjYXRjaCAoRXhjZXB0aW9uIGVycm9yKSB7CiAgICAgIGxvbmcgZWxhcHNlZE1zID0gKFN5c3RlbS5uYW5vVGltZSgpIC0gc3RhcnRlZEF0KSAvIDFfMDAwXzAwMEw7CiAgICAgIExPR0dFUi53YXJuKAogICAgICAgICAgIltTdGl0Y2hdW0Nvbm5lY3Rpb25XYXJtdXBdIGZhaWxlZCBjb25uZWN0aW9uPXt9IGVsYXBzZWRNcz17fSByZWFzb249e30iLAogICAgICAgICAgY29ubmVjdGlvbk5hbWUsCiAgICAgICAgICBlbGFwc2VkTXMsCiAgICAgICAgICBlcnJvci5nZXRNZXNzYWdlKCksCiAgICAgICAgICBlcnJvcik7CiAgICB9CiAgfQoKICBwcml2YXRlIHN0YXRpYyBTdHJpbmcgdG91Y2hXYXJtdXBIYW5kbGUoQXV0b0Nsb3NlYWJsZSBoYW5kbGUpIHsKICAgIGlmIChoYW5kbGUgPT0gbnVsbCkgewogICAgICB0aHJvdyBuZXcgSWxsZWdhbFN0YXRlRXhjZXB0aW9uKCJDb25uZWN0aW9uIHdhcm11cCByZXNvbHZlZCB0byBudWxsIGhhbmRsZSIpOwogICAgfQogICAgaWYgKGhhbmRsZSBpbnN0YW5jZW9mIFMzQ29ubmVjdGlvbiBzMykgewogICAgICAvLyBUb3VjaCBtZXRhZGF0YSBzbyBsYXp5IGNvbm5lY3RvciBpbml0aWFsaXphdGlvbiBoYXBwZW5zIGR1cmluZyB3YXJtdXAuCiAgICAgIHMzLmJ1Y2tldCgpOwogICAgICByZXR1cm4gIlMzIjsKICAgIH0KICAgIGlmIChoYW5kbGUgaW5zdGFuY2VvZiBIdHRwQ29ubmVjdGlvbiBodHRwKSB7CiAgICAgIGh0dHAuYmFzZVVyaSgpOwogICAgICByZXR1cm4gIkhUVFAiOwogICAgfQogICAgaWYgKGhhbmRsZSBpbnN0YW5jZW9mIEFtcHNDb25uZWN0aW9uIGFtcHMpIHsKICAgICAgYW1wcy5jbGllbnQoKTsKICAgICAgcmV0dXJuICJBTVBTIjsKICAgIH0KICAgIGlmIChoYW5kbGUgaW5zdGFuY2VvZiBPZGJjQ29ubmVjdGlvbikgewogICAgICByZXR1cm4gIk9EQkMiOwogICAgfQogICAgcmV0dXJuIGhhbmRsZS5nZXRDbGFzcygpLmdldFNpbXBsZU5hbWUoKTsKICB9CgogIHByaXZhdGUgc3RhdGljIFNzb0NvbmZpZyBidWlsZFNzb0NvbmZpZyhTdGl0Y2hTZXR0aW5ncyBzZXR0aW5ncykgewogICAgU3RpdGNoU2V0dGluZ3MuU3NvIHNzbyA9IE9iamVjdHMucmVxdWlyZU5vbk51bGwoc2V0dGluZ3MsICJzZXR0aW5ncyIpLnNzbygpOwogICAgU3NvQ29uZmlnLlNwb29mIHNwb29mID0KICAgICAgICBTc29Db25maWcuU3Bvb2YuYnVpbGRlcigpCiAgICAgICAgICAgIC53aXRoRW5hYmxlZChzc28uc3Bvb2ZFbmFibGVkKCkpCiAgICAgICAgICAgIC53aXRoQWxsb3dFZGl0aW5nKHNzby5zcG9vZkFsbG93RWRpdGluZygpKQogICAgICAgICAgICAud2l0aENvb2tpZU5hbWUoc3NvLnNwb29mQ29va2llTmFtZSgpKQogICAgICAgICAgICAud2l0aERlZmF1bHRVc2VybmFtZShzc28uc3Bvb2ZEZWZhdWx0VXNlcm5hbWUoKSkKICAgICAgICAgICAgLndpdGhDb29raWVNYXhBZ2VTZWNvbmRzKHNzby5zcG9vZkNvb2tpZU1heEFnZVNlY29uZHMoKSkKICAgICAgICAgICAgLndpdGhBdHRyaWJ1dGVSZXNvbHZlcigKICAgICAgICAgICAgICAgIHVzZXJuYW1lIC0+CiAgICAgICAgICAgICAgICAgICAgc3NvLnNwb29mR3JvdXBzKCkuaXNFbXB0eSgpID8gTWFwLm9mKCkgOiBNYXAub2YoImdyb3VwcyIsIExpc3QuY29weU9mKHNzby5zcG9vZkdyb3VwcygpKSkpCiAgICAgICAgICAgIC5idWlsZCgpOwogICAgcmV0dXJuIFNzb0NvbmZpZy5idWlsZGVyKCkKICAgICAgICAud2l0aEVuYWJsZWQoc3NvLmVuYWJsZWQoKSkKICAgICAgICAud2l0aE1vZGUoc3NvLm1vZGUoKSkKICAgICAgICAud2l0aEZvcndhcmRlZEhlYWRlcnNFbmFibGVkKHNzby5mb3J3YXJkZWRIZWFkZXJzRW5hYmxlZCgpKQogICAgICAgIC53aXRoT2lkYyhzc28ub2lkYygpKQogICAgICAgIC53aXRoU3Bvb2Yoc3Bvb2YpCiAgICAgICAgLmJ1aWxkKCk7CiAgfQoKICBwcml2YXRlIHN0YXRpYyBGYWJyaWMuU2Vzc2lvbiBjcmVhdGVTZXNzaW9uKFN0aXRjaCBzdGl0Y2gpIHRocm93cyBFeGNlcHRpb24gewogICAgdmFyIHNlc3Npb25CdWlsZGVyID0gc3RpdGNoLmZhYnJpYygpLnRvU2Vzc2lvbkJ1aWxkZXIoKTsKICAgIFN0cmluZyBkZWxlZ2F0ZWRTdWJqZWN0ID0gU3RyaW5ncy50cmltVG9OdWxsKHN0aXRjaC5zdGl0Y2goKS5zc28oKS5zcG9vZkRlZmF1bHRVc2VybmFtZSgpKTsKICAgIGlmIChkZWxlZ2F0ZWRTdWJqZWN0ICE9IG51bGwpIHsKICAgICAgc2Vzc2lvbkJ1aWxkZXIud2l0aFN0YXR1c1VzZXJUYWcoZGVsZWdhdGVkU3ViamVjdCk7CiAgICB9CiAgICBGYWJyaWMuU2Vzc2lvbiBzZXNzaW9uID0gc2Vzc2lvbkJ1aWxkZXIuYnVpbGQoKTsKICAgIHNlc3Npb24uc3RhcnQoKTsKICAgIHJldHVybiBzZXNzaW9uOwogIH0KfQoK
+CONTENT_END
+END_FILE
+
+BEGIN_FILE
+ACTION: WRITE
+PATH: fabric-lite-stitch/src/main/java/org/pronzato/fabric/stitch/view/StitchGroupedResultsPage.java
+MODULE: fabric-lite-stitch
+PACKAGE: org.pronzato.fabric.stitch.view
+CONTENT_ENCODING: BASE64
+CONTENT_START
+cGFja2FnZSBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC52aWV3OwoKaW1wb3J0IGNvbS52YWFkaW4uZmxvdy5jb21wb25lbnQuYnV0dG9uLkJ1dHRvbjsKaW1wb3J0IGphdmEudXRpbC5Db21wYXJhdG9yOwppbXBvcnQgamF2YS51dGlsLkxpc3Q7CmltcG9ydCBqYXZhLnV0aWwuTG9jYWxlOwppbXBvcnQgamF2YS51dGlsLk9iamVjdHM7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLmFwaS51dGlsLlN0cmluZ3M7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5jb21wb25lbnQuU3RpdGNoRmlsdGVyc0JhcjsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLmNvbXBvbmVudC5TdGl0Y2hHcm91cEZpbHRlcjsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLmNvbXBvbmVudC5TdGl0Y2hSZXN1bHRzU2VhcmNoOwppbXBvcnQgb3JnLnByb256YXRvLmZhYnJpYy5zdGl0Y2guY29tcG9uZW50LlN0aXRjaFJlc3VsdHNUb29sYmFyOwppbXBvcnQgb3JnLnByb256YXRvLmZhYnJpYy5zdGl0Y2guZ3JpZC5TdGl0Y2hHcmlkOwppbXBvcnQgb3JnLnByb256YXRvLmZhYnJpYy5zdGl0Y2guc3VwcG9ydC5TdGl0Y2hUZXh0U3VwcG9ydDsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLnNlc3Npb24uU3RpdGNoUnVudGltZUNvbnRleHQ7CmltcG9ydCBvcmcuc2xmNGouTG9nZ2VyOwppbXBvcnQgb3JnLnNsZjRqLkxvZ2dlckZhY3Rvcnk7CgpwdWJsaWMgYWJzdHJhY3QgY2xhc3MgU3RpdGNoR3JvdXBlZFJlc3VsdHNQYWdlPFI+IGV4dGVuZHMgU3RpdGNoUGFnZSB7CiAgcHJpdmF0ZSBzdGF0aWMgZmluYWwgTG9nZ2VyIExPR0dFUiA9IExvZ2dlckZhY3RvcnkuZ2V0TG9nZ2VyKFN0aXRjaEdyb3VwZWRSZXN1bHRzUGFnZS5jbGFzcyk7CgogIHByaXZhdGUgZmluYWwgU3RpdGNoUnVudGltZUNvbnRleHQgcnVudGltZUNvbnRleHQ7CiAgcHJpdmF0ZSBmaW5hbCBTdGl0Y2hGaWx0ZXJzQmFyIGZpbHRlcnNCYXIgPSBuZXcgU3RpdGNoRmlsdGVyc0JhcigpOwogIHByaXZhdGUgZmluYWwgU3RpdGNoUmVzdWx0c1ZpZXc8Uj4gcmVzdWx0cyA9IG5ldyBTdGl0Y2hSZXN1bHRzVmlldzw+KCk7CiAgcHJpdmF0ZSBmaW5hbCBTdGl0Y2hHcm91cEZpbHRlciBncm91cEZpbHRlcjsKICBwcml2YXRlIGZpbmFsIFN0aXRjaFJlc3VsdHNTZWFyY2ggc2VhcmNoRmllbGQ7CiAgcHJpdmF0ZSBMaXN0PFI+IGxvYWRlZFJvd3MgPSBMaXN0Lm9mKCk7CiAgcHJpdmF0ZSBTdHJpbmcgZW1wdHlUaXRsZSA9ICJObyByZXN1bHRzIjsKICBwcml2YXRlIFN0cmluZyBlbXB0eU1lc3NhZ2UgPSAiTm8gbWF0Y2hpbmcgcmVzdWx0cyB3ZXJlIGZvdW5kLiI7CgogIHByb3RlY3RlZCBTdGl0Y2hHcm91cGVkUmVzdWx0c1BhZ2UoCiAgICAgIFN0aXRjaFJ1bnRpbWVDb250ZXh0IHJ1bnRpbWVDb250ZXh0LAogICAgICBTdHJpbmcgcGFnZVRpdGxlLAogICAgICBTdHJpbmcgcGFnZVN1YnRpdGxlLAogICAgICBTdHJpbmcgc2VhcmNoUGxhY2Vob2xkZXIsCiAgICAgIFN0cmluZyBzZWFyY2hBcmlhTGFiZWwpIHsKICAgIHN1cGVyKE9iamVjdHMucmVxdWlyZU5vbk51bGwocGFnZVRpdGxlLCAicGFnZVRpdGxlIiksIFN0cmluZ3MuZmlyc3ROb25CbGFuayhwYWdlU3VidGl0bGUsICIiKSk7CiAgICB0aGlzLnJ1bnRpbWVDb250ZXh0ID0gT2JqZWN0cy5yZXF1aXJlTm9uTnVsbChydW50aW1lQ29udGV4dCwgInJ1bnRpbWVDb250ZXh0Iik7CiAgICB0aGlzLmdyb3VwRmlsdGVyID0gbmV3IFN0aXRjaEdyb3VwRmlsdGVyKHJ1bnRpbWVDb250ZXh0KTsKICAgIHRoaXMuc2VhcmNoRmllbGQgPSBuZXcgU3RpdGNoUmVzdWx0c1NlYXJjaChzZWFyY2hQbGFjZWhvbGRlciwgc2VhcmNoQXJpYUxhYmVsKTsKCiAgICBzZXRTaXplRnVsbCgpOwogICAgYm9keSgpLnNldFNpemVGdWxsKCk7CiAgICByZXN1bHRzLnNldFdpZHRoRnVsbCgpOwogICAgcmVzdWx0cy5zZXRIZWlnaHQobnVsbCk7CiAgICByZXN1bHRzLnNldFBhZ2luYXRpb25FbmFibGVkKHRydWUpOwogICAgcmVzdWx0cy5zZXRQYWdlU2l6ZU9wdGlvbnMoMTAsIDI1LCA1MCwgMTAwKTsKICAgIHJlc3VsdHMuc2V0UGFnZVNpemUoMTApOwogICAgcmVzdWx0cy5zZXRSZXN1bHRDb3VudFZpc2libGUoZmFsc2UpOwogICAgcmVzdWx0cy50b29sYmFyKCkuc2V0VmlzaWJsZShmYWxzZSk7CgogICAgZ3JvdXBGaWx0ZXIuYWRkVmFsdWVDaGFuZ2VMaXN0ZW5lcihldmVudCAtPiBhcHBseUZpbHRlcnMoKSk7CiAgICBzZWFyY2hGaWVsZC5vblF1ZXJ5Q2hhbmdlKHF1ZXJ5IC0+IGFwcGx5RmlsdGVycygpKTsKICB9CgogIHByb3RlY3RlZCBmaW5hbCB2b2lkIGluaXRpYWxpemVSZXN1bHRzU2NyZWVuKAogICAgICBTdHJpbmcgZW1wdHlUaXRsZSwgU3RyaW5nIGVtcHR5TWVzc2FnZSwgU3RyaW5nIHJlZnJlc2hBcmlhTGFiZWwpIHsKICAgIHRoaXMuZW1wdHlUaXRsZSA9IFN0cmluZ3MuZmlyc3ROb25CbGFuayhlbXB0eVRpdGxlLCB0aGlzLmVtcHR5VGl0bGUpOwogICAgdGhpcy5lbXB0eU1lc3NhZ2UgPSBTdHJpbmdzLmZpcnN0Tm9uQmxhbmsoZW1wdHlNZXNzYWdlLCB0aGlzLmVtcHR5TWVzc2FnZSk7CiAgICByZXN1bHRzLnNldEVtcHR5U3RhdGUodGhpcy5lbXB0eVRpdGxlLCB0aGlzLmVtcHR5TWVzc2FnZSk7CiAgICBjb25maWd1cmVHcmlkKHJlc3VsdHMuZ3JpZCgpKTsKCiAgICBCdXR0b24gcmVmcmVzaCA9IG5ldyBCdXR0b24oIlJFRlJFU0giLCBldmVudCAtPiByZWZyZXNoUm93cygpKTsKICAgIFN0aXRjaFJlc3VsdHNUb29sYmFyLnN0eWxlUHJpbWFyeUFjdGlvbihyZWZyZXNoKTsKICAgIHJlZnJlc2guYWRkQ2xhc3NOYW1lKCJzdGl0Y2gtcmVmcmVzaC1hY3Rpb24iKTsKICAgIHJlZnJlc2guZ2V0RWxlbWVudCgpLnNldEF0dHJpYnV0ZSgiYXJpYS1sYWJlbCIsIHJlZnJlc2hBcmlhTGFiZWwpOwogICAgcmVmcmVzaC5nZXRFbGVtZW50KCkuc2V0QXR0cmlidXRlKCJ0aXRsZSIsIHJlZnJlc2hBcmlhTGFiZWwpOwoKICAgIGNvbmZpZ3VyZUZpbHRlcnNCYXIoZmlsdGVyc0JhciwgZ3JvdXBGaWx0ZXIsIHNlYXJjaEZpZWxkLCByZWZyZXNoKTsKCiAgICBhZGRUb0JvZHkoZmlsdGVyc0JhciwgcmVzdWx0cyk7CiAgICByZWZyZXNoUm93cygpOwogIH0KCiAgcHJvdGVjdGVkIGZpbmFsIFN0aXRjaFJ1bnRpbWVDb250ZXh0IHJ1bnRpbWVDb250ZXh0KCkgewogICAgcmV0dXJuIHJ1bnRpbWVDb250ZXh0OwogIH0KCiAgcHJvdGVjdGVkIGZpbmFsIFN0aXRjaEZpbHRlcnNCYXIgZmlsdGVyc0JhcigpIHsKICAgIHJldHVybiBmaWx0ZXJzQmFyOwogIH0KCiAgcHJvdGVjdGVkIGZpbmFsIFN0aXRjaEdyb3VwRmlsdGVyIGdyb3VwRmlsdGVyKCkgewogICAgcmV0dXJuIGdyb3VwRmlsdGVyOwogIH0KCiAgcHJvdGVjdGVkIGZpbmFsIFN0aXRjaFJlc3VsdHNTZWFyY2ggc2VhcmNoRmllbGQoKSB7CiAgICByZXR1cm4gc2VhcmNoRmllbGQ7CiAgfQoKICBwcm90ZWN0ZWQgZmluYWwgU3RyaW5nIHNlbGVjdGVkR3JvdXBGaWx0ZXJWYWx1ZSgpIHsKICAgIHJldHVybiBncm91cEZpbHRlci5zZWxlY3RlZEdyb3VwKCk7CiAgfQoKICBwcm90ZWN0ZWQgZmluYWwgU3RpdGNoUmVzdWx0c1ZpZXc8Uj4gcmVzdWx0c1ZpZXcoKSB7CiAgICByZXR1cm4gcmVzdWx0czsKICB9CgogIHByb3RlY3RlZCBmaW5hbCB2b2lkIHJlZnJlc2hSb3dzKCkgewogICAgdHJ5IHsKICAgICAgTGlzdDxSPiByb3dzID0gbG9hZFJvd3MoKTsKICAgICAgQ29tcGFyYXRvcjxSPiBjb21wYXJhdG9yID0gcm93Q29tcGFyYXRvcigpOwogICAgICBMaXN0PFI+IGZpbHRlcmVkID0gcm93cyA9PSBudWxsID8gTGlzdC5vZigpIDogcm93cy5zdHJlYW0oKS5maWx0ZXIoT2JqZWN0czo6bm9uTnVsbCkudG9MaXN0KCk7CiAgICAgIGxvYWRlZFJvd3MgPSBjb21wYXJhdG9yID09IG51bGwgPyBmaWx0ZXJlZCA6IGZpbHRlcmVkLnN0cmVhbSgpLnNvcnRlZChjb21wYXJhdG9yKS50b0xpc3QoKTsKICAgICAgcmVzdWx0cy5zZXRFbXB0eVN0YXRlKGVtcHR5VGl0bGUsIGVtcHR5TWVzc2FnZSk7CiAgICAgIG9uUm93c1JlZnJlc2hlZChsb2FkZWRSb3dzKTsKICAgICAgYXBwbHlGaWx0ZXJzKCk7CiAgICB9IGNhdGNoIChFeGNlcHRpb24gZXJyb3IpIHsKICAgICAgbG9hZGVkUm93cyA9IExpc3Qub2YoKTsKICAgICAgU3RyaW5nIHJlYXNvbiA9IFN0aXRjaFRleHRTdXBwb3J0LnJvb3RNZXNzYWdlKGVycm9yKTsKICAgICAgTE9HR0VSLndhcm4oCiAgICAgICAgICAiW1N0aXRjaF1bUmVzdWx0c10gdW5hYmxlIHRvIGxvYWQgcm93cyBzY3JlZW49e30gcmVhc29uPXt9IiwKICAgICAgICAgIGdldENsYXNzKCkuZ2V0U2ltcGxlTmFtZSgpLAogICAgICAgICAgcmVhc29uLAogICAgICAgICAgZXJyb3IpOwogICAgICByZXN1bHRzLnNldEl0ZW1zKExpc3Qub2YoKSk7CiAgICAgIHJlc3VsdHMuc2V0RW1wdHlTdGF0ZSgiVW5hYmxlIHRvIGxvYWQgcmVzdWx0cyIsIHJlYXNvbik7CiAgICAgIHJlc3VsdHMuc2V0RW1wdHkodHJ1ZSk7CiAgICAgIG9uUm93c0xvYWRGYWlsZWQoZXJyb3IpOwogICAgfQogIH0KCiAgcHJvdGVjdGVkIGZpbmFsIHZvaWQgYXBwbHlDdXJyZW50RmlsdGVycygpIHsKICAgIGFwcGx5RmlsdGVycygpOwogIH0KCiAgcHJvdGVjdGVkIGFic3RyYWN0IHZvaWQgY29uZmlndXJlR3JpZChTdGl0Y2hHcmlkPFI+IGdyaWQpOwoKICBwcm90ZWN0ZWQgYWJzdHJhY3QgTGlzdDxSPiBsb2FkUm93cygpOwoKICBwcm90ZWN0ZWQgYWJzdHJhY3QgQ29tcGFyYXRvcjxSPiByb3dDb21wYXJhdG9yKCk7CgogIHByb3RlY3RlZCBhYnN0cmFjdCBTdHJpbmcgZ3JvdXBWYWx1ZShSIHJvdyk7CgogIHByb3RlY3RlZCBhYnN0cmFjdCBib29sZWFuIG1hdGNoZXNTZWFyY2goUiByb3csIFN0cmluZyBub3JtYWxpemVkUXVlcnkpOwoKICBwcm90ZWN0ZWQgYm9vbGVhbiBtYXRjaGVzQWRkaXRpb25hbEZpbHRlcnMoUiByb3cpIHsKICAgIHJldHVybiB0cnVlOwogIH0KCiAgcHJvdGVjdGVkIHZvaWQgb25Sb3dzUmVmcmVzaGVkKExpc3Q8Uj4gcm93cykge30KCiAgcHJvdGVjdGVkIHZvaWQgb25Sb3dzTG9hZEZhaWxlZChFeGNlcHRpb24gZXJyb3IpIHt9CgogIHByb3RlY3RlZCB2b2lkIGNvbmZpZ3VyZUZpbHRlcnNCYXIoCiAgICAgIFN0aXRjaEZpbHRlcnNCYXIgZmlsdGVyc0JhciwKICAgICAgU3RpdGNoR3JvdXBGaWx0ZXIgZ3JvdXBGaWx0ZXIsCiAgICAgIFN0aXRjaFJlc3VsdHNTZWFyY2ggc2VhcmNoRmllbGQsCiAgICAgIEJ1dHRvbiByZWZyZXNoQWN0aW9uKSB7CiAgICBmaWx0ZXJzQmFyLndpdGhHcm91cFNlbGVjdG9yKGdyb3VwRmlsdGVyKS53aXRoRmlsdGVyKHNlYXJjaEZpZWxkKS53aXRoUmlnaHRBY3Rpb24ocmVmcmVzaEFjdGlvbik7CiAgfQoKICBwcm90ZWN0ZWQgZmluYWwgU3RyaW5nIG5vcm1hbGl6ZShTdHJpbmcgdmFsdWUpIHsKICAgIFN0cmluZyBub3JtYWxpemVkID0gU3RyaW5ncy50cmltVG9OdWxsKHZhbHVlKTsKICAgIHJldHVybiBub3JtYWxpemVkID09IG51bGwgPyAiIiA6IG5vcm1hbGl6ZWQudG9Mb3dlckNhc2UoTG9jYWxlLlJPT1QpOwogIH0KCiAgcHJvdGVjdGVkIGZpbmFsIGJvb2xlYW4gY29udGFpbnMoU3RyaW5nIHRleHQsIFN0cmluZyBub3JtYWxpemVkUXVlcnkpIHsKICAgIHJldHVybiBub3JtYWxpemUodGV4dCkuY29udGFpbnMobm9ybWFsaXplZFF1ZXJ5KTsKICB9CgogIHByaXZhdGUgdm9pZCBhcHBseUZpbHRlcnMoKSB7CiAgICBTdHJpbmcgcXVlcnkgPSBzZWFyY2hGaWVsZC5ub3JtYWxpemVkUXVlcnkoKTsKICAgIExpc3Q8U3RyaW5nPiBlZmZlY3RpdmVHcm91cHMgPSBncm91cEZpbHRlci5lZmZlY3RpdmVHcm91cHMoKTsKICAgIExpc3Q8Uj4gZmlsdGVyZWQgPSBsb2FkZWRSb3dzLnN0cmVhbSgpLmZpbHRlcihyb3cgLT4gbWF0Y2hlc0dyb3VwKHJvdywgZWZmZWN0aXZlR3JvdXBzKSkudG9MaXN0KCk7CiAgICBmaWx0ZXJlZCA9IGZpbHRlcmVkLnN0cmVhbSgpLmZpbHRlcih0aGlzOjptYXRjaGVzQWRkaXRpb25hbEZpbHRlcnMpLnRvTGlzdCgpOwogICAgaWYgKCFxdWVyeS5pc0JsYW5rKCkpIHsKICAgICAgZmlsdGVyZWQgPSBmaWx0ZXJlZC5zdHJlYW0oKS5maWx0ZXIocm93IC0+IG1hdGNoZXNTZWFyY2gocm93LCBxdWVyeSkpLnRvTGlzdCgpOwogICAgfQogICAgcmVzdWx0cy5zZXRJdGVtcyhmaWx0ZXJlZCk7CiAgICByZXN1bHRzLnNldEVtcHR5KGZpbHRlcmVkLmlzRW1wdHkoKSk7CiAgfQoKICBwcml2YXRlIGJvb2xlYW4gbWF0Y2hlc0dyb3VwKFIgcm93LCBMaXN0PFN0cmluZz4gZWZmZWN0aXZlR3JvdXBzKSB7CiAgICBpZiAocm93ID09IG51bGwpIHsKICAgICAgcmV0dXJuIGZhbHNlOwogICAgfQogICAgaWYgKGVmZmVjdGl2ZUdyb3VwcyA9PSBudWxsIHx8IGVmZmVjdGl2ZUdyb3Vwcy5pc0VtcHR5KCkpIHsKICAgICAgcmV0dXJuIHRydWU7CiAgICB9CiAgICBTdHJpbmcgdmFsdWUgPSBub3JtYWxpemUoZ3JvdXBWYWx1ZShyb3cpKTsKICAgIGZvciAoU3RyaW5nIGdyb3VwIDogZWZmZWN0aXZlR3JvdXBzKSB7CiAgICAgIGlmICh2YWx1ZS5lcXVhbHMobm9ybWFsaXplKGdyb3VwKSkpIHsKICAgICAgICByZXR1cm4gdHJ1ZTsKICAgICAgfQogICAgfQogICAgcmV0dXJuIGZhbHNlOwogIH0KfQo=
+CONTENT_END
+END_FILE
+
+BEGIN_FILE
+ACTION: WRITE
+PATH: fabric-lite-stitch-demo/src/main/java/org/pronzato/fabric/stitch/demo/StitchDemoApp.java
+MODULE: fabric-lite-stitch-demo
+PACKAGE: org.pronzato.fabric.stitch.demo
+CONTENT_ENCODING: BASE64
+CONTENT_START
+cGFja2FnZSBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5kZW1vOwoKaW1wb3J0IGphdmEubmlvLmZpbGUuRmlsZXM7CmltcG9ydCBqYXZhLm5pby5maWxlLlBhdGg7CmltcG9ydCBqYXZhLnV0aWwuTGlzdDsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuYXBpLmNvbnRyb2wuZGlzY292ZXJ5LkRpc2NvdmVyeVVybDsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuYXBpLmNvbnRyb2wuc2VjdXJpdHkuc3NvLlNzb01vZGU7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5TdGl0Y2g7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5kYXNoYm9hcmQuU3RpdGNoRGFzaGJvYXJkQWN0aW9uczsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLmRhc2hib2FyZC5TdGl0Y2hEYXNoYm9hcmRCcm93c2VyVmlldzsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLmRhc2hib2FyZC5TdGl0Y2hEYXNoYm9hcmRDYXRhbG9nOwppbXBvcnQgb3JnLnByb256YXRvLmZhYnJpYy5zdGl0Y2guZGFzaGJvYXJkLlN0aXRjaERhc2hib2FyZERhdGFTb3VyY2VzOwppbXBvcnQgb3JnLnByb256YXRvLmZhYnJpYy5zdGl0Y2guZGFzaGJvYXJkLlN0aXRjaERhc2hib2FyZFJ1bnRpbWVQcm92aWRlcjsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLmRhc2hib2FyZC5TdGl0Y2hEYXNoYm9hcmRSdW50aW1lVmlldzsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLm1lbnUuU3RpdGNoTWVudUl0ZW07CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5tZW51LlN0aXRjaE1lbnVQcm92aWRlcjsKaW1wb3J0IG9yZy5wcm9uemF0by5mYWJyaWMuc3RpdGNoLnNlc3Npb24uU3RpdGNoUnVudGltZUNvbnRleHQ7CgpwdWJsaWMgY2xhc3MgU3RpdGNoRGVtb0FwcCB7CiAgcHVibGljIHN0YXRpYyB2b2lkIG1haW4oU3RyaW5nW10gYXJncykgewogICAgU3lzdGVtLnNldFByb3BlcnR5KCJmYWJyaWMucmVwby5yb290IiwgcmVzb2x2ZVJlcG9Sb290UGF0aCgpKTsKICAgIFN0aXRjaC5idWlsZGVyKCkKICAgICAgICAud2l0aEFwcGxpY2F0aW9uQ2xhc3MoU3RpdGNoRGVtb0FwcC5jbGFzcykKICAgICAgICAud2l0aEZhYnJpYygKICAgICAgICAgICAgZmFicmljIC0+CiAgICAgICAgICAgICAgICBmYWJyaWMKICAgICAgICAgICAgICAgICAgICAud2l0aEdyb3VwKCJwbGF0Zm9ybSIpCiAgICAgICAgICAgICAgICAgICAgLndpdGhOYW1lKCJzdHVkaW8iKQogICAgICAgICAgICAgICAgICAgIC53aXRoSW5zdGFuY2UoImluc3RhbmNlMiIpCiAgICAgICAgICAgICAgICAgICAgLndpdGhEaXNjb3ZlcnlVcmxzKERpc2NvdmVyeVVybC5VUkwpCiAgICAgICAgICAgICAgICAgICAgLndpdGhLZXJiZXJvc0tleXRhYihyZXNvbHZlVmF1bHRQYXRoKCJrZXJiZXJvcy9kZmFicmljLmtleXRhYiIpKQogICAgICAgICAgICAgICAgICAgIC53aXRoS2VyYmVyb3NVc2VybmFtZSgiZGZhYnJpYyIpCiAgICAgICAgICAgICAgICAgICAgLndpdGhLZWtGaWxlKHJlc29sdmVWYXVsdFBhdGgoImtla3MvcGxhdGZvcm0vZGZhYnJpYy5rZWsiKSkKICAgICAgICAgICAgICAgICAgICAud2l0aFRydXN0Q2VydChyZXNvbHZlVmF1bHRQYXRoKCJ0bHMvZGVtby1jYS5wZW0iKSkpCiAgICAgICAgLndpdGhTdGl0Y2goCiAgICAgICAgICAgIHNldHRpbmdzIC0+CiAgICAgICAgICAgICAgICBzZXR0aW5ncwogICAgICAgICAgICAgICAgICAgIC53aXRoQXBwVGl0bGUoIlN0aXRjaCBEZW1vIikKICAgICAgICAgICAgICAgICAgICAud2l0aFNlcnZlclBvcnQoODA4MCkKICAgICAgICAgICAgICAgICAgICAud2l0aFB1c2hFbmFibGVkKHRydWUpCiAgICAgICAgICAgICAgICAgICAgLndpdGhDb21wb25lbnRMYWJlbHNFbmFibGVkKHRydWUpCiAgICAgICAgICAgICAgICAgICAgLndpdGhIZWxwKGhlbHAgLT4gaGVscC53aXRoTWVudUVuYWJsZWQodHJ1ZSkud2l0aFJlZmVyZW5jZUVuYWJsZWQodHJ1ZSkpCiAgICAgICAgICAgICAgICAgICAgLndpdGhCcmFuZExvZ29QYXRoKCIvaW1hZ2VzL3N0dWRpby5wbmciKQogICAgICAgICAgICAgICAgICAgIC53aXRoQnJhbmRMb2dvQWx0KCJTdHVkaW8iKQogICAgICAgICAgICAgICAgICAgIC53aXRoU3NvKAogICAgICAgICAgICAgICAgICAgICAgICBzc28gLT4KICAgICAgICAgICAgICAgICAgICAgICAgICAgIHNzbwogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC53aXRoTW9kZShTc29Nb2RlLlNQT09GKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC53aXRoRW5hYmxlZCh0cnVlKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC53aXRoU3Bvb2ZFbmFibGVkKHRydWUpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgLndpdGhTcG9vZkFsbG93RWRpdGluZyh0cnVlKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC53aXRoU3Bvb2ZDb250cm9sVmlzaWJsZSh0cnVlKSkpCiAgICAgICAgLndpdGhEYXNoYm9hcmRSdW50aW1lUHJvdmlkZXIoc3RpdGNoRGVtb0Rhc2hib2FyZFJ1bnRpbWVQcm92aWRlcigpKQogICAgICAgIC53aXRoTWVudVByb3ZpZGVyKHN0aXRjaERlbW9NZW51UHJvdmlkZXIoKSkKICAgICAgICAuYnVpbGQoKQogICAgICAgIC5zdGFydChhcmdzKTsKICB9CgogIHByaXZhdGUgc3RhdGljIFN0aXRjaERhc2hib2FyZFJ1bnRpbWVQcm92aWRlciBzdGl0Y2hEZW1vRGFzaGJvYXJkUnVudGltZVByb3ZpZGVyKCkgewogICAgcmV0dXJuIG5ldyBTdGl0Y2hEYXNoYm9hcmRSdW50aW1lUHJvdmlkZXIoKSB7CiAgICAgIEBPdmVycmlkZQogICAgICBwdWJsaWMgU3RpdGNoRGFzaGJvYXJkQ2F0YWxvZyBjYXRhbG9nKFN0aXRjaFJ1bnRpbWVDb250ZXh0IHJ1bnRpbWVDb250ZXh0KSB7CiAgICAgICAgcmV0dXJuIFN0aXRjaERlbW9EYXNoYm9hcmRzLmNhdGFsb2cocnVudGltZUNvbnRleHQpOwogICAgICB9CgogICAgICBAT3ZlcnJpZGUKICAgICAgcHVibGljIFN0aXRjaERhc2hib2FyZERhdGFTb3VyY2VzIGRhdGFTb3VyY2VzKFN0aXRjaFJ1bnRpbWVDb250ZXh0IHJ1bnRpbWVDb250ZXh0KSB7CiAgICAgICAgcmV0dXJuIFN0aXRjaERlbW9EYXNoYm9hcmRzLmRhdGFTb3VyY2VzKHJ1bnRpbWVDb250ZXh0KTsKICAgICAgfQoKICAgICAgQE92ZXJyaWRlCiAgICAgIHB1YmxpYyBTdGl0Y2hEYXNoYm9hcmRBY3Rpb25zIGFjdGlvbnMoU3RpdGNoUnVudGltZUNvbnRleHQgcnVudGltZUNvbnRleHQpIHsKICAgICAgICByZXR1cm4gU3RpdGNoRGVtb0Rhc2hib2FyZHMuYWN0aW9ucyhydW50aW1lQ29udGV4dCk7CiAgICAgIH0KCiAgICAgIEBPdmVycmlkZQogICAgICBwdWJsaWMgU3RyaW5nIGRlZmF1bHRHcm91cCgpIHsKICAgICAgICByZXR1cm4gImxhYiI7CiAgICAgIH0KCiAgICAgIEBPdmVycmlkZQogICAgICBwdWJsaWMgU3RyaW5nIGRlZmF1bHREYXNoYm9hcmRJZChTdGl0Y2hSdW50aW1lQ29udGV4dCBydW50aW1lQ29udGV4dCkgewogICAgICAgIHJldHVybiBTdGl0Y2hEZW1vRGFzaGJvYXJkcy5kZWZhdWx0RGFzaGJvYXJkSWQocnVudGltZUNvbnRleHQpOwogICAgICB9CiAgICB9OwogIH0KCiAgcHJpdmF0ZSBzdGF0aWMgU3RpdGNoTWVudVByb3ZpZGVyIHN0aXRjaERlbW9NZW51UHJvdmlkZXIoKSB7CiAgICByZXR1cm4gKCkgLT4KICAgICAgICBMaXN0Lm9mKAogICAgICAgICAgICBTdGl0Y2hNZW51SXRlbS5idWlsZGVyKCJkYXNoYm9hcmRzIikKICAgICAgICAgICAgICAgIC53aXRoTGFiZWwoIkRhc2hib2FyZHMiKQogICAgICAgICAgICAgICAgLndpdGhPcmRlcigxMDApCiAgICAgICAgICAgICAgICAud2l0aENoaWxkcmVuKAogICAgICAgICAgICAgICAgICAgIExpc3Qub2YoCiAgICAgICAgICAgICAgICAgICAgICAgIFN0aXRjaE1lbnVJdGVtLmJ1aWxkZXIoImRhc2hib2FyZHMuYnJvd3NlciIpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAud2l0aExhYmVsKCJCcm93c2UiKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgLndpdGhSb3V0ZVBhdGgoU3RpdGNoRGFzaGJvYXJkQnJvd3NlclZpZXcuUk9VVEUpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAud2l0aE9yZGVyKDUpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAuYnVpbGQoKSwKICAgICAgICAgICAgICAgICAgICAgICAgU3RpdGNoTWVudUl0ZW0uYnVpbGRlcigiZGFzaGJvYXJkcy5vcmRlcnMiKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgLndpdGhMYWJlbCgiT3JkZXJzIERhc2hib2FyZCIpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAud2l0aFJvdXRlUGF0aCgKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBTdGl0Y2hEYXNoYm9hcmRSdW50aW1lVmlldy5yb3V0ZUZvcigKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgImxhYiIsIFN0aXRjaERlbW9EYXNoYm9hcmRzLkRBU0hCT0FSRF9PUkRFUlMpKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgLndpdGhPcmRlcigxMCkKICAgICAgICAgICAgICAgICAgICAgICAgICAgIC5idWlsZCgpLAogICAgICAgICAgICAgICAgICAgICAgICBTdGl0Y2hNZW51SXRlbS5idWlsZGVyKCJkYXNoYm9hcmRzLnBvc2l0aW9ucyIpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAud2l0aExhYmVsKCJQb3NpdGlvbnMgRGFzaGJvYXJkIikKICAgICAgICAgICAgICAgICAgICAgICAgICAgIC53aXRoUm91dGVQYXRoKAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIFN0aXRjaERhc2hib2FyZFJ1bnRpbWVWaWV3LnJvdXRlRm9yKAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAibGFiIiwgU3RpdGNoRGVtb0Rhc2hib2FyZHMuREFTSEJPQVJEX1BPU0lUSU9OUykpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAud2l0aE9yZGVyKDE1KQogICAgICAgICAgICAgICAgICAgICAgICAgICAgLmJ1aWxkKCkpKQogICAgICAgICAgICAgICAgLmJ1aWxkKCkpOwogIH0KCiAgcHJpdmF0ZSBzdGF0aWMgU3RyaW5nIHJlc29sdmVSZXBvUm9vdFBhdGgoKSB7CiAgICBQYXRoIGN3ZCA9IFBhdGgub2YoIiIpLnRvQWJzb2x1dGVQYXRoKCkubm9ybWFsaXplKCk7CiAgICBMaXN0PFBhdGg+IGNhbmRpZGF0ZXMgPQogICAgICAgIExpc3Qub2YoY3dkLCBjd2QucmVzb2x2ZSgiLi4iKS5ub3JtYWxpemUoKSwgY3dkLnJlc29sdmUoIi4uIikucmVzb2x2ZSgiLi4iKS5ub3JtYWxpemUoKSk7CiAgICBmb3IgKFBhdGggY2FuZGlkYXRlIDogY2FuZGlkYXRlcykgewogICAgICBpZiAoRmlsZXMuaXNEaXJlY3RvcnkoY2FuZGlkYXRlLnJlc29sdmUoInZhdWx0IikpICYmIEZpbGVzLmlzRGlyZWN0b3J5KGNhbmRpZGF0ZS5yZXNvbHZlKCJkYXRhIikpKSB7CiAgICAgICAgcmV0dXJuIGNhbmRpZGF0ZS50b1N0cmluZygpOwogICAgICB9CiAgICB9CiAgICByZXR1cm4gY3dkLnRvU3RyaW5nKCk7CiAgfQoKICBwcml2YXRlIHN0YXRpYyBTdHJpbmcgcmVzb2x2ZVZhdWx0UGF0aChTdHJpbmcgcmVsYXRpdmVQYXRoKSB7CiAgICBQYXRoIGN3ZCA9IFBhdGgub2YoIiIpLnRvQWJzb2x1dGVQYXRoKCkubm9ybWFsaXplKCk7CiAgICBMaXN0PFBhdGg+IGNhbmRpZGF0ZXMgPQogICAgICAgIExpc3Qub2YoCiAgICAgICAgICAgIGN3ZC5yZXNvbHZlKCJ2YXVsdCIpLnJlc29sdmUocmVsYXRpdmVQYXRoKSwKICAgICAgICAgICAgY3dkLnJlc29sdmUoIi4uIikucmVzb2x2ZSgidmF1bHQiKS5yZXNvbHZlKHJlbGF0aXZlUGF0aCksCiAgICAgICAgICAgIGN3ZC5yZXNvbHZlKCIuLiIpLnJlc29sdmUoIi4uIikucmVzb2x2ZSgidmF1bHQiKS5yZXNvbHZlKHJlbGF0aXZlUGF0aCkpOwogICAgZm9yIChQYXRoIGNhbmRpZGF0ZSA6IGNhbmRpZGF0ZXMpIHsKICAgICAgaWYgKEZpbGVzLmV4aXN0cyhjYW5kaWRhdGUpKSB7CiAgICAgICAgcmV0dXJuIGNhbmRpZGF0ZS5ub3JtYWxpemUoKS50b1N0cmluZygpOwogICAgICB9CiAgICB9CiAgICByZXR1cm4gUGF0aC5vZigidmF1bHQiKS5yZXNvbHZlKHJlbGF0aXZlUGF0aCkudG9TdHJpbmcoKTsKICB9Cn0K
+CONTENT_END
+END_FILE
+
+BEGIN_FILE
+ACTION: WRITE
+PATH: fabric-lite-stitch-studio/src/main/java/org/pronzato/fabric/stitch/studio/StitchStudioRootView.java
+MODULE: fabric-lite-stitch-studio
+PACKAGE: org.pronzato.fabric.stitch.studio
+CONTENT_ENCODING: BASE64
+CONTENT_START
+cGFja2FnZSBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5zdHVkaW87CgppbXBvcnQgY29tLnZhYWRpbi5mbG93LmNvbXBvbmVudC5odG1sLkRpdjsKaW1wb3J0IGNvbS52YWFkaW4uZmxvdy5yb3V0ZXIuQmVmb3JlRW50ZXJFdmVudDsKaW1wb3J0IGNvbS52YWFkaW4uZmxvdy5yb3V0ZXIuQmVmb3JlRW50ZXJPYnNlcnZlcjsKaW1wb3J0IGNvbS52YWFkaW4uZmxvdy5yb3V0ZXIuUm91dGU7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLmFwaS51dGlsLlN0cmluZ3M7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5TdGl0Y2g7CmltcG9ydCBvcmcucHJvbnphdG8uZmFicmljLnN0aXRjaC5mZWF0dXJlLnN0YXR1cy5TdGl0Y2hTdGF0dXNGZWF0dXJlOwoKQFJvdXRlKCIiKQpwdWJsaWMgY2xhc3MgU3RpdGNoU3R1ZGlvUm9vdFZpZXcgZXh0ZW5kcyBEaXYgaW1wbGVtZW50cyBCZWZvcmVFbnRlck9ic2VydmVyIHsKICBwcml2YXRlIHN0YXRpYyBmaW5hbCBTdHJpbmcgUk9PVF9ST1VURV9QUk9QRVJUWSA9ICJzdGl0Y2guc3R1ZGlvLnJvb3Qucm91dGUiOwogIHByaXZhdGUgc3RhdGljIGZpbmFsIFN0cmluZyBST09UX1JPVVRFX0VOViA9ICJTVElUQ0hfU1RVRElPX1JPT1RfUk9VVEUiOwogIHByaXZhdGUgc3RhdGljIGZpbmFsIFN0cmluZyBGQUxMQkFDS19ST1VURSA9ICJzdGl0Y2gvcmVmZXJlbmNlIjsKICBwcml2YXRlIGZpbmFsIFN0cmluZyBkZWZhdWx0Um91dGU7CgogIHB1YmxpYyBTdGl0Y2hTdHVkaW9Sb290VmlldyhTdGl0Y2ggc3RpdGNoKSB7CiAgICBTdHJpbmcgY29uZmlndXJlZFJvb3RSb3V0ZSA9IGNvbmZpZ3VyZWRSb290Um91dGUoKTsKICAgIHRoaXMuZGVmYXVsdFJvdXRlID0KICAgICAgICBjb25maWd1cmVkUm9vdFJvdXRlICE9IG51bGwKICAgICAgICAgICAgPyBjb25maWd1cmVkUm9vdFJvdXRlCiAgICAgICAgICAgIDogc3RpdGNoCiAgICAgICAgICAgICAgICAuZmVhdHVyZXMoKQogICAgICAgICAgICAgICAgLnN0YXR1cygpCiAgICAgICAgICAgICAgICAuZmxhdE1hcChmZWF0dXJlIC0+IGZlYXR1cmUuc2NyZWVuKFN0aXRjaFN0YXR1c0ZlYXR1cmUuQVBQUykpCiAgICAgICAgICAgICAgICAubWFwKHNjcmVlbiAtPiBzY3JlZW4ucm91dGVQYXRoKCkpCiAgICAgICAgICAgICAgICAub3JFbHNlKEZBTExCQUNLX1JPVVRFKTsKICB9CgogIEBPdmVycmlkZQogIHB1YmxpYyB2b2lkIGJlZm9yZUVudGVyKEJlZm9yZUVudGVyRXZlbnQgZXZlbnQpIHsKICAgIGV2ZW50LmZvcndhcmRUbyhkZWZhdWx0Um91dGUpOwogIH0KCiAgcHJpdmF0ZSBzdGF0aWMgU3RyaW5nIGNvbmZpZ3VyZWRSb290Um91dGUoKSB7CiAgICBTdHJpbmcgY29uZmlndXJlZCA9CiAgICAgICAgU3RyaW5ncy5maXJzdE5vbkJsYW5rKFN5c3RlbS5nZXRQcm9wZXJ0eShST09UX1JPVVRFX1BST1BFUlRZKSwgU3lzdGVtLmdldGVudihST09UX1JPVVRFX0VOVikpOwogICAgU3RyaW5nIG5vcm1hbGl6ZWQgPSBTdHJpbmdzLnRyaW1Ub051bGwoY29uZmlndXJlZCk7CiAgICBpZiAobm9ybWFsaXplZCA9PSBudWxsKSB7CiAgICAgIHJldHVybiBudWxsOwogICAgfQogICAgcmV0dXJuIG5vcm1hbGl6ZWQuc3RhcnRzV2l0aCgiLyIpID8gbm9ybWFsaXplZC5zdWJzdHJpbmcoMSkgOiBub3JtYWxpemVkOwogIH0KfQo=
+CONTENT_END
+END_FILE
+
+
+
+
