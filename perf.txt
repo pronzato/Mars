@@ -1,1 +1,14 @@
-null
+That’s fine. You don’t have global npm on PATH, but Vaadin already installed its own npm here:
+
+C:\Users\pronz\.vaadin\node\node.exe
+C:\Users\pronz\.vaadin\node\node_modules\npm\bin\npm-cli.js
+Use it directly:
+
+$node   = "$env:USERPROFILE\.vaadin\node\node.exe"
+$npmCli = "$env:USERPROFILE\.vaadin\node\node_modules\npm\bin\npm-cli.js"
+
+& $node -v
+& $node $npmCli -v
+& $node $npmCli config get registry
+& $node $npmCli ping
+& $node $npmCli view zstddec version
