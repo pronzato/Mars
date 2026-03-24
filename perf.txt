@@ -1,14 +1,77 @@
-That’s fine. You don’t have global npm on PATH, but Vaadin already installed its own npm here:
+Use the Vaadin-local npm directly and set proxy in that same shell.
 
-C:\Users\pronz\.vaadin\node\node.exe
-C:\Users\pronz\.vaadin\node\node_modules\npm\bin\npm-cli.js
-Use it directly:
+$node   = "$env:USERPROFILE\.vaadin\node\node.exe"
+$npmCli = "$env:USERPROFILE\.vaadin\node\node_modules\npm\bin\npm-cli.js"
+$proxy  = "http://YOUR_PROXY_HOST:PORT"
+Set proxy:
+
+& $node $npmCli config set proxy $proxy
+& $node $npmCli config set https-proxy $proxy
+& $node $npmCli config set registry https://registry.npmjs.org/
+Test proxy path:
+
+& $node $npmCli config get proxy
+& $node $npmCli config get https-proxy
+& $node $npmCli ping
+& $node $npmCli view zstddec version
+If ping/view work, run bundle build:
+
+mvn -pl fabric-lite-stitch-demo,fabric-lite-stitch-studio -am `
+  -Pauto-generate-prod-bundle -DskipTests -Dstitch.bundle.builder=true process-classes
+If you get TLS/cert errors, set corp CA:
+
+& $node $npmCli config set cafile "C:\path\corp-ca.pem"
+& $node $npmCli config set strict-ssl true
+
+how do I test the webproxy standalone?  if I try ping YOUR_PROXY_HOST:PORT it just hangs
+
+
+ping is the wrong test for an HTTP proxy port.
+
+ping uses ICMP (no port)
+many corp networks block ICMP, so “hang” is common
+Use these instead in PowerShell:
+
+# 1) TCP reachability to proxy port
+Test-NetConnection PROXY_HOST -Port PROXY_PORT
+If TcpTestSucceeded : True, the port is reachable.
+
+# 2) HTTP through proxy (no auth)
+$proxy = "http://PROXY_HOST:PROXY_PORT"
+Invoke-WebRequest -Uri "https://registry.npmjs.org/zstddec" -Proxy $proxy -UseBasicParsing
+If proxy requires auth:
+
+$proxy = "http://PROXY_HOST:PROXY_PORT"
+$cred  = Get-Credential
+Invoke-WebRequest -Uri "https://registry.npmjs.org/zstddec" -Proxy $proxy -ProxyCredential $cred -UseBasicParsing
+You can also test with curl (Windows has it):
+
+curl.exe -x http://PROXY_HOST:PROXY_PORT https://registry.npmjs.org/zstddec
+If these fail, proxy host/port/auth/allowlist is wrong.
+If they pass, configure npm to use the same proxy.
+
+
+dont I have to set my username/password for https?
+
+
+
+Yes, if your proxy requires authentication, you must provide credentials for HTTPS traffic too.
+
+Best practice for npm is to set authenticated proxy URLs:
 
 $node   = "$env:USERPROFILE\.vaadin\node\node.exe"
 $npmCli = "$env:USERPROFILE\.vaadin\node\node_modules\npm\bin\npm-cli.js"
 
-& $node -v
-& $node $npmCli -v
-& $node $npmCli config get registry
+# URL-encode username/password if they contain special chars
+$proxyAuth = "http://USERNAME:PASSWORD@PROXY_HOST:PROXY_PORT"
+
+& $node $npmCli config set proxy $proxyAuth
+& $node $npmCli config set https-proxy $proxyAuth
+& $node $npmCli config set registry https://registry.npmjs.org/
+Then test:
+
 & $node $npmCli ping
 & $node $npmCli view zstddec version
+If your corp uses NTLM/Kerberos proxy auth, npm may not handle it directly; in that case you typically need a local proxy helper (CNTLM) or an internal npm mirror.
+
+
