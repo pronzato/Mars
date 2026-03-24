@@ -6,6 +6,12 @@ where.exe node
 where.exe npm
 (Get-Command node).Source
 
+npm config set proxy http://user:password@host:port
+npm config set https-proxy http://user:password@host:port
+
+npm config get proxy
+npm config get https-proxy
+
 
 main
 ====
