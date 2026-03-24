@@ -80,6 +80,37 @@ If your corp uses NTLM/Kerberos proxy auth, npm may not handle it directly; in t
 
 
 
+npm
+===
+# Vaadin-managed node/npm
+$node   = "$env:USERPROFILE\.vaadin\node\node.exe"
+$npmCli = "$env:USERPROFILE\.vaadin\node\node_modules\npm\bin\npm-cli.js"
+
+# proxy (replace with yours)
+$proxy  = "http://USERNAME:PASSWORD@PROXY_HOST:PROXY_PORT"
+
+# npm proxy + registry
+& $node $npmCli config set proxy $proxy
+& $node $npmCli config set https-proxy $proxy
+& $node $npmCli config set registry https://registry.npmjs.org/
+& $node $npmCli config set fetch-retries 5
+& $node $npmCli config set fetch-retry-mintimeout 20000
+& $node $npmCli config set fetch-retry-maxtimeout 120000
+
+# optional, if corp TLS interception is used
+# & $node $npmCli config set cafile "C:\path\corp-ca.pem"
+# & $node $npmCli config set strict-ssl true
+
+# verify
+& $node $npmCli config get proxy
+& $node $npmCli config get https-proxy
+& $node $npmCli ping
+& $node $npmCli view zstddec version
+
+
+
+
+
 demo
 ====
   <artifactId>fabric-lite-stitch-demo</artifactId>
