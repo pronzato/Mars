@@ -273,10 +273,15 @@ build.projectVersion=${project.version}
 
 demo
 ====
+  <artifactId>fabric-lite-stitch-demo</artifactId>
+  <name>fabric-lite-stitch-demo</name>
+  <packaging>jar</packaging>
+
   <properties>
     <spring-boot.version>3.4.2</spring-boot.version>
     <vaadin.version>24.6.2</vaadin.version>
     <stitch.uber.skip>false</stitch.uber.skip>
+    <stitch.prod.bundle.exists>false</stitch.prod.bundle.exists>
   </properties>
 
   <dependencyManagement>
@@ -328,6 +333,21 @@ demo
         <artifactId>maven-antrun-plugin</artifactId>
         <version>3.1.0</version>
         <executions>
+          <execution>
+            <id>detect-local-prod-bundle</id>
+            <phase>validate</phase>
+            <goals>
+              <goal>run</goal>
+            </goals>
+            <configuration>
+              <exportAntProperties>true</exportAntProperties>
+              <target>
+                <condition property="stitch.prod.bundle.exists" value="true">
+                  <available file="${project.basedir}/src/main/bundles/prod.bundle"/>
+                </condition>
+              </target>
+            </configuration>
+          </execution>
           <execution>
             <id>unpack-committed-prod-bundle</id>
             <phase>prepare-package</phase>
@@ -398,7 +418,7 @@ demo
   <!-- If local prod.bundle is missing, build it locally -->
   <profiles>
     <profile>
-      <id>auto-generate-prod-bundle</id>
+      <id>auto-generate-prod-bundle-if-missing</id>
       <activation>
         <file>
           <missing>${project.basedir}/src/main/bundles/prod.bundle</missing>
@@ -426,7 +446,7 @@ demo
                   <goal>run</goal>
                 </goals>
                 <configuration>
-                  <target>
+                  <target unless="stitch.prod.bundle.exists">
                     <property name="stitch.vaadin.output" value="${project.build.outputDirectory}/META-INF/VAADIN"/>
                     <fail message="Missing generated VAADIN output at ${stitch.vaadin.output}">
                       <condition>
@@ -457,6 +477,7 @@ demo
             <artifactId>vaadin-maven-plugin</artifactId>
             <version>${vaadin.version}</version>
             <configuration>
+              <skip>${stitch.prod.bundle.exists}</skip>
               <productionMode>${vaadin.productionMode}</productionMode>
               <forceProductionBuild>true</forceProductionBuild>
               <nodeVersion>${node.version}</nodeVersion>
@@ -494,6 +515,7 @@ studio
     <spring-boot.version>3.4.2</spring-boot.version>
     <vaadin.version>24.6.2</vaadin.version>
     <stitch.uber.skip>false</stitch.uber.skip>
+    <stitch.prod.bundle.exists>false</stitch.prod.bundle.exists>
   </properties>
 
   <dependencyManagement>
@@ -545,6 +567,21 @@ studio
         <artifactId>maven-antrun-plugin</artifactId>
         <version>3.1.0</version>
         <executions>
+          <execution>
+            <id>detect-local-prod-bundle</id>
+            <phase>validate</phase>
+            <goals>
+              <goal>run</goal>
+            </goals>
+            <configuration>
+              <exportAntProperties>true</exportAntProperties>
+              <target>
+                <condition property="stitch.prod.bundle.exists" value="true">
+                  <available file="${project.basedir}/src/main/bundles/prod.bundle"/>
+                </condition>
+              </target>
+            </configuration>
+          </execution>
           <execution>
             <id>unpack-committed-prod-bundle</id>
             <phase>prepare-package</phase>
@@ -615,7 +652,7 @@ studio
   <!-- If local prod.bundle is missing, build it locally -->
   <profiles>
     <profile>
-      <id>auto-generate-prod-bundle</id>
+      <id>auto-generate-prod-bundle-if-missing</id>
       <activation>
         <file>
           <missing>${project.basedir}/src/main/bundles/prod.bundle</missing>
@@ -643,7 +680,7 @@ studio
                   <goal>run</goal>
                 </goals>
                 <configuration>
-                  <target>
+                  <target unless="stitch.prod.bundle.exists">
                     <property name="stitch.vaadin.output" value="${project.build.outputDirectory}/META-INF/VAADIN"/>
                     <fail message="Missing generated VAADIN output at ${stitch.vaadin.output}">
                       <condition>
@@ -674,6 +711,7 @@ studio
             <artifactId>vaadin-maven-plugin</artifactId>
             <version>${vaadin.version}</version>
             <configuration>
+              <skip>${stitch.prod.bundle.exists}</skip>
               <productionMode>${vaadin.productionMode}</productionMode>
               <forceProductionBuild>true</forceProductionBuild>
               <nodeVersion>${node.version}</nodeVersion>
