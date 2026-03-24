@@ -1,1 +1,882 @@
-$ErrorActionPreference="Continue";$node="$env:USERPROFILE\.vaadin\node\node.exe";$npmCli="$env:USERPROFILE\.vaadin\node\node_modules\npm\bin\npm-cli.js";$proxy="http://USERNAME:PASSWORD@PROXY_HOST:PROXY_PORT";$cache="C:\dev\nodejs-dist\npm-probe-cache";$outDir=".tmp";$log="$outDir\npm-url-probe.log";$blockedFile="$outDir\blocked-urls.txt";New-Item -ItemType Directory -Force -Path $outDir,$cache|Out-Null;Remove-Item $log,$blockedFile -ErrorAction SilentlyContinue;& $node $npmCli config set proxy $proxy|Out-Null;& $node $npmCli config set https-proxy $proxy|Out-Null;& $node $npmCli config set registry https://registry.npmjs.org/|Out-Null;$urls=(Get-ChildItem -Recurse -Filter package-lock.json|Where-Object{$_.FullName -notmatch "\\node_modules\\"}|ForEach-Object{Get-Content $_.FullName -Raw}|ForEach-Object{[regex]::Matches($_,'"resolved"\s*:\s*"(?<u>https://registry\.npmjs\.org/[^"]+\.tgz)"')|ForEach-Object{$_.Groups["u"].Value}}|Sort-Object -Unique);$blocked=New-Object System.Collections.Generic.List[string];$i=0;$total=$urls.Count;foreach($u in $urls){$i++;$msg="[$i/$total] $u";Write-Host $msg;Add-Content $log $msg;$out=& $node $npmCli cache add --cache $cache --prefer-online $u 2>&1;$txt=($out -join "`n");$bad=($LASTEXITCODE -ne 0 -or $txt -match "GIS_Malicious_Block|Access Denied|Blocked|ETIMEDOUT|EAI_AGAIN|ECONNRESET|ECONNREFUSED|403");if($bad){Write-Host "  -> BLOCKED/FAILED" -ForegroundColor Yellow;Add-Content $log "  -> BLOCKED/FAILED`n$txt`n";$blocked.Add($u)}else{Write-Host "  -> OK" -ForegroundColor DarkGreen;Add-Content $log "  -> OK`n"}};$blocked|Sort-Object -Unique|Set-Content $blockedFile -Encoding UTF8;Write-Host "Done. Total=$total Blocked=$($blocked.Count) Log=$log BlockedFile=$blockedFile"
+$env:PATH = (($env:PATH -split ';') | Where-Object { $_ -and $_ -notlike 'C:\Program Files\nodejs*' }) -join ';'
+$env:PATH = 'C:\Work\apps\nodejs\v20.11.1\node-v20.11.1-win-x64;' + $env:PATH
+$env:NODEJS_PATH = 'C:/Work/apps/nodejs_dist'
+
+where.exe node
+where.exe npm
+(Get-Command node).Source
+
+
+main
+====
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>org.pronzato.fabric</groupId>
+  <artifactId>fabric-parent</artifactId>
+  <version>1.0.0-SNAPSHOT</version>
+  <packaging>pom</packaging>
+  <name>fabric-parent</name>
+
+  <properties>
+    <maven.compiler.release>21</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+    <!-- libs -->
+    <grpc.version>1.66.0</grpc.version>
+    <protobuf.version>4.30.2</protobuf.version>
+    <protobuf.skip>false</protobuf.skip>
+    <jackson.version>2.17.2</jackson.version>
+    <amps.client.version>5.3.3.4</amps.client.version>
+    <arrow.version>18.3.0</arrow.version>
+    <duckdb.version>1.5.0.0</duckdb.version>
+    <aws.sdk.version>2.27.19</aws.sdk.version>
+    <mongodb.driver.version>5.1.0</mongodb.driver.version>
+    <nimbus.version>11.26</nimbus.version>
+    <nimbus.jwt.version>10.0.2</nimbus.jwt.version>
+    <junit.version>5.10.2</junit.version>
+    <mockito.version>4.11.0</mockito.version>
+    <bytebuddy.version>1.14.12</bytebuddy.version>
+    <fabric.arrow.add-opens>--add-opens=java.base/java.nio=ALL-UNNAMED</fabric.arrow.add-opens>
+    <surefire.plugin.version>3.2.5</surefire.plugin.version>
+    <bouncycastle.version>1.78.1</bouncycastle.version>
+    <slf4j.version>2.0.16</slf4j.version>
+    <logback.version>1.5.9</logback.version>
+    <jacoco.plugin.version>0.8.12</jacoco.plugin.version>
+    <jacoco.skip>true</jacoco.skip>
+    <shade.skip>true</shade.skip>
+
+    <!-- default: frontend work is off unless a module opts in -->
+    <vaadin.skip>true</vaadin.skip>
+    <frontend.skip>true</frontend.skip>
+
+    <frontend-maven-plugin.version>1.15.0</frontend-maven-plugin.version>
+    <node.version>v20.11.1</node.version>
+
+    <!-- default local Node dist root -->
+    <node.dist.root>C:/Work/apps/nodejs_dist</node.dist.root>
+    <node.download.root>file:///C:/Work/apps/nodejs_dist/</node.download.root>
+    <node.zip.path>${node.dist.root}/v20.11.1/node-v20.11.1-win-x64.zip</node.zip.path>
+
+    <!-- app modules override this if they want an uber jar -->
+    <stitch.uber.skip>true</stitch.uber.skip>
+  </properties>
+
+  <modules>
+    <module>fabric-kdc</module>
+    <module>fabric-mcp</module>
+    <module>fabric-lite</module>
+    <module>fabric-lite-tools</module>
+    <module>fabric-lite-agents</module>
+    <module>fabric-lite-config</module>
+    <module>fabric-lite-lab</module>
+    <module>fabric-lite-services</module>
+    <module>fabric-lite-stitch</module>
+    <module>fabric-lite-stitch-demo</module>
+    <module>fabric-lite-stitch-studio</module>
+    <module>fabric-lite-vaadin</module>
+    <module>fabric-lite-studio</module>
+    <module>fabric-lite-mongodb</module>
+    <module>fabric-test-oc</module>
+  </modules>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>io.grpc</groupId>
+        <artifactId>grpc-bom</artifactId>
+        <version>1.66.0</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>net.bytebuddy</groupId>
+        <artifactId>byte-buddy</artifactId>
+        <version>${bytebuddy.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>net.bytebuddy</groupId>
+        <artifactId>byte-buddy-agent</artifactId>
+        <version>${bytebuddy.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.google.protobuf</groupId>
+        <artifactId>protobuf-java</artifactId>
+        <version>${protobuf.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.google.protobuf</groupId>
+        <artifactId>protobuf-java-util</artifactId>
+        <version>${protobuf.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.google.protobuf</groupId>
+        <artifactId>protobuf-javalite</artifactId>
+        <version>${protobuf.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+      </plugins>
+    </pluginManagement>
+    <plugins>
+      <plugin>
+        <artifactId>maven-antrun-plugin</artifactId>
+        <version>3.1.0</version>
+        <executions>
+          <execution>
+            <id>fabric-build-id</id>
+            <phase>process-resources</phase>
+            <goals>
+              <goal>run</goal>
+            </goals>
+            <configuration>
+              <exportAntProperties>true</exportAntProperties>
+              <target>
+                <property name="fabric.build.file" value="${project.basedir}/.build/build-info.properties" />
+                <mkdir dir="${project.basedir}/.build" />
+                <propertyfile file="${fabric.build.file}" comment="Fabric build metadata">
+                  <entry key="build.projectVersion" type="string" value="${project.version}" />
+                  <entry key="build.number" type="int" operation="+" value="1" />
+                </propertyfile>
+                <property file="${fabric.build.file}" />
+                <tstamp>
+                  <format property="fabric.build.timestamp" pattern="yyyy-MM-dd'T'HH:mm:ss'Z'" timezone="UTC" />
+                </tstamp>
+                <property name="fabric.build.number" value="${build.number}" />
+                <property name="fabric.build.id" value="${project.version}.${fabric.build.number}" />
+                <mkdir dir="${project.build.outputDirectory}" />
+                <echo file="${project.build.outputDirectory}/build-info.properties">
+build.id=${fabric.build.id}
+build.number=${fabric.build.number}
+build.timestamp=${fabric.build.timestamp}
+build.projectVersion=${project.version}
+</echo>
+              </target>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.11.0</version>
+        <configuration>
+          <release>${maven.compiler.release}</release>
+          <showDeprecation>true</showDeprecation>
+          <showWarnings>true</showWarnings>
+        </configuration>
+      </plugin>
+
+      <plugin>
+        <groupId>org.jacoco</groupId>
+        <artifactId>jacoco-maven-plugin</artifactId>
+        <version>${jacoco.plugin.version}</version>
+        <configuration>
+          <skip>${jacoco.skip}</skip>
+        </configuration>
+        <executions>
+          <execution>
+            <id>prepare-agent</id>
+            <goals>
+              <goal>prepare-agent</goal>
+            </goals>
+          </execution>
+          <execution>
+            <id>report</id>
+            <phase>verify</phase>
+            <goals>
+              <goal>report</goal>
+            </goals>
+          </execution>
+          <execution>
+            <id>jacoco-check</id>
+            <phase>verify</phase>
+            <goals>
+              <goal>check</goal>
+            </goals>
+            <configuration>
+              <rules>
+                <rule>
+                  <element>BUNDLE</element>
+                  <limits>
+                    <limit>
+                      <counter>LINE</counter>
+                      <value>COVEREDRATIO</value>
+                      <minimum>0.90</minimum>
+                    </limit>
+                  </limits>
+                </rule>
+              </rules>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+
+  <profiles>
+    <profile>
+      <id>nodejs-path-from-env</id>
+      <activation>
+        <property>
+          <name>env.NODEJS_PATH</name>
+        </property>
+      </activation>
+      <properties>
+        <node.dist.root>${env.NODEJS_PATH}</node.dist.root>
+        <node.download.root>file:///${env.NODEJS_PATH}/</node.download.root>
+        <node.zip.path>${env.NODEJS_PATH}/v20.11.1/node-v20.11.1-win-x64.zip</node.zip.path>
+      </properties>
+    </profile>
+
+    <profile>
+      <id>fast</id>
+      <modules>
+        <module>fabric-api</module>
+      </modules>
+    </profile>
+
+    <profile>
+      <id>meta-ci</id>
+      <activation>
+        <activeByDefault>false</activeByDefault>
+      </activation>
+      <properties>
+        <skipITs>true</skipITs>
+        <maven.test.skip>true</maven.test.skip>
+        <protobuf.skip>true</protobuf.skip>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <version>${surefire.plugin.version}</version>
+            <configuration>
+              <includes>
+                <include>**/fabric/config/**/*Test.java</include>
+                <include>**/fabric/config/demo/**/*Test.java</include>
+              </includes>
+              <excludes>
+                <exclude>**/*ConnectionManager*Test.java</exclude>
+                <exclude>**/*Kerberos*Test.java</exclude>
+                <exclude>**/*Duckdb*Test.java</exclude>
+                <exclude>**/*DuckDB*Test.java</exclude>
+                <exclude>**/*RowsetManagerRemoteTest.java</exclude>
+                <exclude>**/*TabularRemoteTest.java</exclude>
+                <exclude>**/*GrpcPepIntegrationTest.java</exclude>
+                <exclude>**/*DataEntitlementsParityIntegrationTest.java</exclude>
+                <exclude>**/*MaterializedServiceTest.java</exclude>
+                <exclude>**/*Feed*Test.java</exclude>
+                <exclude>**/*FileFeed*Test.java</exclude>
+                <exclude>**/*ParquetFeed*Test.java</exclude>
+                <exclude>**/*ImpalaFeed*Test.java</exclude>
+                <exclude>**/*LegacyFabricDataServiceCatalogTest.java</exclude>
+                <exclude>**/*DataNameResolverTest.java</exclude>
+                <exclude>**/*RowsetManagerTest.java</exclude>
+                <exclude>**/*TabularStreamEngineTest.java</exclude>
+                <exclude>**/*DefaultHotCacheManagerTest.java</exclude>
+                <exclude>**/*ConfigCacheLastGoodTest.java</exclude>
+                <exclude>**/*Asset*Test.java</exclude>
+                <exclude>**/*CompactionExecutorManifestTest.java</exclude>
+              </excludes>
+              <failIfNoTests>false</failIfNoTests>
+            </configuration>
+          </plugin>
+          <plugin>
+            <artifactId>maven-failsafe-plugin</artifactId>
+            <version>${surefire.plugin.version}</version>
+            <configuration>
+              <skipTests>true</skipTests>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+</project>
+
+
+
+
+
+demo
+====
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.pronzato.fabric</groupId>
+    <artifactId>fabric-parent</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>fabric-lite-stitch-demo</artifactId>
+  <name>fabric-lite-stitch-demo</name>
+  <packaging>jar</packaging>
+
+  <properties>
+    <spring-boot.version>3.4.2</spring-boot.version>
+    <vaadin.version>24.6.2</vaadin.version>
+    <stitch.uber.skip>false</stitch.uber.skip>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-dependencies</artifactId>
+        <version>${spring-boot.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>com.vaadin</groupId>
+        <artifactId>vaadin-bom</artifactId>
+        <version>${vaadin.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.pronzato.fabric</groupId>
+      <artifactId>fabric-lite</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.pronzato.fabric</groupId>
+      <artifactId>fabric-lite-stitch</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.vaadin</groupId>
+      <artifactId>vaadin-spring-boot-starter</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- Normal path: consume committed prod.bundle -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-antrun-plugin</artifactId>
+        <version>3.1.0</version>
+        <executions>
+          <execution>
+            <id>unpack-committed-prod-bundle</id>
+            <phase>prepare-package</phase>
+            <goals>
+              <goal>run</goal>
+            </goals>
+            <configuration>
+              <target unless="stitch.bundle.generated">
+                <property name="stitch.prod.bundle" value="${project.basedir}/src/main/bundles/prod.bundle"/>
+                <fail message="Missing committed production bundle at ${stitch.prod.bundle}">
+                  <condition>
+                    <not>
+                      <available file="${stitch.prod.bundle}"/>
+                    </not>
+                  </condition>
+                </fail>
+                <mkdir dir="${project.build.outputDirectory}/META-INF/VAADIN"/>
+                <unzip src="${stitch.prod.bundle}"
+                       dest="${project.build.outputDirectory}/META-INF/VAADIN"
+                       overwrite="true"/>
+              </target>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+        <version>${spring-boot.version}</version>
+        <configuration>
+          <fork>false</fork>
+          <mainClass>org.pronzato.fabric.stitch.demo.StitchDemoApp</mainClass>
+        </configuration>
+        <executions>
+          <execution>
+            <id>repackage-default</id>
+            <goals>
+              <goal>repackage</goal>
+            </goals>
+          </execution>
+          <execution>
+            <id>repackage-uber</id>
+            <phase>package</phase>
+            <goals>
+              <goal>repackage</goal>
+            </goals>
+            <configuration>
+              <classifier>uber</classifier>
+              <attach>true</attach>
+              <skip>${stitch.uber.skip}</skip>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>${surefire.plugin.version}</version>
+        <configuration>
+          <useModulePath>false</useModulePath>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+
+  <!-- If prod.bundle is missing:
+       - on builder machine with local Node zip: build it
+       - elsewhere: fail fast clearly -->
+  <profiles>
+    <profile>
+      <id>auto-generate-prod-bundle</id>
+      <activation>
+        <file>
+          <missing>${project.basedir}/src/main/bundles/prod.bundle</missing>
+        </file>
+      </activation>
+
+      <properties>
+        <vaadin.skip>false</vaadin.skip>
+        <frontend.skip>false</frontend.skip>
+        <vaadin.productionMode>true</vaadin.productionMode>
+        <stitch.bundle.generated>true</stitch.bundle.generated>
+      </properties>
+
+      <build>
+        <plugins>
+          <!-- Verify local builder eligibility -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-antrun-plugin</artifactId>
+            <version>3.1.0</version>
+            <executions>
+              <execution>
+                <id>verify-bundle-builder-eligibility</id>
+                <phase>validate</phase>
+                <goals>
+                  <goal>run</goal>
+                </goals>
+                <configuration>
+                  <target>
+                    <property name="stitch.prod.bundle" value="${project.basedir}/src/main/bundles/prod.bundle"/>
+                    <condition property="stitch.node.zip.present">
+                      <available file="${node.zip.path}"/>
+                    </condition>
+                    <fail unless="stitch.node.zip.present">
+Missing required production bundle:
+${project.artifactId}/src/main/bundles/prod.bundle
+
+This environment is not configured to rebuild the frontend bundle.
+Normal builds expect committed prod.bundle.
+Only a builder machine with local Node dist is allowed to regenerate it.
+
+On the builder machine, regenerate it with:
+mvn clean install -DskipTests
+
+If your local Node dist is in a different location, set:
+NODEJS_PATH=C:\path\to\nodejs_dist
+                    </fail>
+                  </target>
+                </configuration>
+              </execution>
+
+              <execution>
+                <id>refresh-committed-prod-bundle</id>
+                <phase>process-classes</phase>
+                <goals>
+                  <goal>run</goal>
+                </goals>
+                <configuration>
+                  <target>
+                    <property name="stitch.vaadin.output" value="${project.build.outputDirectory}/META-INF/VAADIN"/>
+                    <fail message="Missing generated VAADIN output at ${stitch.vaadin.output}">
+                      <condition>
+                        <not>
+                          <available file="${stitch.vaadin.output}" type="dir"/>
+                        </not>
+                      </condition>
+                    </fail>
+                    <fail message="Missing generated frontend entrypoint at ${stitch.vaadin.output}/webapp/index.html">
+                      <condition>
+                        <not>
+                          <available file="${stitch.vaadin.output}/webapp/index.html"/>
+                        </not>
+                      </condition>
+                    </fail>
+                    <mkdir dir="${project.basedir}/src/main/bundles"/>
+                    <zip destfile="${project.basedir}/src/main/bundles/prod.bundle"
+                         basedir="${stitch.vaadin.output}"/>
+                  </target>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+
+          <!-- Install Node from local zip, using bundled npm -->
+          <plugin>
+            <groupId>com.github.eirslett</groupId>
+            <artifactId>frontend-maven-plugin</artifactId>
+            <version>${frontend-maven-plugin.version}</version>
+            <executions>
+              <execution>
+                <id>install-node-for-vaadin-build</id>
+                <phase>generate-resources</phase>
+                <goals>
+                  <goal>install-node-and-npm</goal>
+                </goals>
+                <configuration>
+                  <nodeVersion>${node.version}</nodeVersion>
+                  <npmVersion>provided</npmVersion>
+                  <installDirectory>${project.build.directory}/frontend-tools</installDirectory>
+                  <nodeDownloadRoot>${node.download.root}</nodeDownloadRoot>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+
+          <!-- Build fresh frontend only when bundle is missing -->
+          <plugin>
+            <groupId>com.vaadin</groupId>
+            <artifactId>vaadin-maven-plugin</artifactId>
+            <version>${vaadin.version}</version>
+            <configuration>
+              <productionMode>${vaadin.productionMode}</productionMode>
+              <forceProductionBuild>true</forceProductionBuild>
+              <nodeVersion>${node.version}</nodeVersion>
+              <nodeDownloadRoot>${node.download.root}</nodeDownloadRoot>
+              <requireHomeNodeExec>false</requireHomeNodeExec>
+              <nodeAutoUpdate>false</nodeAutoUpdate>
+            </configuration>
+            <executions>
+              <execution>
+                <id>prepare-frontend-production</id>
+                <phase>process-resources</phase>
+                <goals>
+                  <goal>prepare-frontend</goal>
+                </goals>
+              </execution>
+              <execution>
+                <id>build-frontend-production</id>
+                <phase>compile</phase>
+                <goals>
+                  <goal>build-frontend</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+</project>
+
+
+
+
+studio
+======
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.pronzato.fabric</groupId>
+    <artifactId>fabric-parent</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>fabric-lite-stitch-studio</artifactId>
+  <name>fabric-lite-stitch-studio</name>
+  <packaging>jar</packaging>
+
+  <properties>
+    <spring-boot.version>3.4.2</spring-boot.version>
+    <vaadin.version>24.6.2</vaadin.version>
+    <stitch.uber.skip>false</stitch.uber.skip>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-dependencies</artifactId>
+        <version>${spring-boot.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>com.vaadin</groupId>
+        <artifactId>vaadin-bom</artifactId>
+        <version>${vaadin.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.pronzato.fabric</groupId>
+      <artifactId>fabric-lite</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.pronzato.fabric</groupId>
+      <artifactId>fabric-lite-stitch</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.vaadin</groupId>
+      <artifactId>vaadin-spring-boot-starter</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- Normal path: consume committed prod.bundle -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-antrun-plugin</artifactId>
+        <version>3.1.0</version>
+        <executions>
+          <execution>
+            <id>unpack-committed-prod-bundle</id>
+            <phase>prepare-package</phase>
+            <goals>
+              <goal>run</goal>
+            </goals>
+            <configuration>
+              <target unless="stitch.bundle.generated">
+                <property name="stitch.prod.bundle" value="${project.basedir}/src/main/bundles/prod.bundle"/>
+                <fail message="Missing committed production bundle at ${stitch.prod.bundle}">
+                  <condition>
+                    <not>
+                      <available file="${stitch.prod.bundle}"/>
+                    </not>
+                  </condition>
+                </fail>
+                <mkdir dir="${project.build.outputDirectory}/META-INF/VAADIN"/>
+                <unzip src="${stitch.prod.bundle}"
+                       dest="${project.build.outputDirectory}/META-INF/VAADIN"
+                       overwrite="true"/>
+              </target>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+        <version>${spring-boot.version}</version>
+        <configuration>
+          <fork>false</fork>
+          <mainClass>org.pronzato.fabric.stitch.studio.StitchStudioApp</mainClass>
+        </configuration>
+        <executions>
+          <execution>
+            <id>repackage-default</id>
+            <goals>
+              <goal>repackage</goal>
+            </goals>
+          </execution>
+          <execution>
+            <id>repackage-uber</id>
+            <phase>package</phase>
+            <goals>
+              <goal>repackage</goal>
+            </goals>
+            <configuration>
+              <classifier>uber</classifier>
+              <attach>true</attach>
+              <skip>${stitch.uber.skip}</skip>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>${surefire.plugin.version}</version>
+        <configuration>
+          <useModulePath>false</useModulePath>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+
+  <!-- If prod.bundle is missing:
+       - on builder machine with local Node zip: build it
+       - elsewhere: fail fast clearly -->
+  <profiles>
+    <profile>
+      <id>auto-generate-prod-bundle</id>
+      <activation>
+        <file>
+          <missing>${project.basedir}/src/main/bundles/prod.bundle</missing>
+        </file>
+      </activation>
+
+      <properties>
+        <vaadin.skip>false</vaadin.skip>
+        <frontend.skip>false</frontend.skip>
+        <vaadin.productionMode>true</vaadin.productionMode>
+        <stitch.bundle.generated>true</stitch.bundle.generated>
+      </properties>
+
+      <build>
+        <plugins>
+          <!-- Verify local builder eligibility -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-antrun-plugin</artifactId>
+            <version>3.1.0</version>
+            <executions>
+              <execution>
+                <id>verify-bundle-builder-eligibility</id>
+                <phase>validate</phase>
+                <goals>
+                  <goal>run</goal>
+                </goals>
+                <configuration>
+                  <target>
+                    <property name="stitch.prod.bundle" value="${project.basedir}/src/main/bundles/prod.bundle"/>
+                    <condition property="stitch.node.zip.present">
+                      <available file="${node.zip.path}"/>
+                    </condition>
+                    <fail unless="stitch.node.zip.present">
+Missing required production bundle:
+${project.artifactId}/src/main/bundles/prod.bundle
+
+This environment is not configured to rebuild the frontend bundle.
+Normal builds expect committed prod.bundle.
+Only a builder machine with local Node dist is allowed to regenerate it.
+
+On the builder machine, regenerate it with:
+mvn clean install -DskipTests
+
+If your local Node dist is in a different location, set:
+NODEJS_PATH=C:\path\to\nodejs_dist
+                    </fail>
+                  </target>
+                </configuration>
+              </execution>
+
+              <execution>
+                <id>refresh-committed-prod-bundle</id>
+                <phase>process-classes</phase>
+                <goals>
+                  <goal>run</goal>
+                </goals>
+                <configuration>
+                  <target>
+                    <property name="stitch.vaadin.output" value="${project.build.outputDirectory}/META-INF/VAADIN"/>
+                    <fail message="Missing generated VAADIN output at ${stitch.vaadin.output}">
+                      <condition>
+                        <not>
+                          <available file="${stitch.vaadin.output}" type="dir"/>
+                        </not>
+                      </condition>
+                    </fail>
+                    <fail message="Missing generated frontend entrypoint at ${stitch.vaadin.output}/webapp/index.html">
+                      <condition>
+                        <not>
+                          <available file="${stitch.vaadin.output}/webapp/index.html"/>
+                        </not>
+                      </condition>
+                    </fail>
+                    <mkdir dir="${project.basedir}/src/main/bundles"/>
+                    <zip destfile="${project.basedir}/src/main/bundles/prod.bundle"
+                         basedir="${stitch.vaadin.output}"/>
+                  </target>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+
+          <!-- Install Node from local zip, using bundled npm -->
+          <plugin>
+            <groupId>com.github.eirslett</groupId>
+            <artifactId>frontend-maven-plugin</artifactId>
+            <version>${frontend-maven-plugin.version}</version>
+            <executions>
+              <execution>
+                <id>install-node-for-vaadin-build</id>
+                <phase>generate-resources</phase>
+                <goals>
+                  <goal>install-node-and-npm</goal>
+                </goals>
+                <configuration>
+                  <nodeVersion>${node.version}</nodeVersion>
+                  <npmVersion>provided</npmVersion>
+                  <installDirectory>${project.build.directory}/frontend-tools</installDirectory>
+                  <nodeDownloadRoot>${node.download.root}</nodeDownloadRoot>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+
+          <!-- Build fresh frontend only when bundle is missing -->
+          <plugin>
+            <groupId>com.vaadin</groupId>
+            <artifactId>vaadin-maven-plugin</artifactId>
+            <version>${vaadin.version}</version>
+            <configuration>
+              <productionMode>${vaadin.productionMode}</productionMode>
+              <forceProductionBuild>true</forceProductionBuild>
+              <nodeVersion>${node.version}</nodeVersion>
+              <nodeDownloadRoot>${node.download.root}</nodeDownloadRoot>
+              <requireHomeNodeExec>false</requireHomeNodeExec>
+              <nodeAutoUpdate>false</nodeAutoUpdate>
+            </configuration>
+            <executions>
+              <execution>
+                <id>prepare-frontend-production</id>
+                <phase>process-resources</phase>
+                <goals>
+                  <goal>prepare-frontend</goal>
+                </goals>
+              </execution>
+              <execution>
+                <id>build-frontend-production</id>
+                <phase>compile</phase>
+                <goals>
+                  <goal>build-frontend</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+</project>
