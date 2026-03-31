@@ -1,1 +1,259 @@
-null
+{
+    "users":  {
+                  "alice":  {
+                                "id":  "alice",
+                                "firstName":  "Alice",
+                                "lastName":  "P",
+                                "email":  "alice@corp.com"
+                            },
+                  "bella":  {
+                                "id":  "bella",
+                                "firstName":  "Bella",
+                                "lastName":  "B",
+                                "email":  "bella@corp.com"
+                            },
+                  "bob":  {
+                              "id":  "bob",
+                              "firstName":  "Bob",
+                              "lastName":  "T",
+                              "email":  "bob@corp.com"
+                          },
+                  "charlie":  {
+                                  "id":  "charlie",
+                                  "firstName":  "Charlie",
+                                  "lastName":  "B",
+                                  "email":  "charlie@corp.com"
+                              },
+                  "lenny":  {
+                                "id":  "lenny",
+                                "firstName":  "Lenny",
+                                "lastName":  "L",
+                                "email":  "lenny@corp.com"
+                            }
+              },
+    "services":  {
+                     "dcore":  {
+                                   "id":  "dcore",
+                                   "displayName":  "dcore"
+                               },
+                     "dfabric":  {
+                                     "id":  "dfabric",
+                                     "displayName":  "dfabric"
+                                 },
+                     "dlab":  {
+                                  "id":  "dlab",
+                                  "displayName":  "dlab"
+                              }
+                 },
+    "root":  {
+                 "name":  "root",
+                 "nodeName":  "root",
+                 "displayName":  "root",
+                 "type":  "OU",
+                 "description":  "Synthetic root for the organization tree",
+                 "ous":  [
+                             {
+                                 "name":  "fabric",
+                                 "nodeName":  "fabric",
+                                 "displayName":  "Fabric",
+                                 "type":  "OU",
+                                 "description":  "Fabric platform organizational unit",
+                                 "groups":  [
+                                                {
+                                                    "name":  "platform",
+                                                    "nodeName":  "platform",
+                                                    "displayName":  "Platform",
+                                                    "type":  "USER",
+                                                    "description":  "Platform operators group",
+                                                    "userIds":  [
+                                                                    "alice"
+                                                                ],
+                                                    "serviceIds":  [
+                                                                       "dfabric"
+                                                                   ]
+                                                },
+                                                {
+                                                    "name":  "lab",
+                                                    "nodeName":  "lab",
+                                                    "displayName":  "Lab",
+                                                    "type":  "USER",
+                                                    "description":  "Fabric lab users group",
+                                                    "userIds":  [
+                                                                    "lenny"
+                                                                ],
+                                                    "serviceIds":  [
+                                                                       "dlab"
+                                                                   ]
+                                                }
+                                            ]
+                             },
+                             {
+                                 "name":  "equities_ou",
+                                 "nodeName":  "equities_ou",
+                                 "displayName":  "Equities",
+                                 "type":  "OU",
+                                 "description":  "Equities e-trading organizational unit",
+                                 "groups":  [
+                                               {
+                                                   "name":  "marketdata",
+                                                   "nodeName":  "marketdata",
+                                                   "displayName":  "Market Data",
+                                                    "type":  "USER",
+                                                    "description":  "Market data publishing team",
+                                                    "userIds":  [
+                                                                    "lenny"
+                                                                ],
+                                                    "serviceIds":  [
+                                                                       "dlab"
+                                                                   ]
+                                                },
+                                                {
+                                                    "name":  "refdata",
+                                                    "nodeName":  "refdata",
+                                                    "displayName":  "Reference Data",
+                                                    "type":  "USER",
+                                                    "description":  "Reference data publishing team",
+                                                    "userIds":  [
+                                                                    "lenny"
+                                                                ],
+                                                    "serviceIds":  [
+                                                                       "dlab"
+                                                                   ]
+                                                },
+                                                {
+                                                    "name":  "oms",
+                                                    "nodeName":  "oms",
+                                                    "displayName":  "OMS",
+                                                    "type":  "USER",
+                                                    "description":  "Order management publishing team",
+                                                    "userIds":  [
+                                                                    "lenny"
+                                                                ],
+                                                    "serviceIds":  [
+                                                                       "dlab"
+                                                                   ]
+                                                },
+                                                {
+                                                    "name":  "analytics",
+                                                    "nodeName":  "analytics",
+                                                    "displayName":  "Analytics",
+                                                    "type":  "USER",
+                                                    "description":  "Analytics and transforms team",
+                                                    "userIds":  [
+                                                                    "lenny"
+                                                                ],
+                                                    "serviceIds":  [
+                                                                       "dlab"
+                                                                   ]
+                                                },
+                                                {
+                                                    "name":  "desk1",
+                                                    "nodeName":  "desk1",
+                                                    "displayName":  "Desk1",
+                                                    "type":  "USER",
+                                                    "description":  "Equities Desk 1 traders",
+                                                    "userIds":  [
+                                                                    "bob"
+                                                                ],
+                                                    "serviceIds":  [
+
+                                                                   ]
+                                                },
+                                                {
+                                                    "name":  "desk2",
+                                                    "nodeName":  "desk2",
+                                                    "displayName":  "Desk2",
+                                                    "type":  "USER",
+                                                    "description":  "Equities Desk 2 traders",
+                                                    "userIds":  [
+                                                                    "bella"
+                                                                ],
+                                                    "serviceIds":  [
+
+                                                                   ]
+                                                }
+                                            ]
+                             },
+                             {
+                                 "name":  "lob1",
+                                 "nodeName":  "lob1",
+                                 "displayName":  "Lob1",
+                                 "type":  "OU",
+                                 "description":  "Lob1 organizational unit",
+                                 "groups":  [
+                                                {
+                                                    "name":  "core",
+                                                    "nodeName":  "core",
+                                                    "displayName":  "Core",
+                                                    "type":  "USER",
+                                                    "description":  "Core team",
+                                                    "userIds":  [
+                                                                    "charlie"
+                                                                ],
+                                                    "serviceIds":  [
+
+                                                                   ]
+                                                }
+                                            ],
+                                 "ous":  [
+                                             {
+                                                 "name":  "group1",
+                                                 "nodeName":  "group1",
+                                                 "displayName":  "Group1",
+                                                 "type":  "OU",
+                                                 "description":  "Group1 sub-OU under Lob1",
+                                                 "groups":  [
+
+                                                            ],
+                                                 "ous":  [
+                                                             {
+                                                                 "name":  "group1_amrs",
+                                                                 "nodeName":  "group1_amrs",
+                                                                 "displayName":  "Group1 AMRS",
+                                                                 "type":  "OU",
+                                                                 "description":  "Group1 AMRS sub-OU",
+                                                                 "groups":  [
+
+                                                                            ]
+                                                             },
+                                                             {
+                                                                 "name":  "group1_emea",
+                                                                 "nodeName":  "group1_emea",
+                                                                 "displayName":  "Group1 EMEA",
+                                                                 "type":  "OU",
+                                                                 "description":  "Group1 EMEA sub-OU",
+                                                                 "groups":  [
+
+                                                                            ]
+                                                             },
+                                                             {
+                                                                 "name":  "group1_apac",
+                                                                 "nodeName":  "group1_apac",
+                                                                 "displayName":  "Group1 APAC",
+                                                                 "type":  "OU",
+                                                                 "description":  "Group1 APAC sub-OU",
+                                                                 "groups":  [
+
+                                                                            ]
+                                                             }
+                                                         ]
+                                             }
+                                         ]
+                             }
+                         ]
+             },
+    "configId":  "platform-platform",
+    "effectiveConfigId":  "platform-platform",
+    "envelope":  {
+                     "group":  "platform",
+                     "type":  "PLATFORM",
+                     "name":  "platform",
+                     "uuid":  "85b50e36-2fc2-4cc8-afa3-6f2f997d24d2",
+                     "enabled":  true,
+                     "lifecycleStatus":  "ACTIVE",
+                     "createdTimeUtc":  "2026-01-02T20:19:15.788Z",
+                     "createdBy":  "import/fixup",
+                     "updatedTimeUtc":  "2026-01-02T21:26:18.476Z",
+                     "updatedBy":  "import/fixup"
+                 }
+}
