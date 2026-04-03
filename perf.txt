@@ -1,1 +1,534 @@
-null
+package org.pronzato.fabric.api.connectors.s3;
+
+import java.io.InputStream;
+import java.net.URI;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.stream.Collectors;
+import org.pronzato.fabric.api.data.duckdb.DuckdbExtensions;
+import org.pronzato.fabric.api.data.duckdb.DuckdbSession;
+import org.pronzato.fabric.api.util.Strings;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.AwsCredentials;
+import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.core.ResponseBytes;
+import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.core.sync.ResponseTransformer;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.S3ClientBuilder;
+import software.amazon.awssdk.services.s3.model.Delete;
+import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
+import software.amazon.awssdk.services.s3.model.DeleteObjectsRequest;
+import software.amazon.awssdk.services.s3.model.DeleteObjectsResponse;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
+import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
+import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.services.s3.model.S3Exception;
+import software.amazon.awssdk.services.s3.model.S3Object;
+
+/** Administrative/low-level S3 operations exposed behind {@link S3Connection#admin()}. */
+public final class S3Admin implements AutoCloseable {
+  private static final Logger LOGGER = LoggerFactory.getLogger(S3Admin.class);
+  private static final int DELETE_BATCH_LIMIT = 1000;
+  private static final int DUCKDB_HTTP_RETRIES = 1;
+  private static final int DUCKDB_HTTP_RETRY_WAIT_MS = 250;
+
+  private final String name;
+  private final String region;
+  private final String bucket;
+  private final String endpointOverride;
+  private final URI endpointUri;
+  private final boolean useSslForEndpoint;
+  private final boolean pathStyleAccess;
+  private final String basePrefix;
+  private final Map<String, String> attributes;
+  private final String accessKeyId;
+  private final String secretAccessKey;
+  private final String sessionToken;
+  private final S3Client client;
+  private volatile boolean httpfsConfigured;
+  private volatile boolean httpfsUnavailable;
+
+  S3Admin(
+      String name,
+      String region,
+      String bucket,
+      String endpointOverride,
+      boolean pathStyleAccess,
+      String basePrefix,
+      Map<String, String> attributes,
+      String accessKeyId,
+      String secretAccessKey,
+      String sessionToken) {
+    this.name = Objects.requireNonNull(name, "name");
+    this.region = Strings.requireNonBlank(region, "s3.region");
+    this.bucket = Strings.requireNonBlank(bucket, "s3.bucket");
+    this.endpointUri = toEndpointUri(endpointOverride);
+    this.endpointOverride = endpointUri == null ? null : endpointUri.toString();
+    this.useSslForEndpoint =
+        endpointUri == null
+            || endpointUri.getScheme() == null
+            || !"http".equalsIgnoreCase(endpointUri.getScheme());
+    this.pathStyleAccess = pathStyleAccess;
+    this.basePrefix = normalizePrefix(basePrefix);
+    this.attributes = attributes == null ? Map.of() : Map.copyOf(attributes);
+    this.accessKeyId = Strings.requireNonBlank(accessKeyId, "s3.accessKeyId");
+    this.secretAccessKey = Strings.requireNonBlank(secretAccessKey, "s3.secretAccessKey");
+    this.sessionToken = Strings.trimToNull(sessionToken);
+    this.client = buildClient();
+  }
+
+  public S3ListResult listObjects(S3ListRequest request) {
+    Objects.requireNonNull(request, "request");
+    try {
+      ListObjectsV2Request.Builder builder =
+          ListObjectsV2Request.builder().bucket(bucket).maxKeys(Math.max(1, request.maxKeys()));
+      String prefix =
+          request.prefix() == null
+              ? basePrefix
+              : applyBasePrefix(parseKeyOrUri(request.prefix(), true));
+      if (hasText(prefix)) {
+        builder.prefix(prefix);
+      }
+      if (hasText(request.continuationToken())) {
+        builder.continuationToken(request.continuationToken());
+      }
+      if (request.delimiter() != null) {
+        builder.delimiter(request.delimiter());
+      }
+      ListObjectsV2Response response = client.listObjectsV2(builder.build());
+      List<String> commonPrefixes =
+          Optional.ofNullable(response.commonPrefixes()).orElse(List.of()).stream()
+              .map(prefixResult -> prefixResult.prefix())
+              .filter(Objects::nonNull)
+              .collect(Collectors.toList());
+      List<S3ObjectSummary> objects =
+          Optional.ofNullable(response.contents()).orElse(List.of()).stream()
+              .map(S3Admin::toSummary)
+              .collect(Collectors.toList());
+      return new S3ListResult(
+          List.copyOf(commonPrefixes),
+          List.copyOf(objects),
+          response.isTruncated(),
+          response.continuationToken(),
+          response.nextContinuationToken());
+    } catch (S3Exception ex) {
+      throw toOperationException("ListObjectsV2", ex, null);
+    } catch (Exception ex) {
+      throw new IllegalStateException("Failed to list S3 objects: " + ex.getMessage(), ex);
+    }
+  }
+
+  public S3ObjectMetadata headObject(String key) {
+    String resolved = resolveRequiredKey(key);
+    try {
+      HeadObjectResponse response =
+          client.headObject(HeadObjectRequest.builder().bucket(bucket).key(resolved).build());
+      return fromHead(resolved, response);
+    } catch (S3Exception ex) {
+      throw toOperationException("HeadObject", ex, resolved);
+    } catch (Exception ex) {
+      throw new IllegalStateException(
+          "Failed to read metadata for object '" + resolved + "': " + ex.getMessage(), ex);
+    }
+  }
+
+  public S3ObjectContent readObject(S3ReadObjectRequest request) {
+    Objects.requireNonNull(request, "request");
+    String resolved = resolveRequiredKey(request.key());
+    try {
+      GetObjectRequest.Builder builder = GetObjectRequest.builder().bucket(bucket).key(resolved);
+      String range = toRangeHeader(request.rangeStart(), request.rangeEnd());
+      if (range != null) {
+        builder.range(range);
+      }
+      ResponseBytes<GetObjectResponse> response =
+          client.getObject(builder.build(), ResponseTransformer.toBytes());
+      GetObjectResponse metadata = response.response();
+      return new S3ObjectContent(
+          response.asByteArray(), fromGet(resolved, metadata), metadata.contentType());
+    } catch (S3Exception ex) {
+      throw toOperationException("GetObject", ex, resolved);
+    } catch (Exception ex) {
+      throw new IllegalStateException(
+          "Failed to read S3 object '" + resolved + "': " + ex.getMessage(), ex);
+    }
+  }
+
+  public S3ObjectContent readObject(String key) {
+    return readObject(S3ReadObjectRequest.builder().withKey(key).build());
+  }
+
+  public void uploadObject(S3UploadRequest request) {
+    Objects.requireNonNull(request, "request");
+    String resolved = resolveRequiredKey(request.key());
+    try {
+      PutObjectRequest.Builder builder = PutObjectRequest.builder().bucket(bucket).key(resolved);
+      if (hasText(request.contentType())) {
+        builder.contentType(request.contentType());
+      }
+      if (!request.metadata().isEmpty()) {
+        builder.metadata(request.metadata());
+      }
+      PutObjectRequest putRequest = builder.build();
+      if (request.bytes() != null) {
+        client.putObject(putRequest, RequestBody.fromBytes(request.bytes()));
+      } else {
+        InputStream stream = Objects.requireNonNull(request.stream(), "stream");
+        long length = request.contentLength();
+        if (length < 0) {
+          throw new IllegalArgumentException("contentLength must be >= 0 for stream uploads");
+        }
+        try {
+          client.putObject(putRequest, RequestBody.fromInputStream(stream, length));
+        } finally {
+          if (request.closeStream()) {
+            try {
+              stream.close();
+            } catch (Exception ignore) {
+            }
+          }
+        }
+      }
+    } catch (S3Exception ex) {
+      throw toOperationException("PutObject", ex, resolved);
+    } catch (Exception ex) {
+      throw new IllegalStateException(
+          "Failed to upload S3 object '" + resolved + "': " + ex.getMessage(), ex);
+    }
+  }
+
+  public void deleteObject(String key) {
+    String resolved = resolveRequiredKey(key);
+    try {
+      client.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(resolved).build());
+    } catch (S3Exception ex) {
+      throw toOperationException("DeleteObject", ex, resolved);
+    } catch (Exception ex) {
+      throw new IllegalStateException(
+          "Failed to delete S3 object '" + resolved + "': " + ex.getMessage(), ex);
+    }
+  }
+
+  public S3DeleteResult deleteObjects(List<String> keys) {
+    if (Strings.isEmpty(keys)) {
+      return new S3DeleteResult(0, List.of());
+    }
+    List<ObjectIdentifier> identifiers =
+        keys.stream()
+            .filter(Objects::nonNull)
+            .map(this::resolveRequiredKey)
+            .map(key -> ObjectIdentifier.builder().key(key).build())
+            .collect(Collectors.toList());
+    if (identifiers.isEmpty()) {
+      return new S3DeleteResult(0, List.of());
+    }
+    List<String> failed = new ArrayList<>();
+    int deleted = 0;
+    try {
+      for (int offset = 0; offset < identifiers.size(); offset += DELETE_BATCH_LIMIT) {
+        int to = Math.min(offset + DELETE_BATCH_LIMIT, identifiers.size());
+        List<ObjectIdentifier> batch = identifiers.subList(offset, to);
+        DeleteObjectsResponse response =
+            client.deleteObjects(
+                DeleteObjectsRequest.builder()
+                    .bucket(bucket)
+                    .delete(Delete.builder().objects(batch).build())
+                    .build());
+        deleted += response.deleted() == null ? 0 : response.deleted().size();
+        if (response.errors() != null) {
+          response.errors().stream()
+              .map(error -> error.key())
+              .filter(Objects::nonNull)
+              .forEach(failed::add);
+        }
+      }
+      return new S3DeleteResult(deleted, List.copyOf(failed));
+    } catch (S3Exception ex) {
+      throw toOperationException("DeleteObjects", ex, null);
+    } catch (Exception ex) {
+      throw new IllegalStateException("Failed to delete S3 objects: " + ex.getMessage(), ex);
+    }
+  }
+
+  public String resolveKey(String key) {
+    String parsed = parseKeyOrUri(key, false);
+    if (parsed.isEmpty()) {
+      return basePrefix == null ? parsed : basePrefix;
+    }
+    return applyBasePrefix(parsed);
+  }
+
+  public synchronized void configureDuckdbSession(DuckdbSession session) {
+    Objects.requireNonNull(session, "session");
+    if (httpfsUnavailable) {
+      LOGGER.debug(
+          "DuckDB session httpfs extension already marked unavailable for connection={}; skipping retry",
+          name);
+      return;
+    }
+    if (!httpfsConfigured) {
+      boolean loaded = DuckdbExtensions.installAndLoadExtensionBestEffort(session, "httpfs");
+      if (!loaded) {
+        httpfsUnavailable = true;
+        LOGGER.warn(
+            "DuckDB session httpfs extension unavailable; skipping S3 DuckDB session configuration for connection={}",
+            name);
+        return;
+      }
+      httpfsConfigured = true;
+    }
+    session.exec("SET s3_region='" + escapeSql(region) + "'");
+    session.execSensitive("SET s3_access_key_id='" + escapeSql(accessKeyId) + "'");
+    session.execSensitive("SET s3_secret_access_key='" + escapeSql(secretAccessKey) + "'");
+    if (sessionToken != null) {
+      session.execSensitive("SET s3_session_token='" + escapeSql(sessionToken) + "'");
+    }
+    String configuredEndpoint = duckdbEndpoint();
+    session.exec("SET s3_endpoint='" + escapeSql(configuredEndpoint) + "'");
+    session.exec("SET s3_url_style='" + (pathStyleAccess ? "path" : "virtual_host") + "'");
+    session.exec("SET s3_use_ssl=" + (useSslForEndpoint ? "true" : "false"));
+    execOptionalDuckdbSetting(
+        session, "SET s3_allow_unverified_ssl=" + (useSslForEndpoint ? "false" : "true"));
+    // Keep misconfigured/unreachable endpoints from stalling catalog installs for minutes.
+    execBestEffortDuckdbSetting(session, "SET http_retries=" + DUCKDB_HTTP_RETRIES);
+    execBestEffortDuckdbSetting(session, "SET http_retry_wait_ms=" + DUCKDB_HTTP_RETRY_WAIT_MS);
+  }
+
+  private static void execOptionalDuckdbSetting(DuckdbSession session, String sql) {
+    try {
+      session.exec(sql);
+    } catch (IllegalStateException ex) {
+      String message = Strings.trimToNull(ex.getMessage());
+      String normalized = message == null ? "" : message.toLowerCase(Locale.ROOT);
+      if (normalized.contains("unrecognized configuration parameter")) {
+        return;
+      }
+      throw ex;
+    }
+  }
+
+  private static void execBestEffortDuckdbSetting(DuckdbSession session, String sql) {
+    try {
+      session.exec(sql);
+    } catch (IllegalStateException ex) {
+      LOGGER.debug("Skipping optional DuckDB setting sql={} reason={}", sql, compactReason(ex.getMessage()));
+    }
+  }
+
+  private String duckdbEndpoint() {
+    if (endpointUri == null) {
+      return "s3." + region.trim() + ".amazonaws.com";
+    }
+    String host = Strings.trimToNull(endpointUri.getHost());
+    if (host == null) {
+      throw new IllegalStateException(
+          "Invalid s3.endpointOverride for DuckDB endpoint resolution: " + endpointOverride);
+    }
+    int port = endpointUri.getPort();
+    if (port > 0) {
+      return host + ":" + port;
+    }
+    return host;
+  }
+
+  private S3Client buildClient() {
+    AwsCredentials credentials =
+        sessionToken == null
+            ? AwsBasicCredentials.create(accessKeyId, secretAccessKey)
+            : AwsSessionCredentials.create(accessKeyId, secretAccessKey, sessionToken);
+    S3ClientBuilder builder =
+        S3Client.builder()
+            .region(Region.of(region))
+            .credentialsProvider(StaticCredentialsProvider.create(credentials))
+            .forcePathStyle(pathStyleAccess);
+    if (endpointUri != null) {
+      builder.endpointOverride(endpointUri);
+    }
+    return builder.build();
+  }
+
+  private static String normalizePrefix(String value) {
+    String trimmed = Strings.trimToNull(value);
+    if (trimmed == null) {
+      return null;
+    }
+    String normalized = trimmed.replace('\\', '/');
+    while (normalized.startsWith("/")) {
+      normalized = normalized.substring(1);
+    }
+    while (normalized.endsWith("/")) {
+      normalized = normalized.substring(0, normalized.length() - 1);
+    }
+    return Strings.trimToNull(normalized);
+  }
+
+  private String resolveRequiredKey(String value) {
+    String resolved = resolveKey(value);
+    if (Strings.isBlank(resolved)) {
+      throw new IllegalArgumentException("object key is required");
+    }
+    return resolved;
+  }
+
+  private String parseKeyOrUri(String value, boolean allowEmpty) {
+    String trimmed = Strings.trimToNull(value);
+    if (trimmed == null) {
+      if (allowEmpty) {
+        return "";
+      }
+      throw new IllegalArgumentException("object key is required");
+    }
+    if (isS3Uri(trimmed)) {
+      URI uri;
+      try {
+        uri = URI.create(trimmed);
+      } catch (Exception ex) {
+        throw new IllegalArgumentException("Invalid S3 URI: " + value, ex);
+      }
+      String uriBucket = Strings.trimToNull(uri.getHost());
+      if (uriBucket == null) {
+        throw new IllegalArgumentException("S3 URI must include a bucket name: " + value);
+      }
+      if (!bucket.equals(uriBucket)) {
+        throw new IllegalArgumentException(
+            "S3 URI bucket mismatch: expected '" + bucket + "' but was '" + uriBucket + "'");
+      }
+      String path = Strings.trimToNull(uri.getPath());
+      if (path == null || "/".equals(path)) {
+        return "";
+      }
+      return path.startsWith("/") ? path.substring(1) : path;
+    }
+    String normalized = trimmed.replace('\\', '/');
+    while (normalized.startsWith("/")) {
+      normalized = normalized.substring(1);
+    }
+    return normalized;
+  }
+
+  private String applyBasePrefix(String key) {
+    if (!hasText(basePrefix) || !hasText(key)) {
+      return key;
+    }
+    if (key.equals(basePrefix) || key.startsWith(basePrefix + "/")) {
+      return key;
+    }
+    return basePrefix + "/" + key;
+  }
+
+  private static S3ObjectSummary toSummary(S3Object object) {
+    return new S3ObjectSummary(
+        object.key(),
+        object.size(),
+        object.lastModified(),
+        object.eTag(),
+        object.storageClassAsString());
+  }
+
+  private static S3ObjectMetadata fromHead(String key, HeadObjectResponse response) {
+    return new S3ObjectMetadata(
+        key,
+        response.contentLength(),
+        response.lastModified(),
+        response.eTag(),
+        response.contentType(),
+        response.contentEncoding(),
+        response.contentLanguage(),
+        response.metadata() == null ? Map.of() : Map.copyOf(response.metadata()));
+  }
+
+  private static S3ObjectMetadata fromGet(String key, GetObjectResponse response) {
+    return new S3ObjectMetadata(
+        key,
+        response.contentLength(),
+        response.lastModified(),
+        response.eTag(),
+        response.contentType(),
+        response.contentEncoding(),
+        response.contentLanguage(),
+        response.metadata() == null ? Map.of() : Map.copyOf(response.metadata()));
+  }
+
+  private static String toRangeHeader(Long start, Long end) {
+    if (start == null && end == null) {
+      return null;
+    }
+    long resolvedStart = Optional.ofNullable(start).orElse(0L);
+    if (resolvedStart < 0) {
+      throw new IllegalArgumentException("range start must be >= 0");
+    }
+    if (end != null && end < resolvedStart) {
+      throw new IllegalArgumentException("range end must be >= range start");
+    }
+    StringBuilder builder = new StringBuilder("bytes=").append(resolvedStart).append('-');
+    if (end != null) {
+      builder.append(end);
+    }
+    return builder.toString();
+  }
+
+  private static S3OperationException toOperationException(
+      String operation, S3Exception ex, String key) {
+    String errorCode = ex.awsErrorDetails() == null ? null : ex.awsErrorDetails().errorCode();
+    String message =
+        ex.awsErrorDetails() == null ? ex.getMessage() : ex.awsErrorDetails().errorMessage();
+    return new S3OperationException(operation, key, ex.statusCode(), errorCode, message, ex);
+  }
+
+  private static URI toEndpointUri(String value) {
+    String trimmed = Strings.trimToNull(value);
+    if (trimmed == null) {
+      return null;
+    }
+    String normalized = trimmed.contains("://") ? trimmed : "https://" + trimmed;
+    try {
+      return URI.create(normalized);
+    } catch (Exception ex) {
+      throw new IllegalArgumentException("Invalid s3.endpointOverride value: " + value, ex);
+    }
+  }
+
+  private static boolean isS3Uri(String value) {
+    return value != null
+        && (value.regionMatches(true, 0, "s3://", 0, "s3://".length())
+            || value.regionMatches(true, 0, "s3a://", 0, "s3a://".length()));
+  }
+
+  private static boolean hasText(String value) {
+    return !Strings.isBlank(value);
+  }
+
+  @Override
+  public void close() {
+    try {
+      client.close();
+    } catch (Exception ignore) {
+    }
+  }
+
+  private static String escapeSql(String value) {
+    return value.replace("'", "''");
+  }
+
+  private static String compactReason(String value) {
+    String reason = Strings.trimToNull(value);
+    if (reason == null) {
+      return "unknown";
+    }
+    return reason.length() > 180 ? reason.substring(0, 177) + "..." : reason;
+  }
+}
