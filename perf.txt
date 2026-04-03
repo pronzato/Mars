@@ -1,1 +1,35 @@
-null
+h1. Accessibility
+
+Accessibility is a core requirement for Fabric Stitch and is treated as a built-in platform capability rather than an optional enhancement.
+
+Fabric Stitch is designed to support enterprise accessibility requirements, including visually impaired users, keyboard-only users, and assistive technology users.
+
+Accessibility is achieved through a combination of Vaadin’s component model and Fabric Stitch’s strict reuse of UI patterns.
+
+The following summarizes the accessibility capabilities supported across the platform:
+
+| Area | Support |
+|---|---|
+| Standards Alignment | Designed to align with WCAG 2.1 AA principles through Vaadin components and consistent UI patterns |
+| Screen Reader Support | Semantic HTML and ARIA roles provided by Vaadin components |
+| Keyboard Navigation | Full keyboard navigation across navigation, dialogs, tables, and forms |
+| Focus Management | Consistent focus behavior across dialogs, tabs, and workflows |
+| Visual Hierarchy | Structured layouts and consistent component usage improve readability and usability |
+| Contrast and Readability | Dark theme with strong contrast and consistent spacing |
+| Form Accessibility | Consistent labeling, validation messaging, and interaction patterns |
+| Component Consistency | Reuse of components ensures accessibility behavior is implemented once and applied everywhere |
+
+Fabric Stitch enforces accessibility through design:
+
+- all screens use the same component set
+- layout patterns are consistent across the platform
+- interaction models (dialogs, tabs, edit flows) are standardized
+- developers are encouraged to reuse components rather than build custom UI
+
+This approach ensures that accessibility is not dependent on individual screen implementations and scales consistently across the platform.
+
+This is particularly important in enterprise environments where:
+
+- accessibility is a regulatory requirement
+- user populations are diverse
+- consistency and predictability are critical
