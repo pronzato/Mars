@@ -1,3 +1,1 @@
-Get-ChildItem -Recurse -Filter *.wiki | ForEach-Object { $c = Get-Content $_.FullName -Raw; $u = [regex]::Replace($c, '!(?!Fabric\^)([^!\r\n]+\.(png|jpg|jpeg|gif|bmp|webp))!', '!Fabric^$1!', 'IgnoreCase'); if ($u -ne $c) { [System.IO.File]::WriteAllText($_.FullName, $u, (New-Object System.Text.UTF8Encoding($false))) } }
-
-Get-ChildItem -Recurse -Filter *.wiki | ForEach-Object { $c = Get-Content $_.FullName -Raw; $u = [regex]::Replace($c, '(?m)^\-\-\-\r?\n?', ''); if ($u -ne $c) { [System.IO.File]::WriteAllText($_.FullName, $u, (New-Object System.Text.UTF8Encoding($false))) } }
+null
