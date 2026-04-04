@@ -1,1 +1,153 @@
-null
+vault\git\dev\platform\connection\risk-api.json
+{
+  "envelope" : {
+    "group" : "platform",
+    "type" : "CONNECTION",
+    "name" : "risk-api",
+    "uuid" : "19f2f239-8a45-4e75-b1d2-2fe8d8f4b1cf",
+    "enabled" : true,
+    "lifecycleStatus" : "ACTIVE",
+    "createdTimeUtc" : "2026-04-04T10:35:00Z",
+    "createdBy" : "Alice",
+    "updatedTimeUtc" : "2026-04-04T10:35:00Z",
+    "updatedBy" : "Alice"
+  },
+  "connectionType" : "API",
+  "api" : {
+    "apiName" : "Risk Service",
+    "apiType" : "risk",
+    "protocol" : "HTTPS",
+    "baseUrl" : "https://risk.fabric.internal",
+    "basePath" : "/v1",
+    "namespace" : "equities",
+    "clientId" : "fabric-risk-client",
+    "auth" : {
+      "type" : "OAUTH_CLIENT_CREDENTIALS",
+      "credentialsSecretRef" : "secret://platform/risk-api-oauth",
+      "audience" : "risk-service",
+      "scope" : "risk.read risk.write",
+      "forwardBearerToken" : true,
+      "forwardDelegatedSubject" : true,
+      "delegatedSubjectHeader" : "x-fabric-obo-user",
+      "bearerHeaderName" : "authorization"
+    },
+    "defaultHeaders" : {
+      "x-tenant" : "equities",
+      "x-caller-app" : "risk-engine"
+    },
+    "connectTimeoutMs" : 8000,
+    "readTimeoutMs" : 30000
+  },
+  "physicalSites" : [ ],
+  "physical" : {
+    "connectionType" : "API",
+    "uriOrEndpoint" : "https://risk.fabric.internal/v1",
+    "regionOrLocation" : "us-east-1",
+    "options" : { },
+    "tags" : {
+      "domain" : "risk"
+    }
+  },
+  "mode" : "PHYSICAL"
+}
+
+
+
+
+vault\git\dev\platform\environment\environment.json
+{
+  "version" : 1,
+  "environments" : [ {
+    "environment" : "DEV",
+    "regions" : [ {
+      "region" : "AMRS",
+      "sites" : [ {
+        "site" : "AMRS1",
+        "amps" : [ {
+          "name" : "local-amps",
+          "endpoints" : [ "127.0.0.1:9507" ]
+        } ]
+      } ]
+    } ]
+  } ],
+  "entitlements" : {
+    "implementation" : "SIMPLE",
+    "events" : {
+      "enabled" : true,
+      "transport" : "AMPS",
+      "amps" : {
+        "connection" : "amps-fabric-discovery",
+        "topic" : "/fabric/events/entitlements",
+        "maxRetries" : 3,
+        "initialBackoffMillis" : 100,
+        "maxBackoffMillis" : 2000,
+        "backoffMultiplier" : 2.0
+      }
+    },
+    "defaultProviderId" : "platform-model",
+    "providers" : [ {
+      "id" : "platform-model",
+      "type" : "platform-model",
+      "enabled" : true,
+      "config" : { }
+    } ]
+  },
+  "configs" : {
+    "implementation" : "DEFAULT",
+    "events" : {
+      "enabled" : true,
+      "transport" : "AMPS",
+      "amps" : {
+        "connection" : "amps-fabric-discovery",
+        "topic" : "/fabric/events/config",
+        "maxRetries" : 3,
+        "initialBackoffMillis" : 100,
+        "maxBackoffMillis" : 2000,
+        "backoffMultiplier" : 2.0
+      }
+    }
+  },
+  "cadence" : {
+    "appStatusSeconds" : 30,
+    "serviceHeartbeatSeconds" : 10,
+    "serviceStatusSeconds" : 30,
+    "dataStatusSeconds" : 30
+  },
+  "sso" : {
+    "enabled" : true,
+    "mode" : "OIDC",
+    "oidc" : {
+      "issuer" : "https://sso.dev.fabric.local",
+      "jwksUrl" : "https://sso.dev.fabric.local/oauth2/jwks",
+      "audience" : "fabric-api",
+      "clientId" : "fabric-studio",
+      "skewSeconds" : 60,
+      "tokenHeaderName" : "authorization"
+    },
+    "bearer" : {
+      "enabled" : true,
+      "headerName" : "authorization",
+      "tokenType" : "Bearer"
+    },
+    "spoof" : {
+      "enabled" : true,
+      "allowEditing" : true,
+      "defaultUsername" : "user:alice"
+    }
+  },
+  "configId" : "platform-environment",
+  "effectiveConfigId" : "platform-environment",
+  "envelope" : {
+    "group" : "platform",
+    "type" : "ENVIRONMENT",
+    "name" : "environment",
+    "uuid" : "fd37ed58-964e-4d69-9eb4-4077a102c488",
+    "enabled" : true,
+    "lifecycleStatus" : "ACTIVE",
+    "createdTimeUtc" : "2026-01-02T20:19:15.788Z",
+    "createdBy" : "import/fixup",
+    "updatedTimeUtc" : "2026-01-02T21:26:18.475Z",
+    "updatedBy" : "import/fixup"
+  }
+}
+
