@@ -1,1 +1,329 @@
-null
+package org.pronzato.fabric.config.patch;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+import java.util.Base64;
+
+public final class PatchInstaller {
+  private static final String DEFAULT_PATCH_RELATIVE = "docs/patches/patch.txt";
+  private static final String CONTENT_ENCODING_BASE64 = "BASE64";
+  private static final String LEGACY_DOCS_WIKI_PREFIX = "docs/wiki/";
+  private static final String LEGACY_DOCS_STANDARDS_PREFIX = "docs/standards/";
+  private static final String DOCS_MODULE_PREFIX = "fabric-lite-docs/src/main/resources/docs/";
+  private static final String FEATHER_ICONS_PREFIX =
+      "fabric-lite-stitch/src/main/resources/META-INF/resources/images/icons/feather/";
+  private static final String STITCH_THEME_STYLES_PATH =
+      "fabric-lite-stitch/src/main/resources/META-INF/resources/frontend/themes/stitch/styles.css";
+  private static final String VAULT_GIT_PREFIX = "fabric-lite-config/git/";
+  private static final String VAULT_DEV_PREFIX = "fabric-lite-config/git/dev/";
+
+  private PatchInstaller() {}
+
+  public static void main(String[] args) {
+    if (true) {
+      System.out.println("running installer not allowed in this environment");
+      return;
+    }
+    if (args.length > 2) {
+      System.err.println(
+          "Usage: java org.pronzato.fabric.config.patch.PatchInstaller [patch.txt] [repoRoot]");
+      System.exit(2);
+    }
+
+    Path cwd = Paths.get("").toAbsolutePath().normalize();
+    Path repoRoot;
+    Path patchPath;
+
+    try {
+      if (args.length == 0) {
+        repoRoot = findRepoRoot(cwd);
+        patchPath = repoRoot.resolve(DEFAULT_PATCH_RELATIVE).normalize();
+      } else if (args.length == 1) {
+        repoRoot = findRepoRoot(cwd);
+        patchPath = resolveFrom(cwd, args[0]);
+      } else {
+        patchPath = resolveFrom(cwd, args[0]);
+        repoRoot = resolveFrom(cwd, args[1]);
+      }
+    } catch (Exception e) {
+      System.err.println("Patch initialization failed: " + e.getMessage());
+      System.exit(2);
+      return;
+    }
+
+    try {
+      runInstaller(patchPath, repoRoot);
+    } catch (Exception e) {
+      System.err.println("Patch installation failed: " + e.getMessage());
+      System.exit(1);
+    }
+  }
+
+  private static void runInstaller(Path patchPath, Path repoRoot) throws IOException {
+    if (!Files.exists(patchPath)) {
+      throw new IllegalArgumentException("Patch file does not exist: " + patchPath);
+    }
+    if (!Files.isDirectory(repoRoot)) {
+      throw new IllegalArgumentException("Repo root is not a directory: " + repoRoot);
+    }
+
+    int writes = 0;
+    int deletes = 0;
+    int deleteSkipped = 0;
+    int unsupportedSkipped = 0;
+    int errors = 0;
+    boolean noChanges = false;
+
+    try (BufferedReader reader = Files.newBufferedReader(patchPath, StandardCharsets.UTF_8)) {
+      String line;
+      int lineNo = 0;
+      boolean started = false;
+
+      while ((line = reader.readLine()) != null) {
+        lineNo++;
+        if (line.isBlank()) {
+          continue;
+        }
+        if ("NO_CHANGES".equals(line)) {
+          noChanges = true;
+          break;
+        }
+        if ("BEGIN_FILE".equals(line)) {
+          started = true;
+          PatchEntry entry = readEntry(reader, lineNo);
+          lineNo = entry.lastLineNumber;
+          if (!isPatchablePath(entry.path)) {
+            unsupportedSkipped++;
+            System.out.println("SKIP_UNSUPPORTED " + entry.path);
+            continue;
+          }
+          Path target = resolveTarget(repoRoot, entry.path);
+
+          try {
+            if (entry.action == Action.WRITE) {
+              Path parent = target.getParent();
+              if (parent != null) {
+                Files.createDirectories(parent);
+              }
+              Files.write(
+                  target,
+                  entry.contentBytes,
+                  StandardOpenOption.CREATE,
+                  StandardOpenOption.TRUNCATE_EXISTING);
+              writes++;
+              System.out.println("WRITE  " + entry.path);
+            } else {
+              if (Files.exists(target)) {
+                Files.delete(target);
+                deletes++;
+                System.out.println("DELETE " + entry.path);
+              } else {
+                deleteSkipped++;
+                System.out.println("SKIP_DELETE_MISSING " + entry.path);
+              }
+            }
+          } catch (Exception e) {
+            errors++;
+            System.err.println("ERROR applying " + entry.action + " for " + entry.path + ": " + e.getMessage());
+          }
+          continue;
+        }
+
+        if (!started) {
+          continue;
+        }
+        throw new IllegalArgumentException("Malformed patch at line " + lineNo + ": expected BEGIN_FILE or EOF");
+      }
+    }
+
+    if (noChanges) {
+      System.out.println("Patch contains NO_CHANGES. Nothing to apply.");
+    }
+
+    System.out.println();
+    System.out.println("Patch apply summary");
+    System.out.println("  repoRoot            : " + repoRoot);
+    System.out.println("  patchFile           : " + patchPath);
+    System.out.println("  files written       : " + writes);
+    System.out.println("  files deleted       : " + deletes);
+    System.out.println("  delete skipped      : " + deleteSkipped);
+    System.out.println("  unsupported skipped : " + unsupportedSkipped);
+    System.out.println("  errors              : " + errors);
+
+    if (errors > 0) {
+      throw new IllegalStateException("Patch completed with " + errors + " error(s).");
+    }
+  }
+
+  private static Path findRepoRoot(Path start) {
+    Path current = start;
+    while (current != null) {
+      Path candidatePatch = current.resolve(DEFAULT_PATCH_RELATIVE).normalize();
+      if (Files.exists(candidatePatch)) {
+        return current;
+      }
+      current = current.getParent();
+    }
+    throw new IllegalArgumentException(
+        "Could not find repo root containing " + DEFAULT_PATCH_RELATIVE + " starting from " + start);
+  }
+
+  private static Path resolveFrom(Path base, String pathText) {
+    Path path = Paths.get(pathText);
+    if (!path.isAbsolute()) {
+      path = base.resolve(path);
+    }
+    return path.toAbsolutePath().normalize();
+  }
+
+  private static PatchEntry readEntry(BufferedReader reader, int beginLineNo) throws IOException {
+    int lineNo = beginLineNo;
+
+    String actionLine = reader.readLine();
+    lineNo++;
+    String pathLine = reader.readLine();
+    lineNo++;
+    String moduleLine = reader.readLine();
+    lineNo++;
+    String packageLine = reader.readLine();
+    lineNo++;
+
+    String actionValue = parseField(actionLine, "ACTION", lineNo - 3);
+    String pathValue = parseField(pathLine, "PATH", lineNo - 2);
+    parseField(moduleLine, "MODULE", lineNo - 1); // parsed for validation; not used by installer
+    parseField(packageLine, "PACKAGE", lineNo); // parsed for validation; not used by installer
+
+    Action action;
+    if ("WRITE".equals(actionValue)) {
+      action = Action.WRITE;
+    } else if ("DELETE".equals(actionValue)) {
+      action = Action.DELETE;
+    } else {
+      throw new IllegalArgumentException("Invalid ACTION at line " + (lineNo - 3) + ": " + actionValue);
+    }
+
+    byte[] contentBytes = new byte[0];
+    if (action == Action.WRITE) {
+      String contentEncodingLine = reader.readLine();
+      lineNo++;
+      if (contentEncodingLine == null || !contentEncodingLine.startsWith("CONTENT_ENCODING:")) {
+        throw new IllegalArgumentException(
+            "Malformed patch at line "
+                + lineNo
+                + ": expected CONTENT_ENCODING: BASE64 (legacy UTF-8 patches are not supported; regenerate with PatchGenerator)");
+      }
+      String contentEncoding = parseField(contentEncodingLine, "CONTENT_ENCODING", lineNo);
+      String contentStart = reader.readLine();
+      lineNo++;
+      if (!"CONTENT_START".equals(contentStart)) {
+        throw new IllegalArgumentException("Malformed patch at line " + lineNo + ": expected CONTENT_START");
+      }
+
+      StringBuilder content = new StringBuilder();
+      String line;
+      while ((line = reader.readLine()) != null) {
+        lineNo++;
+        if ("CONTENT_END".equals(line)) {
+          break;
+        }
+        content.append(line).append('\n');
+      }
+      if (content.length() > 0) {
+        content.setLength(content.length() - 1);
+      }
+      if (line == null) {
+        throw new IllegalArgumentException("Malformed patch: missing CONTENT_END for " + pathValue);
+      }
+
+      contentBytes = decodeContent(content.toString(), contentEncoding, pathValue);
+    }
+
+    String endFile = reader.readLine();
+    lineNo++;
+    if (!"END_FILE".equals(endFile)) {
+      throw new IllegalArgumentException("Malformed patch at line " + lineNo + ": expected END_FILE");
+    }
+
+    return new PatchEntry(action, pathValue, contentBytes, lineNo);
+  }
+
+  private static String parseField(String line, String key, int lineNo) {
+    String prefix = key + ":";
+    if (line == null || !line.startsWith(prefix)) {
+      throw new IllegalArgumentException("Malformed patch at line " + lineNo + ": expected " + key + ":");
+    }
+    return line.substring(prefix.length()).trim();
+  }
+
+  private static boolean isPatchablePath(String path) {
+    String normalized = path.trim().replace('\\', '/');
+    if (normalized.startsWith(VAULT_GIT_PREFIX) || normalized.startsWith(VAULT_DEV_PREFIX)) {
+      return true;
+    }
+    if (STITCH_THEME_STYLES_PATH.equals(normalized)) {
+      return true;
+    }
+    if (normalized.startsWith(LEGACY_DOCS_WIKI_PREFIX)) {
+      return true;
+    }
+    if (normalized.startsWith(LEGACY_DOCS_STANDARDS_PREFIX)) {
+      return true;
+    }
+    if (normalized.startsWith(DOCS_MODULE_PREFIX)) {
+      return true;
+    }
+    if (normalized.startsWith(FEATHER_ICONS_PREFIX)) {
+      return true;
+    }
+    if (normalized.endsWith(".java")) {
+      return true;
+    }
+    return normalized.contains("/src/main/resources/");
+  }
+
+  private static Path resolveTarget(Path repoRoot, String relativePath) {
+    String normalizedRelative = relativePath.replace('\\', '/');
+    Path target = repoRoot.resolve(normalizedRelative).normalize();
+    if (!target.startsWith(repoRoot)) {
+      throw new IllegalArgumentException("Unsafe path outside repo root: " + relativePath);
+    }
+    return target;
+  }
+
+  private static byte[] decodeContent(String content, String encoding, String pathValue) {
+    if (CONTENT_ENCODING_BASE64.equalsIgnoreCase(encoding)) {
+      try {
+        return Base64.getDecoder().decode(content.replaceAll("\\s+", ""));
+      } catch (IllegalArgumentException e) {
+        throw new IllegalArgumentException("Invalid BASE64 content for " + pathValue + ": " + e.getMessage(), e);
+      }
+    }
+    throw new IllegalArgumentException("Unsupported CONTENT_ENCODING for " + pathValue + ": " + encoding);
+  }
+
+  private enum Action {
+    WRITE,
+    DELETE
+  }
+
+  private static final class PatchEntry {
+    private final Action action;
+    private final String path;
+    private final byte[] contentBytes;
+    private final int lastLineNumber;
+
+    private PatchEntry(Action action, String path, byte[] contentBytes, int lastLineNumber) {
+      this.action = action;
+      this.path = path;
+      this.contentBytes = contentBytes;
+      this.lastLineNumber = lastLineNumber;
+    }
+  }
+}
+
+
