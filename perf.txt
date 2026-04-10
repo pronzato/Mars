@@ -1,1 +1,3 @@
-null
+mvn -pl fabric-lite-stitch-studio -am clean package "-DskipTests" "-Dstitch.uber.skip=false"
+
+java "-Dfabric.group=platform" "-Dfabric.name=studio" "-Dfabric.instance=instance1" "-Dfabric.discoveryUrls=127.0.0.1:9507" "-Dfabric.kerberosKeytabPath=C:/dev/fabric/vault/kerberos/dfabric.keytab" "-Dfabric.kerberosUsername=dfabric" "-Dfabric.secretKeyFile=C:/dev/fabric/vault/keys/platform/platform.fabrickey" "-Dfabric.tlsTrustCertPath=C:/dev/fabric/vault/tls/demo-ca.pem" "-Dfabric.port=8080" -jar "C:/dev/fabric/fabric-lite-stitch-studio/target/fabric-lite-stitch-studio-1.0.0-SNAPSHOT-uber.jar"
