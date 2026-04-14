@@ -1,1 +1,281 @@
-null
+fabric-lite-config\git\dev\oms\entitlement\services_oms-order-service.json
+{
+  "envelope" : {
+    "group" : "oms",
+    "type" : "ENTITLEMENT",
+    "name" : "overrides/services/oms-order-service",
+    "uuid" : "a12d6380-f4f9-447f-b2ce-a1d2e7bd2fd0",
+    "enabled" : true,
+    "lifecycleStatus" : "ACTIVE",
+    "createdTimeUtc" : "2026-04-13T18:50:00Z",
+    "createdBy" : "fabric-lite",
+    "updatedTimeUtc" : "2026-04-13T19:10:18.605186300Z",
+    "updatedBy" : "fabric-lite"
+  },
+  "labels" : {
+    "defaultPlatformInvoke" : "true",
+    "managedBy" : "fabric-lite-defaults"
+  },
+  "notes" : [ "Auto-created service entitlement" ],
+  "policies" : [ {
+    "bindings" : [ {
+      "action" : "service.start",
+      "attributes" : { },
+      "bindingId" : "service-start-allow-app-0",
+      "context" : { },
+      "effect" : "ALLOW",
+      "enabled" : true,
+      "obligations" : {
+        "columnsAllow" : [ ],
+        "columnsMask" : [ ],
+        "datasetScope" : [ ],
+        "methodsAllow" : [ ],
+        "parameters" : { },
+        "rowFilters" : [ ]
+      },
+      "subject" : "app:oms/grpc-sim"
+    }, {
+      "action" : "service.invoke",
+      "attributes" : { },
+      "bindingId" : "service-invoke-allow-app-client-0",
+      "context" : { },
+      "effect" : "ALLOW",
+      "enabled" : true,
+      "obligations" : {
+        "columnsAllow" : [ ],
+        "columnsMask" : [ ],
+        "datasetScope" : [ ],
+        "methodsAllow" : [ ],
+        "parameters" : { },
+        "rowFilters" : [ ]
+      },
+      "subject" : "app:oms/client"
+    }, {
+      "action" : "service.invoke",
+      "attributes" : { },
+      "bindingId" : "service-invoke-allow-app-stitch-oms-1",
+      "context" : { },
+      "effect" : "ALLOW",
+      "enabled" : true,
+      "obligations" : {
+        "columnsAllow" : [ ],
+        "columnsMask" : [ ],
+        "datasetScope" : [ ],
+        "methodsAllow" : [ ],
+        "parameters" : { },
+        "rowFilters" : [ ]
+      },
+      "subject" : "app:oms/stitch-oms"
+    }, {
+      "action" : "service.invoke",
+      "attributes" : { },
+      "bindingId" : "service-invoke-allow-app-platform-studio-2",
+      "context" : { },
+      "effect" : "ALLOW",
+      "enabled" : true,
+      "obligations" : {
+        "columnsAllow" : [ ],
+        "columnsMask" : [ ],
+        "datasetScope" : [ ],
+        "methodsAllow" : [ ],
+        "parameters" : { },
+        "rowFilters" : [ ]
+      },
+      "subject" : "app:platform/studio"
+    }, {
+      "action" : "service.invoke",
+      "attributes" : { },
+      "bindingId" : "service-invoke-allow-group-0",
+      "context" : { },
+      "effect" : "ALLOW",
+      "enabled" : true,
+      "obligations" : {
+        "columnsAllow" : [ ],
+        "columnsMask" : [ ],
+        "datasetScope" : [ ],
+        "methodsAllow" : [ ],
+        "parameters" : { },
+        "rowFilters" : [ ]
+      },
+      "subject" : "group:oms"
+    }, {
+      "action" : "service.invoke",
+      "attributes" : { },
+      "bindingId" : "service-invoke-allow-group-1",
+      "context" : { },
+      "effect" : "ALLOW",
+      "enabled" : true,
+      "obligations" : {
+        "columnsAllow" : [ ],
+        "columnsMask" : [ ],
+        "datasetScope" : [ ],
+        "methodsAllow" : [ ],
+        "parameters" : { },
+        "rowFilters" : [ ]
+      },
+      "subject" : "group:platform"
+    } ],
+    "description" : "Service entitlements",
+    "enabled" : true,
+    "group" : "oms",
+    "lifecycleStatus" : "ACTIVE",
+    "metadata" : { },
+    "name" : "oms-order-service",
+    "policyId" : "service:oms/oms-order-service",
+    "policyUsage" : "SERVICE",
+    "resourceId" : "service:oms/oms-order-service",
+    "schemaVersion" : "1.0",
+    "scopeType" : "SERVICE",
+    "type" : "SERVICE",
+    "usageGroup" : "service-oms-order-service",
+    "version" : "1"
+  } ],
+  "relationships" : [ ],
+  "scopeId" : "service:oms/oms-order-service",
+  "scopeType" : "service"
+}
+
+
+
+
+
+fabric-lite-config\git\dev\oms\entitlement\services_oms-quote-service.json
+{
+  "envelope" : {
+    "group" : "oms",
+    "type" : "ENTITLEMENT",
+    "name" : "overrides/services/oms-quote-service",
+    "uuid" : "0ce3d3a8-7ce8-4d8f-8f5e-f9a4f6c63871",
+    "enabled" : true,
+    "lifecycleStatus" : "ACTIVE",
+    "createdTimeUtc" : "2026-04-13T18:50:00Z",
+    "createdBy" : "fabric-lite",
+    "updatedTimeUtc" : "2026-04-13T19:10:18.295970100Z",
+    "updatedBy" : "fabric-lite"
+  },
+  "labels" : {
+    "defaultPlatformInvoke" : "true",
+    "managedBy" : "fabric-lite-defaults"
+  },
+  "notes" : [ "Auto-created service entitlement" ],
+  "policies" : [ {
+    "bindings" : [ {
+      "action" : "service.start",
+      "attributes" : { },
+      "bindingId" : "service-start-allow-app-0",
+      "context" : { },
+      "effect" : "ALLOW",
+      "enabled" : true,
+      "obligations" : {
+        "columnsAllow" : [ ],
+        "columnsMask" : [ ],
+        "datasetScope" : [ ],
+        "methodsAllow" : [ ],
+        "parameters" : { },
+        "rowFilters" : [ ]
+      },
+      "subject" : "app:oms/grpc-sim"
+    }, {
+      "action" : "service.invoke",
+      "attributes" : { },
+      "bindingId" : "service-invoke-allow-app-client-0",
+      "context" : { },
+      "effect" : "ALLOW",
+      "enabled" : true,
+      "obligations" : {
+        "columnsAllow" : [ ],
+        "columnsMask" : [ ],
+        "datasetScope" : [ ],
+        "methodsAllow" : [ ],
+        "parameters" : { },
+        "rowFilters" : [ ]
+      },
+      "subject" : "app:oms/client"
+    }, {
+      "action" : "service.invoke",
+      "attributes" : { },
+      "bindingId" : "service-invoke-allow-app-stitch-oms-1",
+      "context" : { },
+      "effect" : "ALLOW",
+      "enabled" : true,
+      "obligations" : {
+        "columnsAllow" : [ ],
+        "columnsMask" : [ ],
+        "datasetScope" : [ ],
+        "methodsAllow" : [ ],
+        "parameters" : { },
+        "rowFilters" : [ ]
+      },
+      "subject" : "app:oms/stitch-oms"
+    }, {
+      "action" : "service.invoke",
+      "attributes" : { },
+      "bindingId" : "service-invoke-allow-app-platform-studio-2",
+      "context" : { },
+      "effect" : "ALLOW",
+      "enabled" : true,
+      "obligations" : {
+        "columnsAllow" : [ ],
+        "columnsMask" : [ ],
+        "datasetScope" : [ ],
+        "methodsAllow" : [ ],
+        "parameters" : { },
+        "rowFilters" : [ ]
+      },
+      "subject" : "app:platform/studio"
+    }, {
+      "action" : "service.invoke",
+      "attributes" : { },
+      "bindingId" : "service-invoke-allow-group-0",
+      "context" : { },
+      "effect" : "ALLOW",
+      "enabled" : true,
+      "obligations" : {
+        "columnsAllow" : [ ],
+        "columnsMask" : [ ],
+        "datasetScope" : [ ],
+        "methodsAllow" : [ ],
+        "parameters" : { },
+        "rowFilters" : [ ]
+      },
+      "subject" : "group:oms"
+    }, {
+      "action" : "service.invoke",
+      "attributes" : { },
+      "bindingId" : "service-invoke-allow-group-1",
+      "context" : { },
+      "effect" : "ALLOW",
+      "enabled" : true,
+      "obligations" : {
+        "columnsAllow" : [ ],
+        "columnsMask" : [ ],
+        "datasetScope" : [ ],
+        "methodsAllow" : [ ],
+        "parameters" : { },
+        "rowFilters" : [ ]
+      },
+      "subject" : "group:platform"
+    } ],
+    "description" : "Service entitlements",
+    "enabled" : true,
+    "group" : "oms",
+    "lifecycleStatus" : "ACTIVE",
+    "metadata" : { },
+    "name" : "oms-quote-service",
+    "policyId" : "service:oms/oms-quote-service",
+    "policyUsage" : "SERVICE",
+    "resourceId" : "service:oms/oms-quote-service",
+    "schemaVersion" : "1.0",
+    "scopeType" : "SERVICE",
+    "type" : "SERVICE",
+    "usageGroup" : "service-oms-quote-service",
+    "version" : "1"
+  } ],
+  "relationships" : [ ],
+  "scopeId" : "service:oms/oms-quote-service",
+  "scopeType" : "service"
+}
+
+
+
+
