@@ -1,1 +1,110 @@
-null
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class DuckdbS3ParquetStandalone {
+
+    private static final String DB_URL = "jdbc:duckdb:";
+
+    // Hardcode your local httpfs extension file path here.
+    // Example:
+    // C:/dev/fabric/duckdb/httpfs.duckdb_extension
+    // or
+    // C:/Users/youruser/.duckdb/extensions/v1.1.1/windows_amd64/httpfs.duckdb_extension
+    private static final String HTTPFS_EXTENSION_PATH = "C:/REPLACE/httpfs.duckdb_extension";
+
+    private static final String S3_BUCKET = "REPLACE_BUCKET";
+    private static final String S3_KEY = "fabric/test/duckdb_smoke/test.parquet";
+
+    private static final String S3_REGION = "REPLACE_REGION";
+    private static final String S3_ENDPOINT = "REPLACE_ENDPOINT";
+    private static final boolean S3_USE_SSL = true;
+    private static final String S3_URL_STYLE = "path";
+
+    private static final String S3_ACCESS_KEY_ID = "REPLACE_ACCESS_KEY";
+    private static final String S3_SECRET_ACCESS_KEY = "REPLACE_SECRET_KEY";
+
+    public static void main(String[] args) {
+        try {
+            Class.forName("org.duckdb.DuckDBDriver");
+
+            try (Connection conn = DriverManager.getConnection(DB_URL);
+                 Statement st = conn.createStatement()) {
+
+                System.out.println("Connected to DuckDB");
+
+                String loadSql = "LOAD '" + esc(HTTPFS_EXTENSION_PATH) + "'";
+                System.out.println(loadSql);
+                st.execute(loadSql);
+
+                set(st, "s3_region", S3_REGION);
+                set(st, "s3_endpoint", S3_ENDPOINT);
+                set(st, "s3_use_ssl", Boolean.toString(S3_USE_SSL));
+                set(st, "s3_url_style", S3_URL_STYLE);
+                set(st, "s3_access_key_id", S3_ACCESS_KEY_ID);
+                set(st, "s3_secret_access_key", S3_SECRET_ACCESS_KEY);
+
+                printSetting(st, "s3_region");
+                printSetting(st, "s3_endpoint");
+                printSetting(st, "s3_use_ssl");
+                printSetting(st, "s3_url_style");
+
+                st.execute("create table smoke_test (" +
+                        "id integer, " +
+                        "symbol varchar, " +
+                        "qty integer, " +
+                        "price double, " +
+                        "trade_date date, " +
+                        "event_time timestamp" +
+                        ")");
+
+                st.execute("insert into smoke_test values " +
+                        "(1, 'AAPL', 100, 175.25, DATE '2026-04-14', TIMESTAMP '2026-04-14 14:21:00')," +
+                        "(2, 'MSFT', 250, 421.75, DATE '2026-04-14', TIMESTAMP '2026-04-14 14:21:01')");
+
+                try (ResultSet rs = st.executeQuery("select count(*) from smoke_test")) {
+                    if (rs.next()) {
+                        System.out.println("Row count = " + rs.getInt(1));
+                    }
+                }
+
+                String s3Uri = "s3://" + S3_BUCKET + "/" + S3_KEY;
+                String copySql = "COPY (SELECT * FROM smoke_test) TO '" + esc(s3Uri) + "' " +
+                        "(FORMAT PARQUET, COMPRESSION snappy)";
+                System.out.println(copySql);
+
+                st.execute(copySql);
+
+                System.out.println("SUCCESS: wrote parquet to " + s3Uri);
+            }
+        } catch (Throwable t) {
+            System.err.println("FAILED: " + t.getClass().getName() + ": " + t.getMessage());
+            t.printStackTrace(System.err);
+            Throwable c = t.getCause();
+            while (c != null) {
+                System.err.println("CAUSED BY: " + c.getClass().getName() + ": " + c.getMessage());
+                c.printStackTrace(System.err);
+                c = c.getCause();
+            }
+        }
+    }
+
+    private static void set(Statement st, String key, String value) throws Exception {
+        String sql = "SET " + key + " = '" + esc(value) + "'";
+        System.out.println(sql);
+        st.execute(sql);
+    }
+
+    private static void printSetting(Statement st, String key) throws Exception {
+        try (ResultSet rs = st.executeQuery("select current_setting('" + key + "')")) {
+            if (rs.next()) {
+                System.out.println(key + " = " + rs.getString(1));
+            }
+        }
+    }
+
+    private static String esc(String s) {
+        return s.replace("\\", "/").replace("'", "''");
+    }
+}
