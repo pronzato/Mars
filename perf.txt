@@ -1,1 +1,14 @@
-null
+{
+    "java.compile.nullAnalysis.mode": "automatic",
+    "java.debug.settings.onBuildFailureProceed": true,
+    "java.configuration.updateBuildConfiguration": "automatic",
+    "java.import.maven.enabled": true,
+    "java.server.launchMode": "Standard",
+    "java.trace.server": "verbose",
+    "java.jdt.ls.vmargs": "-XX:+UseParallelGC -XX:GCTimeRatio=4 -XX:AdaptiveSizePolicyWeight=90 -Dsun.zip.disableMemoryMapping=true -Xmx4G -Xms100m -Xlog:disable",
+    "java.debug.settings.enableRunDebugCodeLens": true,
+    "java.debug.settings.showRunDebugButtons": true,
+    "java.debug.settings.forceBuildBeforeLaunch": true,
+    "java.debug.settings.console": "integratedTerminal",
+    "java.debug.settings.vmArgs": "--add-opens=java.base/java.nio=ALL-UNNAMED -Dfabric.log.level=INFO -Dlogback.configurationFile=${workspaceFolder}/fabric-lite-config/logging/logback-dev.xml"
+}
